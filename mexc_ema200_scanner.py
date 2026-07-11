@@ -754,6 +754,244 @@ def detect_support_bounce(rows: list, highs: list[float], lows: list[float],
 
 
 # ----------------------------------------------------------------------------
+# Falling-wedge detection (bullish reversal) — multi-timeframe
+# ----------------------------------------------------------------------------
+def _agg_series(rows: list, group_days: int):
+    """Aggregate 4h rows into a higher timeframe OHLCV (group_days=1 daily,
+    7 weekly) by UTC period. Returns (highs, lows, closes, volumes)."""
+    buckets: dict[int, list] = {}
+    span = 86400000 * group_days
+    for r in rows:
+        try:
+            buckets.setdefault(int(float(r[0])) // span, []).append(r)
+        except (ValueError, IndexError):
+            continue
+    keys = sorted(buckets)
+    highs = [max(float(x[2]) for x in buckets[k]) for k in keys]
+    lows = [min(float(x[3]) for x in buckets[k]) for k in keys]
+    closes = [float(buckets[k][-1][4]) for k in keys]
+    vols = [sum(float(x[5]) for x in buckets[k]) for k in keys]
+    return highs, lows, closes, vols
+
+
+def detect_falling_wedge(highs: list[float], lows: list[float],
+                         closes: list[float], volumes: list[float], *,
+                         window: int = 60, near_tol: float = 0.03,
+                         min_conv: float = 0.15) -> tuple[bool, dict]:
+    """Falling wedge: a bullish reversal where price coils inside two DOWN-sloping,
+    CONVERGING trendlines (lower highs + lower lows, highs falling faster). The
+    setup fires when price is coiling near the apex or has just broken out above
+    the upper (descending resistance) line. Returns (is_hit, details)."""
+    n = len(closes)
+    if n < 30:
+        return False, {}
+    last = n - 1
+    price = closes[last]
+    sh, sl = swing_points(highs, lows, window=window)
+    if len(sh) < 2 or len(sl) < 2:
+        return False, {}
+    ph, pl = sh[-3:], sl[-3:]
+
+    def line(pivots):
+        (i0, p0), (i1, p1) = pivots[0], pivots[-1]
+        if i1 == i0:
+            return None
+        slope = (p1 - p0) / (i1 - i0)
+        return slope, p0 - slope * i0            # value(idx) = slope*idx + b
+
+    up, lo = line(ph), line(pl)
+    if not up or not lo:
+        return False, {}
+    us, ub = up
+    ls, lb = lo
+    # Both lines must fall, and price must make lower highs AND lower lows.
+    if us >= 0 or ls >= 0:
+        return False, {}
+    if ph[-1][1] >= ph[0][1] or pl[-1][1] >= pl[0][1]:
+        return False, {}
+
+    start_idx = min(ph[0][0], pl[0][0])
+    upper_now = us * last + ub
+    lower_now = ls * last + lb
+    w_start = (us * start_idx + ub) - (ls * start_idx + lb)
+    w_now = upper_now - lower_now
+    if w_start <= 0 or w_now <= 0 or w_now >= w_start:
+        return False, {}                          # must be converging
+    conv = 1.0 - w_now / w_start                  # 0..1, higher = tighter apex
+    if conv < min_conv:
+        return False, {}
+
+    broke = price > upper_now
+    near = lower_now * (1 - near_tol) <= price <= upper_now * (1 + near_tol)
+    if not (broke or near):
+        return False, {}
+
+    touches = len(ph) + len(pl)
+    rv = rel_volume(volumes) or 1.0
+    vol_s = min(1.0, max(0.0, (rv - 1.0) / 1.5)) if broke else 0.3
+    apex_gap = abs(price - upper_now) / price
+    apex_s = max(0.0, 1.0 - apex_gap / 0.06)
+    touch_s = min(1.0, (touches - 4) / 4.0) if touches > 4 else 0.3
+    score = round(100 * (0.4 * conv + 0.25 * apex_s +
+                         0.2 * vol_s + 0.15 * touch_s), 1)
+    if broke:
+        score = round(min(100.0, score + 8), 1)   # confirmed breakout nudge
+
+    entry = price
+    a = atr(highs, lows, closes)
+    wedge_lo = min(lows[start_idx:last + 1])
+    optimal_entry = round(upper_now, 10)          # ideal fill: retest of the line
+    sl_tight = min(lower_now, wedge_lo) - 0.5 * a
+    sl_wide = wedge_lo - 1.0 * a
+    if sl_wide > sl_tight:
+        sl_wide = sl_tight
+    mm = upper_now + w_start                       # measured move = wedge height
+    res = resistances_above(highs, last, entry, max_n=4, min_gap=0.008)
+    tps = [t for t in ([upper_now * 1.002] + res + [mm]) if t > price]
+    seen, dedup = set(), []
+    for t in sorted(tps):
+        k = round(t, 8)
+        if k not in seen:
+            seen.add(k)
+            dedup.append(t)
+    bundle = level_bundle(entry, sl_tight, sl_wide, dedup[:5])
+    ms = market_structure(highs, lows, closes)
+    return True, {
+        "price": price,
+        "pattern": "falling_wedge",
+        "broken_out": bool(broke),
+        "upper": upper_now,
+        "lower": lower_now,
+        "conv_pct": round(conv * 100, 1),
+        "touches": touches,
+        "rvol": round(rv, 2),
+        "choch": ms["choch"],
+        "entry": entry,
+        "optimal_entry": optimal_entry,
+        "score": score,
+        **bundle,
+    }
+
+
+def detect_falling_wedge_mtf(rows: list, highs: list[float], lows: list[float],
+                             closes: list[float], volumes: list[float]
+                             ) -> tuple[bool, dict]:
+    """Run the falling-wedge check on 4h, DAILY and WEEKLY series and return the
+    strongest hit, tagged with its timeframe."""
+    best = None
+    frames = [("4h", highs, lows, closes, volumes)]
+    for gd, lbl in ((1, "Daily"), (7, "Weekly")):
+        h, l, c, v = _agg_series(rows, gd)
+        if len(c) >= 30:
+            frames.append((lbl, h, l, c, v))
+    for lbl, h, l, c, v in frames:
+        ok, d = detect_falling_wedge(h, l, c, v)
+        if ok:
+            d = {**d, "tf": lbl}
+            # Prefer a confirmed breakout, then higher score.
+            key = (1 if d["broken_out"] else 0, d["score"])
+            if best is None or key > best[0]:
+                best = (key, d)
+    return (True, best[1]) if best else (False, {})
+
+
+# ----------------------------------------------------------------------------
+# Breakdown-and-retest (bearish mirror of the 200-EMA reclaim) — SHORTS
+# ----------------------------------------------------------------------------
+def detect_breakdown_and_retest(
+    highs: list[float], lows: list[float], closes: list[float],
+    *, ema_period: int = EMA_PERIOD, lookback: int = LOOKBACK,
+    retest_tol: float = RETEST_TOL, break_tol: float = BREAK_TOL,
+    max_below_now: float = MAX_ABOVE_NOW, max_slope: float = -MIN_SLOPE,
+) -> tuple[bool, dict]:
+    """Bearish mirror of cross-and-retest: price breaks DOWN through the 200 EMA,
+    then retests it FROM BELOW (EMA acting as resistance) and rolls over — a short
+    setup. Stops sit ABOVE the EMA; targets are supports below."""
+    e = ema(closes, ema_period)
+    n = len(closes)
+    if n < ema_period + 2 or e[-1] is None:
+        return False, {}
+    last = n - 1
+    ema_now = e[last]
+    close_now = closes[last]
+    if close_now > ema_now:                        # must be below the EMA now
+        return False, {}
+    pct_below = (ema_now - close_now) / ema_now
+    if pct_below > max_below_now:                  # too far below = overextended
+        return False, {}
+
+    j = max(ema_period - 1, last - 20)
+    if e[j] is None or e[j] == 0:
+        return False, {}
+    slope = (ema_now - e[j]) / e[j]
+    if slope > max_slope:                          # EMA must be falling
+        return False, {}
+
+    # Most recent close-above -> close-below cross (the breakdown that started
+    # the current run below the EMA), searching back unbounded.
+    cross_idx = None
+    for i in range(last, ema_period, -1):
+        if e[i] is None or e[i - 1] is None:
+            continue
+        if closes[i - 1] > e[i - 1] and closes[i] <= e[i]:
+            cross_idx = i
+            break
+    if cross_idx is None:
+        return False, {}
+
+    # After the breakdown, price must not have closed decisively back above.
+    for i in range(cross_idx, last + 1):
+        if e[i] is None:
+            continue
+        if closes[i] > e[i] * (1.0 + break_tol):
+            return False, {}
+
+    # Retest from below: a HIGH tags the EMA band while the candle CLOSES at/below
+    # the EMA (held as resistance). Keep the cleanest tag.
+    best_gap = None
+    retest_idx = None
+    for i in range(cross_idx + 1, last + 1):
+        if e[i] is None:
+            continue
+        high_gap = (highs[i] - e[i]) / e[i]
+        if abs(high_gap) <= retest_tol and closes[i] <= e[i]:
+            if best_gap is None or abs(high_gap) < abs(best_gap):
+                best_gap = high_gap
+                retest_idx = i
+    if retest_idx is None:
+        return False, {}
+
+    bars_since_cross = last - cross_idx
+    freshness = max(0.0, 1.0 - bars_since_cross / lookback)
+    tightness = max(0.0, min(1.0, 1.0 - abs(best_gap) / retest_tol))
+    proximity = max(0.0, min(1.0, 1.0 - pct_below / max_below_now))
+    score = round(100 * (0.45 * tightness + 0.35 * freshness + 0.20 * proximity), 1)
+
+    entry = close_now
+    a = atr(highs, lows, closes)
+    optimal_entry = round(ema_now * 0.998, 10)     # ideal short: rally to the EMA
+    tight_struct = max(max(highs[retest_idx:last + 1]), ema_now)
+    wide_struct = max(highs[cross_idx:last + 1])
+    sl_tight = tight_struct + 0.5 * a              # stop ABOVE structure
+    sl_wide = max(wide_struct + 1.0 * a, sl_tight)
+    sup = supports_below(lows, last, entry, max_n=5, min_gap=0.008)
+    bundle = level_bundle(entry, sl_tight, sl_wide, sup)   # rr sign-invariant
+    return True, {
+        "price": close_now,
+        "ema": ema_now,
+        "pct_below_ema": round(pct_below * 100, 2),
+        "bars_since_cross": bars_since_cross,
+        "fresh": bars_since_cross <= 6,
+        "retest_gap_pct": round(best_gap * 100, 2),
+        "side": "short",
+        "score": score,
+        "entry": entry,
+        "optimal_entry": optimal_entry,
+        **bundle,
+    }
+
+
+# ----------------------------------------------------------------------------
 # MEXC API
 # ----------------------------------------------------------------------------
 def get_session() -> requests.Session:
@@ -972,13 +1210,14 @@ def scan_symbol(sess: requests.Session, symbol: str, interval: str,
 
 def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
                       cfg: dict) -> tuple:
-    """Fetch klines ONCE and run all four detectors (200-EMA reclaim, bull flag,
-    narrow CPR, support bounce). One request per symbol powers every scan.
-    Returns (ema, flag, cpr, bounce) dicts (each with 'symbol') or None."""
+    """Fetch klines ONCE and run every detector (200-EMA reclaim, bull flag,
+    narrow CPR, support bounce, falling wedge, bearish breakdown/retest). One
+    request per symbol powers every scan. Returns a 6-tuple of dicts (each with
+    'symbol') or None: (ema, flag, cpr, bounce, wedge, short)."""
     raw = fetch_candles(sess, symbol, interval, cfg["kline_limit"],
                         cfg.get("market", "spot"))
     if not raw or len(raw) < EMA_PERIOD + 2:
-        return None, None, None, None
+        return None, None, None, None, None, None
     # MEXC kline row: [openTime, open, high, low, close, volume, closeTime, ...]
     rows = raw[:-1]                       # drop the still-forming candle
     try:
@@ -987,7 +1226,7 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
         closes = [float(x[4]) for x in rows]
         vols = [float(x[5]) for x in rows]
     except (ValueError, IndexError):
-        return None, None, None, None
+        return None, None, None, None, None, None
 
     rv = rel_volume(vols)                       # relative volume of the latest candle
     ksup = key_supports(rows, lows, closes[-1])  # next 4h / daily / weekly support
@@ -1040,7 +1279,22 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
     if ok4:
         bounce_hit = confirmed(b, boost=True)
 
-    return ema_hit, flag_hit, cpr_hit, bounce_hit
+    wedge_hit = short_hit = None
+    ok5, w = detect_falling_wedge_mtf(rows, highs, lows, closes, vols)
+    if ok5:
+        wedge_hit = confirmed(w, boost=w.get("broken_out", False))
+
+    ok6, s = detect_breakdown_and_retest(
+        highs, lows, closes,
+        ema_period=EMA_PERIOD, lookback=cfg["lookback"],
+        retest_tol=cfg["retest_tol"], break_tol=cfg["break_tol"],
+        max_below_now=cfg["max_above_now"], max_slope=-cfg["min_slope"],
+    )
+    if ok6:
+        short_hit = confirmed(s, boost=True)
+        short_hit["bias_dir"] = "bearish"        # a short is bearish by definition
+
+    return ema_hit, flag_hit, cpr_hit, bounce_hit, wedge_hit, short_hit
 
 
 def supports_below(lows: list[float], upto: int, price: float,

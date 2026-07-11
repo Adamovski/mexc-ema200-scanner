@@ -93,6 +93,12 @@ class State:
         self.bounce_hits: list[dict] = []          # support-bounce setups
         self.prev_bounce_symbols: set[str] | None = None
         self.new_bounce_symbols: list[str] = []
+        self.wedge_hits: list[dict] = []           # falling-wedge setups (multi-TF)
+        self.prev_wedge_symbols: set[str] | None = None
+        self.new_wedge_symbols: list[str] = []
+        self.short_hits: list[dict] = []           # bearish breakdown/retest (shorts)
+        self.prev_short_symbols: set[str] | None = None
+        self.new_short_symbols: list[str] = []
         self.both_symbols: list[str] = []          # appear on 2+ scans (confluence)
         self.prev_both: set[str] | None = None     # confluence set from previous scan
         self.watch: dict[str, float] = {}          # symbol -> flag breakout level (armed)
@@ -135,6 +141,10 @@ class State:
                 "cpr_new_symbols": list(self.new_cpr_symbols),
                 "bounce_hits": withlive(self.bounce_hits),
                 "bounce_new_symbols": list(self.new_bounce_symbols),
+                "wedge_hits": withlive(self.wedge_hits),
+                "wedge_new_symbols": list(self.new_wedge_symbols),
+                "short_hits": withlive(self.short_hits),
+                "short_new_symbols": list(self.new_short_symbols),
                 "both_symbols": list(self.both_symbols),
                 "breakout_events": list(self.breakout_events),
                 "error": self.error,
@@ -173,6 +183,8 @@ def run_one_scan(state: State) -> None:
     flags: list[dict] = []
     cprs: list[dict] = []
     bounces: list[dict] = []
+    wedges: list[dict] = []
+    shorts: list[dict] = []
     done = 0
     scan_cfg = {k: cfg[k] for k in
                 ("kline_limit", "lookback", "retest_tol", "break_tol",
@@ -188,9 +200,9 @@ def run_one_scan(state: State) -> None:
                 with state.lock:
                     state.progress = (done, len(symbols))
             try:
-                h, f, c, b = fut.result()
+                h, f, c, b, w, sh = fut.result()
             except Exception:
-                h, f, c, b = None, None, None, None
+                h, f, c, b, w, sh = None, None, None, None, None, None
             if h:
                 hits.append(h)
             if f:
@@ -199,6 +211,10 @@ def run_one_scan(state: State) -> None:
                 cprs.append(c)
             if b:
                 bounces.append(b)
+            if w:
+                wedges.append(w)
+            if sh:
+                shorts.append(sh)
 
     # Persist recently broken-out flags on the list (tagged) so the Bull-flags tab
     # doesn't "reset" the moment a flag triggers. The forming flags are recorded
@@ -220,6 +236,8 @@ def run_one_scan(state: State) -> None:
     flags.sort(key=lambda h: h["score"], reverse=True)
     cprs.sort(key=lambda h: h["score"], reverse=True)
     bounces.sort(key=lambda h: h["score"], reverse=True)
+    wedges.sort(key=lambda h: h["score"], reverse=True)
+    shorts.sort(key=lambda h: h["score"], reverse=True)
 
     def tag_new(items, prev):
         """Return (rows, new_syms, cur_syms) with an is_new flag per row."""
@@ -236,6 +254,7 @@ def run_one_scan(state: State) -> None:
         "Bull flag": {h["symbol"] for h in flags},
         "Narrow CPR": {h["symbol"] for h in cprs},
         "Support bounce": {h["symbol"] for h in bounces},
+        "Falling wedge": {h["symbol"] for h in wedges},
     }
     conf: dict[str, list[str]] = {}          # symbol -> list of scan labels it's in
     for label, members in scan_members.items():
@@ -248,7 +267,9 @@ def run_one_scan(state: State) -> None:
         frows, fnew, fcur = tag_new(flags, state.prev_flag_symbols)
         crows, cnew, ccur = tag_new(cprs, state.prev_cpr_symbols)
         brows, bnew, bcur = tag_new(bounces, state.prev_bounce_symbols)
-        for d in rows + frows + crows + brows:
+        wrows, wnew, wcur = tag_new(wedges, state.prev_wedge_symbols)
+        srows, snew, scur = tag_new(shorts, state.prev_short_symbols)
+        for d in rows + frows + crows + brows + wrows + srows:
             labels = conf.get(d["symbol"], [])
             d["both"] = len(labels) >= 2
             d["both_count"] = len(labels)
@@ -257,6 +278,8 @@ def run_one_scan(state: State) -> None:
         state.flag_hits, state.new_flag_symbols, state.prev_flag_symbols = frows, fnew, fcur
         state.cpr_hits, state.new_cpr_symbols, state.prev_cpr_symbols = crows, cnew, ccur
         state.bounce_hits, state.new_bounce_symbols, state.prev_bounce_symbols = brows, bnew, bcur
+        state.wedge_hits, state.new_wedge_symbols, state.prev_wedge_symbols = wrows, wnew, wcur
+        state.short_hits, state.new_short_symbols, state.prev_short_symbols = srows, snew, scur
         state.both_symbols = sorted(both)
 
         # Arm breakout alerts for the current bull flags (their breakout level).
@@ -518,6 +541,14 @@ PAGE = """<!doctype html>
   .aztag{font-size:11.5px;border-radius:6px;padding:2px 8px;border:1px solid var(--line);color:var(--dim)}
   .aztag.on{background:rgba(63,185,80,.14);color:var(--accent);border-color:rgba(63,185,80,.5);font-weight:600}
   .azerr{color:var(--warn);padding:10px 0}
+  .topgrid{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:0 16px 16px}
+  @media(max-width:960px){.topgrid{grid-template-columns:1fr}}
+  .toptitle{font-size:13px;font-weight:800;letter-spacing:.04em;padding:8px 4px;text-transform:uppercase}
+  .toptitle.bull{color:var(--accent)}
+  .toptitle.bear{color:#f85149}
+  .phasepill{border-radius:6px;padding:1px 7px;font-size:11px;font-weight:700;border:1px solid var(--line)}
+  .phase-broke{background:rgba(63,185,80,.16);color:var(--accent);border-color:rgba(63,185,80,.5)}
+  .phase-form{background:rgba(139,152,173,.12);color:var(--dim)}
 </style></head>
 <body>
 <header>
@@ -533,6 +564,9 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabFlags" onclick="showTab('flags')">Bull flags</div>
   <div class="tab" id="tabCpr" onclick="showTab('cpr')">Narrow CPR</div>
   <div class="tab" id="tabBounce" onclick="showTab('bounce')">Support bounce</div>
+  <div class="tab" id="tabWedge" onclick="showTab('wedge')">Falling wedge</div>
+  <div class="tab" id="tabShorts" onclick="showTab('shorts')">Shorts</div>
+  <div class="tab" id="tabTop" onclick="showTab('top')">⭐ Top setups</div>
   <div class="tab" id="tabAnalyze" onclick="showTab('analyze')">Analyze a coin</div>
   <div class="tab" id="tabInfo" onclick="showTab('info')">Info</div>
 </div>
@@ -665,6 +699,93 @@ PAGE = """<!doctype html>
     <tbody id="brows"></tbody>
   </table>
   <div class="empty" id="bempty" style="display:none">No support-bounce setups right now. The loop keeps scanning…</div>
+</div>
+</div>
+
+<div class="view" id="viewWedge">
+<div class="status">
+  <span>Falling wedge — price coiling in a converging downtrend (bullish reversal), on 4h / Daily / Weekly. Fires near the apex or on the breakout.</span>
+  <span id="wedgeCount"></span>
+</div>
+<div class="wrap">
+  <table id="wtbl">
+    <thead><tr>
+      <th data-wk="symbol">Symbol</th>
+      <th data-wk="price">Price</th>
+      <th data-wk="tf">TF</th>
+      <th data-wk="phase">Phase</th>
+      <th data-wk="conv_pct">Converge %</th>
+      <th data-wk="touches">Touches</th>
+      <th data-wk="bias">Bias</th>
+      <th data-wk="optimal_entry">Breakout entry</th>
+      <th data-wk="sl_tight">SL tight</th>
+      <th data-wk="sl_wide">SL wide</th>
+      <th data-wk="tp1">TP1</th>
+      <th data-wk="tp2">TP2</th>
+      <th data-wk="tp3">TP3</th>
+      <th data-wk="tp4">TP4</th>
+      <th data-wk="tp5">TP5</th>
+      <th data-wk="rvol">RVol</th>
+      <th data-wk="score">Score</th>
+    </tr></thead>
+    <tbody id="wrows"></tbody>
+  </table>
+  <div class="empty" id="wempty" style="display:none">No falling-wedge setups right now. The loop keeps scanning…</div>
+</div>
+</div>
+
+<div class="view" id="viewShorts">
+<div class="status">
+  <span>Shorts — bearish breakdown &amp; retest of the 200 EMA (price broke below a falling EMA and rejected it from underneath). Stops sit ABOVE, targets BELOW.</span>
+  <span id="shortCount"></span>
+</div>
+<div class="wrap">
+  <table id="stbl">
+    <thead><tr>
+      <th data-sk="symbol">Symbol</th>
+      <th data-sk="price">Price</th>
+      <th data-sk="pct_below_ema">% &lt; EMA</th>
+      <th data-sk="bars_since_cross">Bars</th>
+      <th data-sk="bias">Bias</th>
+      <th data-sk="optimal_entry">Optimal entry</th>
+      <th data-sk="sl_tight">SL tight</th>
+      <th data-sk="sl_wide">SL wide</th>
+      <th data-sk="tp1">TP1</th>
+      <th data-sk="tp2">TP2</th>
+      <th data-sk="tp3">TP3</th>
+      <th data-sk="tp4">TP4</th>
+      <th data-sk="tp5">TP5</th>
+      <th data-sk="rvol">RVol</th>
+      <th data-sk="score">Score</th>
+    </tr></thead>
+    <tbody id="srows"></tbody>
+  </table>
+  <div class="empty" id="sempty" style="display:none">No short setups right now. The loop keeps scanning…</div>
+</div>
+</div>
+
+<div class="view" id="viewTop">
+<div class="status">
+  <span>Top setups — the strongest bullish and bearish candidates aggregated across every scan, ranked by score (★ = multi-scan confluence).</span>
+  <span id="topCount"></span>
+</div>
+<div class="topgrid">
+  <div class="topcol">
+    <div class="toptitle bull">▲ Most bullish</div>
+    <div class="wrap"><table id="tbtbl"><thead><tr>
+      <th>Symbol</th><th>Setups</th><th>Price</th><th>Bias</th>
+      <th>Entry</th><th>SL tight</th><th>TP1</th><th>RR1</th><th>Score</th>
+    </tr></thead><tbody id="tbrows"></tbody></table>
+    <div class="empty" id="tbempty" style="display:none">No bullish setups yet…</div></div>
+  </div>
+  <div class="topcol">
+    <div class="toptitle bear">▼ Most bearish</div>
+    <div class="wrap"><table id="tstbl"><thead><tr>
+      <th>Symbol</th><th>Setups</th><th>Price</th><th>Bias</th>
+      <th>Entry</th><th>SL tight</th><th>TP1</th><th>RR1</th><th>Score</th>
+    </tr></thead><tbody id="tsrows"></tbody></table>
+    <div class="empty" id="tsempty" style="display:none">No bearish setups yet…</div></div>
+  </div>
 </div>
 </div>
 
@@ -898,10 +1019,13 @@ let sortKey="score", sortDir=-1, latest=[];
 let fSortKey="score", fSortDir=-1, flatest=[];
 let cSortKey="score", cSortDir=-1, clatest=[];
 let bSortKey="score", bSortDir=-1, blatest=[];
+let wSortKey="score", wSortDir=-1, wlatest=[];
+let sSortKey="score", sSortDir=-1, slatest=[];
 let activeTab="setups", lastData=null;
 // Per-tab filters so a filter on one tab never hides rows on another.
 const FILT={ setups:{bias:"all",fresh:false}, flags:{bias:"all",phase:"all"},
-             cpr:{bias:"all"}, bounce:{bias:"all"} };
+             cpr:{bias:"all"}, bounce:{bias:"all"},
+             wedge:{bias:"all",phase:"all"}, shorts:{bias:"all"} };
 function biasOk(h,tab){ const b=FILT[tab].bias; return b==="all"||h.bias_dir===b; }
 function renderFilterBar(){
   const bar=document.getElementById("filterbar"); if(!bar) return;
@@ -920,10 +1044,16 @@ function renderFilterBar(){
     for(const [k,l] of [["all","All flags"],["forming","Forming only"],["broken","Broken out only"]])
       h+=`<span class="fbtn ${f.phase===k?'active':''}" onclick="setF('flags','phase','${k}')">${l}</span>`;
   }
+  if(t==="wedge"){
+    h+='<span style="color:var(--line)">|</span>';
+    for(const [k,l] of [["all","All wedges"],["forming","Coiling only"],["broken","Broken out only"]])
+      h+=`<span class="fbtn ${f.phase===k?'active':''}" onclick="setF('wedge','phase','${k}')">${l}</span>`;
+  }
   bar.innerHTML=h;
 }
 function setF(tab,key,val){ FILT[tab][key]=val; renderFilterBar();
-  ({setups:render,flags:renderFlags,cpr:renderCPR,bounce:renderBounce}[tab]||(()=>{}))();
+  ({setups:render,flags:renderFlags,cpr:renderCPR,bounce:renderBounce,
+    wedge:renderWedge,shorts:renderShorts}[tab]||(()=>{}))();
 }
 let alertsOn=false, audioCtx=null, seenBreak=Math.floor(Date.now()/1000);
 function enableAlerts(){
@@ -1013,7 +1143,7 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["wedge","Wedge"],["shorts","Shorts"],["top","Top"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
@@ -1102,6 +1232,8 @@ function renderBanner(){
   else if(activeTab==="flags"){ newSyms=(lastData&&lastData.flag_new_symbols)||[]; what="bull flag"; }
   else if(activeTab==="cpr"){ newSyms=(lastData&&lastData.cpr_new_symbols)||[]; what="narrow CPR"; }
   else if(activeTab==="bounce"){ newSyms=(lastData&&lastData.bounce_new_symbols)||[]; what="support bounce"; }
+  else if(activeTab==="wedge"){ newSyms=(lastData&&lastData.wedge_new_symbols)||[]; what="falling wedge"; }
+  else if(activeTab==="shorts"){ newSyms=(lastData&&lastData.short_new_symbols)||[]; what="short setup"; }
   if(!newSyms.length){ b.classList.remove("show"); b.innerHTML=""; return; }
   const chips=newSyms.map(s=>`<span class="chip"><a href="${tvLink(s)}" target="_blank" rel="noopener">${s}</a></span>`).join("");
   const label=newSyms.length===1?`new ${what} just triggered`:`new ${what} setups just triggered`;
@@ -1237,6 +1369,111 @@ function renderCPR(){
     tb.appendChild(tr);
   }
 }
+document.querySelectorAll("th[data-wk]").forEach(th=>th.addEventListener("click",()=>{
+  const k=th.dataset.wk; if(k===wSortKey) wSortDir*=-1; else {wSortKey=k; wSortDir=(k==="symbol"||k==="tf"||k==="phase")?1:-1;}
+  renderWedge();
+}));
+document.querySelectorAll("th[data-sk]").forEach(th=>th.addEventListener("click",()=>{
+  const k=th.dataset.sk; if(k===sSortKey) sSortDir*=-1; else {sSortKey=k; sSortDir=(k==="symbol")?1:-1;}
+  renderShorts();
+}));
+function wedgePhase(h){ return h.broken_out
+  ? '<span class="phasepill phase-broke">🚀 Broke out</span>'
+  : '<span class="phasepill phase-form">Coiling</span>'; }
+function renderWedge(){
+  const ph=FILT.wedge.phase;
+  const rows=[...wlatest].filter(h=>biasOk(h,"wedge")
+      &&(ph==="all"||(ph==="broken"?h.broken_out:!h.broken_out))).sort((a,b)=>{
+    const x=a[wSortKey],y=b[wSortKey];
+    if(typeof x==="string") return wSortDir*x.localeCompare(y);
+    return wSortDir*((x??0)-(y??0));
+  });
+  const tb=document.getElementById("wrows"); tb.innerHTML="";
+  document.getElementById("wempty").style.display = rows.length? "none":"block";
+  for(const h of rows){
+    const tr=document.createElement("tr");
+    tr.className=rowClass(h);
+    tr.innerHTML =
+      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
+      `<td><span class="tfpill tf-${(h.tf||'').toLowerCase()}">${h.tf||'4h'}</span></td>`+
+      `<td>${wedgePhase(h)}</td>`+
+      `<td data-tip="How far the two wedge lines have converged toward the apex. Higher = tighter coil, closer to resolution.">${h.conv_pct==null?'—':(+h.conv_pct).toFixed(1)}</td>`+
+      `<td>${h.touches==null?'—':h.touches}</td>`+
+      `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
+      `<td data-tip="Breakout entry — a break/retest of the upper (descending) wedge line rather than chasing.">${fmtNum(h.optimal_entry)}</td>`+
+      `<td data-tip="Tight stop — just below the wedge low, ATR-buffered. A close below invalidates the wedge.">${fmtNum(h.sl_tight)}</td>`+
+      `<td data-tip="Wide stop — below a deeper swing low.">${fmtNum(h.sl_wide)}</td>`+
+      tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
+      rvCell(h.rvol)+
+      `<td class="score">${(+h.score).toFixed(1)}</td>`;
+    tb.appendChild(tr);
+  }
+}
+function renderShorts(){
+  const rows=[...slatest].filter(h=>biasOk(h,"shorts")).sort((a,b)=>{
+    const x=a[sSortKey],y=b[sSortKey];
+    if(typeof x==="string") return sSortDir*x.localeCompare(y);
+    return sSortDir*((x??0)-(y??0));
+  });
+  const tb=document.getElementById("srows"); tb.innerHTML="";
+  document.getElementById("sempty").style.display = rows.length? "none":"block";
+  for(const h of rows){
+    const tr=document.createElement("tr");
+    tr.className=rowClass(h);
+    tr.innerHTML =
+      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
+      `<td>${(+h.pct_below_ema).toFixed(2)}</td>`+
+      `<td>${h.bars_since_cross}</td>`+
+      `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
+      `<td data-tip="Optimal short entry — a rally back up to the 200 EMA (resistance) rather than shorting into support.">${fmtNum(h.optimal_entry)}</td>`+
+      `<td data-tip="Tight stop — just ABOVE the EMA / retest high, ATR-buffered. A close back above invalidates the short.">${fmtNum(h.sl_tight)}</td>`+
+      `<td data-tip="Wide stop — above a deeper swing high.">${fmtNum(h.sl_wide)}</td>`+
+      tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
+      rvCell(h.rvol)+
+      `<td class="score">${(+h.score).toFixed(1)}</td>`;
+    tb.appendChild(tr);
+  }
+}
+function renderTop(){
+  if(!lastData) return;
+  const srcB=[["Reclaim",lastData.hits],["Flag",lastData.flag_hits],["CPR",lastData.cpr_hits],
+              ["Bounce",lastData.bounce_hits],["Wedge",lastData.wedge_hits]];
+  const srcS=[["Short",lastData.short_hits]];
+  function agg(srcs){
+    const m={};
+    for(const [lbl,list] of srcs) for(const h of (list||[])){
+      const k=h.symbol;
+      if(!m[k]) m[k]={row:h,score:h.score||0,setups:new Set()};
+      m[k].setups.add(lbl);
+      if((h.score||0)>m[k].score){ m[k].score=h.score||0; m[k].row=h; }
+    }
+    return Object.values(m).sort((a,b)=> b.setups.size-a.setups.size || b.score-a.score).slice(0,25);
+  }
+  function fill(rowsId,emptyId,items){
+    const tb=document.getElementById(rowsId); tb.innerHTML="";
+    document.getElementById(emptyId).style.display = items.length? "none":"block";
+    for(const e of items){
+      const h=e.row, setups=[...e.setups].join(", ");
+      const P=h.live!=null?h.live:h.price;
+      const tr=document.createElement("tr"); tr.className=rowClass(h);
+      tr.innerHTML =
+        `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+        `<td data-tip="Setups this coin appears on: ${setups}">${e.setups.size>1?'★ ':''}${setups}</td>`+
+        `<td>${fmtNum(P)}</td>`+
+        `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
+        `<td>${fmtNum(h.optimal_entry)}</td>`+
+        `<td>${fmtNum(h.sl_tight)}</td>`+
+        tpCell(h.tp1,h.rr1)+
+        `<td>${h.rr1!=null?(+h.rr1).toFixed(2):'—'}</td>`+
+        `<td class="score">${(+e.score).toFixed(1)}</td>`;
+      tb.appendChild(tr);
+    }
+  }
+  fill('tbrows','tbempty',agg(srcB));
+  fill('tsrows','tsempty',agg(srcS));
+}
 async function poll(){
   try{
     const r=await fetch("/data",{cache:"no-store"}); const d=await r.json();
@@ -1245,6 +1482,9 @@ async function poll(){
     flatest=d.flag_hits||[]; renderFlags();
     clatest=d.cpr_hits||[]; renderCPR();
     blatest=d.bounce_hits||[]; renderBounce();
+    wlatest=d.wedge_hits||[]; renderWedge();
+    slatest=d.short_hits||[]; renderShorts();
+    renderTop();
     const evs=(d.breakout_events||[]).filter(e=>e.time>seenBreak);
     if(evs.length){ seenBreak=Math.max(seenBreak, ...evs.map(e=>e.time)); if(alertsOn) fireBreakout(evs); }
     renderBanner();
@@ -1253,6 +1493,9 @@ async function poll(){
     document.getElementById("flagCount").textContent = `${flatest.length} flag(s) · ${d.universe} pairs${bothTxt}`;
     document.getElementById("cprCount").textContent = `${clatest.length} narrow-CPR · ${d.universe} pairs${bothTxt}`;
     document.getElementById("bounceCount").textContent = `${blatest.length} bounce(s) · ${d.universe} pairs${bothTxt}`;
+    document.getElementById("wedgeCount").textContent = `${wlatest.length} wedge(s) · ${d.universe} pairs${bothTxt}`;
+    document.getElementById("shortCount").textContent = `${slatest.length} short(s) · ${d.universe} pairs`;
+    document.getElementById("topCount").textContent = `${latest.length+flatest.length+clatest.length+blatest.length+wlatest.length} bullish · ${slatest.length} bearish signals`;
     document.getElementById("meta").textContent =
       `${d.cfg.interval} chart · MEXC ${d.cfg.market==='futures'?'perps ⚡':'spot'} · ${d.cfg.quote} · EMA${d.cfg.ema_period} · rescans every ${d.cfg.scan_every}m${d.cfg.telegram?' · 📲 Telegram on':''}`;
     const dot=document.getElementById("dot");
@@ -1296,11 +1539,14 @@ const HDR_TIPS={
   tf:"Strongest timeframe the support sits on — Weekly (gold) > Daily (green) > 4h. Higher = more significant.",
   touches:"How many times that support level has been tested. More = stronger.",
   dist_to_support_pct:"How far price currently sits above the support (%). Smaller = fresher bounce.",
-  rsi:"RSI(14) momentum, 0–100. Below 30 = oversold (bounce potential), above 70 = overbought."
+  rsi:"RSI(14) momentum, 0–100. Below 30 = oversold (bounce potential), above 70 = overbought.",
+  conv_pct:"How far the two wedge lines have converged toward the apex. Higher = tighter coil, nearer resolution.",
+  phase:"Coiling = still forming inside the wedge. Broke out = price has pushed above the upper (descending) line.",
+  pct_below_ema:"How far price sits BELOW the falling 200 EMA (%). This is a short: closer to the line = tighter entry."
 };
 function applyHeaderTips(){
-  document.querySelectorAll("th[data-k],th[data-fk],th[data-ck],th[data-bk]").forEach(th=>{
-    const k=th.dataset.k||th.dataset.fk||th.dataset.ck||th.dataset.bk;
+  document.querySelectorAll("th[data-k],th[data-fk],th[data-ck],th[data-bk],th[data-wk],th[data-sk]").forEach(th=>{
+    const k=th.dataset.k||th.dataset.fk||th.dataset.ck||th.dataset.bk||th.dataset.wk||th.dataset.sk;
     if(HDR_TIPS[k]) th.setAttribute("data-tip",HDR_TIPS[k]);
   });
 }
