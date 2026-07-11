@@ -495,7 +495,8 @@ PAGE = """<!doctype html>
   <span class="fbtn" data-bias="bullish" onclick="setBias('bullish')">Bullish</span>
   <span class="fbtn" data-bias="bearish" onclick="setBias('bearish')">Bearish</span>
   <span class="fbtn" data-bias="neutral" onclick="setBias('neutral')">Neutral</span>
-  <span style="color:var(--dim)">— market-structure bias of each setup</span>
+  <span style="color:var(--line)">|</span>
+  <span class="fbtn" id="freshBtn" onclick="toggleFresh()" data-tip="200-EMA reclaim tab only: show just reclaims that crossed within the last ~24h (≤6 4h-candles).">🔵 Fresh reclaims only</span>
 </div>
 
 <div class="view active" id="viewSetups">
@@ -864,6 +865,11 @@ function setBias(b){ biasFilter=b;
   render(); renderFlags(); renderCPR(); renderBounce();
 }
 function biasOk(h){ return biasFilter==="all" || h.bias_dir===biasFilter; }
+let freshOnly=false;
+function toggleFresh(){ freshOnly=!freshOnly;
+  document.getElementById("freshBtn").classList.toggle("active",freshOnly);
+  render();
+}
 let alertsOn=false, audioCtx=null, seenBreak=Math.floor(Date.now()/1000);
 function enableAlerts(){
   try{ if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)();
@@ -1073,7 +1079,7 @@ function renderFlags(){
   }
 }
 function render(){
-  const rows=[...latest].filter(biasOk).sort((a,b)=>{
+  const rows=[...latest].filter(h=>biasOk(h)&&(!freshOnly||h.fresh)).sort((a,b)=>{
     const x=a[sortKey],y=b[sortKey];
     if(typeof x==="string") return sortDir*x.localeCompare(y);
     return sortDir*((x??0)-(y??0));
