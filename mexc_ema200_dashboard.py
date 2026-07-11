@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# build: per-tab filters + robust live prices (retry/fallback) — auto-deploy trigger
 """
 MEXC 200-EMA "cross & retest" LIVE DASHBOARD (4h chart)
 =======================================================
