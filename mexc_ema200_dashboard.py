@@ -97,6 +97,7 @@ class State:
         self.watch: dict[str, float] = {}          # symbol -> flag breakout level (armed)
         self.watch_fired: set[str] = set()         # already-alerted breakouts
         self.breakout_events: list[dict] = []      # recent triggered breakouts
+        self.live_prices: dict[str, float] = {}    # symbol -> live last price (refreshed ~20s)
         self.last_scan: float | None = None      # epoch seconds
         self.next_scan: float | None = None
         self.scanning: bool = False
@@ -106,19 +107,32 @@ class State:
 
     def snapshot(self) -> dict:
         with self.lock:
+            lp = self.live_prices
+
+            def withlive(rows):
+                """Copy each row and attach the current LIVE price so the tables
+                show up-to-the-second prices between 15-min rescans."""
+                out = []
+                for r in rows:
+                    d = dict(r)
+                    p = lp.get(d.get("symbol"))
+                    d["live"] = p if p else d.get("price")
+                    out.append(d)
+                return out
+
             return {
-                "hits": list(self.hits),
+                "hits": withlive(self.hits),
                 "last_scan": self.last_scan,
                 "next_scan": self.next_scan,
                 "scanning": self.scanning,
                 "progress": self.progress,
                 "universe": self.universe,
                 "new_symbols": list(self.new_symbols),
-                "flag_hits": list(self.flag_hits),
+                "flag_hits": withlive(self.flag_hits),
                 "flag_new_symbols": list(self.new_flag_symbols),
-                "cpr_hits": list(self.cpr_hits),
+                "cpr_hits": withlive(self.cpr_hits),
                 "cpr_new_symbols": list(self.new_cpr_symbols),
-                "bounce_hits": list(self.bounce_hits),
+                "bounce_hits": withlive(self.bounce_hits),
                 "bounce_new_symbols": list(self.new_bounce_symbols),
                 "both_symbols": list(self.both_symbols),
                 "breakout_events": list(self.breakout_events),
@@ -295,15 +309,17 @@ def breakout_watcher(state: State) -> None:
     sess = get_session()
     market = state.cfg.get("market", "futures")
     while True:
-        time.sleep(45)
-        with state.lock:
-            watch = dict(state.watch)
-            fired = set(state.watch_fired)
-        if not watch:
-            continue
+        time.sleep(20)
         try:
             prices = fetch_all_prices(sess, market)
         except Exception:
+            continue
+        # Always publish the fresh price map so every scan table shows live prices.
+        with state.lock:
+            state.live_prices = prices
+            watch = dict(state.watch)
+            fired = set(state.watch_fired)
+        if not watch:
             continue
         events = []
         for sym, bo in watch.items():
@@ -519,14 +535,7 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabAnalyze" onclick="showTab('analyze')">Analyze a coin</div>
   <div class="tab" id="tabInfo" onclick="showTab('info')">Info</div>
 </div>
-<div class="filterbar">Bias filter:
-  <span class="fbtn active" data-bias="all" onclick="setBias('all')">All</span>
-  <span class="fbtn" data-bias="bullish" onclick="setBias('bullish')">Bullish</span>
-  <span class="fbtn" data-bias="bearish" onclick="setBias('bearish')">Bearish</span>
-  <span class="fbtn" data-bias="neutral" onclick="setBias('neutral')">Neutral</span>
-  <span style="color:var(--line)">|</span>
-  <span class="fbtn" id="freshBtn" onclick="toggleFresh()" data-tip="200-EMA reclaim tab only: show just reclaims that crossed within the last ~24h (≤6 4h-candles).">🔵 Fresh reclaims only</span>
-</div>
+<div class="filterbar" id="filterbar"></div>
 
 <div class="view active" id="viewSetups">
 <div class="status">
@@ -888,16 +897,32 @@ let sortKey="score", sortDir=-1, latest=[];
 let fSortKey="score", fSortDir=-1, flatest=[];
 let cSortKey="score", cSortDir=-1, clatest=[];
 let bSortKey="score", bSortDir=-1, blatest=[];
-let activeTab="setups", lastData=null, biasFilter="all";
-function setBias(b){ biasFilter=b;
-  document.querySelectorAll(".fbtn").forEach(x=>x.classList.toggle("active",x.dataset.bias===b));
-  render(); renderFlags(); renderCPR(); renderBounce();
+let activeTab="setups", lastData=null;
+// Per-tab filters so a filter on one tab never hides rows on another.
+const FILT={ setups:{bias:"all",fresh:false}, flags:{bias:"all",phase:"all"},
+             cpr:{bias:"all"}, bounce:{bias:"all"} };
+function biasOk(h,tab){ const b=FILT[tab].bias; return b==="all"||h.bias_dir===b; }
+function renderFilterBar(){
+  const bar=document.getElementById("filterbar"); if(!bar) return;
+  const t=activeTab;
+  if(!FILT[t]){ bar.style.display="none"; return; }
+  bar.style.display="flex";
+  const f=FILT[t]; let h="Bias: ";
+  for(const [k,l] of [["all","All"],["bullish","Bullish"],["bearish","Bearish"],["neutral","Neutral"]])
+    h+=`<span class="fbtn ${f.bias===k?'active':''}" onclick="setF('${t}','bias','${k}')">${l}</span>`;
+  if(t==="setups"){
+    h+='<span style="color:var(--line)">|</span>';
+    h+=`<span class="fbtn ${f.fresh?'active':''}" onclick="setF('setups','fresh',${!f.fresh})" data-tip="Show only reclaims that crossed the 200 EMA within the last ~24h (≤6 4h-candles).">🔵 Fresh reclaims only</span>`;
+  }
+  if(t==="flags"){
+    h+='<span style="color:var(--line)">|</span>';
+    for(const [k,l] of [["all","All flags"],["forming","Forming only"],["broken","Broken out only"]])
+      h+=`<span class="fbtn ${f.phase===k?'active':''}" onclick="setF('flags','phase','${k}')">${l}</span>`;
+  }
+  bar.innerHTML=h;
 }
-function biasOk(h){ return biasFilter==="all" || h.bias_dir===biasFilter; }
-let freshOnly=false;
-function toggleFresh(){ freshOnly=!freshOnly;
-  document.getElementById("freshBtn").classList.toggle("active",freshOnly);
-  render();
+function setF(tab,key,val){ FILT[tab][key]=val; renderFilterBar();
+  ({setups:render,flags:renderFlags,cpr:renderCPR,bounce:renderBounce}[tab]||(()=>{}))();
 }
 let alertsOn=false, audioCtx=null, seenBreak=Math.floor(Date.now()/1000);
 function enableAlerts(){
@@ -956,7 +981,8 @@ function badges(h){
     const inList=(h.both_in||[]).join(", ");
     s+=`<span class="bothbadge" data-tip="On ${h.both_count} scans: ${inList}" title="On ${h.both_count} scans: ${inList}">★ ${h.both_count}</span>`;
   }
-  const dd=v=> (h.price&&v)? " (-"+(((h.price-v)/h.price)*100).toFixed(1)+"%)" : "";
+  const P=h.live!=null?h.live:h.price;
+  const dd=v=> (P&&v)? " (-"+(((P-v)/P)*100).toFixed(1)+"%)" : "";
   const sp=[];
   if(h.sup_4h!=null) sp.push("4h "+fmtNum(h.sup_4h)+dd(h.sup_4h));
   if(h.sup_1d!=null) sp.push("Daily "+fmtNum(h.sup_1d)+dd(h.sup_1d));
@@ -991,6 +1017,7 @@ function showTab(which){
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
   renderBanner();  // banner follows the active scan tab
+  renderFilterBar();  // filters are per-tab
 }
 let azTf="4h";
 function setAzTf(tf){ azTf=tf;
@@ -1081,7 +1108,9 @@ function renderBanner(){
   b.classList.add("show");
 }
 function renderFlags(){
-  const rows=[...flatest].filter(biasOk).sort((a,b)=>{
+  const ph=FILT.flags.phase;
+  const rows=[...flatest].filter(h=>biasOk(h,"flags")
+      &&(ph==="all"||(ph==="broken"?h.broken_out:!h.broken_out))).sort((a,b)=>{
     const x=a[fSortKey],y=b[fSortKey];
     if(typeof x==="string") return fSortDir*x.localeCompare(y);
     return fSortDir*((x??0)-(y??0));
@@ -1093,7 +1122,7 @@ function renderFlags(){
     tr.className=rowClass(h);
     tr.innerHTML =
       `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
-      `<td>${fmtNum(h.price)}</td>`+
+      `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.pole_gain_pct).toFixed(1)}</td>`+
       `<td>${h.flag_bars}</td>`+
       `<td>${(+h.pullback_pct).toFixed(1)}</td>`+
@@ -1109,7 +1138,7 @@ function renderFlags(){
   }
 }
 function render(){
-  const rows=[...latest].filter(h=>biasOk(h)&&(!freshOnly||h.fresh)).sort((a,b)=>{
+  const rows=[...latest].filter(h=>biasOk(h,"setups")&&(!FILT.setups.fresh||h.fresh)).sort((a,b)=>{
     const x=a[sortKey],y=b[sortKey];
     if(typeof x==="string") return sortDir*x.localeCompare(y);
     return sortDir*((x??0)-(y??0));
@@ -1121,7 +1150,7 @@ function render(){
     tr.className=rowClass(h);
     tr.innerHTML =
       `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
-      `<td>${fmtNum(h.price)}</td>`+
+      `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.pct_above_ema).toFixed(2)}</td>`+
       `<td>${h.bars_since_cross}</td>`+
       biasPill(h)+
@@ -1151,7 +1180,7 @@ document.querySelectorAll("th[data-bk]").forEach(th=>th.addEventListener("click"
   renderBounce();
 }));
 function renderBounce(){
-  const rows=[...blatest].filter(biasOk).sort((a,b)=>{
+  const rows=[...blatest].filter(h=>biasOk(h,"bounce")).sort((a,b)=>{
     const x=a[bSortKey],y=b[bSortKey];
     if(typeof x==="string") return bSortDir*x.localeCompare(y);
     return bSortDir*((x??0)-(y??0));
@@ -1163,7 +1192,7 @@ function renderBounce(){
     tr.className=rowClass(h);
     tr.innerHTML =
       `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
-      `<td>${fmtNum(h.price)}</td>`+
+      `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${fmtNum(h.support)}</td>`+
       `<td><span class="tfpill tf-${(h.tf||'').toLowerCase()}">${h.tf||'—'}</span></td>`+
       `<td>${h.touches}</td>`+
@@ -1180,7 +1209,7 @@ function renderBounce(){
   }
 }
 function renderCPR(){
-  const rows=[...clatest].filter(biasOk).sort((a,b)=>{
+  const rows=[...clatest].filter(h=>biasOk(h,"cpr")).sort((a,b)=>{
     const x=a[cSortKey],y=b[cSortKey];
     if(typeof x==="string") return cSortDir*x.localeCompare(y);
     return cSortDir*((x??0)-(y??0));
@@ -1192,7 +1221,7 @@ function renderCPR(){
     tr.className=rowClass(h);
     tr.innerHTML =
       `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
-      `<td>${fmtNum(h.price)}</td>`+
+      `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.cpr_width_pct).toFixed(3)}</td>`+
       `<td>${h.position}</td>`+
       biasPill(h)+

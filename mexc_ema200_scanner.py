@@ -900,25 +900,46 @@ def fetch_candles(sess: requests.Session, symbol: str, interval: str,
     return fetch_klines(sess, symbol, interval, limit)
 
 
+def _futures_live_price(sess: requests.Session, symbol: str) -> float | None:
+    r = sess.get(f"{FUTURES_BASE}/api/v1/contract/ticker",
+                 params={"symbol": to_contract(symbol)}, timeout=15)
+    r.raise_for_status()
+    d = r.json().get("data")
+    if isinstance(d, list):
+        d = d[0] if d else {}
+    return float(d["lastPrice"]) if d and d.get("lastPrice") else None
+
+
+def _spot_live_price(sess: requests.Session, symbol: str) -> float | None:
+    r = sess.get(f"{BASE}/api/v3/ticker/price",
+                 params={"symbol": symbol}, timeout=15)
+    r.raise_for_status()
+    p = r.json().get("price")
+    return float(p) if p else None
+
+
 def fetch_live_price(sess: requests.Session, symbol: str,
                      market: str) -> float | None:
     """The current LIVE last-traded price for one symbol — independent of the
-    chart timeframe, so 'current price' is always up to the second."""
-    try:
-        if market == "futures":
-            r = sess.get(f"{FUTURES_BASE}/api/v1/contract/ticker",
-                         params={"symbol": to_contract(symbol)}, timeout=15)
-            r.raise_for_status()
-            d = r.json().get("data")
-            if isinstance(d, list):
-                d = d[0] if d else {}
-            return float(d["lastPrice"]) if d and d.get("lastPrice") else None
-        r = sess.get(f"{BASE}/api/v3/ticker/price",
-                     params={"symbol": symbol}, timeout=15)
-        r.raise_for_status()
-        return float(r.json()["price"])
-    except (requests.RequestException, KeyError, ValueError, TypeError):
-        return None
+    chart timeframe, so 'current price' is always up to the second.
+
+    Retries on transient errors and, if the primary market's ticker fails,
+    falls back to the other market so the Analyze card never silently drops to
+    a stale per-timeframe candle close."""
+    order = ([_futures_live_price, _spot_live_price] if market == "futures"
+             else [_spot_live_price, _futures_live_price])
+    for fn in order:
+        for attempt in range(3):
+            try:
+                p = fn(sess, symbol)
+                if p:
+                    return p
+                break  # valid response but no price here — try the other market
+            except requests.RequestException:
+                time.sleep(0.6 * (attempt + 1))   # transient — back off and retry
+            except (KeyError, ValueError, TypeError):
+                break
+    return None
 
 
 _SPOT_IV = {"1h": "60m", "1w": "1W"}   # normalize to MEXC spot interval names
