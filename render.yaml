@@ -1,0 +1,11 @@
+# Render blueprint. Push these files to a GitHub repo, then in Render:
+# New +  ->  Blueprint  ->  pick the repo. It reads this file automatically.
+services:
+  - type: web
+    name: mexc-ema200-dashboard
+    runtime: docker
+    plan: free            # free spins down after ~15 min idle; use "starter" for always-on
+    envVars:
+      - key: SCAN_EVERY
+        value: "10"       # minutes between full rescans (lines up with a 10-min uptime pinger)
+    healthCheckPath: /
