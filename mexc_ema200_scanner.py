@@ -382,7 +382,7 @@ def detect_bull_flag(
     highs: list[float], lows: list[float], closes: list[float],
     volumes: list[float], *,
     pole_min_gain: float = 0.15, pole_max_len: int = 8,
-    flag_min_bars: int = 3, flag_max_bars: int = 12,
+    flag_min_bars: int = 3, flag_max_bars: int = 20,
     max_retrace: float = 0.5, search: int = 30,
 ) -> tuple[bool, dict]:
     """

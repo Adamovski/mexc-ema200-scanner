@@ -84,6 +84,8 @@ class State:
         self.flag_hits: list[dict] = []            # bull-flag setups
         self.prev_flag_symbols: set[str] | None = None
         self.new_flag_symbols: list[str] = []
+        self.flag_by_symbol: dict[str, dict] = {}  # latest forming flag per symbol
+        self.broken_flags: dict[str, dict] = {}    # flags that have broken out (kept a while)
         self.cpr_hits: list[dict] = []             # narrow-CPR setups
         self.prev_cpr_symbols: set[str] | None = None
         self.new_cpr_symbols: list[str] = []
@@ -182,6 +184,22 @@ def run_one_scan(state: State) -> None:
                 cprs.append(c)
             if b:
                 bounces.append(b)
+
+    # Persist recently broken-out flags on the list (tagged) so the Bull-flags tab
+    # doesn't "reset" the moment a flag triggers. The forming flags are recorded
+    # for the breakout watcher to promote to 'broken out' when they fire.
+    now = time.time()
+    with state.lock:
+        state.flag_by_symbol = {f["symbol"]: f for f in flags}
+        broken = {s: v for s, v in state.broken_flags.items()
+                  if now - v.get("broke_time", 0) < 12 * 3600}
+        state.broken_flags = broken
+    cur_flag_syms = {f["symbol"] for f in flags}
+    for f in flags:
+        f["broken_out"] = False
+    for s, v in broken.items():
+        if s not in cur_flag_syms:
+            flags.append(dict(v))
 
     hits.sort(key=lambda h: h["score"], reverse=True)
     flags.sort(key=lambda h: h["score"], reverse=True)
@@ -296,8 +314,17 @@ def breakout_watcher(state: State) -> None:
                 fired.add(sym)
         if events:
             with state.lock:
+                fbs = dict(state.flag_by_symbol)
+                bf = dict(state.broken_flags)
+            for e in events:
+                fd = fbs.get(e["symbol"])
+                if fd:
+                    bf[e["symbol"]] = {**fd, "broken_out": True,
+                                       "broke_time": e["time"], "price": e["price"]}
+            with state.lock:
                 state.watch_fired = fired
                 state.breakout_events = (state.breakout_events + events)[-20:]
+                state.broken_flags = bf
             for e in events:
                 send_telegram(state.cfg,
                     f"🚀 <b>{e['symbol']}</b> BULL-FLAG BREAKOUT\n"
@@ -396,6 +423,8 @@ PAGE = """<!doctype html>
   .supbadge{cursor:help;margin-left:6px;font-size:12px;opacity:.85}
   .freshbadge{display:inline-block;background:#2f81f7;color:#fff;font-size:10px;font-weight:700;
        border-radius:5px;padding:1px 5px;margin-left:7px;vertical-align:middle;letter-spacing:.03em;cursor:help}
+  .brokebadge{display:inline-block;background:rgba(248,81,73,.2);color:#ff7b72;border:1px solid #f85149;
+       font-size:10px;font-weight:700;border-radius:5px;padding:1px 5px;margin-left:7px;vertical-align:middle;cursor:help}
   #tip{position:fixed;z-index:9999;display:none;pointer-events:none;max-width:300px;
        background:#0b0e14;border:1px solid #f0b429;color:var(--txt);padding:7px 11px;
        border-radius:7px;font-size:12px;line-height:1.4;box-shadow:0 6px 20px rgba(0,0,0,.6)}
@@ -922,6 +951,7 @@ function badges(h){
   let s="";
   if(h.is_new) s+='<span class="newbadge">NEW</span>';
   if(h.fresh) s+='<span class="freshbadge" data-tip="Fresh reclaim — price crossed back above the 200 EMA within the last ~24h (≤6 of the 4h candles). Older reclaims still show while price holds above the EMA, just without this badge.">FRESH</span>';
+  if(h.broken_out) s+='<span class="brokebadge" data-tip="This bull flag already broke out above its trigger — kept on the list for ~12h so it doesn\\'t vanish the moment it fires.">🚀 BROKEN OUT</span>';
   if(h.both){
     const inList=(h.both_in||[]).join(", ");
     s+=`<span class="bothbadge" data-tip="On ${h.both_count} scans: ${inList}" title="On ${h.both_count} scans: ${inList}">★ ${h.both_count}</span>`;
