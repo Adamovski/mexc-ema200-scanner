@@ -432,6 +432,9 @@ PAGE = """<!doctype html>
        padding:0 18px;font-weight:700;font-size:14px;cursor:pointer}
   .azbar button:disabled{opacity:.5;cursor:default}
   .azhint{color:var(--dim);font-size:12.5px;max-width:760px}
+  .aztfs{display:flex;gap:6px;align-items:center;color:var(--dim);font-size:12.5px;margin:2px 0 10px}
+  .tfbtn{padding:3px 12px;border:1px solid var(--line);border-radius:14px;cursor:pointer;color:var(--dim)}
+  .tfbtn.active{background:var(--accent);color:#04140a;border-color:var(--accent);font-weight:700}
   .azresult{max-width:820px}
   .azcard{background:var(--panel);border:1px solid var(--line);border-radius:12px;
        padding:16px 18px;margin:6px 0 14px}
@@ -451,7 +454,7 @@ PAGE = """<!doctype html>
   td[data-tip]{cursor:help}
   .azladder{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 4px}
   .ladchip{background:var(--bg);border:1px solid var(--line);border-radius:8px;
-       padding:7px 11px;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}
+       padding:7px 11px;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;cursor:help}
   .azsec{font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;
        color:var(--accent);margin:18px 0 2px;border-bottom:1px solid var(--line);padding-bottom:5px}
   .azsec .azsub{color:var(--dim);font-weight:500;text-transform:none;letter-spacing:0;font-size:11.5px}
@@ -629,6 +632,12 @@ PAGE = """<!doctype html>
     <input id="azInput" type="text" placeholder="Enter a ticker, e.g. BTC or SOLUSDT"
            autocomplete="off" spellcheck="false" onkeydown="if(event.key==='Enter')analyze()">
     <button id="azBtn" onclick="analyze()">Analyze</button>
+  </div>
+  <div class="aztfs">Timeframe:
+    <span class="tfbtn" data-tf="1h" onclick="setAzTf('1h')">1h</span>
+    <span class="tfbtn active" data-tf="4h" onclick="setAzTf('4h')">4h</span>
+    <span class="tfbtn" data-tf="1d" onclick="setAzTf('1d')">1D</span>
+    <span class="tfbtn" data-tf="1w" onclick="setAzTf('1w')">1W</span>
   </div>
   <div id="azResult" class="azresult"></div>
   <p class="azhint">Live 4h read from MEXC: a Long/Short lean, trend vs the 200 EMA (4h/1D/1W),
@@ -939,6 +948,11 @@ function showTab(which){
   }
   renderBanner();  // banner follows the active scan tab
 }
+let azTf="4h";
+function setAzTf(tf){ azTf=tf;
+  document.querySelectorAll(".tfbtn").forEach(x=>x.classList.toggle("active",x.dataset.tf===tf));
+  if(document.getElementById("azInput").value.trim()) analyze();
+}
 async function analyze(){
   const inp=document.getElementById("azInput");
   const btn=document.getElementById("azBtn");
@@ -946,9 +960,9 @@ async function analyze(){
   const sym=inp.value.trim();
   if(!sym){ box.innerHTML='<div class="azerr">Enter a ticker, e.g. BTC.</div>'; return; }
   btn.disabled=true; const t=btn.textContent; btn.textContent="…";
-  box.innerHTML='<div class="azhint">Fetching 4h candles from MEXC and analyzing…</div>';
+  box.innerHTML=`<div class="azhint">Fetching ${azTf} candles from MEXC and analyzing…</div>`;
   try{
-    const r=await fetch("/analyze?symbol="+encodeURIComponent(sym),{cache:"no-store"});
+    const r=await fetch("/analyze?symbol="+encodeURIComponent(sym)+"&interval="+azTf,{cache:"no-store"});
     const d=await r.json();
     box.innerHTML = d.error ? '<div class="azerr">'+d.error+'</div>' : azCard(d);
   }catch(e){ box.innerHTML='<div class="azerr">Analysis failed — try again.</div>'; }
@@ -962,6 +976,7 @@ function azCard(d){
   return `<div class="azcard">
     <div class="azhead">
       <span class="sym">${d.symbol}</span>
+      <span style="color:var(--dim);font-size:12px;border:1px solid var(--line);border-radius:6px;padding:1px 7px">${(d.interval||'4h')} chart</span>
       <span class="dirpill dir-${(d.direction||'neutral').toLowerCase()}" data-tip="Overall trade-direction call from all signals (${d.dir_long_pts||0} long vs ${d.dir_short_pts||0} short points)">${(d.direction||'—').toUpperCase()}${d.direction==='Long'?' ▲':d.direction==='Short'?' ▼':''}</span>
       <span class="biaspill bias-${d.bias}" data-tip="Trend bias from price vs the 200 EMA and its slope">${d.bias.toUpperCase()}</span>
       <span>${fmtNum(d.price)}</span>
@@ -980,7 +995,7 @@ function azCard(d){
       ${cell("Volume", (d.vol_trend||'—')+(d.vol_ratio?` ×${d.vol_ratio}`:''), "Is recent volume rising, steady or falling vs its longer average.")}
       ${cell("Pressure", d.pressure||'—', "Whether buyers or sellers control recent candles (up-candle vs down-candle volume).")}
       ${cell("Rel volume", d.rvol==null?'—':(+d.rvol).toFixed(2)+'× latest bar', "The latest candle's volume vs its 20-bar average. Above 1x = above-average activity = confirmation.")}
-      ${cell("Range position", d.range_pos==null?'—':d.range_pos+'%', "Where price sits in its recent 120-bar range: 0% = range low, 100% = range high.")}
+      ${cell("Range position", d.range_pos==null?'—':d.range_pos+'%', `Where price sits in its recent 120-candle range on the ${d.interval||'4h'} timeframe (0% = range low, 100% = range high).`)}
       ${cell("ATR", d.atr_pct==null?'—':d.atr_pct+'%', "Average True Range as a % of price — the coin's volatility. Stops are buffered by a fraction of this.")}
       ${cell("Supports (distance)", (d.supports||[]).slice(0,3).map(v=>fmtNum(v)+pct(v,'-')).join(' · ')||'—', "Nearest support levels below price, with how far (%) each sits below the current price.")}
       ${cell("Resistances (distance)", (d.resistances||[]).slice(0,3).map(v=>fmtNum(v)+pct(v,'+')).join(' · ')||'—', "Nearest resistance levels above price, with how far (%) each sits above the current price.")}
@@ -1002,7 +1017,7 @@ function azCard(d){
     </div>
     <div class="azsec" data-tip="A fuller ladder of profit targets: overhead resistance levels blended with Fibonacci extensions of the recent range, in order. Each shows % upside and R:R to the tight stop.">Target ladder <span class="azsub">resistances + Fibonacci extensions (hover for more)</span></div>
     <div class="azladder">
-      ${(d.target_ladder||[]).map((t,i)=>`<span class="ladchip">T${i+1} ${fmtNum(t.level)} <span class="rr">+${t.pct}%${t.rr!=null?` · R${t.rr}`:''}</span></span>`).join('') || '<span style="color:var(--dim)">No overhead targets — blue sky.</span>'}
+      ${(d.target_ladder||[]).map((t,i)=>`<span class="ladchip" data-tip="Target ${i+1}: ${t.kind} at ${fmtNum(t.level)} — +${t.pct}% upside, R:R ${t.rr!=null?t.rr:'—'} to the tight stop.">T${i+1} ${fmtNum(t.level)} <span class="rr">+${t.pct}%${t.rr!=null?` · R${t.rr}`:''}</span></span>`).join('') || '<span style="color:var(--dim)">No overhead targets — blue sky.</span>'}
     </div>
     <div class="azsec">In plain English</div>
     <ul class="aznotes">${notes}</ul>
@@ -1211,6 +1226,9 @@ def make_handler(state: State):
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(self.path).query)
             raw = (q.get("symbol") or [""])[0]
+            iv = (q.get("interval") or [state.cfg["interval"]])[0]
+            if iv not in ("1h", "4h", "1d", "1w"):
+                iv = "4h"
             sym = normalize_symbol(raw, state.cfg.get("quote", "USDT"))
             if not sym:
                 self._send(200, json.dumps({"error": "Enter a ticker, e.g. BTC."}).encode(),
@@ -1218,7 +1236,7 @@ def make_handler(state: State):
                 return
             try:
                 sess = get_session()
-                out = analyze_symbol(sess, sym, state.cfg["interval"], state.cfg)
+                out = analyze_symbol(sess, sym, iv, state.cfg)
             except Exception as e:
                 out = {"error": f"Analysis failed: {e}"}
             self._send(200, json.dumps(out).encode(), "application/json")

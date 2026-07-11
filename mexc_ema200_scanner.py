@@ -894,8 +894,12 @@ def fetch_candles(sess: requests.Session, symbol: str, interval: str,
     return fetch_klines(sess, symbol, interval, limit)
 
 
+_SPOT_IV = {"1h": "60m", "1w": "1W"}   # normalize to MEXC spot interval names
+
+
 def fetch_klines(sess: requests.Session, symbol: str, interval: str,
                  limit: int) -> list[list] | None:
+    interval = _SPOT_IV.get(interval, interval)
     for attempt in range(4):
         try:
             r = sess.get(
@@ -1191,24 +1195,27 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     # Target ladder: overhead resistances BLENDED with Fibonacci extensions of the
     # recent range, deduped and sorted — a fuller set of profit targets (up to 8).
     rng = hh - ll if hh > ll else 0.0
-    cand = list(res)
+    cand = [(lvl, "overhead resistance (prior swing high)") for lvl in res]
     for ratio in (0.272, 0.414, 0.618, 1.0, 1.618, 2.0):
         lvl = hh + rng * ratio
         if lvl > price:
-            cand.append(lvl)
-    ladder_levels = []
-    for lvl in sorted(cand):
+            cand.append((lvl, f"{ratio:g}× Fibonacci extension of the recent range"))
+    cand.sort(key=lambda x: x[0])
+    picked = []
+    for lvl, kind in cand:
         if lvl <= price:
             continue
-        if not ladder_levels or lvl > ladder_levels[-1] * 1.005:
-            ladder_levels.append(lvl)
-    target_ladder = [{"level": lvl, "pct": round((lvl - entry) / entry * 100, 1),
+        if not picked or lvl > picked[-1][0] * 1.005:
+            picked.append((lvl, kind))
+    target_ladder = [{"level": lvl, "kind": kind,
+                      "pct": round((lvl - entry) / entry * 100, 1),
                       "rr": round((lvl - entry) / (entry - sl_tight), 2)
                              if entry > sl_tight else None}
-                     for lvl in ladder_levels[:8]]
+                     for lvl, kind in picked[:8]]
 
     return {
         "symbol": symbol,
+        "interval": interval,
         "price": price,
         "ema": ema_now,
         "pct_vs_ema": round(pct_vs_ema, 2),
