@@ -67,6 +67,7 @@ class State:
         self.flag_hits: list[dict] = []            # bull-flag setups
         self.prev_flag_symbols: set[str] | None = None
         self.new_flag_symbols: list[str] = []
+        self.both_symbols: list[str] = []          # appear on BOTH scans (confluence)
         self.last_scan: float | None = None      # epoch seconds
         self.next_scan: float | None = None
         self.scanning: bool = False
@@ -86,12 +87,14 @@ class State:
                 "new_symbols": list(self.new_symbols),
                 "flag_hits": list(self.flag_hits),
                 "flag_new_symbols": list(self.new_flag_symbols),
+                "both_symbols": list(self.both_symbols),
                 "error": self.error,
                 "cfg": {
                     "interval": self.cfg["interval"],
                     "quote": self.cfg["quote"],
                     "scan_every": self.cfg["scan_every"],
                     "ema_period": EMA_PERIOD,
+                    "futures_only": self.cfg.get("futures_only", True),
                 },
             }
 
@@ -103,7 +106,8 @@ def run_one_scan(state: State) -> None:
         state.scanning = True
         state.error = ""
     try:
-        symbols = list_symbols(sess, cfg["quote"])
+        symbols = list_symbols(sess, cfg["quote"],
+                               futures_only=cfg.get("futures_only", True))
         with state.lock:
             state.universe = len(symbols)
             state.progress = (0, len(symbols))
@@ -150,16 +154,21 @@ def run_one_scan(state: State) -> None:
             rows.append(d)
         return rows, [it.symbol for it in items if it.symbol in new], cur
 
+    # Confluence: coins that show up on BOTH scans (reclaim + bull flag).
+    both = {h.symbol for h in hits} & {h.symbol for h in flags}
+
     with state.lock:
         rows, new_syms, cur = tag_new(hits, state.prev_symbols)
+        frows, fnew, fcur = tag_new(flags, state.prev_flag_symbols)
+        for d in rows + frows:
+            d["both"] = d["symbol"] in both
         state.hits = rows
         state.new_symbols = new_syms
         state.prev_symbols = cur
-
-        frows, fnew, fcur = tag_new(flags, state.prev_flag_symbols)
         state.flag_hits = frows
         state.new_flag_symbols = fnew
         state.prev_flag_symbols = fcur
+        state.both_symbols = sorted(both)
 
         state.last_scan = time.time()
         state.progress = (done, len(symbols))
@@ -238,6 +247,12 @@ PAGE = """<!doctype html>
        font-size:10px;font-weight:700;border-radius:5px;padding:1px 5px;margin-left:7px;
        vertical-align:middle;letter-spacing:.03em}
   tr.isnew td{background:rgba(63,185,80,.06)}
+  /* confluence: appears on both scans */
+  .bothbadge{display:inline-block;background:#f0b429;color:#231a00;
+       font-size:10px;font-weight:800;border-radius:5px;padding:1px 6px;margin-left:7px;
+       vertical-align:middle;letter-spacing:.03em}
+  tr.both td{background:rgba(240,180,41,.10)}
+  tr.both td:first-child{box-shadow:inset 3px 0 0 #f0b429}
   /* info panel */
   .info{max-width:900px;color:var(--txt);font-size:14px;line-height:1.65}
   .info h2{font-size:15px;margin:22px 0 8px;color:var(--txt)}
@@ -282,7 +297,9 @@ PAGE = """<!doctype html>
       <th data-k="bars_since_cross">Bars since cross</th>
       <th data-k="retest_gap_pct">Retest %</th>
       <th data-k="sl">Stop (SL)</th>
-      <th data-k="tp">Target (TP)</th>
+      <th data-k="tp1">TP1</th>
+      <th data-k="tp2">TP2</th>
+      <th data-k="tp3">TP3</th>
       <th data-k="rr">R:R</th>
       <th data-k="score">Score</th>
     </tr></thead>
@@ -308,7 +325,9 @@ PAGE = """<!doctype html>
       <th data-fk="vol_contraction">Vol ratio</th>
       <th data-fk="breakout">Breakout</th>
       <th data-fk="sl">Stop (SL)</th>
-      <th data-fk="tp">Target (TP)</th>
+      <th data-fk="tp1">TP1</th>
+      <th data-fk="tp2">TP2</th>
+      <th data-fk="tp3">TP3</th>
       <th data-fk="rr">R:R</th>
       <th data-fk="score">Score</th>
     </tr></thead>
@@ -321,11 +340,11 @@ PAGE = """<!doctype html>
 <div class="view" id="viewInfo">
 <div class="wrap"><div class="info">
   <h2>What this scanner looks for</h2>
-  <p>It watches every <b>crypto</b> pair on MEXC spot quoted in USDT and flags one
-  specific bullish pattern on the <b>4-hour</b> chart: a <b>200-EMA cross &amp;
-  retest</b>. Leveraged tokens, stablecoin pairs, and MEXC's tokenized
-  stocks/ETFs (Tesla, Apple, iShares ETFs, etc.) are all filtered out — this is a
-  crypto-only scan.</p>
+  <p>It watches <b>crypto</b> pairs on MEXC quoted in USDT that are also listed on
+  MEXC <b>futures</b> (USDT perpetuals), and flags one specific bullish pattern on
+  the <b>4-hour</b> chart: a <b>200-EMA cross &amp; retest</b>. Leveraged tokens,
+  stablecoin pairs, tokenized stocks/ETFs (Tesla, Apple, iShares, etc.), and any
+  spot coin without a futures contract are all filtered out.</p>
   <p>The 200-period exponential moving average is a widely watched trend line.
   The pattern has three parts, all confirmed on <i>closed</i> candles:</p>
   <p><b>1. Reclaim</b> — price was trading below the 200 EMA, then a candle closes
@@ -348,8 +367,9 @@ PAGE = """<!doctype html>
     <tr><td>Bars since cross</td><td>How many 4h candles ago the reclaim happened. Fewer = fresher.</td></tr>
     <tr><td>Retest %</td><td>How close the pullback's low came to the EMA. Near 0 = a clean tag; a small negative means the wick dipped just below the line before closing back above.</td></tr>
     <tr><td>Stop (SL)</td><td>Suggested stop-loss — just below the setup's support (the lower of the EMA and the retest low). A close below here would invalidate the reclaim.</td></tr>
-    <tr><td>Target (TP)</td><td>Suggested take-profit at the nearest overhead resistance (the next prior swing high above price). "—" means price is at/near its highs with no overhead resistance (blue sky).</td></tr>
-    <tr><td>R:R</td><td>Reward-to-risk ratio = distance to the target ÷ distance to the stop, using current price as entry. Higher is a more favourable payoff. "—" when there's no overhead target.</td></tr>
+    <tr><td>TP1 / TP2 / TP3</td><td>Three take-profit targets at successive overhead resistances — the nearest prior swing highs above price, in order. Scale out as each is reached. "—" means no more resistance above (blue sky).</td></tr>
+    <tr><td>R:R</td><td>Reward-to-risk ratio to <b>TP1</b> = distance to TP1 ÷ distance to the stop, with <b>entry = current price</b>. Higher is a more favourable payoff. "—" when there's no overhead target.</td></tr>
+    <tr><td>★ BOTH</td><td>Confluence flag — this coin also appears on the other scan (see below). Rows are highlighted gold.</td></tr>
     <tr><td>Score</td><td>Overall quality, 0–100 (see below).</td></tr>
   </table>
 
@@ -370,9 +390,9 @@ PAGE = """<!doctype html>
   chart structure:</p>
   <p><b>Entry</b> is the current price. <b>Stop (SL)</b> sits just below the
   support that would invalidate the reclaim — the lower of the 200 EMA and the
-  retest low, with a small buffer. <b>Target (TP)</b> is the nearest overhead
-  resistance, found as the closest prior swing high above price. <b>R:R</b> is
-  how many units of reward you'd get per unit of risk to that target.</p>
+  retest low, with a small buffer. <b>TP1/TP2/TP3</b> are the next three overhead
+  resistances (prior swing highs above price), so you can scale out. <b>R:R</b> is
+  reward per unit of risk to TP1, measured from the current price.</p>
   <p>These are mechanical estimates to save you eyeballing the chart, not
   recommendations. A high R:R only means the geometry is favourable, not that the
   trade will work — size and manage risk yourself.</p>
@@ -396,12 +416,19 @@ PAGE = """<!doctype html>
     <tr><td>Pullback %</td><td>How deeply the flag retraced the pole. Shallower (well under 50%) is healthier.</td></tr>
     <tr><td>Vol ratio</td><td>Average flag volume ÷ average pole volume. Below 1 means volume is drying up during the pause — the classic, constructive flag signature.</td></tr>
     <tr><td>Breakout</td><td>The trigger level — the top of the flag. A move above it confirms the pattern.</td></tr>
-    <tr><td>Stop / Target / R:R</td><td>Stop sits just below the flag low; the target is a <b>measured move</b> (breakout level + the pole's height), the textbook flag projection; R:R is reward ÷ risk from the current price.</td></tr>
+    <tr><td>Stop / TPs / R:R</td><td>Stop sits just below the flag low. TP1 is the classic <b>measured move</b> (breakout + 1.0× the pole's height); TP2 and TP3 are the 1.618× and 2.0× pole extensions. R:R is reward ÷ risk to TP1, entry = current price.</td></tr>
     <tr><td>Score</td><td>0–100, weighting pole strength (35%), pullback tightness (25%), volume contraction (25%), and how coiled near the breakout price is (15%).</td></tr>
   </table>
   <p>The two tabs are complementary: the 200-EMA tab catches trend <i>reclaims</i>,
-  the bull-flag tab catches <i>continuations</i> mid-trend. A coin appearing on
-  both is worth a closer look.</p>
+  the bull-flag tab catches <i>continuations</i> mid-trend.</p>
+
+  <h2>Confluence — coins on both scans</h2>
+  <p>When a coin shows up on <b>both</b> the 200-EMA reclaim and the bull-flag scan
+  at the same time, it's flagged with a gold <span class="bothbadge">★ BOTH</span>
+  badge and its row is highlighted gold on both tabs. The header also shows a
+  running "★ N on both" count. These are the highest-conviction names — a trend
+  reclaim and a continuation pattern lining up on the same chart — so they're
+  worth looking at first.</p>
 
   <h2>How often it updates</h2>
   <p>The server re-scans all pairs on a loop (the cadence is shown in the header)
@@ -427,6 +454,14 @@ function ago(ts){ if(!ts) return "—"; const s=Math.max(0,Math.floor(Date.now()
 function until(ts){ if(!ts) return "—"; const s=Math.floor(ts-Date.now()/1000);
   if(s<=0) return "due"; const m=Math.floor(s/60); return m>0? m+"m "+(s%60)+"s" : s+"s"; }
 function tvLink(sym){ return "https://www.tradingview.com/chart/?symbol=MEXC:"+sym; }
+function badges(h){
+  let s="";
+  if(h.is_new) s+='<span class="newbadge">NEW</span>';
+  if(h.both) s+='<span class="bothbadge" title="Appears on BOTH scans — confluence">★ BOTH</span>';
+  return s;
+}
+function rowClass(h){ return (h.is_new?"isnew ":"")+(h.both?"both":""); }
+function tpCell(v){ return `<td>${v==null?'—':fmtNum(v)}</td>`; }
 function showTab(which){
   activeTab=which;
   for(const [t,v] of [["setups","Setups"],["flags","Flags"],["info","Info"]]){
@@ -456,10 +491,9 @@ function renderFlags(){
   document.getElementById("fempty").style.display = rows.length? "none":"block";
   for(const h of rows){
     const tr=document.createElement("tr");
-    if(h.is_new) tr.className="isnew";
-    const badge = h.is_new ? '<span class="newbadge">NEW</span>' : '';
+    tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badge}</td>`+
+      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
       `<td>${fmtNum(h.price)}</td>`+
       `<td>${(+h.pole_gain_pct).toFixed(1)}</td>`+
       `<td>${h.flag_bars}</td>`+
@@ -467,7 +501,7 @@ function renderFlags(){
       `<td>${(+h.vol_contraction).toFixed(2)}</td>`+
       `<td>${fmtNum(h.breakout)}</td>`+
       `<td>${fmtNum(h.sl)}</td>`+
-      `<td>${fmtNum(h.tp)}</td>`+
+      tpCell(h.tp1)+tpCell(h.tp2)+tpCell(h.tp3)+
       `<td>${(+h.rr).toFixed(2)}</td>`+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
@@ -483,17 +517,16 @@ function render(){
   document.getElementById("empty").style.display = rows.length? "none":"block";
   for(const h of rows){
     const tr=document.createElement("tr");
-    if(h.is_new) tr.className="isnew";
-    const badge = h.is_new ? '<span class="newbadge">NEW</span>' : '';
+    tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badge}</td>`+
+      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
       `<td>${fmtNum(h.price)}</td>`+
       `<td>${fmtNum(h.ema)}</td>`+
       `<td>${(+h.pct_above_ema).toFixed(2)}</td>`+
       `<td>${h.bars_since_cross}</td>`+
       `<td>${(+h.retest_gap_pct).toFixed(2)}</td>`+
       `<td>${fmtNum(h.sl)}</td>`+
-      `<td>${h.tp==null?'—':fmtNum(h.tp)}</td>`+
+      tpCell(h.tp1)+tpCell(h.tp2)+tpCell(h.tp3)+
       `<td>${h.rr==null?'—':(+h.rr).toFixed(2)}</td>`+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
@@ -514,9 +547,11 @@ async function poll(){
     latest=d.hits||[]; render();
     flatest=d.flag_hits||[]; renderFlags();
     renderBanner();
-    document.getElementById("flagCount").textContent = `${flatest.length} flag(s) · ${d.universe} pairs`;
+    const nboth=(d.both_symbols||[]).length;
+    const bothTxt=nboth?` · ★ ${nboth} on both`:"";
+    document.getElementById("flagCount").textContent = `${flatest.length} flag(s) · ${d.universe} pairs${bothTxt}`;
     document.getElementById("meta").textContent =
-      `${d.cfg.interval} chart · ${d.cfg.quote} spot · EMA${d.cfg.ema_period} · rescans every ${d.cfg.scan_every}m`;
+      `${d.cfg.interval} chart · ${d.cfg.quote} ${d.cfg.futures_only?'· futures-listed':'spot'} · EMA${d.cfg.ema_period} · rescans every ${d.cfg.scan_every}m`;
     const dot=document.getElementById("dot");
     dot.className = "dot" + (d.scanning? " live":"");
     document.getElementById("scanState").textContent =
@@ -525,7 +560,7 @@ async function poll(){
     document.getElementById("nextScan").textContent =
       d.scanning ? "next scan: —" : "next scan: "+until(d.next_scan);
     document.getElementById("count").textContent =
-      `${latest.length} setup(s) · ${d.universe} pairs`;
+      `${latest.length} setup(s) · ${d.universe} pairs${bothTxt}`;
     document.getElementById("err").textContent = d.error||"";
   }catch(e){ document.getElementById("err").textContent="dashboard offline?"; }
 }
@@ -580,6 +615,9 @@ def main() -> None:
                    help="bull flag: min flagpole rise (0.15 = 15%%)")
     p.add_argument("--flag-max-retrace", type=float, default=0.5,
                    help="bull flag: max pullback of the pole (0.5 = 50%%)")
+    p.add_argument("--include-spot-only", action="store_true",
+                   help="also scan coins NOT listed on MEXC futures "
+                        "(default: futures-listed coins only)")
     args = p.parse_args()
 
     cfg = {
@@ -589,6 +627,7 @@ def main() -> None:
         "retest_tol": args.retest_tol, "break_tol": args.break_tol,
         "max_above_now": args.max_above, "min_slope": args.min_slope,
         "pole_min_gain": args.pole_min_gain, "flag_max_retrace": args.flag_max_retrace,
+        "futures_only": not args.include_spot_only,
     }
     state = State(cfg)
 

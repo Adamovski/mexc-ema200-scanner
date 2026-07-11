@@ -91,26 +91,36 @@ class Hit:
     retest_gap_pct: float  # how close the retest low came to the EMA (%)
     score: float           # higher = cleaner / fresher setup
     sl: float              # suggested stop-loss (below structure / EMA)
-    tp: float | None       # take-profit at nearest overhead resistance (None = blue sky)
-    rr: float | None       # reward:risk ratio to that TP (None if no overhead TP)
+    tp1: float | None      # 1st target: nearest overhead resistance (None = blue sky)
+    tp2: float | None      # 2nd target: next resistance above
+    tp3: float | None      # 3rd target: next resistance above that
+    rr: float | None       # reward:risk to TP1, entry = current price
 
 
-def next_resistance(highs: list[float], upto: int, price: float,
-                    left: int = 3, right: int = 3, window: int = 220):
-    """Nearest swing-high pivot ABOVE `price` (the next overhead resistance).
+def resistances_above(highs: list[float], upto: int, price: float,
+                      left: int = 3, right: int = 3, window: int = 300,
+                      max_n: int = 3) -> list[float]:
+    """The nearest swing-high pivots ABOVE `price`, ascending — the overhead
+    resistance ceilings price would run into, in order.
 
     A pivot high is a candle whose high is >= the `left` highs before it and the
-    `right` highs after it. Returns the lowest such pivot above price (the first
-    ceiling price would run into), or None if there's no overhead resistance."""
+    `right` highs after it. Near-equal levels (within 0.5%) are merged so the
+    targets are meaningfully separated. Returns up to `max_n` levels."""
     start = max(left, upto - window)
     res = []
     for i in range(start, upto - right + 1):
         h = highs[i]
         if all(h >= highs[i - d] for d in range(1, left + 1)) and \
-           all(h >= highs[i + d] for d in range(1, right + 1)):
-            if h > price:
-                res.append(h)
-    return min(res) if res else None
+           all(h >= highs[i + d] for d in range(1, right + 1)) and h > price:
+            res.append(h)
+    res.sort()
+    out: list[float] = []
+    for h in res:
+        if not out or h > out[-1] * 1.005:
+            out.append(h)
+        if len(out) >= max_n:
+            break
+    return out
 
 
 def detect_cross_and_retest(
@@ -205,15 +215,16 @@ def detect_cross_and_retest(
     # back below the reclaimed EMA, so the stop sits just under the structural
     # support: the lower of the EMA and the lowest low since the reclaim (the
     # retest low), minus a small buffer.
-    entry = close_now
+    entry = close_now                       # entry = current price
     swing_low = min(lows[cross_idx:last + 1])
     sl = min(swing_low, ema_now) * (1.0 - 0.003)
-    # Take-profit at the nearest overhead resistance (a prior swing high above
-    # price). If there's none (price at/near all-time highs), TP/RR are blank.
-    tp = next_resistance(highs, last, entry)
-    rr = None
-    if tp is not None and entry > sl:
-        rr = round((tp - entry) / (entry - sl), 2)
+    # Targets = the nearest overhead resistances (prior swing highs above price),
+    # in order. If price is in blue sky some/all will be None.
+    res = resistances_above(highs, last, entry, max_n=3)
+    tp1 = res[0] if len(res) > 0 else None
+    tp2 = res[1] if len(res) > 1 else None
+    tp3 = res[2] if len(res) > 2 else None
+    rr = round((tp1 - entry) / (entry - sl), 2) if (tp1 and entry > sl) else None
 
     return True, {
         "price": close_now,
@@ -223,7 +234,9 @@ def detect_cross_and_retest(
         "retest_gap_pct": round(best_gap * 100, 2),
         "score": score,
         "sl": sl,
-        "tp": tp,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
         "rr": rr,
     }
 
@@ -241,8 +254,10 @@ class FlagHit:
     vol_contraction: float  # flag avg volume / pole avg volume (<1 = drying up)
     breakout: float         # breakout trigger (top of the flag)
     sl: float               # stop below the flag
-    tp: float               # measured-move target (breakout + pole height)
-    rr: float               # reward:risk to the measured move
+    tp1: float              # measured move (breakout + 1.0x pole height)
+    tp2: float              # 1.618x pole extension
+    tp3: float              # 2.0x pole extension
+    rr: float               # reward:risk to TP1, entry = current price
     score: float            # overall quality 0-100
 
 
@@ -319,12 +334,16 @@ def detect_bull_flag(
     (score, flag_bars, pole_gain, retrace, vol_contraction,
      flag_hi, flag_lo, pole_top, pole_low, close_now) = best
 
-    entry = close_now
+    entry = close_now                    # entry = current price
     breakout = flag_hi
     sl = flag_lo * (1.0 - 0.003)
     pole_height = pole_top - pole_low
-    tp = breakout + pole_height          # classic measured move
-    rr = round((tp - entry) / (entry - sl), 2) if entry > sl else 0.0
+    # Continuation targets projected off the breakout: the classic measured move
+    # (1.0x pole) then the common 1.618x and 2.0x extensions.
+    tp1 = breakout + 1.000 * pole_height
+    tp2 = breakout + 1.618 * pole_height
+    tp3 = breakout + 2.000 * pole_height
+    rr = round((tp1 - entry) / (entry - sl), 2) if entry > sl else 0.0
 
     return True, {
         "price": close_now,
@@ -334,7 +353,9 @@ def detect_bull_flag(
         "vol_contraction": round(vol_contraction, 2),
         "breakout": breakout,
         "sl": sl,
-        "tp": tp,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
         "rr": rr,
         "score": round(score, 1),
     }
@@ -358,10 +379,37 @@ STABLE_BASES = {
 }
 
 
-def list_symbols(sess: requests.Session, quote: str) -> list[str]:
+FUTURES_BASE = "https://contract.mexc.com"
+
+
+def list_futures_bases(sess: requests.Session) -> set[str]:
+    """Base coins that have a USDT-settled perpetual on MEXC futures.
+    Used to restrict the spot scan to coins that also trade on futures."""
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = sess.get(f"{FUTURES_BASE}/api/v1/contract/detail", timeout=30)
+            r.raise_for_status()
+            data = r.json().get("data", [])
+            bases = {str(c.get("baseCoin", "")).upper()
+                     for c in data
+                     if c.get("quoteCoin") == "USDT" and not c.get("isHidden")}
+            if bases:
+                return bases
+        except requests.RequestException as e:
+            last_err = e
+            time.sleep(0.8 * (attempt + 1))
+    raise requests.RequestException(
+        f"could not load MEXC futures contract list: {last_err}")
+
+
+def list_symbols(sess: requests.Session, quote: str,
+                 futures_only: bool = False) -> list[str]:
     r = sess.get(f"{BASE}/api/v3/exchangeInfo", timeout=30)
     r.raise_for_status()
     data = r.json()
+    # When futures_only, keep only coins that also have a USDT perpetual.
+    fut_bases = list_futures_bases(sess) if futures_only else None
     syms = []
     for s in data.get("symbols", []):
         if s.get("quoteAsset") != quote:
@@ -385,6 +433,9 @@ def list_symbols(sess: requests.Session, quote: str) -> list[str]:
         if {51, 56} <= plates:
             continue
         if "(ondo)" in str(s.get("fullName", "")).lower():
+            continue
+        # keep only coins that also trade on MEXC USDT-perp futures
+        if fut_bases is not None and base.upper() not in fut_bases:
             continue
         syms.append(s["symbol"])
     return sorted(set(syms))
@@ -489,6 +540,9 @@ def main() -> None:
     p.add_argument("--break-tol", type=float, default=BREAK_TOL)
     p.add_argument("--max-above", type=float, default=MAX_ABOVE_NOW)
     p.add_argument("--min-slope", type=float, default=MIN_SLOPE)
+    p.add_argument("--include-spot-only", action="store_true",
+                   help="also scan coins NOT listed on MEXC futures "
+                        "(default: futures-listed coins only)")
     args = p.parse_args()
 
     cfg = {
@@ -498,9 +552,12 @@ def main() -> None:
     }
 
     sess = get_session()
-    print(f"Fetching {args.quote} spot symbols from MEXC ...", file=sys.stderr)
+    futures_only = not args.include_spot_only
+    print(f"Fetching {args.quote} spot symbols from MEXC "
+          f"({'futures-listed only' if futures_only else 'all spot'}) ...",
+          file=sys.stderr)
     try:
-        symbols = list_symbols(sess, args.quote)
+        symbols = list_symbols(sess, args.quote, futures_only=futures_only)
     except requests.RequestException as e:
         sys.exit(f"Could not reach MEXC: {e}")
     print(f"Scanning {len(symbols)} pairs on the {args.interval} chart "

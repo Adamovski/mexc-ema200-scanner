@@ -93,6 +93,14 @@ Environment variables (or CLI flags of the same name):
 |              | `--break-tol`   | 0.005   | A close this far below the EMA voids the reclaim    |
 |              | `--max-above`   | 0.08    | Skip names already >8% above the EMA (extended)     |
 |              | `--min-slope`   | 0.0     | Require EMA slope ≥ this over the lookback          |
+|              | `--pole-min-gain`   | 0.15 | Bull flag: minimum flagpole rise (15%)          |
+|              | `--flag-max-retrace`| 0.5  | Bull flag: max pullback of the pole (50%)       |
+|              | `--include-spot-only`| off | Also scan coins NOT on MEXC futures (default: futures-listed only) |
+
+The scan is **crypto-only** (leveraged tokens, stablecoins, and tokenized
+stocks/ETFs are filtered out) and, by default, restricted to coins that are also
+listed on **MEXC USDT-perp futures**. The dashboard runs two scans — 200-EMA
+reclaim and bull flags — and highlights coins that appear on both.
 
 Example, a tighter/faster screen:
 ```
