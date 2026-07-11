@@ -90,6 +90,27 @@ class Hit:
     bars_since_cross: int  # candles since the reclaim
     retest_gap_pct: float  # how close the retest low came to the EMA (%)
     score: float           # higher = cleaner / fresher setup
+    sl: float              # suggested stop-loss (below structure / EMA)
+    tp: float | None       # take-profit at nearest overhead resistance (None = blue sky)
+    rr: float | None       # reward:risk ratio to that TP (None if no overhead TP)
+
+
+def next_resistance(highs: list[float], upto: int, price: float,
+                    left: int = 3, right: int = 3, window: int = 220):
+    """Nearest swing-high pivot ABOVE `price` (the next overhead resistance).
+
+    A pivot high is a candle whose high is >= the `left` highs before it and the
+    `right` highs after it. Returns the lowest such pivot above price (the first
+    ceiling price would run into), or None if there's no overhead resistance."""
+    start = max(left, upto - window)
+    res = []
+    for i in range(start, upto - right + 1):
+        h = highs[i]
+        if all(h >= highs[i - d] for d in range(1, left + 1)) and \
+           all(h >= highs[i + d] for d in range(1, right + 1)):
+            if h > price:
+                res.append(h)
+    return min(res) if res else None
 
 
 def detect_cross_and_retest(
@@ -179,6 +200,21 @@ def detect_cross_and_retest(
     proximity = max(0.0, min(1.0, 1.0 - pct_above / max_above_now))
     score = round(100 * (0.45 * tightness + 0.35 * freshness + 0.20 * proximity), 1)
 
+    # --- suggested trade levels (technical estimate, NOT advice) -------------
+    # Entry is taken at the current price. The setup is invalidated on a close
+    # back below the reclaimed EMA, so the stop sits just under the structural
+    # support: the lower of the EMA and the lowest low since the reclaim (the
+    # retest low), minus a small buffer.
+    entry = close_now
+    swing_low = min(lows[cross_idx:last + 1])
+    sl = min(swing_low, ema_now) * (1.0 - 0.003)
+    # Take-profit at the nearest overhead resistance (a prior swing high above
+    # price). If there's none (price at/near all-time highs), TP/RR are blank.
+    tp = next_resistance(highs, last, entry)
+    rr = None
+    if tp is not None and entry > sl:
+        rr = round((tp - entry) / (entry - sl), 2)
+
     return True, {
         "price": close_now,
         "ema": ema_now,
@@ -186,6 +222,121 @@ def detect_cross_and_retest(
         "bars_since_cross": bars_since_cross,
         "retest_gap_pct": round(best_gap * 100, 2),
         "score": score,
+        "sl": sl,
+        "tp": tp,
+        "rr": rr,
+    }
+
+
+# ----------------------------------------------------------------------------
+# Bull-flag detection
+# ----------------------------------------------------------------------------
+@dataclass
+class FlagHit:
+    symbol: str
+    price: float
+    pole_gain_pct: float    # size of the flagpole (impulse) move, %
+    flag_bars: int          # length of the consolidation, in candles
+    pullback_pct: float     # how deep the flag retraced the pole, %
+    vol_contraction: float  # flag avg volume / pole avg volume (<1 = drying up)
+    breakout: float         # breakout trigger (top of the flag)
+    sl: float               # stop below the flag
+    tp: float               # measured-move target (breakout + pole height)
+    rr: float               # reward:risk to the measured move
+    score: float            # overall quality 0-100
+
+
+def detect_bull_flag(
+    highs: list[float], lows: list[float], closes: list[float],
+    volumes: list[float], *,
+    pole_min_gain: float = 0.15, pole_max_len: int = 8,
+    flag_min_bars: int = 3, flag_max_bars: int = 12,
+    max_retrace: float = 0.5, search: int = 30,
+) -> tuple[bool, dict]:
+    """
+    Detect a classic bull flag on closed candles: a sharp impulse up (the
+    flagpole) followed by a shallow, tightening pullback (the flag), ideally on
+    declining volume, that hasn't broken down or fully broken out yet.
+
+    Returns (is_hit, details). Scans recent candles for the best-scoring flag.
+    """
+    n = len(closes)
+    if n < search + pole_max_len + 2:
+        return False, {}
+    last = n - 1
+
+    best = None
+    # Try each possible flag length ending on the latest candle.
+    for flag_bars in range(flag_min_bars, flag_max_bars + 1):
+        flag_start = last - flag_bars + 1
+        if flag_start - pole_max_len < 1:
+            continue
+        # Pole = the run into the flag. Pole top is the high just before the flag.
+        pole_top = max(highs[flag_start - pole_max_len:flag_start])
+        pole_low = min(lows[flag_start - pole_max_len:flag_start])
+        if pole_low <= 0:
+            continue
+        pole_gain = (pole_top - pole_low) / pole_low
+        if pole_gain < pole_min_gain:
+            continue
+
+        flag_hi = max(highs[flag_start:last + 1])
+        flag_lo = min(lows[flag_start:last + 1])
+        close_now = closes[last]
+
+        # Flag must consolidate BELOW the pole top (not already run away), and
+        # must not have broken down (price still above the flag low / mid-pole).
+        if flag_hi > pole_top * 1.03:
+            continue
+        if close_now <= flag_lo:
+            continue
+        # Shallow pullback: the flag low shouldn't retrace more than max_retrace
+        # of the pole.
+        retrace = (pole_top - flag_lo) / (pole_top - pole_low)
+        if retrace > max_retrace:
+            continue
+
+        pole_vol = sum(volumes[flag_start - pole_max_len:flag_start]) / pole_max_len
+        flag_vol = sum(volumes[flag_start:last + 1]) / flag_bars
+        vol_contraction = (flag_vol / pole_vol) if pole_vol > 0 else 1.0
+
+        # Score components, each 0-1.
+        pole_s = max(0.0, min(1.0, (pole_gain - pole_min_gain) / (0.6 - pole_min_gain)))
+        tight_s = max(0.0, min(1.0, 1.0 - retrace / max_retrace))
+        vol_s = max(0.0, min(1.0, 1.0 - vol_contraction / 1.0))   # lower vol = better
+        # Position: reward price sitting near the top of the flag (coiled to break)
+        rng = max(flag_hi - flag_lo, 1e-12)
+        pos_s = max(0.0, min(1.0, (close_now - flag_lo) / rng))
+        score = 100 * (0.35 * pole_s + 0.25 * tight_s + 0.25 * vol_s + 0.15 * pos_s)
+
+        if best is None or score > best[0]:
+            best = (score, flag_bars, pole_gain, retrace, vol_contraction,
+                    flag_hi, flag_lo, pole_top, pole_low, close_now)
+
+    if best is None:
+        return False, {}
+
+    (score, flag_bars, pole_gain, retrace, vol_contraction,
+     flag_hi, flag_lo, pole_top, pole_low, close_now) = best
+
+    entry = close_now
+    breakout = flag_hi
+    sl = flag_lo * (1.0 - 0.003)
+    pole_height = pole_top - pole_low
+    tp = breakout + pole_height          # classic measured move
+    rr = round((tp - entry) / (entry - sl), 2) if entry > sl else 0.0
+
+    return True, {
+        "price": close_now,
+        "pole_gain_pct": round(pole_gain * 100, 1),
+        "flag_bars": flag_bars,
+        "pullback_pct": round(retrace * 100, 1),
+        "vol_contraction": round(vol_contraction, 2),
+        "breakout": breakout,
+        "sl": sl,
+        "tp": tp,
+        "rr": rr,
+        "score": round(score, 1),
     }
 
 
@@ -224,6 +375,16 @@ def list_symbols(sess: requests.Session, quote: str) -> list[str]:
             continue
         # skip stablecoin/pegged bases (no meaningful trend on a $1 peg)
         if base.upper() in STABLE_BASES:
+            continue
+        # skip TOKENIZED STOCKS / ETFs (crypto-only scan). MEXC now lists Ondo
+        # tokenized equities on spot (e.g. TSLAON, AAPLON, NOCON, EFAON). They
+        # all carry the tokenized-equity category tags conceptPlateIds 51 & 56,
+        # which real crypto never has, so this is a precise, future-proof filter.
+        # (A "(Ondo)" full name is a secondary backstop.)
+        plates = set(s.get("conceptPlateIds") or [])
+        if {51, 56} <= plates:
+            continue
+        if "(ondo)" in str(s.get("fullName", "")).lower():
             continue
         syms.append(s["symbol"])
     return sorted(set(syms))
@@ -272,6 +433,44 @@ def scan_symbol(sess: requests.Session, symbol: str, interval: str,
     if not ok:
         return None
     return Hit(symbol=symbol, **d)
+
+
+def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
+                      cfg: dict) -> tuple[Hit | None, FlagHit | None]:
+    """Fetch klines ONCE and run both the 200-EMA and bull-flag detectors.
+    Used by the dashboard so a two-scan page still costs one request per symbol."""
+    raw = fetch_klines(sess, symbol, interval, cfg["kline_limit"])
+    if not raw or len(raw) < EMA_PERIOD + 2:
+        return None, None
+    rows = raw[:-1]                       # drop the still-forming candle
+    try:
+        highs = [float(x[2]) for x in rows]
+        lows = [float(x[3]) for x in rows]
+        closes = [float(x[4]) for x in rows]
+        vols = [float(x[5]) for x in rows]
+    except (ValueError, IndexError):
+        return None, None
+
+    ema_hit = None
+    ok, d = detect_cross_and_retest(
+        highs, lows, closes,
+        ema_period=EMA_PERIOD, lookback=cfg["lookback"],
+        retest_tol=cfg["retest_tol"], break_tol=cfg["break_tol"],
+        max_above_now=cfg["max_above_now"], min_slope=cfg["min_slope"],
+    )
+    if ok:
+        ema_hit = Hit(symbol=symbol, **d)
+
+    flag_hit = None
+    ok2, f = detect_bull_flag(
+        highs, lows, closes, vols,
+        pole_min_gain=cfg.get("pole_min_gain", 0.15),
+        max_retrace=cfg.get("flag_max_retrace", 0.5),
+    )
+    if ok2:
+        flag_hit = FlagHit(symbol=symbol, **f)
+
+    return ema_hit, flag_hit
 
 
 # ----------------------------------------------------------------------------

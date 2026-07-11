@@ -47,7 +47,7 @@ except ImportError:
 # Reuse the tested scanner core.
 try:
     from mexc_ema200_scanner import (
-        list_symbols, scan_symbol, get_session, Hit, EMA_PERIOD,
+        list_symbols, scan_symbol_multi, get_session, Hit, FlagHit, EMA_PERIOD,
     )
 except ImportError:
     sys.exit("Could not import mexc_ema200_scanner.py — keep both files in the "
@@ -64,6 +64,9 @@ class State:
         self.hits: list[dict] = []
         self.prev_symbols: set[str] | None = None  # symbols from the previous scan
         self.new_symbols: list[str] = []           # setups new in the latest scan
+        self.flag_hits: list[dict] = []            # bull-flag setups
+        self.prev_flag_symbols: set[str] | None = None
+        self.new_flag_symbols: list[str] = []
         self.last_scan: float | None = None      # epoch seconds
         self.next_scan: float | None = None
         self.scanning: bool = False
@@ -81,6 +84,8 @@ class State:
                 "progress": self.progress,
                 "universe": self.universe,
                 "new_symbols": list(self.new_symbols),
+                "flag_hits": list(self.flag_hits),
+                "flag_new_symbols": list(self.new_flag_symbols),
                 "error": self.error,
                 "cfg": {
                     "interval": self.cfg["interval"],
@@ -109,12 +114,13 @@ def run_one_scan(state: State) -> None:
         return
 
     hits: list[Hit] = []
+    flags: list[FlagHit] = []
     done = 0
     scan_cfg = {k: cfg[k] for k in
                 ("kline_limit", "lookback", "retest_tol", "break_tol",
-                 "max_above_now", "min_slope")}
+                 "max_above_now", "min_slope", "pole_min_gain", "flag_max_retrace")}
     with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
-        futs = {ex.submit(scan_symbol, sess, s, cfg["interval"], scan_cfg): s
+        futs = {ex.submit(scan_symbol_multi, sess, s, cfg["interval"], scan_cfg): s
                 for s in symbols}
         for fut in as_completed(futs):
             done += 1
@@ -122,29 +128,39 @@ def run_one_scan(state: State) -> None:
                 with state.lock:
                     state.progress = (done, len(symbols))
             try:
-                h = fut.result()
+                h, f = fut.result()
             except Exception:
-                h = None
+                h, f = None, None
             if h:
                 hits.append(h)
+            if f:
+                flags.append(f)
 
     hits.sort(key=lambda h: h.score, reverse=True)
-    cur_symbols = {h.symbol for h in hits}
-    with state.lock:
-        # "New" = setups that appear now but weren't in the previous scan.
-        # On the very first scan there's no baseline, so nothing is marked new.
-        if state.prev_symbols is None:
-            new = set()
-        else:
-            new = cur_symbols - state.prev_symbols
+    flags.sort(key=lambda h: h.score, reverse=True)
+
+    def tag_new(items, prev):
+        """Return (rows, new_syms, cur_syms) with an is_new flag per row."""
+        cur = {it.symbol for it in items}
+        new = set() if prev is None else cur - prev
         rows = []
-        for h in hits:
-            d = asdict(h)
-            d["is_new"] = h.symbol in new
+        for it in items:
+            d = asdict(it)
+            d["is_new"] = it.symbol in new
             rows.append(d)
+        return rows, [it.symbol for it in items if it.symbol in new], cur
+
+    with state.lock:
+        rows, new_syms, cur = tag_new(hits, state.prev_symbols)
         state.hits = rows
-        state.new_symbols = [h.symbol for h in hits if h.symbol in new]
-        state.prev_symbols = cur_symbols
+        state.new_symbols = new_syms
+        state.prev_symbols = cur
+
+        frows, fnew, fcur = tag_new(flags, state.prev_flag_symbols)
+        state.flag_hits = frows
+        state.new_flag_symbols = fnew
+        state.prev_flag_symbols = fcur
+
         state.last_scan = time.time()
         state.progress = (done, len(symbols))
         state.scanning = False
@@ -243,7 +259,8 @@ PAGE = """<!doctype html>
 </header>
 <div class="banner" id="banner"></div>
 <div class="tabs">
-  <div class="tab active" id="tabSetups" onclick="showTab('setups')">Setups</div>
+  <div class="tab active" id="tabSetups" onclick="showTab('setups')">200-EMA reclaim</div>
+  <div class="tab" id="tabFlags" onclick="showTab('flags')">Bull flags</div>
   <div class="tab" id="tabInfo" onclick="showTab('info')">Info</div>
 </div>
 
@@ -264,6 +281,9 @@ PAGE = """<!doctype html>
       <th data-k="pct_above_ema">% &gt; EMA</th>
       <th data-k="bars_since_cross">Bars since cross</th>
       <th data-k="retest_gap_pct">Retest %</th>
+      <th data-k="sl">Stop (SL)</th>
+      <th data-k="tp">Target (TP)</th>
+      <th data-k="rr">R:R</th>
       <th data-k="score">Score</th>
     </tr></thead>
     <tbody id="rows"></tbody>
@@ -272,12 +292,40 @@ PAGE = """<!doctype html>
 </div>
 </div>
 
+<div class="view" id="viewFlags">
+<div class="status">
+  <span>Bull flags — impulse + tight pullback, ranked by strength &amp; volume dry-up</span>
+  <span id="flagCount"></span>
+</div>
+<div class="wrap">
+  <table id="ftbl">
+    <thead><tr>
+      <th data-fk="symbol">Symbol</th>
+      <th data-fk="price">Price</th>
+      <th data-fk="pole_gain_pct">Pole %</th>
+      <th data-fk="flag_bars">Flag bars</th>
+      <th data-fk="pullback_pct">Pullback %</th>
+      <th data-fk="vol_contraction">Vol ratio</th>
+      <th data-fk="breakout">Breakout</th>
+      <th data-fk="sl">Stop (SL)</th>
+      <th data-fk="tp">Target (TP)</th>
+      <th data-fk="rr">R:R</th>
+      <th data-fk="score">Score</th>
+    </tr></thead>
+    <tbody id="frows"></tbody>
+  </table>
+  <div class="empty" id="fempty" style="display:none">No bull flags right now. The loop keeps scanning…</div>
+</div>
+</div>
+
 <div class="view" id="viewInfo">
 <div class="wrap"><div class="info">
   <h2>What this scanner looks for</h2>
-  <p>It watches every crypto pair on MEXC spot quoted in USDT (leveraged tokens
-  and stablecoin pairs are excluded) and flags one specific bullish pattern on
-  the <b>4-hour</b> chart: a <b>200-EMA cross &amp; retest</b>.</p>
+  <p>It watches every <b>crypto</b> pair on MEXC spot quoted in USDT and flags one
+  specific bullish pattern on the <b>4-hour</b> chart: a <b>200-EMA cross &amp;
+  retest</b>. Leveraged tokens, stablecoin pairs, and MEXC's tokenized
+  stocks/ETFs (Tesla, Apple, iShares ETFs, etc.) are all filtered out — this is a
+  crypto-only scan.</p>
   <p>The 200-period exponential moving average is a widely watched trend line.
   The pattern has three parts, all confirmed on <i>closed</i> candles:</p>
   <p><b>1. Reclaim</b> — price was trading below the 200 EMA, then a candle closes
@@ -299,6 +347,9 @@ PAGE = """<!doctype html>
     <tr><td>% &gt; EMA</td><td>How far the current price sits above the EMA. Smaller = closer to the line = a tighter entry.</td></tr>
     <tr><td>Bars since cross</td><td>How many 4h candles ago the reclaim happened. Fewer = fresher.</td></tr>
     <tr><td>Retest %</td><td>How close the pullback's low came to the EMA. Near 0 = a clean tag; a small negative means the wick dipped just below the line before closing back above.</td></tr>
+    <tr><td>Stop (SL)</td><td>Suggested stop-loss — just below the setup's support (the lower of the EMA and the retest low). A close below here would invalidate the reclaim.</td></tr>
+    <tr><td>Target (TP)</td><td>Suggested take-profit at the nearest overhead resistance (the next prior swing high above price). "—" means price is at/near its highs with no overhead resistance (blue sky).</td></tr>
+    <tr><td>R:R</td><td>Reward-to-risk ratio = distance to the target ÷ distance to the stop, using current price as entry. Higher is a more favourable payoff. "—" when there's no overhead target.</td></tr>
     <tr><td>Score</td><td>Overall quality, 0–100 (see below).</td></tr>
   </table>
 
@@ -314,11 +365,43 @@ PAGE = """<!doctype html>
   precisely, and is still hugging the line rather than having run away. It ranks
   setups; it does not predict outcomes.</p>
 
+  <h2>Stop, target &amp; R:R</h2>
+  <p>For each setup the scanner sketches a <b>potential</b> trade, purely from
+  chart structure:</p>
+  <p><b>Entry</b> is the current price. <b>Stop (SL)</b> sits just below the
+  support that would invalidate the reclaim — the lower of the 200 EMA and the
+  retest low, with a small buffer. <b>Target (TP)</b> is the nearest overhead
+  resistance, found as the closest prior swing high above price. <b>R:R</b> is
+  how many units of reward you'd get per unit of risk to that target.</p>
+  <p>These are mechanical estimates to save you eyeballing the chart, not
+  recommendations. A high R:R only means the geometry is favourable, not that the
+  trade will work — size and manage risk yourself.</p>
+
   <h2>The "just triggered" banner</h2>
   <p>Each scan is compared with the one before it. Any pair that shows up now but
   wasn't in the previous scan is a <b>brand-new setup</b> — it gets called out in
   the green banner at the top and tagged <span class="newbadge">NEW</span> in the
   table, so you can spot fresh signals at a glance.</p>
+
+  <h2>The Bull flags tab</h2>
+  <p>A second, independent scan of the same crypto universe looks for
+  <b>bull flags</b>: a sharp impulsive rally (the <b>flagpole</b>) followed by a
+  shallow, orderly pullback or sideways drift (the <b>flag</b>) — ideally on
+  fading volume — that hasn't broken down or fully broken out yet. It's a
+  continuation pattern: the market pauses to catch its breath before (often)
+  pushing higher.</p>
+  <table class="def">
+    <tr><td>Pole %</td><td>Size of the flagpole — how far price ran up into the flag. Bigger impulse = stronger setup.</td></tr>
+    <tr><td>Flag bars</td><td>How many candles the consolidation has lasted.</td></tr>
+    <tr><td>Pullback %</td><td>How deeply the flag retraced the pole. Shallower (well under 50%) is healthier.</td></tr>
+    <tr><td>Vol ratio</td><td>Average flag volume ÷ average pole volume. Below 1 means volume is drying up during the pause — the classic, constructive flag signature.</td></tr>
+    <tr><td>Breakout</td><td>The trigger level — the top of the flag. A move above it confirms the pattern.</td></tr>
+    <tr><td>Stop / Target / R:R</td><td>Stop sits just below the flag low; the target is a <b>measured move</b> (breakout level + the pole's height), the textbook flag projection; R:R is reward ÷ risk from the current price.</td></tr>
+    <tr><td>Score</td><td>0–100, weighting pole strength (35%), pullback tightness (25%), volume contraction (25%), and how coiled near the breakout price is (15%).</td></tr>
+  </table>
+  <p>The two tabs are complementary: the 200-EMA tab catches trend <i>reclaims</i>,
+  the bull-flag tab catches <i>continuations</i> mid-trend. A coin appearing on
+  both is worth a closer look.</p>
 
   <h2>How often it updates</h2>
   <p>The server re-scans all pairs on a loop (the cadence is shown in the header)
@@ -333,6 +416,8 @@ PAGE = """<!doctype html>
 </div>
 <script>
 let sortKey="score", sortDir=-1, latest=[];
+let fSortKey="score", fSortDir=-1, flatest=[];
+let activeTab="setups", lastData=null;
 function fmtNum(n){ if(n===null||n===undefined) return "—";
   const a=Math.abs(n); if(a!==0&&a<0.001) return n.toExponential(2);
   return (+n).toLocaleString(undefined,{maximumSignificantDigits:8}); }
@@ -343,19 +428,50 @@ function until(ts){ if(!ts) return "—"; const s=Math.floor(ts-Date.now()/1000)
   if(s<=0) return "due"; const m=Math.floor(s/60); return m>0? m+"m "+(s%60)+"s" : s+"s"; }
 function tvLink(sym){ return "https://www.tradingview.com/chart/?symbol=MEXC:"+sym; }
 function showTab(which){
-  const s=which==="setups";
-  document.getElementById("tabSetups").classList.toggle("active",s);
-  document.getElementById("tabInfo").classList.toggle("active",!s);
-  document.getElementById("viewSetups").classList.toggle("active",s);
-  document.getElementById("viewInfo").classList.toggle("active",!s);
+  activeTab=which;
+  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["info","Info"]]){
+    document.getElementById("tab"+v).classList.toggle("active", t===which);
+    document.getElementById("view"+v).classList.toggle("active", t===which);
+  }
+  renderBanner();  // banner follows the active scan tab
 }
-function renderBanner(newSyms){
+function renderBanner(){
   const b=document.getElementById("banner");
-  if(!newSyms || !newSyms.length){ b.classList.remove("show"); b.innerHTML=""; return; }
+  let newSyms=[], what="";
+  if(activeTab==="setups"){ newSyms=(lastData&&lastData.new_symbols)||[]; what="200-EMA reclaim"; }
+  else if(activeTab==="flags"){ newSyms=(lastData&&lastData.flag_new_symbols)||[]; what="bull flag"; }
+  if(!newSyms.length){ b.classList.remove("show"); b.innerHTML=""; return; }
   const chips=newSyms.map(s=>`<span class="chip"><a href="${tvLink(s)}" target="_blank" rel="noopener">${s}</a></span>`).join("");
-  const label=newSyms.length===1?"new setup just triggered":"new setups just triggered";
+  const label=newSyms.length===1?`new ${what} just triggered`:`new ${what} setups just triggered`;
   b.innerHTML=`<b>🆕 ${newSyms.length} ${label}</b> since the last scan: ${chips}`;
   b.classList.add("show");
+}
+function renderFlags(){
+  const rows=[...flatest].sort((a,b)=>{
+    const x=a[fSortKey],y=b[fSortKey];
+    if(typeof x==="string") return fSortDir*x.localeCompare(y);
+    return fSortDir*((x??0)-(y??0));
+  });
+  const tb=document.getElementById("frows"); tb.innerHTML="";
+  document.getElementById("fempty").style.display = rows.length? "none":"block";
+  for(const h of rows){
+    const tr=document.createElement("tr");
+    if(h.is_new) tr.className="isnew";
+    const badge = h.is_new ? '<span class="newbadge">NEW</span>' : '';
+    tr.innerHTML =
+      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badge}</td>`+
+      `<td>${fmtNum(h.price)}</td>`+
+      `<td>${(+h.pole_gain_pct).toFixed(1)}</td>`+
+      `<td>${h.flag_bars}</td>`+
+      `<td>${(+h.pullback_pct).toFixed(1)}</td>`+
+      `<td>${(+h.vol_contraction).toFixed(2)}</td>`+
+      `<td>${fmtNum(h.breakout)}</td>`+
+      `<td>${fmtNum(h.sl)}</td>`+
+      `<td>${fmtNum(h.tp)}</td>`+
+      `<td>${(+h.rr).toFixed(2)}</td>`+
+      `<td class="score">${(+h.score).toFixed(1)}</td>`;
+    tb.appendChild(tr);
+  }
 }
 function render(){
   const rows=[...latest].sort((a,b)=>{
@@ -376,19 +492,29 @@ function render(){
       `<td>${(+h.pct_above_ema).toFixed(2)}</td>`+
       `<td>${h.bars_since_cross}</td>`+
       `<td>${(+h.retest_gap_pct).toFixed(2)}</td>`+
+      `<td>${fmtNum(h.sl)}</td>`+
+      `<td>${h.tp==null?'—':fmtNum(h.tp)}</td>`+
+      `<td>${h.rr==null?'—':(+h.rr).toFixed(2)}</td>`+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
   }
 }
-document.querySelectorAll("th").forEach(th=>th.addEventListener("click",()=>{
+document.querySelectorAll("th[data-k]").forEach(th=>th.addEventListener("click",()=>{
   const k=th.dataset.k; if(k===sortKey) sortDir*=-1; else {sortKey=k; sortDir=(k==="symbol")?1:-1;}
   render();
+}));
+document.querySelectorAll("th[data-fk]").forEach(th=>th.addEventListener("click",()=>{
+  const k=th.dataset.fk; if(k===fSortKey) fSortDir*=-1; else {fSortKey=k; fSortDir=(k==="symbol")?1:-1;}
+  renderFlags();
 }));
 async function poll(){
   try{
     const r=await fetch("/data",{cache:"no-store"}); const d=await r.json();
+    lastData=d;
     latest=d.hits||[]; render();
-    renderBanner(d.new_symbols);
+    flatest=d.flag_hits||[]; renderFlags();
+    renderBanner();
+    document.getElementById("flagCount").textContent = `${flatest.length} flag(s) · ${d.universe} pairs`;
     document.getElementById("meta").textContent =
       `${d.cfg.interval} chart · ${d.cfg.quote} spot · EMA${d.cfg.ema_period} · rescans every ${d.cfg.scan_every}m`;
     const dot=document.getElementById("dot");
@@ -450,6 +576,10 @@ def main() -> None:
     p.add_argument("--break-tol", type=float, default=0.005)
     p.add_argument("--max-above", type=float, default=0.08)
     p.add_argument("--min-slope", type=float, default=0.0)
+    p.add_argument("--pole-min-gain", type=float, default=0.15,
+                   help="bull flag: min flagpole rise (0.15 = 15%%)")
+    p.add_argument("--flag-max-retrace", type=float, default=0.5,
+                   help="bull flag: max pullback of the pole (0.5 = 50%%)")
     args = p.parse_args()
 
     cfg = {
@@ -458,6 +588,7 @@ def main() -> None:
         "kline_limit": args.kline_limit, "lookback": args.lookback,
         "retest_tol": args.retest_tol, "break_tol": args.break_tol,
         "max_above_now": args.max_above, "min_slope": args.min_slope,
+        "pole_min_gain": args.pole_min_gain, "flag_max_retrace": args.flag_max_retrace,
     }
     state = State(cfg)
 
