@@ -541,11 +541,13 @@ PAGE = """<!doctype html>
   .aztag{font-size:11.5px;border-radius:6px;padding:2px 8px;border:1px solid var(--line);color:var(--dim)}
   .aztag.on{background:rgba(63,185,80,.14);color:var(--accent);border-color:rgba(63,185,80,.5);font-weight:600}
   .azerr{color:var(--warn);padding:10px 0}
-  .topgrid{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:0 16px 16px}
-  @media(max-width:960px){.topgrid{grid-template-columns:1fr}}
-  .toptitle{font-size:13px;font-weight:800;letter-spacing:.04em;padding:8px 4px;text-transform:uppercase}
-  .toptitle.bull{color:var(--accent)}
-  .toptitle.bear{color:#f85149}
+  .grade{display:inline-block;border-radius:6px;padding:1px 8px;font-weight:800;font-size:12.5px}
+  .g-a{background:rgba(63,185,80,.22);color:var(--accent);border:1px solid rgba(63,185,80,.6)}
+  .g-b{background:rgba(88,166,255,.16);color:#58a6ff;border:1px solid rgba(88,166,255,.5)}
+  .g-c{background:rgba(210,153,34,.16);color:#d29922;border:1px solid rgba(210,153,34,.5)}
+  .g-d{background:rgba(139,152,173,.14);color:var(--dim);border:1px solid var(--line)}
+  .gscore{color:var(--dim);font-size:11.5px;font-variant-numeric:tabular-nums;margin-left:4px}
+  .whycell{color:#c3ccd8;font-size:12.5px;max-width:340px}
   .phasepill{border-radius:6px;padding:1px 7px;font-size:11px;font-weight:700;border:1px solid var(--line)}
   .phase-broke{background:rgba(63,185,80,.16);color:var(--accent);border-color:rgba(63,185,80,.5)}
   .phase-form{background:rgba(139,152,173,.12);color:var(--dim)}
@@ -736,17 +738,19 @@ PAGE = """<!doctype html>
 
 <div class="view" id="viewShorts">
 <div class="status">
-  <span>Shorts — bearish breakdown &amp; retest of the 200 EMA (price broke below a falling EMA and rejected it from underneath). Stops sit ABOVE, targets BELOW.</span>
+  <span>Shorts — only coins worth shorting: a bearish breakdown &amp; retest of a <b>falling</b> 200 EMA (price broke below it and rejected it from underneath). Stops sit ABOVE, targets BELOW. Ranked by a composite <b>conviction rating</b>; hover it for the reasons.</span>
   <span id="shortCount"></span>
 </div>
 <div class="wrap">
   <table id="stbl">
     <thead><tr>
       <th data-sk="symbol">Symbol</th>
+      <th data-tip="Composite short-conviction rating (A+ → D, 0–100): blends the detector score (30%), market-structure alignment to the downside (20%), volume (15%), reward:risk (10%), plus a base for a confirmed breakdown+retest. Higher = a cleaner short.">Rating</th>
       <th data-sk="price">Price</th>
       <th data-sk="pct_below_ema">% &lt; EMA</th>
       <th data-sk="bars_since_cross">Bars</th>
       <th data-sk="bias">Bias</th>
+      <th data-tip="Plain-English reasons this qualifies as a short.">Why</th>
       <th data-sk="optimal_entry">Optimal entry</th>
       <th data-sk="sl_tight">SL tight</th>
       <th data-sk="sl_wide">SL wide</th>
@@ -766,26 +770,26 @@ PAGE = """<!doctype html>
 
 <div class="view" id="viewTop">
 <div class="status">
-  <span>Top setups — the strongest bullish and bearish candidates aggregated across every scan, ranked by score (★ = multi-scan confluence).</span>
+  <span>Top setups — the highest-conviction <b>LONG</b> opportunities, aggregated across every bullish scan and ranked by a composite <b>conviction rating</b> (A+ → D). Hover the rating or the "Why" to see exactly what earns the grade.</span>
   <span id="topCount"></span>
 </div>
-<div class="topgrid">
-  <div class="topcol">
-    <div class="toptitle bull">▲ Most bullish</div>
-    <div class="wrap"><table id="tbtbl"><thead><tr>
-      <th>Symbol</th><th>Setups</th><th>Price</th><th>Bias</th>
-      <th>Entry</th><th>SL tight</th><th>TP1</th><th>RR1</th><th>Score</th>
-    </tr></thead><tbody id="tbrows"></tbody></table>
-    <div class="empty" id="tbempty" style="display:none">No bullish setups yet…</div></div>
-  </div>
-  <div class="topcol">
-    <div class="toptitle bear">▼ Most bearish</div>
-    <div class="wrap"><table id="tstbl"><thead><tr>
-      <th>Symbol</th><th>Setups</th><th>Price</th><th>Bias</th>
-      <th>Entry</th><th>SL tight</th><th>TP1</th><th>RR1</th><th>Score</th>
-    </tr></thead><tbody id="tsrows"></tbody></table>
-    <div class="empty" id="tsempty" style="display:none">No bearish setups yet…</div></div>
-  </div>
+<div class="wrap">
+  <table id="tbtbl">
+    <thead><tr>
+      <th>Symbol</th>
+      <th data-tip="Composite conviction rating (A+ → D, 0–100). Blends: multi-scan confluence (35%), the best detector's own score (25%), volume confirmation via RVol (15%), market-structure alignment (15%), and the best reward:risk (10%). Higher = more evidence stacking up for a long.">Rating</th>
+      <th data-tip="Which bullish scans this coin currently appears on. Appearing on 2+ (★) is strong confluence.">Setups</th>
+      <th data-tip="Live last-traded price (updates ~every 20s).">Price</th>
+      <th data-tip="Market-structure bias from swing highs/lows.">Bias</th>
+      <th data-tip="Lower-risk entry — a pullback to the setup's support / EMA / breakout level.">Entry</th>
+      <th data-tip="Tight stop-loss for the best setup on this coin.">SL tight</th>
+      <th data-tip="First profit target and its reward:risk.">TP1</th>
+      <th data-tip="Reward:risk to the tight stop for TP1.">RR1</th>
+      <th data-tip="Plain-English summary of what earns this coin its rating.">Why it's a top setup</th>
+    </tr></thead>
+    <tbody id="tbrows"></tbody>
+  </table>
+  <div class="empty" id="tbempty" style="display:none">No high-conviction long setups yet — the loop keeps scanning…</div>
 </div>
 </div>
 
@@ -1410,8 +1414,59 @@ function renderWedge(){
     tb.appendChild(tr);
   }
 }
+// ---- Conviction rating: a composite 0–100 grade with a plain-English "why". ----
+const clamp01=v=>Math.max(0,Math.min(1,v));
+function gradeOf(s){ return s>=82?'A+':s>=72?'A':s>=62?'B':s>=48?'C':'D'; }
+function gradeClass(s){ return s>=72?'g-a':s>=62?'g-b':s>=48?'g-c':'g-d'; }
+function esc(t){ return (''+t).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
+function ratingCell(score,why){
+  const g=gradeOf(score);
+  const tip=esc(`Rated ${g} (${score}/100). ${why.join(' · ')}`);
+  return `<td data-tip="${tip}"><span class="grade ${gradeClass(score)}">${g}</span><span class="gscore">${score}</span></td>`;
+}
+function bullConviction(f){
+  const conf = f.nScans>=3?1 : f.nScans===2?0.7 : 0.35;                 // confluence
+  const qual = clamp01((f.bestScore||0)/100);                          // detector quality
+  const vol  = f.rvol? clamp01((f.rvol-1)/1.5) : 0.3;                  // volume confirmation
+  const struct = (f.bias==='Bullish'||f.bias==='Bullish CHoCH')?1 : (f.choch==='bullish'?0.6:0.3);
+  const rr   = f.bestRR? clamp01(f.bestRR/3) : 0.2;                    // reward:risk
+  return Math.round(100*(0.35*conf+0.25*qual+0.15*vol+0.15*struct+0.10*rr));
+}
+function bearConviction(f){
+  const qual = clamp01((f.bestScore||0)/100);
+  const vol  = f.rvol? clamp01((f.rvol-1)/1.5) : 0.3;
+  const struct = (f.bias==='Bearish')?1 : (f.choch==='bearish'?0.6:0.3);
+  const rr   = f.bestRR? clamp01(f.bestRR/3) : 0.2;
+  const base = 0.6;                                                     // it's a confirmed breakdown+retest
+  return Math.round(100*(0.25*base+0.30*qual+0.20*struct+0.15*vol+0.10*rr));
+}
+function bullWhy(f){
+  const w=[];
+  w.push(f.nScans>=2 ? `Confluence: on ${f.nScans} scans (${f.setups})`
+                     : `Single setup: ${f.setups}`);
+  w.push(`Best detector score ${Math.round(f.bestScore)}/100`);
+  if(f.rvol) w.push(`Volume ${f.rvol.toFixed(2)}× ${f.rvol>=1.5?'(strong confirmation)':f.rvol>=1?'(above average)':'(light)'}`);
+  w.push(`Structure: ${f.bias||'—'}${f.choch==='bullish'?' + bullish CHoCH':''}`);
+  if(f.bestRR) w.push(`Best R:R ${f.bestRR.toFixed(2)} to tight stop`);
+  if(f.fresh) w.push('Fresh trigger this scan');
+  return w;
+}
+function bearWhy(f){
+  const w=[];
+  w.push('Broke below a falling 200 EMA and retested it from below');
+  w.push(`Detector score ${Math.round(f.bestScore)}/100`);
+  w.push(`Structure: ${f.bias||'—'}${f.choch==='bearish'?' + bearish CHoCH':''}`);
+  if(f.rvol) w.push(`Volume ${f.rvol.toFixed(2)}×`);
+  if(f.bestRR) w.push(`R:R ${f.bestRR.toFixed(2)} to tight stop`);
+  if(f.fresh) w.push('Fresh breakdown this scan');
+  return w;
+}
 function renderShorts(){
-  const rows=[...slatest].filter(h=>biasOk(h,"shorts")).sort((a,b)=>{
+  const rows=[...slatest].map(h=>{
+    const f={bestScore:h.score||0,rvol:h.rvol,bias:h.bias,choch:h.choch,bestRR:h.rr1,fresh:h.is_new};
+    return {...h, _rating:bearConviction(f), _why:bearWhy(f)};
+  }).filter(h=>biasOk(h,"shorts")).sort((a,b)=>{
+    if(sSortKey==="score"){ return sSortDir*((a._rating)-(b._rating)); }  // sort by rating on the Score/default
     const x=a[sSortKey],y=b[sSortKey];
     if(typeof x==="string") return sSortDir*x.localeCompare(y);
     return sSortDir*((x??0)-(y??0));
@@ -1423,10 +1478,12 @@ function renderShorts(){
     tr.className=rowClass(h);
     tr.innerHTML =
       `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      ratingCell(h._rating,h._why)+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.pct_below_ema).toFixed(2)}</td>`+
       `<td>${h.bars_since_cross}</td>`+
       `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
+      `<td class="whycell" data-tip="${esc(h._why.join(' · '))}">${h._why[0]}</td>`+
       `<td data-tip="Optimal short entry — a rally back up to the 200 EMA (resistance) rather than shorting into support.">${fmtNum(h.optimal_entry)}</td>`+
       `<td data-tip="Tight stop — just ABOVE the EMA / retest high, ATR-buffered. A close back above invalidates the short.">${fmtNum(h.sl_tight)}</td>`+
       `<td data-tip="Wide stop — above a deeper swing high.">${fmtNum(h.sl_wide)}</td>`+
@@ -1438,41 +1495,46 @@ function renderShorts(){
 }
 function renderTop(){
   if(!lastData) return;
-  const srcB=[["Reclaim",lastData.hits],["Flag",lastData.flag_hits],["CPR",lastData.cpr_hits],
-              ["Bounce",lastData.bounce_hits],["Wedge",lastData.wedge_hits]];
-  const srcS=[["Short",lastData.short_hits]];
-  function agg(srcs){
-    const m={};
-    for(const [lbl,list] of srcs) for(const h of (list||[])){
-      const k=h.symbol;
-      if(!m[k]) m[k]={row:h,score:h.score||0,setups:new Set()};
-      m[k].setups.add(lbl);
-      if((h.score||0)>m[k].score){ m[k].score=h.score||0; m[k].row=h; }
-    }
-    return Object.values(m).sort((a,b)=> b.setups.size-a.setups.size || b.score-a.score).slice(0,25);
+  const srcB=[["200-EMA reclaim",lastData.hits],["Bull flag",lastData.flag_hits],
+              ["Narrow CPR",lastData.cpr_hits],["Support bounce",lastData.bounce_hits],
+              ["Falling wedge",lastData.wedge_hits]];
+  const m={};
+  for(const [lbl,list] of srcB) for(const h of (list||[])){
+    const k=h.symbol;
+    if(!m[k]) m[k]={row:h,best:h.score||0,setups:new Set(),rvol:0,rr:0,fresh:false,bias:h.bias,choch:h.choch};
+    const o=m[k]; o.setups.add(lbl);
+    if((h.score||0)>=o.best){ o.best=h.score||0; o.row=h; o.bias=h.bias; o.choch=h.choch; }
+    if(h.rvol&&h.rvol>o.rvol) o.rvol=h.rvol;
+    if(h.rr1&&h.rr1>o.rr) o.rr=h.rr1;
+    if(h.is_new||h.fresh) o.fresh=true;
   }
-  function fill(rowsId,emptyId,items){
-    const tb=document.getElementById(rowsId); tb.innerHTML="";
-    document.getElementById(emptyId).style.display = items.length? "none":"block";
-    for(const e of items){
-      const h=e.row, setups=[...e.setups].join(", ");
-      const P=h.live!=null?h.live:h.price;
-      const tr=document.createElement("tr"); tr.className=rowClass(h);
-      tr.innerHTML =
-        `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
-        `<td data-tip="Setups this coin appears on: ${setups}">${e.setups.size>1?'★ ':''}${setups}</td>`+
-        `<td>${fmtNum(P)}</td>`+
-        `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
-        `<td>${fmtNum(h.optimal_entry)}</td>`+
-        `<td>${fmtNum(h.sl_tight)}</td>`+
-        tpCell(h.tp1,h.rr1)+
-        `<td>${h.rr1!=null?(+h.rr1).toFixed(2):'—'}</td>`+
-        `<td class="score">${(+e.score).toFixed(1)}</td>`;
-      tb.appendChild(tr);
-    }
+  const items=Object.values(m).map(o=>{
+    const f={nScans:o.setups.size,bestScore:o.best,rvol:o.rvol,bias:o.bias,choch:o.choch,
+             bestRR:o.rr,fresh:o.fresh,setups:[...o.setups].join(', ')};
+    o.rating=bullConviction(f); o.why=bullWhy(f); o.f=f; return o;
+  }).sort((a,b)=> b.rating-a.rating || b.best-a.best).slice(0,30);
+  const tb=document.getElementById('tbrows'); tb.innerHTML="";
+  document.getElementById('tbempty').style.display = items.length? "none":"block";
+  const topEl=document.getElementById('topCount');
+  if(topEl) topEl.textContent = `${items.length} ranked long setups`;
+  for(const o of items){
+    const h=o.row, P=h.live!=null?h.live:h.price;
+    const shortWhy = (o.f.nScans>=2? `★ ${o.f.nScans} scans (${o.f.setups})` : o.f.setups)
+                   + (o.rvol? ` · vol ${o.rvol.toFixed(1)}×`:'');
+    const tr=document.createElement('tr'); tr.className=rowClass(h);
+    tr.innerHTML =
+      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      ratingCell(o.rating,o.why)+
+      `<td data-tip="${esc(o.f.setups)}">${o.f.nScans>1?'★ ':''}${o.f.nScans}</td>`+
+      `<td>${fmtNum(P)}</td>`+
+      `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
+      `<td>${fmtNum(h.optimal_entry)}</td>`+
+      `<td>${fmtNum(h.sl_tight)}</td>`+
+      tpCell(h.tp1,h.rr1)+
+      `<td>${h.rr1!=null?(+h.rr1).toFixed(2):'—'}</td>`+
+      `<td class="whycell" data-tip="${esc(o.why.join(' · '))}">${shortWhy}</td>`;
+    tb.appendChild(tr);
   }
-  fill('tbrows','tbempty',agg(srcB));
-  fill('tsrows','tsempty',agg(srcS));
 }
 async function poll(){
   try{
@@ -1494,8 +1556,8 @@ async function poll(){
     document.getElementById("cprCount").textContent = `${clatest.length} narrow-CPR · ${d.universe} pairs${bothTxt}`;
     document.getElementById("bounceCount").textContent = `${blatest.length} bounce(s) · ${d.universe} pairs${bothTxt}`;
     document.getElementById("wedgeCount").textContent = `${wlatest.length} wedge(s) · ${d.universe} pairs${bothTxt}`;
-    document.getElementById("shortCount").textContent = `${slatest.length} short(s) · ${d.universe} pairs`;
-    document.getElementById("topCount").textContent = `${latest.length+flatest.length+clatest.length+blatest.length+wlatest.length} bullish · ${slatest.length} bearish signals`;
+    document.getElementById("shortCount").textContent = `${slatest.length} short setup(s) · ${d.universe} pairs`;
+    // topCount is set inside renderTop() (it knows the deduped long count).
     document.getElementById("meta").textContent =
       `${d.cfg.interval} chart · MEXC ${d.cfg.market==='futures'?'perps ⚡':'spot'} · ${d.cfg.quote} · EMA${d.cfg.ema_period} · rescans every ${d.cfg.scan_every}m${d.cfg.telegram?' · 📲 Telegram on':''}`;
     const dot=document.getElementById("dot");
