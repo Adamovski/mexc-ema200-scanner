@@ -1193,6 +1193,44 @@ async function poll(){
     document.getElementById("err").textContent = d.error||"";
   }catch(e){ document.getElementById("err").textContent="dashboard offline?"; }
 }
+const HDR_TIPS={
+  symbol:"The coin. Click a column header to sort by it; click a symbol to open its TradingView chart. The ★ badge = confluence (hover it), the 🛟 = next 4h/Daily/Weekly support (hover it).",
+  price:"Last closed price on the scan timeframe.",
+  pct_above_ema:"How far price sits above the 200 EMA (%). Smaller = closer to the line = tighter entry.",
+  bars_since_cross:"How many candles ago the EMA was reclaimed. Fewer = fresher signal.",
+  retest_gap_pct:"How close the pullback's low tagged the EMA. Near 0 = a clean retest.",
+  bias:"Market-structure bias of the setup: Bullish, Bullish CHoCH (fresh reversal), Bearish, or Range.",
+  optimal_entry:"Lower-risk entry — a pullback to the setup's support / EMA / breakout level rather than chasing.",
+  sl_tight:"Tighter stop-loss, ATR-buffered just below the immediate structure. Smaller risk, easier to get stopped.",
+  sl_wide:"Wider stop-loss below a deeper swing low. More room, bigger risk per unit.",
+  tp1:"First profit target with its reward:risk to the tight stop.",
+  tp2:"Second profit target (R:R to tight stop).",
+  tp3:"Third profit target (R:R to tight stop).",
+  tp4:"Fourth profit target (R:R to tight stop).",
+  tp5:"Fifth profit target (R:R to tight stop).",
+  rvol:"Relative volume — latest candle vs its 20-bar average. Above 1× = above-average activity = confirmation.",
+  score:"Overall setup quality, 0–100 (higher = cleaner/stronger).",
+  pole_gain_pct:"Flagpole size — how far price ran up into the flag (%). Bigger impulse = stronger.",
+  flag_bars:"How many candles the flag consolidation has lasted.",
+  pullback_pct:"How deep the flag retraced the pole. Shallower (well under 50%) is healthier.",
+  vol_contraction:"Flag average volume ÷ pole average volume. Below 1 = volume drying up = the classic constructive flag.",
+  breakout:"The breakout trigger — the top of the flag / CPR. A move above confirms.",
+  cpr_width_pct:"Central Pivot Range width as % of price. Narrower = more compressed/coiled.",
+  position:"Where price sits vs the CPR — above (breakout side) or inside.",
+  tc:"CPR top (Top Central).", bc:"CPR bottom (Bottom Central).",
+  support:"The horizontal support level price is bouncing from.",
+  tf:"Strongest timeframe the support sits on — Weekly (gold) > Daily (green) > 4h. Higher = more significant.",
+  touches:"How many times that support level has been tested. More = stronger.",
+  dist_to_support_pct:"How far price currently sits above the support (%). Smaller = fresher bounce.",
+  rsi:"RSI(14) momentum, 0–100. Below 30 = oversold (bounce potential), above 70 = overbought."
+};
+function applyHeaderTips(){
+  document.querySelectorAll("th[data-k],th[data-fk],th[data-ck],th[data-bk]").forEach(th=>{
+    const k=th.dataset.k||th.dataset.fk||th.dataset.ck||th.dataset.bk;
+    if(HDR_TIPS[k]) th.setAttribute("data-tip",HDR_TIPS[k]);
+  });
+}
+applyHeaderTips();
 poll(); setInterval(poll, 3000);
 </script>
 </body></html>"""
