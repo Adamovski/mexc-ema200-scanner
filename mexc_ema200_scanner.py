@@ -78,25 +78,28 @@ def ema(values: list[float], period: int) -> list[float]:
     return out
 
 
+def atr(highs: list[float], lows: list[float], closes: list[float],
+        period: int = 14) -> float:
+    """Average True Range over the last `period` candles — a volatility measure
+    used to size stop-loss buffers so they adapt to each coin instead of a flat %."""
+    n = len(closes)
+    if n < 2:
+        return 0.0
+    trs = []
+    for i in range(1, n):
+        trs.append(max(highs[i] - lows[i],
+                       abs(highs[i] - closes[i - 1]),
+                       abs(lows[i] - closes[i - 1])))
+    recent = trs[-period:] if len(trs) >= period else trs
+    return sum(recent) / len(recent) if recent else 0.0
+
+
 # ----------------------------------------------------------------------------
 # Setup detection
 # ----------------------------------------------------------------------------
-@dataclass
-class Hit:
-    symbol: str
-    price: float
-    ema: float
-    pct_above_ema: float   # how far current close sits above the EMA (%)
-    bars_since_cross: int  # candles since the reclaim
-    retest_gap_pct: float  # how close the retest low came to the EMA (%)
-    score: float           # higher = cleaner / fresher setup
-    sl: float              # suggested stop-loss (below structure / EMA)
-    tp1: float | None      # 1st target: nearest overhead resistance (None = blue sky)
-    tp2: float | None      # 2nd target: next resistance above
-    tp3: float | None      # 3rd target: next resistance above that
-    rr1: float | None      # reward:risk to TP1  = (TP1-entry)/(entry-SL)
-    rr2: float | None      # reward:risk to TP2
-    rr3: float | None      # reward:risk to TP3
+# Scan results are plain dicts (each detector returns its own fields plus the
+# shared level bundle from level_bundle(): sl_tight, sl_wide, tp1..tp5,
+# rr1..rr5 [to tight stop], rrw1..rrw5 [to wide stop]).
 
 
 def resistances_above(highs: list[float], upto: int, price: float,
@@ -124,6 +127,21 @@ def resistances_above(highs: list[float], upto: int, price: float,
             out.append(h)
         if len(out) >= max_n:
             break
+    return out
+
+
+def level_bundle(entry: float, sl_tight: float, sl_wide: float,
+                 tps: list) -> dict:
+    """Package two stop scenarios and up to 5 targets, with R:R (to the tight
+    stop) for each. R:R = (TP - entry) / (entry - stop) = profit / loss."""
+    def rr(tp, sl):
+        return round((tp - entry) / (entry - sl), 2) if (tp and entry > sl) else None
+    out = {"sl_tight": sl_tight, "sl_wide": sl_wide}
+    padded = list(tps[:5]) + [None] * (5 - len(tps[:5]))
+    for i, tp in enumerate(padded, 1):
+        out[f"tp{i}"] = tp
+        out[f"rr{i}"] = rr(tp, sl_tight)
+        out[f"rrw{i}"] = rr(tp, sl_wide)   # R:R against the wider stop
     return out
 
 
@@ -220,20 +238,20 @@ def detect_cross_and_retest(
     # support: the lower of the EMA and the lowest low since the reclaim (the
     # retest low), minus a small buffer.
     entry = close_now                       # entry = current price
-    # Stop just under the reclaimed support. Anchor to the RETEST low (which held
-    # above the EMA), not the pre-cross low that sat below the EMA — using the
-    # deep cross-candle low would blow up the risk and wreck the R:R.
-    struct_low = min(lows[retest_idx:last + 1])
-    sl = min(struct_low, ema_now) * (1.0 - 0.003)
-    # Targets = the nearest MEANINGFUL overhead resistances (prior swing highs
-    # more than ~0.8% above price), in order. Blue sky -> some/all None.
-    res = resistances_above(highs, last, entry, max_n=3, min_gap=0.008)
-    tp1 = res[0] if len(res) > 0 else None
-    tp2 = res[1] if len(res) > 1 else None
-    tp3 = res[2] if len(res) > 2 else None
-
-    def _rr(tp):  # reward:risk = potential profit / potential loss, entry=current price
-        return round((tp - entry) / (entry - sl), 2) if (tp and entry > sl) else None
+    a = atr(highs, lows, closes)
+    # Optimal entry: the lower-risk fill is a pullback that retests the reclaimed
+    # EMA, so the ideal entry sits at/just above the EMA rather than chasing.
+    optimal_entry = round(ema_now * 1.002, 10)
+    # Sensible, volatility-aware stops (ATR buffer below real structure):
+    #  - tight: just under the retest low / EMA (whichever is lower) - 0.5 ATR
+    #  - wide:  under the deeper swing low of the whole move            - 1.0 ATR
+    tight_struct = min(min(lows[retest_idx:last + 1]), ema_now)
+    wide_struct = min(lows[cross_idx:last + 1])
+    sl_tight = tight_struct - 0.5 * a
+    sl_wide = min(wide_struct - 1.0 * a, sl_tight)
+    # Up to 5 overhead resistances (skip trivially-close ceilings) as targets.
+    res = resistances_above(highs, last, entry, max_n=5, min_gap=0.008)
+    bundle = level_bundle(entry, sl_tight, sl_wide, res)
 
     return True, {
         "price": close_now,
@@ -242,38 +260,15 @@ def detect_cross_and_retest(
         "bars_since_cross": bars_since_cross,
         "retest_gap_pct": round(best_gap * 100, 2),
         "score": score,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "rr1": _rr(tp1),
-        "rr2": _rr(tp2),
-        "rr3": _rr(tp3),
+        "entry": entry,
+        "optimal_entry": optimal_entry,
+        **bundle,
     }
 
 
 # ----------------------------------------------------------------------------
 # Bull-flag detection
 # ----------------------------------------------------------------------------
-@dataclass
-class FlagHit:
-    symbol: str
-    price: float
-    pole_gain_pct: float    # size of the flagpole (impulse) move, %
-    flag_bars: int          # length of the consolidation, in candles
-    pullback_pct: float     # how deep the flag retraced the pole, %
-    vol_contraction: float  # flag avg volume / pole avg volume (<1 = drying up)
-    breakout: float         # breakout trigger (top of the flag)
-    sl: float               # stop below the flag
-    tp1: float              # measured move (breakout + 1.0x pole height)
-    tp2: float              # 1.618x pole extension
-    tp3: float              # 2.0x pole extension
-    rr1: float              # reward:risk to TP1 = (TP1-entry)/(entry-SL)
-    rr2: float              # reward:risk to TP2
-    rr3: float              # reward:risk to TP3
-    score: float            # overall quality 0-100
-
-
 def detect_bull_flag(
     highs: list[float], lows: list[float], closes: list[float],
     volumes: list[float], *,
@@ -349,16 +344,20 @@ def detect_bull_flag(
 
     entry = close_now                    # entry = current price
     breakout = flag_hi
-    sl = flag_lo * (1.0 - 0.003)
+    a = atr(highs, lows, closes)
     pole_height = pole_top - pole_low
-    # Continuation targets projected off the breakout: the classic measured move
-    # (1.0x pole) then the common 1.618x and 2.0x extensions.
-    tp1 = breakout + 1.000 * pole_height
-    tp2 = breakout + 1.618 * pole_height
-    tp3 = breakout + 2.000 * pole_height
-
-    def _rr(tp):  # potential profit / potential loss, entry = current price
-        return round((tp - entry) / (entry - sl), 2) if entry > sl else 0.0
+    # Optimal entry for a continuation is the break of the flag high (enter on
+    # strength); a pullback to the flag low is the alternative lower-risk fill.
+    optimal_entry = round(breakout * 1.001, 10)
+    # Stops (ATR-buffered below real structure):
+    #  - tight: just under the flag low          - 0.5 ATR
+    #  - wide:  under the whole pole's base       - 0.5 ATR (much more room)
+    sl_tight = flag_lo - 0.5 * a
+    sl_wide = min(pole_low - 0.5 * a, sl_tight)
+    # Five continuation targets: measured move then Fib extensions of the pole,
+    # so proper breakouts have higher targets to run to.
+    tps = [breakout + m * pole_height for m in (1.0, 1.618, 2.0, 2.618, 3.0)]
+    bundle = level_bundle(entry, sl_tight, sl_wide, tps)
 
     return True, {
         "price": close_now,
@@ -367,14 +366,97 @@ def detect_bull_flag(
         "pullback_pct": round(retrace * 100, 1),
         "vol_contraction": round(vol_contraction, 2),
         "breakout": breakout,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "rr1": _rr(tp1),
-        "rr2": _rr(tp2),
-        "rr3": _rr(tp3),
+        "entry": entry,
+        "optimal_entry": optimal_entry,
         "score": round(score, 1),
+        **bundle,
+    }
+
+
+# ----------------------------------------------------------------------------
+# Narrow CPR (Central Pivot Range) detection
+# ----------------------------------------------------------------------------
+def detect_narrow_cpr(rows: list, *, cpr_max_width_pct: float = 0.75,
+                      max_ext_above: float = 0.08) -> tuple[bool, dict]:
+    """Narrow Central Pivot Range on the DAILY frame (from 4h candles).
+
+    CPR uses the previous day's High/Low/Close:
+        Pivot P = (H+L+C)/3,  BC = (H+L)/2,  TC = 2P - BC.
+    A NARROW CPR (small TC-BC relative to price) signals compressed, coiled
+    price — often a precursor to a trending / breakout move. We flag coins whose
+    latest CPR is narrow and price is at/above it (bullish side), and attach a
+    trade plan (entry, two stops, five targets).
+    """
+    if len(rows) < 30:
+        return False, {}
+    try:
+        times = [int(float(r[0])) for r in rows]
+        highs = [float(r[2]) for r in rows]
+        lows = [float(r[3]) for r in rows]
+        closes = [float(r[4]) for r in rows]
+    except (ValueError, IndexError):
+        return False, {}
+
+    # group candle indices by UTC day
+    days: dict[int, list[int]] = {}
+    for i, t in enumerate(times):
+        days.setdefault(t // 86400000, []).append(i)
+    keys = list(days.keys())
+    if len(keys) < 2:
+        return False, {}
+
+    prev = days[keys[-2]]                      # last fully-closed day = "yesterday"
+    dh = max(highs[i] for i in prev)
+    dl = min(lows[i] for i in prev)
+    dc = closes[prev[-1]]
+    P = (dh + dl + dc) / 3.0
+    BC = (dh + dl) / 2.0
+    TC = 2 * P - BC
+    top, bot = max(TC, BC), min(TC, BC)
+    width = top - bot
+    price = closes[-1]
+    if price <= 0:
+        return False, {}
+    width_pct = width / price * 100.0
+    if width_pct > cpr_max_width_pct:
+        return False, {}
+
+    if price > top:
+        position = "above"
+    elif price < bot:
+        position = "below"
+    else:
+        position = "inside"
+    if position == "below":                    # broken down — not a long setup
+        return False, {}
+    if price > top * (1.0 + max_ext_above):    # already flown too far past CPR
+        return False, {}
+
+    ref = closes[max(0, len(closes) - 31)]
+    slope = (price - ref) / ref if ref else 0.0
+    trend = "up" if slope > 0.01 else ("down" if slope < -0.01 else "flat")
+
+    narrow_s = max(0.0, min(1.0, 1.0 - width_pct / cpr_max_width_pct))
+    pos_s = 1.0 if position == "above" else 0.5
+    trend_s = 1.0 if trend == "up" else (0.5 if trend == "flat" else 0.0)
+    score = round(100 * (0.5 * narrow_s + 0.3 * pos_s + 0.2 * trend_s), 1)
+
+    entry = price
+    a = atr(highs, lows, closes)
+    optimal_entry = round(top * 1.001, 10)     # break above the CPR top
+    sl_tight = BC - 0.5 * a                     # below the CPR bottom
+    sl_wide = min(dl - 0.5 * a, sl_tight)       # below yesterday's low
+    res = resistances_above(highs, len(closes) - 1, entry, max_n=5, min_gap=0.005)
+    bundle = level_bundle(entry, sl_tight, sl_wide, res)
+
+    return True, {
+        "price": price,
+        "pivot": P, "tc": TC, "bc": BC,
+        "cpr_width_pct": round(width_pct, 3),
+        "position": position, "trend": trend,
+        "entry": entry, "optimal_entry": optimal_entry,
+        "score": score,
+        **bundle,
     }
 
 
@@ -478,38 +560,20 @@ def fetch_klines(sess: requests.Session, symbol: str, interval: str,
 
 
 def scan_symbol(sess: requests.Session, symbol: str, interval: str,
-                cfg: dict) -> Hit | None:
-    raw = fetch_klines(sess, symbol, interval, cfg["kline_limit"])
-    if not raw or len(raw) < EMA_PERIOD + 2:
-        return None
-    # MEXC kline row: [openTime, open, high, low, close, volume, closeTime, ...]
-    # Drop the last (still-forming) candle so we work with closed bars only.
-    rows = raw[:-1]
-    try:
-        highs = [float(x[2]) for x in rows]
-        lows = [float(x[3]) for x in rows]
-        closes = [float(x[4]) for x in rows]
-    except (ValueError, IndexError):
-        return None
-
-    ok, d = detect_cross_and_retest(
-        highs, lows, closes,
-        ema_period=EMA_PERIOD, lookback=cfg["lookback"],
-        retest_tol=cfg["retest_tol"], break_tol=cfg["break_tol"],
-        max_above_now=cfg["max_above_now"], min_slope=cfg["min_slope"],
-    )
-    if not ok:
-        return None
-    return Hit(symbol=symbol, **d)
+                cfg: dict) -> dict | None:
+    ema_hit, _flag, _cpr = scan_symbol_multi(sess, symbol, interval, cfg)
+    return ema_hit
 
 
 def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
-                      cfg: dict) -> tuple[Hit | None, FlagHit | None]:
-    """Fetch klines ONCE and run both the 200-EMA and bull-flag detectors.
-    Used by the dashboard so a two-scan page still costs one request per symbol."""
+                      cfg: dict) -> tuple[dict | None, dict | None, dict | None]:
+    """Fetch klines ONCE and run the 200-EMA, bull-flag and narrow-CPR detectors.
+    One request per symbol powers all three scans. Returns (ema, flag, cpr) dicts
+    (each with 'symbol' added) or None where there's no setup."""
     raw = fetch_klines(sess, symbol, interval, cfg["kline_limit"])
     if not raw or len(raw) < EMA_PERIOD + 2:
-        return None, None
+        return None, None, None
+    # MEXC kline row: [openTime, open, high, low, close, volume, closeTime, ...]
     rows = raw[:-1]                       # drop the still-forming candle
     try:
         highs = [float(x[2]) for x in rows]
@@ -517,9 +581,9 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
         closes = [float(x[4]) for x in rows]
         vols = [float(x[5]) for x in rows]
     except (ValueError, IndexError):
-        return None, None
+        return None, None, None
 
-    ema_hit = None
+    ema_hit = flag_hit = cpr_hit = None
     ok, d = detect_cross_and_retest(
         highs, lows, closes,
         ema_period=EMA_PERIOD, lookback=cfg["lookback"],
@@ -527,18 +591,22 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
         max_above_now=cfg["max_above_now"], min_slope=cfg["min_slope"],
     )
     if ok:
-        ema_hit = Hit(symbol=symbol, **d)
+        ema_hit = {"symbol": symbol, **d}
 
-    flag_hit = None
     ok2, f = detect_bull_flag(
         highs, lows, closes, vols,
         pole_min_gain=cfg.get("pole_min_gain", 0.15),
         max_retrace=cfg.get("flag_max_retrace", 0.5),
     )
     if ok2:
-        flag_hit = FlagHit(symbol=symbol, **f)
+        flag_hit = {"symbol": symbol, **f}
 
-    return ema_hit, flag_hit
+    ok3, c = detect_narrow_cpr(
+        rows, cpr_max_width_pct=cfg.get("cpr_max_width_pct", 0.75))
+    if ok3:
+        cpr_hit = {"symbol": symbol, **c}
+
+    return ema_hit, flag_hit, cpr_hit
 
 
 def supports_below(lows: list[float], upto: int, price: float,
@@ -605,21 +673,24 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     pct_vs_ema = (price - ema_now) / ema_now * 100
 
     sup = supports_below(lows, last, price, max_n=3, min_gap=0.005)
-    res = resistances_above(highs, last, price, max_n=3, min_gap=0.008)
+    res = resistances_above(highs, last, price, max_n=5, min_gap=0.008)
+    a = atr(highs, lows, closes)
 
     entry = price
-    support0 = sup[0] if sup else ema_now
-    # stop below the nearest support (or the EMA if that's higher and price is above it)
-    stop_anchor = support0
-    if above and ema_now < price:
-        stop_anchor = min(support0, ema_now) if sup else ema_now
-    sl = stop_anchor * (1.0 - 0.003)
-    tp1 = res[0] if len(res) > 0 else None
-    tp2 = res[1] if len(res) > 1 else None
-    tp3 = res[2] if len(res) > 2 else None
-
-    def _rr(tp):
-        return round((tp - entry) / (entry - sl), 2) if (tp and entry > sl) else None
+    # Optimal (lower-risk) entry: pull back to the nearest support, or the EMA if
+    # price is extended above a rising EMA.
+    if sup:
+        optimal_entry = sup[0]
+    elif above:
+        optimal_entry = round(ema_now * 1.002, 10)
+    else:
+        optimal_entry = price
+    # ATR-buffered stops below real structure.
+    near_support = sup[0] if sup else (ema_now if above else price * 0.97)
+    sl_tight = near_support - 0.5 * a
+    deep_support = sup[1] if len(sup) > 1 else (sup[0] if sup else near_support)
+    sl_wide = min(deep_support - 1.0 * a, sl_tight)
+    bundle = level_bundle(entry, sl_tight, sl_wide, res)
 
     okE, dE = detect_cross_and_retest(
         highs, lows, closes, ema_period=EMA_PERIOD,
@@ -667,16 +738,14 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "above_ema": above,
         "bias": bias,
         "entry": entry,
-        "pullback_entry": (sup[0] if sup else ema_now),
-        "sl": sl,
+        "optimal_entry": optimal_entry,
         "supports": sup,
-        "tp1": tp1, "tp2": tp2, "tp3": tp3,
-        "rr1": _rr(tp1), "rr2": _rr(tp2), "rr3": _rr(tp3),
         "ema_reclaim": bool(okE),
         "ema_reclaim_score": dE.get("score") if okE else None,
         "bull_flag": bool(okF),
         "bull_flag_score": dF.get("score") if okF else None,
         "notes": notes,
+        **bundle,
     }
 
 
@@ -705,6 +774,7 @@ def main() -> None:
         "kline_limit": args.kline_limit, "lookback": args.lookback,
         "retest_tol": args.retest_tol, "break_tol": args.break_tol,
         "max_above_now": args.max_above, "min_slope": args.min_slope,
+        "pole_min_gain": 0.15, "flag_max_retrace": 0.5, "cpr_max_width_pct": 0.75,
     }
 
     sess = get_session()
@@ -719,7 +789,7 @@ def main() -> None:
     print(f"Scanning {len(symbols)} pairs on the {args.interval} chart "
           f"(200 EMA cross & retest) ...", file=sys.stderr)
 
-    hits: list[Hit] = []
+    hits: list[dict] = []
     done = 0
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         futs = {ex.submit(scan_symbol, sess, s, args.interval, cfg): s
@@ -732,7 +802,7 @@ def main() -> None:
             if h:
                 hits.append(h)
 
-    hits.sort(key=lambda h: h.score, reverse=True)
+    hits.sort(key=lambda h: h["score"], reverse=True)
     if args.top > 0:
         hits = hits[:args.top]
 
@@ -744,19 +814,18 @@ def main() -> None:
               f"{'%>EMA':>8}{'BARS':>6}{'RETEST%':>9}{'SCORE':>7}")
         print("-" * 72)
         for h in hits:
-            print(f"{h.symbol:<14}{h.price:>14.8g}{h.ema:>14.8g}"
-                  f"{h.pct_above_ema:>8.2f}{h.bars_since_cross:>6}"
-                  f"{h.retest_gap_pct:>9.2f}{h.score:>7.1f}")
+            print(f"{h['symbol']:<14}{h['price']:>14.8g}{h['ema']:>14.8g}"
+                  f"{h['pct_above_ema']:>8.2f}{h['bars_since_cross']:>6}"
+                  f"{h['retest_gap_pct']:>9.2f}{h['score']:>7.1f}")
         print(f"\n{len(hits)} setup(s).  BARS = candles since the reclaim; "
               f"RETEST% = how close the pullback came to the EMA.")
 
     if args.csv:
         with open(args.csv, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(asdict(hits[0]).keys())
+            w = csv.DictWriter(f, fieldnames=list(hits[0].keys())
                                if hits else ["symbol"])
             w.writeheader()
-            for h in hits:
-                w.writerow(asdict(h))
+            w.writerows(hits)
         print(f"Wrote {len(hits)} rows to {args.csv}", file=sys.stderr)
 
 

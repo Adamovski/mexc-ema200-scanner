@@ -47,7 +47,7 @@ except ImportError:
 # Reuse the tested scanner core.
 try:
     from mexc_ema200_scanner import (
-        list_symbols, scan_symbol_multi, get_session, Hit, FlagHit, EMA_PERIOD,
+        list_symbols, scan_symbol_multi, get_session, EMA_PERIOD,
         analyze_symbol, normalize_symbol,
     )
 except ImportError:
@@ -68,7 +68,10 @@ class State:
         self.flag_hits: list[dict] = []            # bull-flag setups
         self.prev_flag_symbols: set[str] | None = None
         self.new_flag_symbols: list[str] = []
-        self.both_symbols: list[str] = []          # appear on BOTH scans (confluence)
+        self.cpr_hits: list[dict] = []             # narrow-CPR setups
+        self.prev_cpr_symbols: set[str] | None = None
+        self.new_cpr_symbols: list[str] = []
+        self.both_symbols: list[str] = []          # appear on 2+ scans (confluence)
         self.last_scan: float | None = None      # epoch seconds
         self.next_scan: float | None = None
         self.scanning: bool = False
@@ -88,6 +91,8 @@ class State:
                 "new_symbols": list(self.new_symbols),
                 "flag_hits": list(self.flag_hits),
                 "flag_new_symbols": list(self.new_flag_symbols),
+                "cpr_hits": list(self.cpr_hits),
+                "cpr_new_symbols": list(self.new_cpr_symbols),
                 "both_symbols": list(self.both_symbols),
                 "error": self.error,
                 "cfg": {
@@ -118,12 +123,14 @@ def run_one_scan(state: State) -> None:
             state.scanning = False
         return
 
-    hits: list[Hit] = []
-    flags: list[FlagHit] = []
+    hits: list[dict] = []
+    flags: list[dict] = []
+    cprs: list[dict] = []
     done = 0
     scan_cfg = {k: cfg[k] for k in
                 ("kline_limit", "lookback", "retest_tol", "break_tol",
-                 "max_above_now", "min_slope", "pole_min_gain", "flag_max_retrace")}
+                 "max_above_now", "min_slope", "pole_min_gain", "flag_max_retrace",
+                 "cpr_max_width_pct")}
     with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
         futs = {ex.submit(scan_symbol_multi, sess, s, cfg["interval"], scan_cfg): s
                 for s in symbols}
@@ -133,42 +140,45 @@ def run_one_scan(state: State) -> None:
                 with state.lock:
                     state.progress = (done, len(symbols))
             try:
-                h, f = fut.result()
+                h, f, c = fut.result()
             except Exception:
-                h, f = None, None
+                h, f, c = None, None, None
             if h:
                 hits.append(h)
             if f:
                 flags.append(f)
+            if c:
+                cprs.append(c)
 
-    hits.sort(key=lambda h: h.score, reverse=True)
-    flags.sort(key=lambda h: h.score, reverse=True)
+    hits.sort(key=lambda h: h["score"], reverse=True)
+    flags.sort(key=lambda h: h["score"], reverse=True)
+    cprs.sort(key=lambda h: h["score"], reverse=True)
 
     def tag_new(items, prev):
         """Return (rows, new_syms, cur_syms) with an is_new flag per row."""
-        cur = {it.symbol for it in items}
+        cur = {it["symbol"] for it in items}
         new = set() if prev is None else cur - prev
-        rows = []
-        for it in items:
-            d = asdict(it)
-            d["is_new"] = it.symbol in new
-            rows.append(d)
-        return rows, [it.symbol for it in items if it.symbol in new], cur
+        rows = [dict(it) for it in items]
+        for d in rows:
+            d["is_new"] = d["symbol"] in new
+        return rows, [s for s in (it["symbol"] for it in items) if s in new], cur
 
-    # Confluence: coins that show up on BOTH scans (reclaim + bull flag).
-    both = {h.symbol for h in hits} & {h.symbol for h in flags}
+    # Confluence: coins that appear on 2 or more of the three scans.
+    from collections import Counter
+    counts = Counter([h["symbol"] for h in hits] +
+                     [h["symbol"] for h in flags] +
+                     [h["symbol"] for h in cprs])
+    both = {s for s, n in counts.items() if n >= 2}
 
     with state.lock:
         rows, new_syms, cur = tag_new(hits, state.prev_symbols)
         frows, fnew, fcur = tag_new(flags, state.prev_flag_symbols)
-        for d in rows + frows:
+        crows, cnew, ccur = tag_new(cprs, state.prev_cpr_symbols)
+        for d in rows + frows + crows:
             d["both"] = d["symbol"] in both
-        state.hits = rows
-        state.new_symbols = new_syms
-        state.prev_symbols = cur
-        state.flag_hits = frows
-        state.new_flag_symbols = fnew
-        state.prev_flag_symbols = fcur
+        state.hits, state.new_symbols, state.prev_symbols = rows, new_syms, cur
+        state.flag_hits, state.new_flag_symbols, state.prev_flag_symbols = frows, fnew, fcur
+        state.cpr_hits, state.new_cpr_symbols, state.prev_cpr_symbols = crows, cnew, ccur
         state.both_symbols = sorted(both)
 
         state.last_scan = time.time()
@@ -211,8 +221,9 @@ PAGE = """<!doctype html>
   @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(63,185,80,.5)}
                    70%{box-shadow:0 0 0 7px rgba(63,185,80,0)}
                    100%{box-shadow:0 0 0 0 rgba(63,185,80,0)}}
-  .wrap{padding:14px 22px 40px}
+  .wrap{padding:14px 22px 40px;overflow-x:auto}
   table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+  td .rr{color:var(--dim);font-size:11px;margin-left:3px}
   th,td{padding:8px 12px;text-align:right;border-bottom:1px solid var(--line);
         white-space:nowrap}
   th{position:sticky;top:0;background:var(--head);color:var(--dim);
@@ -308,6 +319,7 @@ PAGE = """<!doctype html>
 <div class="tabs">
   <div class="tab active" id="tabSetups" onclick="showTab('setups')">200-EMA reclaim</div>
   <div class="tab" id="tabFlags" onclick="showTab('flags')">Bull flags</div>
+  <div class="tab" id="tabCpr" onclick="showTab('cpr')">Narrow CPR</div>
   <div class="tab" id="tabAnalyze" onclick="showTab('analyze')">Analyze a coin</div>
   <div class="tab" id="tabInfo" onclick="showTab('info')">Info</div>
 </div>
@@ -325,17 +337,16 @@ PAGE = """<!doctype html>
     <thead><tr>
       <th data-k="symbol">Symbol</th>
       <th data-k="price">Price</th>
-      <th data-k="ema">EMA200</th>
       <th data-k="pct_above_ema">% &gt; EMA</th>
-      <th data-k="bars_since_cross">Bars since cross</th>
-      <th data-k="retest_gap_pct">Retest %</th>
-      <th data-k="sl">Stop (SL)</th>
+      <th data-k="bars_since_cross">Bars</th>
+      <th data-k="optimal_entry">Optimal entry</th>
+      <th data-k="sl_tight">SL tight</th>
+      <th data-k="sl_wide">SL wide</th>
       <th data-k="tp1">TP1</th>
-      <th data-k="rr1">R:R 1</th>
       <th data-k="tp2">TP2</th>
-      <th data-k="rr2">R:R 2</th>
       <th data-k="tp3">TP3</th>
-      <th data-k="rr3">R:R 3</th>
+      <th data-k="tp4">TP4</th>
+      <th data-k="tp5">TP5</th>
       <th data-k="score">Score</th>
     </tr></thead>
     <tbody id="rows"></tbody>
@@ -358,19 +369,49 @@ PAGE = """<!doctype html>
       <th data-fk="flag_bars">Flag bars</th>
       <th data-fk="pullback_pct">Pullback %</th>
       <th data-fk="vol_contraction">Vol ratio</th>
-      <th data-fk="breakout">Breakout</th>
-      <th data-fk="sl">Stop (SL)</th>
+      <th data-fk="optimal_entry">Breakout entry</th>
+      <th data-fk="sl_tight">SL tight</th>
+      <th data-fk="sl_wide">SL wide</th>
       <th data-fk="tp1">TP1</th>
-      <th data-fk="rr1">R:R 1</th>
       <th data-fk="tp2">TP2</th>
-      <th data-fk="rr2">R:R 2</th>
       <th data-fk="tp3">TP3</th>
-      <th data-fk="rr3">R:R 3</th>
+      <th data-fk="tp4">TP4</th>
+      <th data-fk="tp5">TP5</th>
       <th data-fk="score">Score</th>
     </tr></thead>
     <tbody id="frows"></tbody>
   </table>
   <div class="empty" id="fempty" style="display:none">No bull flags right now. The loop keeps scanning…</div>
+</div>
+</div>
+
+<div class="view" id="viewCpr">
+<div class="status">
+  <span>Narrow CPR — compressed daily pivot range, a coiled-for-breakout signal</span>
+  <span id="cprCount"></span>
+</div>
+<div class="wrap">
+  <table id="ctbl">
+    <thead><tr>
+      <th data-ck="symbol">Symbol</th>
+      <th data-ck="price">Price</th>
+      <th data-ck="cpr_width_pct">CPR width %</th>
+      <th data-ck="position">Pos</th>
+      <th data-ck="tc">TC</th>
+      <th data-ck="bc">BC</th>
+      <th data-ck="optimal_entry">Breakout entry</th>
+      <th data-ck="sl_tight">SL tight</th>
+      <th data-ck="sl_wide">SL wide</th>
+      <th data-ck="tp1">TP1</th>
+      <th data-ck="tp2">TP2</th>
+      <th data-ck="tp3">TP3</th>
+      <th data-ck="tp4">TP4</th>
+      <th data-ck="tp5">TP5</th>
+      <th data-ck="score">Score</th>
+    </tr></thead>
+    <tbody id="crows"></tbody>
+  </table>
+  <div class="empty" id="cempty" style="display:none">No narrow-CPR setups right now. The loop keeps scanning…</div>
 </div>
 </div>
 
@@ -416,11 +457,12 @@ PAGE = """<!doctype html>
     <tr><td>EMA200</td><td>The 200-period EMA value on the 4h chart.</td></tr>
     <tr><td>% &gt; EMA</td><td>How far the current price sits above the EMA. Smaller = closer to the line = a tighter entry.</td></tr>
     <tr><td>Bars since cross</td><td>How many 4h candles ago the reclaim happened. Fewer = fresher.</td></tr>
-    <tr><td>Retest %</td><td>How close the pullback's low came to the EMA. Near 0 = a clean tag; a small negative means the wick dipped just below the line before closing back above.</td></tr>
-    <tr><td>Stop (SL)</td><td>Suggested stop-loss — just below the setup's support (the lower of the EMA and the retest low). A close below here would invalidate the reclaim.</td></tr>
-    <tr><td>TP1 / TP2 / TP3</td><td>Three take-profit targets at successive overhead resistances — the nearest prior swing highs above price, in order. Scale out as each is reached. "—" means no more resistance above (blue sky).</td></tr>
-    <tr><td>R:R 1 / 2 / 3</td><td>Reward-to-risk to each target = (TP − entry) ÷ (entry − stop), i.e. potential profit ÷ potential loss, with <b>entry = current price</b>. Shown per target so you can see the payoff of holding for TP1 vs TP2 vs TP3. Nearer targets have lower R:R; further ones higher.</td></tr>
-    <tr><td>★ BOTH</td><td>Confluence flag — this coin also appears on the other scan (see below). Rows are highlighted gold.</td></tr>
+    <tr><td>Bars</td><td>How many 4h candles ago the reclaim happened. Fewer = fresher.</td></tr>
+    <tr><td>Optimal entry</td><td>The lower-risk fill — a pullback that retests the reclaimed EMA — rather than chasing the current price.</td></tr>
+    <tr><td>SL tight / SL wide</td><td>Two stop scenarios, both ATR-buffered (scaled to the coin's volatility). <b>Tight</b> sits just under the retest low / EMA; <b>wide</b> sits under the deeper swing low of the whole move — more breathing room, bigger risk.</td></tr>
+    <tr><td>TP1 … TP5</td><td>Up to five take-profit targets at successive overhead resistances (nearest prior swing highs above price). Each cell shows the price and, in grey, its <b>R:R</b> to the <i>tight</i> stop. Scale out as each is hit; "—" = no more resistance (blue sky).</td></tr>
+    <tr><td>R:R (grey on each TP)</td><td>(TP − entry) ÷ (entry − tight stop) = potential profit ÷ potential loss, entry = current price. Nearer targets = lower R:R, further = higher. Using the wide stop lowers each R:R.</td></tr>
+    <tr><td>★ BOTH</td><td>Confluence — this coin also appears on another scan (see below). Rows are highlighted gold.</td></tr>
     <tr><td>Score</td><td>Overall quality, 0–100 (see below).</td></tr>
   </table>
 
@@ -436,18 +478,19 @@ PAGE = """<!doctype html>
   precisely, and is still hugging the line rather than having run away. It ranks
   setups; it does not predict outcomes.</p>
 
-  <h2>Stop, target &amp; R:R</h2>
-  <p>For each setup the scanner sketches a <b>potential</b> trade, purely from
-  chart structure:</p>
-  <p><b>Entry</b> is the current price. <b>Stop (SL)</b> sits just below the
-  support that would invalidate the reclaim — the lower of the 200 EMA and the
-  <i>retest</i> low, with a small buffer (deliberately not the pre-cross low,
-  which sat below the EMA and would inflate the risk). <b>TP1/TP2/TP3</b> are the
-  next three meaningful overhead resistances, and <b>R:R 1/2/3</b> is the
-  reward-to-risk to each — potential profit ÷ potential loss from the current
-  price. Reclaim setups often have low R:R to the nearest target because you're
-  buying close to support with resistance overhead; the further targets show the
-  fuller payoff.</p>
+  <h2>Entries, stops, targets &amp; R:R</h2>
+  <p>For each setup the scanner sketches a <b>potential</b> trade from chart
+  structure. Every tab (and the Analyze tab) shows the same anatomy:</p>
+  <p><b>Entry</b> is the current price; <b>optimal entry</b> is a lower-risk fill
+  (a pullback to the reclaimed EMA / flag or CPR breakout level / nearest support,
+  depending on the tab). There are <b>two stop scenarios</b>, both buffered by
+  <b>ATR</b> (the coin's own volatility) rather than a flat %: <b>SL tight</b> sits
+  just under the immediate structure, <b>SL wide</b> under a deeper swing low for
+  more breathing room. There are up to <b>five targets</b> (TP1–TP5) at successive
+  resistances (or, for flags, measured-move and Fibonacci pole extensions so
+  proper breakouts have room to run), and each shows its <b>R:R</b> to the tight
+  stop — profit ÷ loss from the current price. Nearer targets have lower R:R,
+  further ones higher.</p>
   <p>These are mechanical estimates to save you eyeballing the chart, not
   recommendations. A high R:R only means the geometry is favourable, not that the
   trade will work — size and manage risk yourself.</p>
@@ -477,13 +520,23 @@ PAGE = """<!doctype html>
   <p>The two tabs are complementary: the 200-EMA tab catches trend <i>reclaims</i>,
   the bull-flag tab catches <i>continuations</i> mid-trend.</p>
 
-  <h2>Confluence — coins on both scans</h2>
-  <p>When a coin shows up on <b>both</b> the 200-EMA reclaim and the bull-flag scan
-  at the same time, it's flagged with a gold <span class="bothbadge">★ BOTH</span>
-  badge and its row is highlighted gold on both tabs. The header also shows a
-  running "★ N on both" count. These are the highest-conviction names — a trend
-  reclaim and a continuation pattern lining up on the same chart — so they're
-  worth looking at first.</p>
+  <h2>The Narrow CPR tab</h2>
+  <p>A third scan built on the <b>Central Pivot Range</b> (CPR), computed on the
+  <b>daily</b> frame from the 4h candles using the previous day's High/Low/Close:
+  Pivot P = (H+L+C)/3, BC = (H+L)/2, TC = 2P − BC. When the range between TC and
+  BC is <b>narrow</b> relative to price, it means the market is coiled and
+  compressed — often the calm before a trending / breakout move. The scan flags
+  coins whose latest CPR is narrow and price is sitting at or above it (bullish
+  side), and shows the CPR width %, where price sits (Pos: above / inside), the TC
+  and BC levels, a breakout entry, both stops, and five targets.</p>
+
+  <h2>Confluence — coins on 2+ scans</h2>
+  <p>When a coin shows up on <b>two or more</b> of the three scans (reclaim, bull
+  flag, narrow CPR) at once, it's flagged with a gold <span class="bothbadge">★ BOTH</span>
+  badge and its row is highlighted gold on every tab, with a running
+  "★ N confluence" count in the header. These are the highest-conviction names —
+  multiple bullish signals lining up on the same chart — so they're worth a look
+  first.</p>
 
   <h2>The Analyze a coin tab</h2>
   <p>Type any MEXC ticker (e.g. <code>BTC</code>, <code>SOL</code>,
@@ -508,6 +561,7 @@ PAGE = """<!doctype html>
 <script>
 let sortKey="score", sortDir=-1, latest=[];
 let fSortKey="score", fSortDir=-1, flatest=[];
+let cSortKey="score", cSortDir=-1, clatest=[];
 let activeTab="setups", lastData=null;
 function fmtNum(n){ if(n===null||n===undefined) return "—";
   const a=Math.abs(n); if(a!==0&&a<0.001) return n.toExponential(2);
@@ -525,11 +579,11 @@ function badges(h){
   return s;
 }
 function rowClass(h){ return (h.is_new?"isnew ":"")+(h.both?"both":""); }
-function tpCell(v){ return `<td>${v==null?'—':fmtNum(v)}</td>`; }
-function rrCell(v){ return `<td>${v==null?'—':(+v).toFixed(2)}</td>`; }
+function tpCell(v,rr){ return v==null?'<td>—</td>'
+  :`<td>${fmtNum(v)}${rr!=null?`<span class="rr">R${(+rr).toFixed(1)}</span>`:''}</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
@@ -568,11 +622,14 @@ function azCard(d){
     </div>
     <div class="azgrid">
       ${cell("Entry (now)", fmtNum(d.entry))}
-      ${cell("Pullback entry", fmtNum(d.pullback_entry))}
-      ${cell("Stop (SL)", fmtNum(d.sl))}
+      ${cell("Optimal entry", fmtNum(d.optimal_entry))}
+      ${cell("SL tight", fmtNum(d.sl_tight))}
+      ${cell("SL wide", fmtNum(d.sl_wide))}
       ${cell("TP1", tp(d.tp1,d.rr1))}
       ${cell("TP2", tp(d.tp2,d.rr2))}
       ${cell("TP3", tp(d.tp3,d.rr3))}
+      ${cell("TP4", tp(d.tp4,d.rr4))}
+      ${cell("TP5", tp(d.tp5,d.rr5))}
     </div>
     <ul class="aznotes">${notes}</ul>
   </div>`;
@@ -582,6 +639,7 @@ function renderBanner(){
   let newSyms=[], what="";
   if(activeTab==="setups"){ newSyms=(lastData&&lastData.new_symbols)||[]; what="200-EMA reclaim"; }
   else if(activeTab==="flags"){ newSyms=(lastData&&lastData.flag_new_symbols)||[]; what="bull flag"; }
+  else if(activeTab==="cpr"){ newSyms=(lastData&&lastData.cpr_new_symbols)||[]; what="narrow CPR"; }
   if(!newSyms.length){ b.classList.remove("show"); b.innerHTML=""; return; }
   const chips=newSyms.map(s=>`<span class="chip"><a href="${tvLink(s)}" target="_blank" rel="noopener">${s}</a></span>`).join("");
   const label=newSyms.length===1?`new ${what} just triggered`:`new ${what} setups just triggered`;
@@ -606,9 +664,10 @@ function renderFlags(){
       `<td>${h.flag_bars}</td>`+
       `<td>${(+h.pullback_pct).toFixed(1)}</td>`+
       `<td>${(+h.vol_contraction).toFixed(2)}</td>`+
-      `<td>${fmtNum(h.breakout)}</td>`+
-      `<td>${fmtNum(h.sl)}</td>`+
-      tpCell(h.tp1)+rrCell(h.rr1)+tpCell(h.tp2)+rrCell(h.rr2)+tpCell(h.tp3)+rrCell(h.rr3)+
+      `<td>${fmtNum(h.optimal_entry)}</td>`+
+      `<td>${fmtNum(h.sl_tight)}</td>`+
+      `<td>${fmtNum(h.sl_wide)}</td>`+
+      tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
   }
@@ -627,12 +686,12 @@ function render(){
     tr.innerHTML =
       `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
       `<td>${fmtNum(h.price)}</td>`+
-      `<td>${fmtNum(h.ema)}</td>`+
       `<td>${(+h.pct_above_ema).toFixed(2)}</td>`+
       `<td>${h.bars_since_cross}</td>`+
-      `<td>${(+h.retest_gap_pct).toFixed(2)}</td>`+
-      `<td>${fmtNum(h.sl)}</td>`+
-      tpCell(h.tp1)+rrCell(h.rr1)+tpCell(h.tp2)+rrCell(h.rr2)+tpCell(h.tp3)+rrCell(h.rr3)+
+      `<td>${fmtNum(h.optimal_entry)}</td>`+
+      `<td>${fmtNum(h.sl_tight)}</td>`+
+      `<td>${fmtNum(h.sl_wide)}</td>`+
+      tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
   }
@@ -645,16 +704,48 @@ document.querySelectorAll("th[data-fk]").forEach(th=>th.addEventListener("click"
   const k=th.dataset.fk; if(k===fSortKey) fSortDir*=-1; else {fSortKey=k; fSortDir=(k==="symbol")?1:-1;}
   renderFlags();
 }));
+document.querySelectorAll("th[data-ck]").forEach(th=>th.addEventListener("click",()=>{
+  const k=th.dataset.ck; if(k===cSortKey) cSortDir*=-1; else {cSortKey=k; cSortDir=(k==="symbol"||k==="position")?1:-1;}
+  renderCPR();
+}));
+function renderCPR(){
+  const rows=[...clatest].sort((a,b)=>{
+    const x=a[cSortKey],y=b[cSortKey];
+    if(typeof x==="string") return cSortDir*x.localeCompare(y);
+    return cSortDir*((x??0)-(y??0));
+  });
+  const tb=document.getElementById("crows"); tb.innerHTML="";
+  document.getElementById("cempty").style.display = rows.length? "none":"block";
+  for(const h of rows){
+    const tr=document.createElement("tr");
+    tr.className=rowClass(h);
+    tr.innerHTML =
+      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td>${fmtNum(h.price)}</td>`+
+      `<td>${(+h.cpr_width_pct).toFixed(3)}</td>`+
+      `<td>${h.position}</td>`+
+      `<td>${fmtNum(h.tc)}</td>`+
+      `<td>${fmtNum(h.bc)}</td>`+
+      `<td>${fmtNum(h.optimal_entry)}</td>`+
+      `<td>${fmtNum(h.sl_tight)}</td>`+
+      `<td>${fmtNum(h.sl_wide)}</td>`+
+      tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
+      `<td class="score">${(+h.score).toFixed(1)}</td>`;
+    tb.appendChild(tr);
+  }
+}
 async function poll(){
   try{
     const r=await fetch("/data",{cache:"no-store"}); const d=await r.json();
     lastData=d;
     latest=d.hits||[]; render();
     flatest=d.flag_hits||[]; renderFlags();
+    clatest=d.cpr_hits||[]; renderCPR();
     renderBanner();
     const nboth=(d.both_symbols||[]).length;
-    const bothTxt=nboth?` · ★ ${nboth} on both`:"";
+    const bothTxt=nboth?` · ★ ${nboth} confluence`:"";
     document.getElementById("flagCount").textContent = `${flatest.length} flag(s) · ${d.universe} pairs${bothTxt}`;
+    document.getElementById("cprCount").textContent = `${clatest.length} narrow-CPR · ${d.universe} pairs${bothTxt}`;
     document.getElementById("meta").textContent =
       `${d.cfg.interval} chart · ${d.cfg.quote} ${d.cfg.futures_only?'· futures-listed':'spot'} · EMA${d.cfg.ema_period} · rescans every ${d.cfg.scan_every}m`;
     const dot=document.getElementById("dot");
@@ -738,6 +829,8 @@ def main() -> None:
                    help="bull flag: min flagpole rise (0.15 = 15%%)")
     p.add_argument("--flag-max-retrace", type=float, default=0.5,
                    help="bull flag: max pullback of the pole (0.5 = 50%%)")
+    p.add_argument("--cpr-max-width", type=float, default=0.75,
+                   help="narrow CPR: max CPR width as %% of price (0.75 = 0.75%%)")
     p.add_argument("--include-spot-only", action="store_true",
                    help="also scan coins NOT listed on MEXC futures "
                         "(default: futures-listed coins only)")
@@ -750,6 +843,7 @@ def main() -> None:
         "retest_tol": args.retest_tol, "break_tol": args.break_tol,
         "max_above_now": args.max_above, "min_slope": args.min_slope,
         "pole_min_gain": args.pole_min_gain, "flag_max_retrace": args.flag_max_retrace,
+        "cpr_max_width_pct": args.cpr_max_width,
         "futures_only": not args.include_spot_only,
     }
     state = State(cfg)
