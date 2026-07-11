@@ -62,6 +62,8 @@ class State:
         self.cfg = cfg
         self.lock = threading.Lock()
         self.hits: list[dict] = []
+        self.prev_symbols: set[str] | None = None  # symbols from the previous scan
+        self.new_symbols: list[str] = []           # setups new in the latest scan
         self.last_scan: float | None = None      # epoch seconds
         self.next_scan: float | None = None
         self.scanning: bool = False
@@ -78,6 +80,7 @@ class State:
                 "scanning": self.scanning,
                 "progress": self.progress,
                 "universe": self.universe,
+                "new_symbols": list(self.new_symbols),
                 "error": self.error,
                 "cfg": {
                     "interval": self.cfg["interval"],
@@ -126,8 +129,22 @@ def run_one_scan(state: State) -> None:
                 hits.append(h)
 
     hits.sort(key=lambda h: h.score, reverse=True)
+    cur_symbols = {h.symbol for h in hits}
     with state.lock:
-        state.hits = [asdict(h) for h in hits]
+        # "New" = setups that appear now but weren't in the previous scan.
+        # On the very first scan there's no baseline, so nothing is marked new.
+        if state.prev_symbols is None:
+            new = set()
+        else:
+            new = cur_symbols - state.prev_symbols
+        rows = []
+        for h in hits:
+            d = asdict(h)
+            d["is_new"] = h.symbol in new
+            rows.append(d)
+        state.hits = rows
+        state.new_symbols = [h.symbol for h in hits if h.symbol in new]
+        state.prev_symbols = cur_symbols
         state.last_scan = time.time()
         state.progress = (done, len(symbols))
         state.scanning = False
@@ -182,12 +199,55 @@ PAGE = """<!doctype html>
   .empty{color:var(--dim);padding:40px 0;text-align:center}
   .pill{background:var(--panel);border:1px solid var(--line);border-radius:20px;
         padding:2px 10px;color:var(--dim)}
+  /* new-coins alert banner */
+  .banner{display:none;margin:12px 22px 0;padding:11px 16px;border-radius:10px;
+          background:rgba(63,185,80,.10);border:1px solid rgba(63,185,80,.45);
+          color:var(--txt);font-size:13px;line-height:1.5}
+  .banner.show{display:block}
+  .banner b{color:var(--accent)}
+  .banner .chip{display:inline-block;background:rgba(63,185,80,.16);
+          border:1px solid rgba(63,185,80,.5);border-radius:6px;padding:1px 7px;
+          margin:2px 4px 2px 0;font-weight:600}
+  .banner .chip a{color:var(--accent);text-decoration:none}
+  /* tabs */
+  .tabs{display:flex;gap:4px;padding:10px 22px 0}
+  .tab{padding:7px 16px;border:1px solid var(--line);border-bottom:none;
+       border-radius:8px 8px 0 0;background:var(--panel);color:var(--dim);
+       cursor:pointer;font-size:13px;font-weight:600}
+  .tab.active{background:var(--head);color:var(--txt)}
+  .view{display:none}
+  .view.active{display:block}
+  /* NEW badge */
+  .newbadge{display:inline-block;background:var(--accent);color:#04140a;
+       font-size:10px;font-weight:700;border-radius:5px;padding:1px 5px;margin-left:7px;
+       vertical-align:middle;letter-spacing:.03em}
+  tr.isnew td{background:rgba(63,185,80,.06)}
+  /* info panel */
+  .info{max-width:900px;color:var(--txt);font-size:14px;line-height:1.65}
+  .info h2{font-size:15px;margin:22px 0 8px;color:var(--txt)}
+  .info h2:first-child{margin-top:6px}
+  .info p{color:#c3ccd8;margin:8px 0}
+  .info code{background:var(--panel);border:1px solid var(--line);border-radius:4px;
+       padding:1px 5px;font-size:12.5px;color:var(--txt)}
+  .info table.def{border-collapse:collapse;margin:6px 0 12px;width:100%}
+  .info table.def td{border-bottom:1px solid var(--line);padding:7px 10px;
+       text-align:left;vertical-align:top;font-size:13px}
+  .info table.def td:first-child{color:var(--accent);font-weight:600;
+       white-space:nowrap;width:170px}
+  .info .warn{color:var(--warn)}
 </style></head>
 <body>
 <header>
   <h1>MEXC · 200-EMA cross &amp; retest</h1>
   <span class="sub" id="meta"></span>
 </header>
+<div class="banner" id="banner"></div>
+<div class="tabs">
+  <div class="tab active" id="tabSetups" onclick="showTab('setups')">Setups</div>
+  <div class="tab" id="tabInfo" onclick="showTab('info')">Info</div>
+</div>
+
+<div class="view active" id="viewSetups">
 <div class="status">
   <span><span class="dot" id="dot"></span><span id="scanState">starting…</span></span>
   <span id="lastScan">last scan: —</span>
@@ -210,6 +270,67 @@ PAGE = """<!doctype html>
   </table>
   <div class="empty" id="empty" style="display:none">No cross-and-retest setups right now. The loop keeps scanning…</div>
 </div>
+</div>
+
+<div class="view" id="viewInfo">
+<div class="wrap"><div class="info">
+  <h2>What this scanner looks for</h2>
+  <p>It watches every crypto pair on MEXC spot quoted in USDT (leveraged tokens
+  and stablecoin pairs are excluded) and flags one specific bullish pattern on
+  the <b>4-hour</b> chart: a <b>200-EMA cross &amp; retest</b>.</p>
+  <p>The 200-period exponential moving average is a widely watched trend line.
+  The pattern has three parts, all confirmed on <i>closed</i> candles:</p>
+  <p><b>1. Reclaim</b> — price was trading below the 200 EMA, then a candle closes
+  back above it (a fresh cross up).<br>
+  <b>2. Retest</b> — price pulls back down and a candle's low <i>tags</i> the EMA
+  (comes within the retest tolerance) while still closing above it, i.e. the EMA
+  held as support.<br>
+  <b>3. Hold / confirm</b> — price never closes decisively back below the EMA
+  after the reclaim, the latest candle is above the EMA but not overextended, and
+  the EMA is sloping up.</p>
+  <p>The idea: a reclaim that gets bought on the retest is a cleaner, more
+  reliable trend change than a price that just spikes across the average.</p>
+
+  <h2>The columns</h2>
+  <table class="def">
+    <tr><td>Symbol</td><td>The MEXC pair. Click it to open the chart on TradingView.</td></tr>
+    <tr><td>Price</td><td>Last closed 4h price.</td></tr>
+    <tr><td>EMA200</td><td>The 200-period EMA value on the 4h chart.</td></tr>
+    <tr><td>% &gt; EMA</td><td>How far the current price sits above the EMA. Smaller = closer to the line = a tighter entry.</td></tr>
+    <tr><td>Bars since cross</td><td>How many 4h candles ago the reclaim happened. Fewer = fresher.</td></tr>
+    <tr><td>Retest %</td><td>How close the pullback's low came to the EMA. Near 0 = a clean tag; a small negative means the wick dipped just below the line before closing back above.</td></tr>
+    <tr><td>Score</td><td>Overall quality, 0–100 (see below).</td></tr>
+  </table>
+
+  <h2>How the score works (0–100)</h2>
+  <p>The score is a weighted blend of three things, each measured 0 to 1 and then
+  scaled to 100. Higher means a cleaner, fresher, better-positioned setup:</p>
+  <table class="def">
+    <tr><td>Retest tightness — 45%</td><td>How close the pullback low tagged the EMA. A low sitting right on the line scores 1; one that only came within the full tolerance (default 2%) scores 0.</td></tr>
+    <tr><td>Freshness — 35%</td><td>How recent the reclaim is. A cross on the latest candle scores near 1; one near the edge of the lookback window (default 30 bars) scores near 0.</td></tr>
+    <tr><td>Proximity — 20%</td><td>How close current price still is to the EMA. Right at the line scores 1; already extended (near the max-above cap, default 8%) scores 0.</td></tr>
+  </table>
+  <p>So a high score = price reclaimed the EMA recently, pulled back and kissed it
+  precisely, and is still hugging the line rather than having run away. It ranks
+  setups; it does not predict outcomes.</p>
+
+  <h2>The "just triggered" banner</h2>
+  <p>Each scan is compared with the one before it. Any pair that shows up now but
+  wasn't in the previous scan is a <b>brand-new setup</b> — it gets called out in
+  the green banner at the top and tagged <span class="newbadge">NEW</span> in the
+  table, so you can spot fresh signals at a glance.</p>
+
+  <h2>How often it updates</h2>
+  <p>The server re-scans all pairs on a loop (the cadence is shown in the header)
+  and the page refreshes itself every few seconds — no need to reload.</p>
+
+  <h2 class="warn">Important</h2>
+  <p class="warn">This is a screener to speed up chart work, not financial advice
+  and not a signal to trade. It can produce false positives, especially on thin,
+  low-liquidity coins. Always confirm the setup on the chart and manage your own
+  risk before acting.</p>
+</div></div>
+</div>
 <script>
 let sortKey="score", sortDir=-1, latest=[];
 function fmtNum(n){ if(n===null||n===undefined) return "—";
@@ -221,6 +342,21 @@ function ago(ts){ if(!ts) return "—"; const s=Math.max(0,Math.floor(Date.now()
 function until(ts){ if(!ts) return "—"; const s=Math.floor(ts-Date.now()/1000);
   if(s<=0) return "due"; const m=Math.floor(s/60); return m>0? m+"m "+(s%60)+"s" : s+"s"; }
 function tvLink(sym){ return "https://www.tradingview.com/chart/?symbol=MEXC:"+sym; }
+function showTab(which){
+  const s=which==="setups";
+  document.getElementById("tabSetups").classList.toggle("active",s);
+  document.getElementById("tabInfo").classList.toggle("active",!s);
+  document.getElementById("viewSetups").classList.toggle("active",s);
+  document.getElementById("viewInfo").classList.toggle("active",!s);
+}
+function renderBanner(newSyms){
+  const b=document.getElementById("banner");
+  if(!newSyms || !newSyms.length){ b.classList.remove("show"); b.innerHTML=""; return; }
+  const chips=newSyms.map(s=>`<span class="chip"><a href="${tvLink(s)}" target="_blank" rel="noopener">${s}</a></span>`).join("");
+  const label=newSyms.length===1?"new setup just triggered":"new setups just triggered";
+  b.innerHTML=`<b>🆕 ${newSyms.length} ${label}</b> since the last scan: ${chips}`;
+  b.classList.add("show");
+}
 function render(){
   const rows=[...latest].sort((a,b)=>{
     const x=a[sortKey],y=b[sortKey];
@@ -231,8 +367,10 @@ function render(){
   document.getElementById("empty").style.display = rows.length? "none":"block";
   for(const h of rows){
     const tr=document.createElement("tr");
+    if(h.is_new) tr.className="isnew";
+    const badge = h.is_new ? '<span class="newbadge">NEW</span>' : '';
     tr.innerHTML =
-      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a></td>`+
+      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badge}</td>`+
       `<td>${fmtNum(h.price)}</td>`+
       `<td>${fmtNum(h.ema)}</td>`+
       `<td>${(+h.pct_above_ema).toFixed(2)}</td>`+
@@ -250,6 +388,7 @@ async function poll(){
   try{
     const r=await fetch("/data",{cache:"no-store"}); const d=await r.json();
     latest=d.hits||[]; render();
+    renderBanner(d.new_symbols);
     document.getElementById("meta").textContent =
       `${d.cfg.interval} chart · ${d.cfg.quote} spot · EMA${d.cfg.ema_period} · rescans every ${d.cfg.scan_every}m`;
     const dot=document.getElementById("dot");
