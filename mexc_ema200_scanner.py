@@ -590,6 +590,41 @@ def htf_swing_lows(rows: list, group_days: int, left: int = 2, right: int = 2,
     return out
 
 
+def htf_swing_highs(rows: list, group_days: int, left: int = 2, right: int = 2,
+                    window: int = 60) -> list[float]:
+    """Higher-timeframe swing-HIGH pivots (daily=1, weekly=7) — resistances."""
+    buckets: dict[int, list] = {}
+    span = 86400000 * group_days
+    for r in rows:
+        try:
+            buckets.setdefault(int(float(r[0])) // span, []).append(r)
+        except (ValueError, IndexError):
+            continue
+    keys = sorted(buckets)
+    H = [max(float(x[2]) for x in buckets[k]) for k in keys]
+    if len(H) < left + right + 1:
+        return []
+    out = []
+    start = max(left, len(H) - window)
+    for i in range(start, len(H) - right):
+        if all(H[i] >= H[i - d] for d in range(1, left + 1)) and \
+           all(H[i] >= H[i + d] for d in range(1, right + 1)):
+            out.append(H[i])
+    return out
+
+
+def key_resistances(rows: list, highs: list[float], price: float) -> dict:
+    """Nearest resistance ABOVE price on each timeframe (4h / daily / weekly)."""
+    r4 = resistances_above(highs, len(highs) - 1, price, max_n=1, min_gap=0.003)
+    dh = [p for p in htf_swing_highs(rows, 1) if p > price]
+    wh = [p for p in htf_swing_highs(rows, 7) if p > price]
+    return {
+        "res_4h": r4[0] if r4 else None,
+        "res_1d": min(dh) if dh else None,
+        "res_1w": min(wh) if wh else None,
+    }
+
+
 def key_supports(rows: list, lows: list[float], price: float) -> dict:
     """Nearest support BELOW price on each timeframe: 4h swing low, daily swing
     low, weekly swing low — the safety nets under a trade."""
@@ -982,11 +1017,11 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     """On-demand technical read of one coin on the 4h chart: trend vs the 200 EMA,
     support/resistance, a suggested entry / stop / three targets with R:R, and
     whether it currently matches either scan. Technical estimate, NOT advice."""
-    raw = fetch_candles(sess, symbol, interval, cfg.get("kline_limit", 1000),
-                        cfg.get("market", "spot"))
+    mkt = cfg.get("market", "futures")
+    raw = fetch_candles(sess, symbol, interval, cfg.get("kline_limit", 1000), mkt)
     if not raw or len(raw) < EMA_PERIOD + 2:
-        return {"error": f"Not enough 4h data for '{symbol}'. Check the ticker "
-                         f"is a coin listed on MEXC spot (e.g. BTCUSDT)."}
+        return {"error": f"Not enough 4h data for '{symbol}'. Check it's a coin "
+                         f"listed on MEXC {mkt} (e.g. BTC, SOL, ETHUSDT)."}
     rows = raw[:-1]
     try:
         highs = [float(x[2]) for x in rows]
@@ -1012,7 +1047,19 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     sup = supports_below(lows, last, price, max_n=4, min_gap=0.005)
     res = resistances_above(highs, last, price, max_n=5, min_gap=0.008)
     ksup = key_supports(rows, lows, price)       # next 4h / daily / weekly support
+    kres = key_resistances(rows, highs, price)   # next 4h / daily / weekly resistance
     a = atr(highs, lows, closes)
+
+    # 200 EMA on the daily & weekly frames (fetched separately; None if the coin
+    # doesn't have enough history — common for newer alts, esp. weekly).
+    def _tf_ema(iv):
+        rr = fetch_candles(sess, symbol, iv, 1000, cfg.get("market", "spot"))
+        if not rr or len(rr) < EMA_PERIOD + 2:
+            return None
+        ev = ema([float(x[4]) for x in rr[:-1]], EMA_PERIOD)
+        return ev[-1]
+    ema_1d = _tf_ema("1d")
+    ema_1w = _tf_ema("1w")
     atr_pct = round(a / price * 100, 2) if price else None
     r14 = rsi(closes)
     ms = market_structure(highs, lows, closes)
@@ -1130,11 +1177,35 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         notes.append(f"Directional lean: <b>NEUTRAL</b> — signals are mixed "
                      f"({long_pts} long vs {short_pts} short); better to wait.")
 
+    # Target ladder: overhead resistances BLENDED with Fibonacci extensions of the
+    # recent range, deduped and sorted — a fuller set of profit targets (up to 8).
+    rng = hh - ll if hh > ll else 0.0
+    cand = list(res)
+    for ratio in (0.272, 0.414, 0.618, 1.0, 1.618, 2.0):
+        lvl = hh + rng * ratio
+        if lvl > price:
+            cand.append(lvl)
+    ladder_levels = []
+    for lvl in sorted(cand):
+        if lvl <= price:
+            continue
+        if not ladder_levels or lvl > ladder_levels[-1] * 1.005:
+            ladder_levels.append(lvl)
+    target_ladder = [{"level": lvl, "pct": round((lvl - entry) / entry * 100, 1),
+                      "rr": round((lvl - entry) / (entry - sl_tight), 2)
+                             if entry > sl_tight else None}
+                     for lvl in ladder_levels[:8]]
+
     return {
         "symbol": symbol,
         "price": price,
         "ema": ema_now,
         "pct_vs_ema": round(pct_vs_ema, 2),
+        "ema_1d": ema_1d, "ema_1w": ema_1w,
+        "dist_ema_1d": round((price - ema_1d) / ema_1d * 100, 2) if ema_1d else None,
+        "dist_ema_1w": round((price - ema_1w) / ema_1w * 100, 2) if ema_1w else None,
+        "res_4h": kres["res_4h"], "res_1d": kres["res_1d"], "res_1w": kres["res_1w"],
+        "target_ladder": target_ladder,
         "trend": trend,
         "above_ema": above,
         "bias": bias,

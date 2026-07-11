@@ -443,6 +443,10 @@ PAGE = """<!doctype html>
   .dir-short{background:rgba(248,81,73,.2);color:#f85149;border:1px solid #f85149}
   .dir-neutral{background:rgba(139,152,173,.15);color:var(--dim);border:1px solid var(--line)}
   .azcell[data-tip]{cursor:help}
+  .azsec[data-tip]{cursor:help}
+  .azladder{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 4px}
+  .ladchip{background:var(--bg);border:1px solid var(--line);border-radius:8px;
+       padding:7px 11px;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}
   .azsec{font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;
        color:var(--accent);margin:18px 0 2px;border-bottom:1px solid var(--line);padding-bottom:5px}
   .azsec .azsub{color:var(--dim);font-weight:500;text-transform:none;letter-spacing:0;font-size:11.5px}
@@ -612,9 +616,10 @@ PAGE = """<!doctype html>
     <button id="azBtn" onclick="analyze()">Analyze</button>
   </div>
   <div id="azResult" class="azresult"></div>
-  <p class="azhint">4h chart read from live MEXC data: trend vs the 200 EMA, support/resistance,
-     a suggested entry, stop, and three targets with R:R. A technical estimate to speed up
-     your own analysis — not financial advice.</p>
+  <p class="azhint">Live 4h read from MEXC: a Long/Short lean, trend vs the 200 EMA (4h/1D/1W),
+     market structure &amp; CHoCH, RSI, volume, multi-timeframe support/resistance, and a full
+     entry / two-stop / target-ladder plan with R:R. Hover any box for what it means.
+     A technical estimate to speed up your own analysis — not financial advice.</p>
 </div>
 </div>
 
@@ -958,6 +963,8 @@ function azCard(d){
       ${cell("Supports (distance)", (d.supports||[]).slice(0,3).map(v=>fmtNum(v)+pct(v,'-')).join(' · ')||'—', "Nearest support levels below price, with how far (%) each sits below the current price.")}
       ${cell("Resistances (distance)", (d.resistances||[]).slice(0,3).map(v=>fmtNum(v)+pct(v,'+')).join(' · ')||'—', "Nearest resistance levels above price, with how far (%) each sits above the current price.")}
       ${cell("Next support 4h·1D·1W (drawdown)", [d.sup_4h,d.sup_1d,d.sup_1w].map(v=>v==null?'—':fmtNum(v)+pct(v,'-')).join(' · '), "The next major support on the 4h, Daily and Weekly charts — your safety-net levels — with the % drawdown to each.")}
+      ${cell("Next resistance 4h·1D·1W (upside)", [d.res_4h,d.res_1d,d.res_1w].map(v=>v==null?'—':fmtNum(v)+pct(v,'+')).join(' · '), "The next major resistance on the 4h, Daily and Weekly charts — likely ceilings — with the % upside to each.")}
+      ${cell("Dist. from 200 EMA (4h·1D·1W)", `4h ${d.pct_vs_ema>=0?'+':''}${d.pct_vs_ema}% · 1D ${d.dist_ema_1d==null?'—':(d.dist_ema_1d>=0?'+':'')+d.dist_ema_1d+'%'} · 1W ${d.dist_ema_1w==null?'—':(d.dist_ema_1w>=0?'+':'')+d.dist_ema_1w+'%'}`, "How far price sits above/below the 200 EMA on each timeframe. Above on all three = a strong multi-timeframe uptrend regime. '—' = not enough history for that EMA.")}
     </div>
     <div class="azsec">Trade plan <span class="azsub">entry → stops → 5 targets (with R:R)</span></div>
     <div class="azgrid">
@@ -970,6 +977,10 @@ function azCard(d){
       ${cell("TP3", tp(d.tp3,d.rr3), "Third target and its reward:risk to the tight stop.")}
       ${cell("TP4", tp(d.tp4,d.rr4), "Fourth target and its reward:risk to the tight stop.")}
       ${cell("TP5", tp(d.tp5,d.rr5), "Fifth target and its reward:risk to the tight stop.")}
+    </div>
+    <div class="azsec" data-tip="A fuller ladder of profit targets: overhead resistance levels blended with Fibonacci extensions of the recent range, in order. Each shows % upside and R:R to the tight stop.">Target ladder <span class="azsub">resistances + Fibonacci extensions (hover for more)</span></div>
+    <div class="azladder">
+      ${(d.target_ladder||[]).map((t,i)=>`<span class="ladchip">T${i+1} ${fmtNum(t.level)} <span class="rr">+${t.pct}%${t.rr!=null?` · R${t.rr}`:''}</span></span>`).join('') || '<span style="color:var(--dim)">No overhead targets — blue sky.</span>'}
     </div>
     <div class="azsec">In plain English</div>
     <ul class="aznotes">${notes}</ul>
