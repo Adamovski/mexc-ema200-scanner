@@ -283,18 +283,21 @@ def detect_cross_and_retest(
     if pct_above > max_above_now:
         return False, {}
 
-    # EMA slope over the lookback window (rise / value).
-    j = max(ema_period - 1, last - lookback)
+    # EMA slope over a fixed recent window (trend filter, independent of how long
+    # ago the reclaim was).
+    j = max(ema_period - 1, last - 20)
     if e[j] is None or e[j] == 0:
         return False, {}
     slope = (ema_now - e[j]) / e[j]
     if slope < min_slope:
         return False, {}
 
-    # Find the most recent reclaim (cross up) inside the lookback window.
+    # Find the reclaim that STARTED the current run above the EMA — the most
+    # recent close-below -> close-at/above cross, searching all the way back (not
+    # capped to a fixed window). This keeps a reclaim on the board for as long as
+    # price holds above the EMA, rather than expiring after N candles.
     cross_idx = None
-    start = max(ema_period, last - lookback)
-    for i in range(last, start, -1):
+    for i in range(last, ema_period, -1):
         if e[i] is None or e[i - 1] is None:
             continue
         if closes[i - 1] < e[i - 1] and closes[i] >= e[i]:
@@ -363,6 +366,7 @@ def detect_cross_and_retest(
         "ema": ema_now,
         "pct_above_ema": round(pct_above * 100, 2),
         "bars_since_cross": bars_since_cross,
+        "fresh": bars_since_cross <= 6,          # reclaimed within ~24h (6× 4h bars)
         "retest_gap_pct": round(best_gap * 100, 2),
         "score": score,
         "entry": entry,
@@ -1170,7 +1174,6 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         sl_tight = r0 + 0.5 * a                   # stop ABOVE resistance
         r1 = res[1] if len(res) > 1 else r0
         sl_wide = max(r1 + 1.0 * a, sl_tight)
-        plan_tps = sup                            # targets = supports BELOW
     else:
         if sup:
             optimal_entry = sup[0]
@@ -1182,7 +1185,53 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         sl_tight = near_support - 0.5 * a
         deep_support = sup[1] if len(sup) > 1 else (sup[0] if sup else near_support)
         sl_wide = min(deep_support - 1.0 * a, sl_tight)
-        plan_tps = res                            # targets = resistances ABOVE
+
+    # Target ladder — structural levels (supports for shorts / resistances for
+    # longs) blended with Fibonacci extensions, deduped, up to 8. ALWAYS yields
+    # targets: if structure runs out (coin at its highs/lows) it falls back to
+    # measured % steps so the plan is never empty.
+    rng = hh - ll if hh > ll else 0.0
+    if side == "short":                          # targets go DOWN
+        cand = [(lvl, "support (prior swing low)") for lvl in sup]
+        for ratio in (0.272, 0.414, 0.618, 1.0, 1.618, 2.0):
+            lvl = ll - rng * ratio
+            if 0 < lvl < price:
+                cand.append((lvl, f"{ratio:g}× Fibonacci downside extension"))
+        cand.sort(key=lambda x: -x[0])
+        picked = []
+        for lvl, kind in cand:
+            if lvl >= price:
+                continue
+            if not picked or lvl < picked[-1][0] * 0.995:
+                picked.append((lvl, kind))
+        if not picked:
+            picked = [(round(entry * (1 - p), 10), f"{int(p*100)}% measured drop")
+                      for p in (0.1, 0.2, 0.3, 0.4, 0.5)]
+    else:                                        # targets go UP
+        cand = [(lvl, "overhead resistance (prior swing high)") for lvl in res]
+        for ratio in (0.272, 0.414, 0.618, 1.0, 1.618, 2.0):
+            lvl = hh + rng * ratio
+            if lvl > price:
+                cand.append((lvl, f"{ratio:g}× Fibonacci extension of the recent range"))
+        cand.sort(key=lambda x: x[0])
+        picked = []
+        for lvl, kind in cand:
+            if lvl <= price:
+                continue
+            if not picked or lvl > picked[-1][0] * 1.005:
+                picked.append((lvl, kind))
+        if not picked:
+            picked = [(round(entry * (1 + p), 10), f"{int(p*100)}% measured move")
+                      for p in (0.1, 0.2, 0.3, 0.4, 0.5)]
+    picked = picked[:8]
+    target_ladder = [{"level": lvl, "kind": kind,
+                      "pct": round((lvl - entry) / entry * 100, 1),
+                      "rr": round((lvl - entry) / (entry - sl_tight), 2)
+                             if entry != sl_tight else None}
+                     for lvl, kind in picked]
+    # Trade-plan TP1..TP5 = the first five ladder targets — always populated and
+    # consistent with the ladder shown below.
+    plan_tps = [t["level"] for t in target_ladder[:5]]
     bundle = level_bundle(entry, sl_tight, sl_wide, plan_tps)
 
     notes = []
@@ -1237,41 +1286,6 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     else:
         notes.append(f"Directional lean: <b>NEUTRAL</b> — signals are mixed "
                      f"({long_pts} long vs {short_pts} short); better to wait.")
-
-    # Target ladder: overhead resistances BLENDED with Fibonacci extensions of the
-    # recent range, deduped and sorted — a fuller set of profit targets (up to 8).
-    rng = hh - ll if hh > ll else 0.0
-    if side == "short":                          # targets go DOWN
-        cand = [(lvl, "support (prior swing low)") for lvl in sup]
-        for ratio in (0.272, 0.414, 0.618, 1.0, 1.618, 2.0):
-            lvl = ll - rng * ratio
-            if 0 < lvl < price:
-                cand.append((lvl, f"{ratio:g}× Fibonacci downside extension"))
-        cand.sort(key=lambda x: -x[0])           # nearest below first
-        picked = []
-        for lvl, kind in cand:
-            if lvl >= price:
-                continue
-            if not picked or lvl < picked[-1][0] * 0.995:
-                picked.append((lvl, kind))
-    else:                                        # targets go UP
-        cand = [(lvl, "overhead resistance (prior swing high)") for lvl in res]
-        for ratio in (0.272, 0.414, 0.618, 1.0, 1.618, 2.0):
-            lvl = hh + rng * ratio
-            if lvl > price:
-                cand.append((lvl, f"{ratio:g}× Fibonacci extension of the recent range"))
-        cand.sort(key=lambda x: x[0])
-        picked = []
-        for lvl, kind in cand:
-            if lvl <= price:
-                continue
-            if not picked or lvl > picked[-1][0] * 1.005:
-                picked.append((lvl, kind))
-    target_ladder = [{"level": lvl, "kind": kind,
-                      "pct": round((lvl - entry) / entry * 100, 1),
-                      "rr": round((lvl - entry) / (entry - sl_tight), 2)
-                             if entry != sl_tight else None}
-                     for lvl, kind in picked[:8]]
 
     return {
         "symbol": symbol,

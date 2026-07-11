@@ -394,6 +394,8 @@ PAGE = """<!doctype html>
   tr.both td:first-child{box-shadow:inset 3px 0 0 #f0b429}
   .bothbadge{cursor:help}
   .supbadge{cursor:help;margin-left:6px;font-size:12px;opacity:.85}
+  .freshbadge{display:inline-block;background:#2f81f7;color:#fff;font-size:10px;font-weight:700;
+       border-radius:5px;padding:1px 5px;margin-left:7px;vertical-align:middle;letter-spacing:.03em;cursor:help}
   #tip{position:fixed;z-index:9999;display:none;pointer-events:none;max-width:300px;
        background:#0b0e14;border:1px solid #f0b429;color:var(--txt);padding:7px 11px;
        border-radius:7px;font-size:12px;line-height:1.4;box-shadow:0 6px 20px rgba(0,0,0,.6)}
@@ -913,6 +915,7 @@ function tvLink(sym){ const perp=(lastData&&lastData.cfg&&lastData.cfg.market===
 function badges(h){
   let s="";
   if(h.is_new) s+='<span class="newbadge">NEW</span>';
+  if(h.fresh) s+='<span class="freshbadge" data-tip="Fresh reclaim — price crossed back above the 200 EMA within the last ~24h (≤6 of the 4h candles). Older reclaims still show while price holds above the EMA, just without this badge.">FRESH</span>';
   if(h.both){
     const inList=(h.both_in||[]).join(", ");
     s+=`<span class="bothbadge" data-tip="On ${h.both_count} scans: ${inList}" title="On ${h.both_count} scans: ${inList}">★ ${h.both_count}</span>`;
