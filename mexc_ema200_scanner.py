@@ -554,40 +554,73 @@ def detect_narrow_cpr(rows: list, *, cpr_max_width_pct: float = 0.75,
 
 
 # ----------------------------------------------------------------------------
-# Support-bounce detection
+# Support-bounce detection (multi-timeframe: 4h / 1D / 1W)
 # ----------------------------------------------------------------------------
-def detect_support_bounce(highs: list[float], lows: list[float],
+def htf_swing_lows(rows: list, group_days: int, left: int = 2, right: int = 2,
+                   window: int = 60) -> list[float]:
+    """Aggregate 4h candles into a higher timeframe (group_days=1 -> daily,
+    7 -> weekly) by UTC period and return that timeframe's swing-low pivots."""
+    buckets: dict[int, list] = {}
+    span = 86400000 * group_days
+    for r in rows:
+        try:
+            buckets.setdefault(int(float(r[0])) // span, []).append(r)
+        except (ValueError, IndexError):
+            continue
+    keys = sorted(buckets)
+    L = [min(float(x[3]) for x in buckets[k]) for k in keys]
+    if len(L) < left + right + 1:
+        return []
+    out = []
+    start = max(left, len(L) - window)
+    for i in range(start, len(L) - right):
+        if all(L[i] <= L[i - d] for d in range(1, left + 1)) and \
+           all(L[i] <= L[i + d] for d in range(1, right + 1)):
+            out.append(L[i])
+    return out
+
+
+def detect_support_bounce(rows: list, highs: list[float], lows: list[float],
                           closes: list[float], volumes: list[float], *,
                           zone_tol: float = 0.015, touch_tol: float = 0.015,
                           recent: int = 5, min_touches: int = 2,
                           window: int = 90) -> tuple[bool, dict]:
-    """Coin bouncing off a strong horizontal support on the 4h chart.
-
-    Finds swing-low pivots, clusters them into support ZONES (a level tested
-    more than once = stronger), then flags the case where price has just tagged
-    the nearest such zone and is turning back up — a potential reversal long."""
+    """Coin bouncing off a strong horizontal support, considering 4h, DAILY and
+    WEEKLY supports. Swing lows from all three timeframes are clustered into
+    zones; a level confirmed on a higher timeframe (or tested repeatedly) is
+    stronger. Flags where price has just tagged the nearest strong zone and is
+    turning back up."""
     n = len(closes)
     if n < window:
         return False, {}
     last = n - 1
     price = closes[last]
 
-    _, sl = swing_points(highs, lows, window=window)
-    if len(sl) < 2:
+    _, sl4 = swing_points(highs, lows, window=window)
+    tagged_lows = [("4h", p) for _, p in sl4]
+    tagged_lows += [("1d", p) for p in htf_swing_lows(rows, 1)]
+    tagged_lows += [("1w", p) for p in htf_swing_lows(rows, 7)]
+    if len(tagged_lows) < 2:
         return False, {}
 
+    rank = {"4h": 0, "1d": 1, "1w": 2}
     zones: list[dict] = []
-    for _, p in sl:
+    for tf, p in tagged_lows:
         for z in zones:
             if abs(p - z["level"]) / z["level"] <= zone_tol:
                 z["prices"].append(p)
                 z["level"] = sum(z["prices"]) / len(z["prices"])
+                z["tfs"].add(tf)
                 break
         else:
-            zones.append({"level": p, "prices": [p]})
+            zones.append({"level": p, "prices": [p], "tfs": {tf}})
 
-    cands = [z for z in zones if len(z["prices"]) >= min_touches
-             and z["level"] <= price * 1.005]
+    def best_tf(z):
+        return max(z["tfs"], key=lambda t: rank[t])
+
+    # A zone qualifies if tested 2+ times OR confirmed on a higher timeframe.
+    cands = [z for z in zones if z["level"] <= price * 1.005 and
+             (len(z["prices"]) >= min_touches or z["tfs"] & {"1d", "1w"})]
     if not cands:
         cands = [z for z in zones if z["level"] <= price * 1.005]
     if not cands:
@@ -595,6 +628,7 @@ def detect_support_bounce(highs: list[float], lows: list[float],
     support = max(cands, key=lambda z: z["level"])   # nearest support below price
     slevel = support["level"]
     touches = len(support["prices"])
+    tf = best_tf(support)
 
     tagged = any(lows[i] <= slevel * (1 + touch_tol) and
                  lows[i] >= slevel * (1 - 2 * touch_tol)
@@ -610,13 +644,14 @@ def detect_support_bounce(highs: list[float], lows: list[float],
     res = resistances_above(highs, last, price, max_n=5, min_gap=0.005)
     dist = abs(price - slevel) / price
 
+    tf_s = {"1w": 1.0, "1d": 0.7, "4h": 0.4}[tf]     # higher timeframe = stronger
     touch_s = min(1.0, (touches - 1) / 3.0)
     fresh_s = 1.0 if dist < 0.03 else max(0.0, 1.0 - dist / 0.08)
     room_s = min(1.0, ((res[-1] - price) / price) / 0.30) if res else 0.0
     rsi_s = 1.0 if r14 < 45 else (0.5 if r14 < 60 else 0.0)
     turn_s = 1.0 if turning else 0.3
-    score = round(100 * (0.30 * touch_s + 0.25 * fresh_s + 0.20 * room_s +
-                         0.15 * rsi_s + 0.10 * turn_s), 1)
+    score = round(100 * (0.22 * tf_s + 0.22 * touch_s + 0.2 * fresh_s +
+                         0.18 * room_s + 0.1 * rsi_s + 0.08 * turn_s), 1)
 
     entry = price
     a = atr(highs, lows, closes)
@@ -627,9 +662,11 @@ def detect_support_bounce(highs: list[float], lows: list[float],
     sl_wide = min(wide_anchor - 1.0 * a, sl_tight)
     bundle = level_bundle(entry, sl_tight, sl_wide, res)
 
+    tf_label = {"1w": "Weekly", "1d": "Daily", "4h": "4h"}[tf]
     return True, {
         "price": price,
         "support": slevel,
+        "tf": tf_label,
         "touches": touches,
         "dist_to_support_pct": round(dist * 100, 2),
         "rsi": r14,
@@ -786,7 +823,7 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
     if ok3:
         cpr_hit = {"symbol": symbol, **c}
 
-    ok4, b = detect_support_bounce(highs, lows, closes, vols)
+    ok4, b = detect_support_bounce(rows, highs, lows, closes, vols)
     if ok4:
         bounce_hit = {"symbol": symbol, **b}
 
@@ -894,7 +931,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         highs, lows, closes, vols,
         pole_min_gain=cfg.get("pole_min_gain", 0.15),
         max_retrace=cfg.get("flag_max_retrace", 0.5))
-    okB, dB = detect_support_bounce(highs, lows, closes, vols)
+    okB, dB = detect_support_bounce(rows, highs, lows, closes, vols)
 
     if above and trend == "up":
         bias = "bullish"

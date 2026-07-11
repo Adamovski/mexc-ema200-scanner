@@ -75,6 +75,9 @@ class State:
         self.prev_bounce_symbols: set[str] | None = None
         self.new_bounce_symbols: list[str] = []
         self.both_symbols: list[str] = []          # appear on 2+ scans (confluence)
+        self.watch: dict[str, float] = {}          # symbol -> flag breakout level (armed)
+        self.watch_fired: set[str] = set()         # already-alerted breakouts
+        self.breakout_events: list[dict] = []      # recent triggered breakouts
         self.last_scan: float | None = None      # epoch seconds
         self.next_scan: float | None = None
         self.scanning: bool = False
@@ -99,6 +102,7 @@ class State:
                 "bounce_hits": list(self.bounce_hits),
                 "bounce_new_symbols": list(self.new_bounce_symbols),
                 "both_symbols": list(self.both_symbols),
+                "breakout_events": list(self.breakout_events),
                 "error": self.error,
                 "cfg": {
                     "interval": self.cfg["interval"],
@@ -173,12 +177,17 @@ def run_one_scan(state: State) -> None:
         return rows, [s for s in (it["symbol"] for it in items) if s in new], cur
 
     # Confluence: coins that appear on 2 or more of the three scans.
-    from collections import Counter
-    counts = Counter([h["symbol"] for h in hits] +
-                     [h["symbol"] for h in flags] +
-                     [h["symbol"] for h in cprs] +
-                     [h["symbol"] for h in bounces])
-    both = {s for s, n in counts.items() if n >= 2}
+    scan_members = {
+        "200-EMA reclaim": {h["symbol"] for h in hits},
+        "Bull flag": {h["symbol"] for h in flags},
+        "Narrow CPR": {h["symbol"] for h in cprs},
+        "Support bounce": {h["symbol"] for h in bounces},
+    }
+    conf: dict[str, list[str]] = {}          # symbol -> list of scan labels it's in
+    for label, members in scan_members.items():
+        for s in members:
+            conf.setdefault(s, []).append(label)
+    both = {s for s, labels in conf.items() if len(labels) >= 2}
 
     with state.lock:
         rows, new_syms, cur = tag_new(hits, state.prev_symbols)
@@ -186,12 +195,20 @@ def run_one_scan(state: State) -> None:
         crows, cnew, ccur = tag_new(cprs, state.prev_cpr_symbols)
         brows, bnew, bcur = tag_new(bounces, state.prev_bounce_symbols)
         for d in rows + frows + crows + brows:
-            d["both"] = d["symbol"] in both
+            labels = conf.get(d["symbol"], [])
+            d["both"] = len(labels) >= 2
+            d["both_count"] = len(labels)
+            d["both_in"] = labels
         state.hits, state.new_symbols, state.prev_symbols = rows, new_syms, cur
         state.flag_hits, state.new_flag_symbols, state.prev_flag_symbols = frows, fnew, fcur
         state.cpr_hits, state.new_cpr_symbols, state.prev_cpr_symbols = crows, cnew, ccur
         state.bounce_hits, state.new_bounce_symbols, state.prev_bounce_symbols = brows, bnew, bcur
         state.both_symbols = sorted(both)
+
+        # Arm breakout alerts for the current bull flags (their breakout level).
+        new_watch = {f["symbol"]: f["breakout"] for f in flags if f.get("breakout")}
+        state.watch_fired = {s for s in state.watch_fired if s in new_watch}
+        state.watch = new_watch
 
         state.last_scan = time.time()
         state.progress = (done, len(symbols))
@@ -205,6 +222,39 @@ def scan_loop(state: State) -> None:
         with state.lock:
             state.next_scan = time.time() + every
         time.sleep(every)
+
+
+MEXC_PRICE_URL = "https://api.mexc.com/api/v3/ticker/price"
+
+
+def breakout_watcher(state: State) -> None:
+    """Every ~45s, pull ALL prices in one request and fire an alert the moment a
+    watched bull flag trades above its breakout level. Cheap: one call per tick."""
+    sess = get_session()
+    while True:
+        time.sleep(45)
+        with state.lock:
+            watch = dict(state.watch)
+            fired = set(state.watch_fired)
+        if not watch:
+            continue
+        try:
+            r = sess.get(MEXC_PRICE_URL, timeout=20)
+            r.raise_for_status()
+            prices = {d["symbol"]: float(d["price"]) for d in r.json()}
+        except Exception:
+            continue
+        events = []
+        for sym, bo in watch.items():
+            p = prices.get(sym)
+            if p is not None and p >= bo * 1.0005 and sym not in fired:
+                events.append({"symbol": sym, "breakout": bo, "price": p,
+                               "time": time.time()})
+                fired.add(sym)
+        if events:
+            with state.lock:
+                state.watch_fired = fired
+                state.breakout_events = (state.breakout_events + events)[-20:]
 
 
 # ----------------------------------------------------------------------------
@@ -222,6 +272,20 @@ PAGE = """<!doctype html>
        font:14px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
   header{padding:16px 22px;border-bottom:1px solid var(--line);
          display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+  .alertbtn{margin-left:auto;background:var(--panel);border:1px solid var(--line);
+       color:var(--txt);border-radius:8px;padding:7px 14px;font-size:12.5px;
+       font-weight:600;cursor:pointer}
+  .alertbtn.on{background:rgba(63,185,80,.15);border-color:rgba(63,185,80,.6);color:var(--accent)}
+  .bkbanner{display:none;margin:12px 22px 0;padding:13px 18px;border-radius:10px;
+       background:rgba(248,81,73,.12);border:1px solid #f85149;color:var(--txt);
+       font-size:14px;animation:bkflash 1s ease-in-out infinite}
+  .bkbanner.show{display:block}
+  .bkbanner b{color:#ff7b72}
+  .bkbanner .chip{display:inline-block;background:rgba(248,81,73,.18);
+       border:1px solid rgba(248,81,73,.5);border-radius:6px;padding:1px 8px;margin:2px 4px 2px 0;font-weight:600}
+  .bkbanner .chip a{color:#ff9e96;text-decoration:none}
+  @keyframes bkflash{0%,100%{box-shadow:0 0 0 0 rgba(248,81,73,.5)}
+                     50%{box-shadow:0 0 14px 2px rgba(248,81,73,.55)}}
   h1{font-size:16px;margin:0;font-weight:650}
   .sub{color:var(--dim);font-size:12.5px}
   .status{padding:10px 22px;border-bottom:1px solid var(--line);color:var(--dim);
@@ -277,6 +341,13 @@ PAGE = """<!doctype html>
        vertical-align:middle;letter-spacing:.03em}
   tr.both td{background:rgba(240,180,41,.10)}
   tr.both td:first-child{box-shadow:inset 3px 0 0 #f0b429}
+  .bothbadge{cursor:help}
+  /* timeframe pill on the support tab */
+  .tfpill{display:inline-block;border-radius:5px;padding:1px 7px;font-size:11px;
+       font-weight:700;border:1px solid var(--line);color:var(--dim)}
+  .tfpill.tf-weekly{background:rgba(240,180,41,.16);color:#f0b429;border-color:rgba(240,180,41,.5)}
+  .tfpill.tf-daily{background:rgba(63,185,80,.14);color:var(--accent);border-color:rgba(63,185,80,.5)}
+  .tfpill.tf-4h{background:var(--panel)}
   /* info panel */
   .info{max-width:900px;color:var(--txt);font-size:14px;line-height:1.65}
   .info h2{font-size:15px;margin:22px 0 8px;color:var(--txt)}
@@ -326,7 +397,9 @@ PAGE = """<!doctype html>
 <header>
   <h1>MEXC · 200-EMA cross &amp; retest</h1>
   <span class="sub" id="meta"></span>
+  <button id="alertBtn" class="alertbtn" onclick="enableAlerts()">🔔 Enable breakout alerts</button>
 </header>
+<div class="bkbanner" id="bkbanner"></div>
 <div class="banner" id="banner"></div>
 <div class="tabs">
   <div class="tab active" id="tabSetups" onclick="showTab('setups')">200-EMA reclaim</div>
@@ -439,6 +512,7 @@ PAGE = """<!doctype html>
       <th data-bk="symbol">Symbol</th>
       <th data-bk="price">Price</th>
       <th data-bk="support">Support</th>
+      <th data-bk="tf">TF</th>
       <th data-bk="touches">Touches</th>
       <th data-bk="dist_to_support_pct">Dist %</th>
       <th data-bk="rsi">RSI</th>
@@ -538,6 +612,15 @@ PAGE = """<!doctype html>
   recommendations. A high R:R only means the geometry is favourable, not that the
   trade will work — size and manage risk yourself.</p>
 
+  <h2>Bull-flag breakout alerts 🔔</h2>
+  <p>Click <b>Enable breakout alerts</b> (top-right) once to turn on sound and
+  desktop notifications. Every bull flag currently on the board is "armed" at its
+  breakout level, and a background watcher checks live prices every ~45 seconds —
+  so the moment a flag actually trades <b>above its breakout trigger</b>, you get
+  a loud triple beep, a browser notification, and a flashing red banner naming the
+  coin. (Browsers require that one click before they'll allow sound/notifications;
+  keep the tab open to receive them.)</p>
+
   <h2>The "just triggered" banner</h2>
   <p>Each scan is compared with the one before it. Any pair that shows up now but
   wasn't in the previous scan is a <b>brand-new setup</b> — it gets called out in
@@ -575,12 +658,14 @@ PAGE = """<!doctype html>
 
   <h2>The Support bounce tab</h2>
   <p>A fourth scan for reversals: coins <b>bouncing off a strong horizontal
-  support</b>. It finds swing-low pivots, clusters nearby lows into support
-  <b>zones</b> (a level tested more than once is stronger — that's the
-  <b>Touches</b> column), then flags the case where price has just tagged the
-  nearest zone and is turning back up, with room to a resistance above.</p>
+  support</b>, looked for across <b>three timeframes</b> — 4-hour, <b>Daily</b>
+  and <b>Weekly</b> (the 4h candles are aggregated up). It finds swing-low pivots
+  on each, clusters nearby lows into support <b>zones</b> (confirmed on a higher
+  timeframe, or tested repeatedly = stronger), then flags where price has just
+  tagged the nearest strong zone and is turning back up, with room above.</p>
   <table class="def">
     <tr><td>Support</td><td>The support level price is bouncing from.</td></tr>
+    <tr><td>TF</td><td>The strongest timeframe that support sits on — <b>Weekly</b> (gold) &gt; <b>Daily</b> (green) &gt; 4h. Higher-timeframe supports are more significant and score higher.</td></tr>
     <tr><td>Touches</td><td>How many times that level has been tested. More touches = a more significant, better-respected support.</td></tr>
     <tr><td>Dist %</td><td>How far price currently sits above the support. Smaller = a fresher bounce, tighter entry.</td></tr>
     <tr><td>RSI</td><td>Relative Strength Index (0–100). Bouncing from oversold (&lt;30–45) scores higher — more room to rally.</td></tr>
@@ -592,11 +677,11 @@ PAGE = """<!doctype html>
   <h2>Confluence — coins on 2+ scans</h2>
   <p>When a coin shows up on <b>two or more</b> of the four scans (200-EMA
   reclaim, bull flag, narrow CPR, support bounce) at once, it's flagged with a
-  gold <span class="bothbadge">★ BOTH</span>
-  badge and its row is highlighted gold on every tab, with a running
-  "★ N confluence" count in the header. These are the highest-conviction names —
-  multiple bullish signals lining up on the same chart — so they're worth a look
-  first.</p>
+  gold <span class="bothbadge">★ 2</span> badge showing <b>how many scans</b> it's
+  on (★ 2 / ★ 3 / ★ 4) — <b>hover the badge to see exactly which scans</b>. The
+  row is highlighted gold on every tab, with a running "★ N confluence" count in
+  the header. These are the highest-conviction names — multiple bullish signals
+  lining up on the same chart — so they're worth a look first.</p>
 
   <h2>The Analyze a coin tab</h2>
   <p>Type any MEXC ticker (e.g. <code>BTC</code>, <code>SOL</code>,
@@ -645,6 +730,39 @@ let fSortKey="score", fSortDir=-1, flatest=[];
 let cSortKey="score", cSortDir=-1, clatest=[];
 let bSortKey="score", bSortDir=-1, blatest=[];
 let activeTab="setups", lastData=null;
+let alertsOn=false, audioCtx=null, seenBreak=Math.floor(Date.now()/1000);
+function enableAlerts(){
+  try{ if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+       if(audioCtx.state==="suspended") audioCtx.resume(); }catch(e){}
+  if("Notification" in window && Notification.permission==="default") Notification.requestPermission();
+  alertsOn=true;
+  const b=document.getElementById("alertBtn"); b.textContent="🔔 Breakout alerts ON"; b.classList.add("on");
+  beep(1);
+}
+function beep(times){
+  if(!audioCtx) return;
+  let t=audioCtx.currentTime;
+  for(let i=0;i<times;i++){
+    const o=audioCtx.createOscillator(), g=audioCtx.createGain();
+    o.type="square"; o.frequency.value=880;
+    g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(0.35,t+0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001,t+0.28);
+    o.connect(g); g.connect(audioCtx.destination); o.start(t); o.stop(t+0.3);
+    t+=0.34;
+  }
+}
+function fireBreakout(evs){
+  beep(3);
+  if("Notification" in window && Notification.permission==="granted"){
+    for(const e of evs){ try{ new Notification("🚀 "+e.symbol+" broke out!",
+      {body:"Above flag breakout "+(+e.breakout).toPrecision(6)+" — now "+(+e.price).toPrecision(6)}); }catch(x){} }
+  }
+  const bb=document.getElementById("bkbanner");
+  const chips=evs.map(e=>`<span class="chip"><a href="${tvLink(e.symbol)}" target="_blank" rel="noopener">${e.symbol}</a> @ ${fmtNum(e.price)}</span>`).join("");
+  bb.innerHTML=`<b>🚀 BULL FLAG BREAKOUT</b> — price crossed the flag trigger on: ${chips}`;
+  bb.classList.add("show");
+  clearTimeout(window._bkT); window._bkT=setTimeout(()=>bb.classList.remove("show"), 90000);
+}
 function fmtNum(n){ if(n===null||n===undefined) return "—";
   const a=Math.abs(n); if(a!==0&&a<0.001) return n.toExponential(2);
   return (+n).toLocaleString(undefined,{maximumSignificantDigits:8}); }
@@ -657,7 +775,10 @@ function tvLink(sym){ return "https://www.tradingview.com/chart/?symbol=MEXC:"+s
 function badges(h){
   let s="";
   if(h.is_new) s+='<span class="newbadge">NEW</span>';
-  if(h.both) s+='<span class="bothbadge" title="Appears on BOTH scans — confluence">★ BOTH</span>';
+  if(h.both){
+    const inList=(h.both_in||[]).join(", ");
+    s+=`<span class="bothbadge" title="Confluence — on ${h.both_count} scans: ${inList}">★ ${h.both_count}</span>`;
+  }
   return s;
 }
 function rowClass(h){ return (h.is_new?"isnew ":"")+(h.both?"both":""); }
@@ -821,6 +942,7 @@ function renderBounce(){
       `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
       `<td>${fmtNum(h.price)}</td>`+
       `<td>${fmtNum(h.support)}</td>`+
+      `<td><span class="tfpill tf-${(h.tf||'').toLowerCase()}">${h.tf||'—'}</span></td>`+
       `<td>${h.touches}</td>`+
       `<td>${(+h.dist_to_support_pct).toFixed(2)}</td>`+
       `<td>${h.rsi==null?'—':(+h.rsi).toFixed(0)}</td>`+
@@ -866,6 +988,8 @@ async function poll(){
     flatest=d.flag_hits||[]; renderFlags();
     clatest=d.cpr_hits||[]; renderCPR();
     blatest=d.bounce_hits||[]; renderBounce();
+    const evs=(d.breakout_events||[]).filter(e=>e.time>seenBreak);
+    if(evs.length){ seenBreak=Math.max(seenBreak, ...evs.map(e=>e.time)); if(alertsOn) fireBreakout(evs); }
     renderBanner();
     const nboth=(d.both_symbols||[]).length;
     const bothTxt=nboth?` · ★ ${nboth} confluence`:"";
@@ -976,6 +1100,7 @@ def main() -> None:
 
     t = threading.Thread(target=scan_loop, args=(state,), daemon=True)
     t.start()
+    threading.Thread(target=breakout_watcher, args=(state,), daemon=True).start()
 
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(state))
     url = f"http://localhost:{args.port}"
