@@ -590,6 +590,19 @@ def htf_swing_lows(rows: list, group_days: int, left: int = 2, right: int = 2,
     return out
 
 
+def key_supports(rows: list, lows: list[float], price: float) -> dict:
+    """Nearest support BELOW price on each timeframe: 4h swing low, daily swing
+    low, weekly swing low — the safety nets under a trade."""
+    s4 = supports_below(lows, len(lows) - 1, price, max_n=1, min_gap=0.003)
+    dl = [p for p in htf_swing_lows(rows, 1) if p < price]
+    wl = [p for p in htf_swing_lows(rows, 7) if p < price]
+    return {
+        "sup_4h": s4[0] if s4 else None,
+        "sup_1d": max(dl) if dl else None,
+        "sup_1w": max(wl) if wl else None,
+    }
+
+
 def detect_support_bounce(rows: list, highs: list[float], lows: list[float],
                           closes: list[float], volumes: list[float], *,
                           zone_tol: float = 0.015, touch_tol: float = 0.015,
@@ -811,11 +824,13 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
         return None, None, None, None
 
     rv = rel_volume(vols)                       # relative volume of the latest candle
+    ksup = key_supports(rows, lows, closes[-1])  # next 4h / daily / weekly support
 
     def confirmed(d: dict, boost: bool) -> dict:
-        """Attach relative volume, and (for momentum setups) nudge the score up
-        when the signal candle prints on above-average volume — confirmation."""
-        d = {"symbol": symbol, "rvol": rv, **d}
+        """Attach relative volume + the next multi-timeframe supports, and (for
+        momentum setups) nudge the score up when the signal candle prints on
+        above-average volume — confirmation."""
+        d = {"symbol": symbol, "rvol": rv, **ksup, **d}
         if boost and rv:
             factor = 1.0 + 0.15 * max(0.0, min(1.0, (rv - 1.0) / 1.5))
             d["score"] = round(min(100.0, d["score"] * factor), 1)
@@ -916,6 +931,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
 
     sup = supports_below(lows, last, price, max_n=4, min_gap=0.005)
     res = resistances_above(highs, last, price, max_n=5, min_gap=0.008)
+    ksup = key_supports(rows, lows, price)       # next 4h / daily / weekly support
     a = atr(highs, lows, closes)
     atr_pct = round(a / price * 100, 2) if price else None
     r14 = rsi(closes)
@@ -984,6 +1000,18 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         notes.append("Nearest supports: " + ", ".join(f"{s:.6g}" for s in sup[:3]) + ".")
     if res:
         notes.append("Nearest resistances: " + ", ".join(f"{s:.6g}" for s in res[:3]) + ".")
+    def _dd(sv):
+        return f"{sv:.6g} (-{(price - sv) / price * 100:.1f}%)"
+    tf_parts = []
+    if ksup["sup_4h"]:
+        tf_parts.append("4h " + _dd(ksup["sup_4h"]))
+    if ksup["sup_1d"]:
+        tf_parts.append("Daily " + _dd(ksup["sup_1d"]))
+    if ksup["sup_1w"]:
+        tf_parts.append("Weekly " + _dd(ksup["sup_1w"]))
+    if tf_parts:
+        notes.append("Next major support (drawdown from here) — "
+                     + ", ".join(tf_parts) + ".")
     matched = []
     if okE:
         matched.append(f"200-EMA reclaim (score {dE['score']})")
@@ -1017,6 +1045,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "support_bounce_tf": dB.get("tf") if okB else None,
         "support_bounce_support": dB.get("support") if okB else None,
         "support_bounce_touches": dB.get("touches") if okB else None,
+        "sup_4h": ksup["sup_4h"], "sup_1d": ksup["sup_1d"], "sup_1w": ksup["sup_1w"],
         "entry": entry,
         "optimal_entry": optimal_entry,
         "supports": sup,

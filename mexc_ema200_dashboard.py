@@ -374,6 +374,7 @@ PAGE = """<!doctype html>
   tr.both td{background:rgba(240,180,41,.10)}
   tr.both td:first-child{box-shadow:inset 3px 0 0 #f0b429}
   .bothbadge{cursor:help}
+  .supbadge{cursor:help;margin-left:6px;font-size:12px;opacity:.85}
   #tip{position:fixed;z-index:9999;display:none;pointer-events:none;max-width:300px;
        background:#0b0e14;border:1px solid #f0b429;color:var(--txt);padding:7px 11px;
        border-radius:7px;font-size:12px;line-height:1.4;box-shadow:0 6px 20px rgba(0,0,0,.6)}
@@ -655,6 +656,13 @@ PAGE = """<!doctype html>
   recommendations. A high R:R only means the geometry is favourable, not that the
   trade will work — size and manage risk yourself.</p>
 
+  <h2>Next support 🛟 (4h / Daily / Weekly)</h2>
+  <p>Every setup row has a small <b>🛟 buoy</b> next to the symbol — <b>hover it</b>
+  to see the next major support below current price on all three timeframes:
+  <b>4h</b>, <b>Daily</b> and <b>Weekly</b>. It's your safety-net map: where price
+  is likely to find a floor if the trade goes against you. (The Analyze tab shows
+  the same three levels as a dedicated field.)</p>
+
   <h2>RVol — volume confirmation</h2>
   <p>The <b>RVol</b> column is the latest candle's volume divided by its recent
   20-bar average. Above <b>1.0×</b> means the signal is printing on
@@ -841,11 +849,17 @@ function badges(h){
     const inList=(h.both_in||[]).join(", ");
     s+=`<span class="bothbadge" data-tip="On ${h.both_count} scans: ${inList}" title="On ${h.both_count} scans: ${inList}">★ ${h.both_count}</span>`;
   }
+  const dd=v=> (h.price&&v)? " (-"+(((h.price-v)/h.price)*100).toFixed(1)+"%)" : "";
+  const sp=[];
+  if(h.sup_4h!=null) sp.push("4h "+fmtNum(h.sup_4h)+dd(h.sup_4h));
+  if(h.sup_1d!=null) sp.push("Daily "+fmtNum(h.sup_1d)+dd(h.sup_1d));
+  if(h.sup_1w!=null) sp.push("Weekly "+fmtNum(h.sup_1w)+dd(h.sup_1w));
+  if(sp.length) s+=`<span class="supbadge" data-tip="Next support below (drawdown) — ${sp.join("  ·  ")}">🛟</span>`;
   return s;
 }
 // instant custom tooltip for the ★ confluence badge (reliable, no native delay)
 document.addEventListener("mouseover",e=>{
-  const b=e.target.closest(".bothbadge"); if(!b) return;
+  const b=e.target.closest("[data-tip]"); if(!b) return;
   const t=document.getElementById("tip"); if(!t) return;
   t.textContent=b.getAttribute("data-tip")||""; t.style.display="block";
 });
@@ -854,7 +868,7 @@ document.addEventListener("mousemove",e=>{
   if(t&&t.style.display==="block"){ t.style.left=(e.clientX+14)+"px"; t.style.top=(e.clientY+16)+"px"; }
 });
 document.addEventListener("mouseout",e=>{
-  if(e.target.closest&&e.target.closest(".bothbadge")){ const t=document.getElementById("tip"); if(t) t.style.display="none"; }
+  if(e.target.closest&&e.target.closest("[data-tip]")){ const t=document.getElementById("tip"); if(t) t.style.display="none"; }
 });
 function rowClass(h){ return (h.is_new?"isnew ":"")+(h.both?"both":""); }
 function tpCell(v,rr){ return v==null?'<td>—</td>'
@@ -912,6 +926,7 @@ function azCard(d){
       ${cell("ATR", d.atr_pct==null?'—':d.atr_pct+'%')}
       ${cell("Supports", (d.supports||[]).slice(0,3).map(fmtNum).join(' · ')||'—')}
       ${cell("Resistances", (d.resistances||[]).slice(0,3).map(fmtNum).join(' · ')||'—')}
+      ${cell("Next support 4h·1D·1W (drawdown)", [d.sup_4h,d.sup_1d,d.sup_1w].map(v=>v==null?'—':fmtNum(v)+(d.price?` <span class="rr">-${(((d.price-v)/d.price)*100).toFixed(1)}%</span>`:'')).join(' · '))}
     </div>
     <div class="azsec">Trade plan <span class="azsub">entry → stops → 5 targets (with R:R)</span></div>
     <div class="azgrid">
