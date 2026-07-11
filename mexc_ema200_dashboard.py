@@ -342,6 +342,9 @@ PAGE = """<!doctype html>
   tr.both td{background:rgba(240,180,41,.10)}
   tr.both td:first-child{box-shadow:inset 3px 0 0 #f0b429}
   .bothbadge{cursor:help}
+  #tip{position:fixed;z-index:9999;display:none;pointer-events:none;max-width:300px;
+       background:#0b0e14;border:1px solid #f0b429;color:var(--txt);padding:7px 11px;
+       border-radius:7px;font-size:12px;line-height:1.4;box-shadow:0 6px 20px rgba(0,0,0,.6)}
   /* timeframe pill on the support tab */
   .tfpill{display:inline-block;border-radius:5px;padding:1px 7px;font-size:11px;
        font-weight:700;border:1px solid var(--line);color:var(--dim)}
@@ -380,8 +383,11 @@ PAGE = """<!doctype html>
   .bias-bullish{background:rgba(63,185,80,.15);color:var(--accent);border:1px solid rgba(63,185,80,.5)}
   .bias-bearish{background:rgba(248,81,73,.15);color:#f85149;border:1px solid rgba(248,81,73,.5)}
   .bias-neutral{background:rgba(139,152,173,.15);color:var(--dim);border:1px solid var(--line)}
+  .azsec{font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;
+       color:var(--accent);margin:18px 0 2px;border-bottom:1px solid var(--line);padding-bottom:5px}
+  .azsec .azsub{color:var(--dim);font-weight:500;text-transform:none;letter-spacing:0;font-size:11.5px}
   .azgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));
-       gap:10px;margin:12px 0}
+       gap:10px;margin:10px 0 4px}
   .azcell{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:9px 11px}
   .azcell .k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
   .azcell .v{font-size:15px;font-weight:650;font-variant-numeric:tabular-nums;margin-top:2px}
@@ -399,6 +405,7 @@ PAGE = """<!doctype html>
   <span class="sub" id="meta"></span>
   <button id="alertBtn" class="alertbtn" onclick="enableAlerts()">🔔 Enable breakout alerts</button>
 </header>
+<div id="tip"></div>
 <div class="bkbanner" id="bkbanner"></div>
 <div class="banner" id="banner"></div>
 <div class="tabs">
@@ -777,10 +784,23 @@ function badges(h){
   if(h.is_new) s+='<span class="newbadge">NEW</span>';
   if(h.both){
     const inList=(h.both_in||[]).join(", ");
-    s+=`<span class="bothbadge" title="Confluence — on ${h.both_count} scans: ${inList}">★ ${h.both_count}</span>`;
+    s+=`<span class="bothbadge" data-tip="On ${h.both_count} scans: ${inList}" title="On ${h.both_count} scans: ${inList}">★ ${h.both_count}</span>`;
   }
   return s;
 }
+// instant custom tooltip for the ★ confluence badge (reliable, no native delay)
+document.addEventListener("mouseover",e=>{
+  const b=e.target.closest(".bothbadge"); if(!b) return;
+  const t=document.getElementById("tip"); if(!t) return;
+  t.textContent=b.getAttribute("data-tip")||""; t.style.display="block";
+});
+document.addEventListener("mousemove",e=>{
+  const t=document.getElementById("tip");
+  if(t&&t.style.display==="block"){ t.style.left=(e.clientX+14)+"px"; t.style.top=(e.clientY+16)+"px"; }
+});
+document.addEventListener("mouseout",e=>{
+  if(e.target.closest&&e.target.closest(".bothbadge")){ const t=document.getElementById("tip"); if(t) t.style.display="none"; }
+});
 function rowClass(h){ return (h.is_new?"isnew ":"")+(h.both?"both":""); }
 function tpCell(v,rr){ return v==null?'<td>—</td>'
   :`<td>${fmtNum(v)}${rr!=null?`<span class="rr">R${(+rr).toFixed(1)}</span>`:''}</td>`; }
@@ -822,8 +842,9 @@ function azCard(d){
     <div class="aztags">
       <span class="aztag ${d.ema_reclaim?'on':''}">200-EMA reclaim${d.ema_reclaim?' · '+d.ema_reclaim_score:''}</span>
       <span class="aztag ${d.bull_flag?'on':''}">Bull flag${d.bull_flag?' · '+d.bull_flag_score:''}</span>
-      <span class="aztag ${d.support_bounce?'on':''}">Support bounce${d.support_bounce?' · '+d.support_bounce_score:''}</span>
+      <span class="aztag ${d.support_bounce?'on':''}">Support bounce${d.support_bounce?` · ${d.support_bounce_tf} support · `+d.support_bounce_score:''}</span>
     </div>
+    <div class="azsec">Market read</div>
     <div class="azgrid">
       ${cell("Structure", (d.structure||'—')+(d.choch?` · ${d.choch} CHoCH`:''))}
       ${cell("RSI (14)", d.rsi==null?'—':(+d.rsi).toFixed(0)+(d.rsi<30?' oversold':d.rsi>70?' overbought':''))}
@@ -834,6 +855,7 @@ function azCard(d){
       ${cell("Supports", (d.supports||[]).slice(0,3).map(fmtNum).join(' · ')||'—')}
       ${cell("Resistances", (d.resistances||[]).slice(0,3).map(fmtNum).join(' · ')||'—')}
     </div>
+    <div class="azsec">Trade plan <span class="azsub">entry → stops → 5 targets (with R:R)</span></div>
     <div class="azgrid">
       ${cell("Entry (now)", fmtNum(d.entry))}
       ${cell("Optimal entry", fmtNum(d.optimal_entry))}
@@ -845,6 +867,7 @@ function azCard(d){
       ${cell("TP4", tp(d.tp4,d.rr4))}
       ${cell("TP5", tp(d.tp5,d.rr5))}
     </div>
+    <div class="azsec">In plain English</div>
     <ul class="aznotes">${notes}</ul>
   </div>`;
 }

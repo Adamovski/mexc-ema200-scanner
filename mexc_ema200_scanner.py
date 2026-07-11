@@ -965,7 +965,8 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     if okF:
         matched.append(f"bull flag (pole {dF['pole_gain_pct']}%, score {dF['score']})")
     if okB:
-        matched.append(f"support bounce ({dB['touches']} touches, score {dB['score']})")
+        matched.append(f"support bounce off {dB['tf']} support at {dB['support']:.6g} "
+                       f"({dB['touches']} touches, score {dB['score']})")
     notes.append("Active setups: " + (", ".join(matched) if matched else "none right now") + ".")
 
     return {
@@ -987,6 +988,9 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "resistances": res[:4],
         "support_bounce": bool(okB),
         "support_bounce_score": dB.get("score") if okB else None,
+        "support_bounce_tf": dB.get("tf") if okB else None,
+        "support_bounce_support": dB.get("support") if okB else None,
+        "support_bounce_touches": dB.get("touches") if okB else None,
         "entry": entry,
         "optimal_entry": optimal_entry,
         "supports": sup,
