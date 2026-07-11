@@ -94,6 +94,99 @@ def atr(highs: list[float], lows: list[float], closes: list[float],
     return sum(recent) / len(recent) if recent else 0.0
 
 
+def rsi(closes: list[float], period: int = 14) -> float | None:
+    """Relative Strength Index (0-100). <30 oversold, >70 overbought."""
+    if len(closes) < period + 1:
+        return None
+    gains = losses = 0.0
+    for i in range(len(closes) - period, len(closes)):
+        ch = closes[i] - closes[i - 1]
+        if ch >= 0:
+            gains += ch
+        else:
+            losses -= ch
+    avg_gain, avg_loss = gains / period, losses / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - 100 / (1 + rs), 1)
+
+
+def swing_points(highs: list[float], lows: list[float], left: int = 3,
+                 right: int = 3, window: int = 80):
+    """Return (swing_highs, swing_lows) as lists of (index, price), most recent
+    last — the pivots used for market-structure analysis."""
+    n = len(highs)
+    start = max(left, n - window)
+    sh, sl = [], []
+    for i in range(start, n - right):
+        h = highs[i]
+        if all(h >= highs[i - d] for d in range(1, left + 1)) and \
+           all(h >= highs[i + d] for d in range(1, right + 1)):
+            sh.append((i, h))
+        l = lows[i]
+        if all(l <= lows[i - d] for d in range(1, left + 1)) and \
+           all(l <= lows[i + d] for d in range(1, right + 1)):
+            sl.append((i, l))
+    return sh, sl
+
+
+def market_structure(highs: list[float], lows: list[float],
+                     closes: list[float]) -> dict:
+    """Classify trend structure and detect a Change of Character (CHoCH).
+
+    Uptrend = higher highs + higher lows; downtrend = lower highs + lower lows.
+    A bullish CHoCH is when price (in a downtrend) closes above the last swing
+    high — the first sign the character is flipping up; bearish is the mirror."""
+    sh, sl = swing_points(highs, lows)
+    price = closes[-1]
+    structure = "range"
+    if len(sh) >= 2 and len(sl) >= 2:
+        hh = sh[-1][1] > sh[-2][1]
+        hl = sl[-1][1] > sl[-2][1]
+        lh = sh[-1][1] < sh[-2][1]
+        ll = sl[-1][1] < sl[-2][1]
+        if hh and hl:
+            structure = "uptrend"
+        elif lh and ll:
+            structure = "downtrend"
+    choch = None
+    if sh and price > sh[-1][1] and structure != "uptrend":
+        choch = "bullish"          # broke the last lower-high → flipping up
+    elif sl and price < sl[-1][1] and structure != "downtrend":
+        choch = "bearish"
+    return {
+        "structure": structure,
+        "choch": choch,
+        "last_swing_high": sh[-1][1] if sh else None,
+        "last_swing_low": sl[-1][1] if sl else None,
+    }
+
+
+def volume_profile(volumes: list[float], closes: list[float],
+                   lookback: int = 20) -> dict:
+    """Recent volume vs its longer average, and whether up-candles or down-candles
+    carry more volume (buy vs sell pressure)."""
+    if len(volumes) < lookback + 5:
+        return {"vol_trend": "n/a", "vol_ratio": None, "pressure": "n/a"}
+    recent = volumes[-lookback:]
+    base = volumes[-lookback * 3:-lookback] or volumes[:-lookback]
+    ravg = sum(recent) / len(recent)
+    bavg = (sum(base) / len(base)) if base else ravg
+    ratio = round(ravg / bavg, 2) if bavg else None
+    vtrend = "rising" if ratio and ratio > 1.15 else ("falling" if ratio and ratio < 0.85 else "steady")
+    up = dn = 0.0
+    for i in range(len(closes) - lookback, len(closes)):
+        if i <= 0:
+            continue
+        if closes[i] >= closes[i - 1]:
+            up += volumes[i]
+        else:
+            dn += volumes[i]
+    pressure = "buyers" if up > dn * 1.15 else ("sellers" if dn > up * 1.15 else "balanced")
+    return {"vol_trend": vtrend, "vol_ratio": ratio, "pressure": pressure}
+
+
 # ----------------------------------------------------------------------------
 # Setup detection
 # ----------------------------------------------------------------------------
@@ -461,6 +554,94 @@ def detect_narrow_cpr(rows: list, *, cpr_max_width_pct: float = 0.75,
 
 
 # ----------------------------------------------------------------------------
+# Support-bounce detection
+# ----------------------------------------------------------------------------
+def detect_support_bounce(highs: list[float], lows: list[float],
+                          closes: list[float], volumes: list[float], *,
+                          zone_tol: float = 0.015, touch_tol: float = 0.015,
+                          recent: int = 5, min_touches: int = 2,
+                          window: int = 90) -> tuple[bool, dict]:
+    """Coin bouncing off a strong horizontal support on the 4h chart.
+
+    Finds swing-low pivots, clusters them into support ZONES (a level tested
+    more than once = stronger), then flags the case where price has just tagged
+    the nearest such zone and is turning back up — a potential reversal long."""
+    n = len(closes)
+    if n < window:
+        return False, {}
+    last = n - 1
+    price = closes[last]
+
+    _, sl = swing_points(highs, lows, window=window)
+    if len(sl) < 2:
+        return False, {}
+
+    zones: list[dict] = []
+    for _, p in sl:
+        for z in zones:
+            if abs(p - z["level"]) / z["level"] <= zone_tol:
+                z["prices"].append(p)
+                z["level"] = sum(z["prices"]) / len(z["prices"])
+                break
+        else:
+            zones.append({"level": p, "prices": [p]})
+
+    cands = [z for z in zones if len(z["prices"]) >= min_touches
+             and z["level"] <= price * 1.005]
+    if not cands:
+        cands = [z for z in zones if z["level"] <= price * 1.005]
+    if not cands:
+        return False, {}
+    support = max(cands, key=lambda z: z["level"])   # nearest support below price
+    slevel = support["level"]
+    touches = len(support["prices"])
+
+    tagged = any(lows[i] <= slevel * (1 + touch_tol) and
+                 lows[i] >= slevel * (1 - 2 * touch_tol)
+                 for i in range(max(0, last - recent + 1), last + 1))
+    if not tagged:
+        return False, {}
+    if price < slevel * (1 - 0.01):                  # decisively broke support
+        return False, {}
+
+    turning = closes[last] > closes[last - 1] or (
+        last - 2 >= 0 and closes[last] > closes[last - 2])
+    r14 = rsi(closes) or 50.0
+    res = resistances_above(highs, last, price, max_n=5, min_gap=0.005)
+    dist = abs(price - slevel) / price
+
+    touch_s = min(1.0, (touches - 1) / 3.0)
+    fresh_s = 1.0 if dist < 0.03 else max(0.0, 1.0 - dist / 0.08)
+    room_s = min(1.0, ((res[-1] - price) / price) / 0.30) if res else 0.0
+    rsi_s = 1.0 if r14 < 45 else (0.5 if r14 < 60 else 0.0)
+    turn_s = 1.0 if turning else 0.3
+    score = round(100 * (0.30 * touch_s + 0.25 * fresh_s + 0.20 * room_s +
+                         0.15 * rsi_s + 0.10 * turn_s), 1)
+
+    entry = price
+    a = atr(highs, lows, closes)
+    optimal_entry = round(slevel * 1.005, 10)        # buy near the support
+    sl_tight = slevel - 0.5 * a
+    lower = [z["level"] for z in zones if z["level"] < slevel * 0.99]
+    wide_anchor = max(lower) if lower else slevel
+    sl_wide = min(wide_anchor - 1.0 * a, sl_tight)
+    bundle = level_bundle(entry, sl_tight, sl_wide, res)
+
+    return True, {
+        "price": price,
+        "support": slevel,
+        "touches": touches,
+        "dist_to_support_pct": round(dist * 100, 2),
+        "rsi": r14,
+        "turning_up": bool(turning),
+        "entry": entry,
+        "optimal_entry": optimal_entry,
+        "score": score,
+        **bundle,
+    }
+
+
+# ----------------------------------------------------------------------------
 # MEXC API
 # ----------------------------------------------------------------------------
 def get_session() -> requests.Session:
@@ -561,18 +742,17 @@ def fetch_klines(sess: requests.Session, symbol: str, interval: str,
 
 def scan_symbol(sess: requests.Session, symbol: str, interval: str,
                 cfg: dict) -> dict | None:
-    ema_hit, _flag, _cpr = scan_symbol_multi(sess, symbol, interval, cfg)
-    return ema_hit
+    return scan_symbol_multi(sess, symbol, interval, cfg)[0]
 
 
 def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
-                      cfg: dict) -> tuple[dict | None, dict | None, dict | None]:
-    """Fetch klines ONCE and run the 200-EMA, bull-flag and narrow-CPR detectors.
-    One request per symbol powers all three scans. Returns (ema, flag, cpr) dicts
-    (each with 'symbol' added) or None where there's no setup."""
+                      cfg: dict) -> tuple:
+    """Fetch klines ONCE and run all four detectors (200-EMA reclaim, bull flag,
+    narrow CPR, support bounce). One request per symbol powers every scan.
+    Returns (ema, flag, cpr, bounce) dicts (each with 'symbol') or None."""
     raw = fetch_klines(sess, symbol, interval, cfg["kline_limit"])
     if not raw or len(raw) < EMA_PERIOD + 2:
-        return None, None, None
+        return None, None, None, None
     # MEXC kline row: [openTime, open, high, low, close, volume, closeTime, ...]
     rows = raw[:-1]                       # drop the still-forming candle
     try:
@@ -581,9 +761,9 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
         closes = [float(x[4]) for x in rows]
         vols = [float(x[5]) for x in rows]
     except (ValueError, IndexError):
-        return None, None, None
+        return None, None, None, None
 
-    ema_hit = flag_hit = cpr_hit = None
+    ema_hit = flag_hit = cpr_hit = bounce_hit = None
     ok, d = detect_cross_and_retest(
         highs, lows, closes,
         ema_period=EMA_PERIOD, lookback=cfg["lookback"],
@@ -606,7 +786,11 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
     if ok3:
         cpr_hit = {"symbol": symbol, **c}
 
-    return ema_hit, flag_hit, cpr_hit
+    ok4, b = detect_support_bounce(highs, lows, closes, vols)
+    if ok4:
+        bounce_hit = {"symbol": symbol, **b}
+
+    return ema_hit, flag_hit, cpr_hit, bounce_hit
 
 
 def supports_below(lows: list[float], upto: int, price: float,
@@ -672,9 +856,17 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     above = price >= ema_now
     pct_vs_ema = (price - ema_now) / ema_now * 100
 
-    sup = supports_below(lows, last, price, max_n=3, min_gap=0.005)
+    sup = supports_below(lows, last, price, max_n=4, min_gap=0.005)
     res = resistances_above(highs, last, price, max_n=5, min_gap=0.008)
     a = atr(highs, lows, closes)
+    atr_pct = round(a / price * 100, 2) if price else None
+    r14 = rsi(closes)
+    ms = market_structure(highs, lows, closes)
+    vp = volume_profile(vols, closes)
+    win = closes[-120:] if len(closes) >= 120 else closes
+    hh = max(highs[-120:]) if len(highs) >= 120 else max(highs)
+    ll = min(lows[-120:]) if len(lows) >= 120 else min(lows)
+    range_pos = round((price - ll) / (hh - ll) * 100, 1) if hh > ll else None
 
     entry = price
     # Optimal (lower-risk) entry: pull back to the nearest support, or the EMA if
@@ -702,6 +894,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         highs, lows, closes, vols,
         pole_min_gain=cfg.get("pole_min_gain", 0.15),
         max_retrace=cfg.get("flag_max_retrace", 0.5))
+    okB, dB = detect_support_bounce(highs, lows, closes, vols)
 
     if above and trend == "up":
         bias = "bullish"
@@ -712,22 +905,31 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
 
     notes = []
     notes.append(f"Price is {abs(pct_vs_ema):.1f}% {'above' if above else 'below'} "
-                 f"the 200 EMA, which is sloping {trend}.")
+                 f"the 200 EMA, which is sloping {trend} — {bias} trend bias.")
+    notes.append(f"Market structure is {ms['structure']}"
+                 + (f", with a fresh {ms['choch']} CHoCH (change of character)."
+                    if ms['choch'] else "."))
+    if r14 is not None:
+        state = ("oversold" if r14 < 30 else "overbought" if r14 > 70 else "neutral")
+        notes.append(f"RSI(14) is {r14} ({state}).")
+    notes.append(f"Volume is {vp['vol_trend']} vs its average"
+                 + (f" (x{vp['vol_ratio']})" if vp['vol_ratio'] else "")
+                 + f", with {vp['pressure']} in control of recent candles.")
+    if range_pos is not None:
+        notes.append(f"Price sits {range_pos}% up its recent range "
+                     f"(0% = range low, 100% = range high); ATR ≈ {atr_pct}% of price.")
+    if sup:
+        notes.append("Nearest supports: " + ", ".join(f"{s:.6g}" for s in sup[:3]) + ".")
+    if res:
+        notes.append("Nearest resistances: " + ", ".join(f"{s:.6g}" for s in res[:3]) + ".")
+    matched = []
     if okE:
-        notes.append(f"Matches the 200-EMA cross & retest setup (score {dE['score']}).")
+        matched.append(f"200-EMA reclaim (score {dE['score']})")
     if okF:
-        notes.append(f"Matches a bull flag: pole {dF['pole_gain_pct']}%, "
-                     f"{dF['flag_bars']}-bar flag, score {dF['score']}.")
-    if not okE and not okF:
-        notes.append("No active reclaim or bull-flag setup right now.")
-    if bias == "bullish":
-        notes.append("Bias is bullish while price holds above the rising 200 EMA; "
-                     "a pullback toward the EMA / nearest support is the lower-risk entry.")
-    elif bias == "bearish":
-        notes.append("Bias is bearish while price is below a falling 200 EMA; "
-                     "longs are counter-trend here.")
-    else:
-        notes.append("Bias is neutral/mixed — wait for a cleaner reclaim or flag.")
+        matched.append(f"bull flag (pole {dF['pole_gain_pct']}%, score {dF['score']})")
+    if okB:
+        matched.append(f"support bounce ({dB['touches']} touches, score {dB['score']})")
+    notes.append("Active setups: " + (", ".join(matched) if matched else "none right now") + ".")
 
     return {
         "symbol": symbol,
@@ -737,6 +939,17 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "trend": trend,
         "above_ema": above,
         "bias": bias,
+        "rsi": r14,
+        "atr_pct": atr_pct,
+        "range_pos": range_pos,
+        "structure": ms["structure"],
+        "choch": ms["choch"],
+        "vol_trend": vp["vol_trend"],
+        "vol_ratio": vp["vol_ratio"],
+        "pressure": vp["pressure"],
+        "resistances": res[:4],
+        "support_bounce": bool(okB),
+        "support_bounce_score": dB.get("score") if okB else None,
         "entry": entry,
         "optimal_entry": optimal_entry,
         "supports": sup,

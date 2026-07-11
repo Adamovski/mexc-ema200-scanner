@@ -71,6 +71,9 @@ class State:
         self.cpr_hits: list[dict] = []             # narrow-CPR setups
         self.prev_cpr_symbols: set[str] | None = None
         self.new_cpr_symbols: list[str] = []
+        self.bounce_hits: list[dict] = []          # support-bounce setups
+        self.prev_bounce_symbols: set[str] | None = None
+        self.new_bounce_symbols: list[str] = []
         self.both_symbols: list[str] = []          # appear on 2+ scans (confluence)
         self.last_scan: float | None = None      # epoch seconds
         self.next_scan: float | None = None
@@ -93,6 +96,8 @@ class State:
                 "flag_new_symbols": list(self.new_flag_symbols),
                 "cpr_hits": list(self.cpr_hits),
                 "cpr_new_symbols": list(self.new_cpr_symbols),
+                "bounce_hits": list(self.bounce_hits),
+                "bounce_new_symbols": list(self.new_bounce_symbols),
                 "both_symbols": list(self.both_symbols),
                 "error": self.error,
                 "cfg": {
@@ -126,6 +131,7 @@ def run_one_scan(state: State) -> None:
     hits: list[dict] = []
     flags: list[dict] = []
     cprs: list[dict] = []
+    bounces: list[dict] = []
     done = 0
     scan_cfg = {k: cfg[k] for k in
                 ("kline_limit", "lookback", "retest_tol", "break_tol",
@@ -140,19 +146,22 @@ def run_one_scan(state: State) -> None:
                 with state.lock:
                     state.progress = (done, len(symbols))
             try:
-                h, f, c = fut.result()
+                h, f, c, b = fut.result()
             except Exception:
-                h, f, c = None, None, None
+                h, f, c, b = None, None, None, None
             if h:
                 hits.append(h)
             if f:
                 flags.append(f)
             if c:
                 cprs.append(c)
+            if b:
+                bounces.append(b)
 
     hits.sort(key=lambda h: h["score"], reverse=True)
     flags.sort(key=lambda h: h["score"], reverse=True)
     cprs.sort(key=lambda h: h["score"], reverse=True)
+    bounces.sort(key=lambda h: h["score"], reverse=True)
 
     def tag_new(items, prev):
         """Return (rows, new_syms, cur_syms) with an is_new flag per row."""
@@ -167,18 +176,21 @@ def run_one_scan(state: State) -> None:
     from collections import Counter
     counts = Counter([h["symbol"] for h in hits] +
                      [h["symbol"] for h in flags] +
-                     [h["symbol"] for h in cprs])
+                     [h["symbol"] for h in cprs] +
+                     [h["symbol"] for h in bounces])
     both = {s for s, n in counts.items() if n >= 2}
 
     with state.lock:
         rows, new_syms, cur = tag_new(hits, state.prev_symbols)
         frows, fnew, fcur = tag_new(flags, state.prev_flag_symbols)
         crows, cnew, ccur = tag_new(cprs, state.prev_cpr_symbols)
-        for d in rows + frows + crows:
+        brows, bnew, bcur = tag_new(bounces, state.prev_bounce_symbols)
+        for d in rows + frows + crows + brows:
             d["both"] = d["symbol"] in both
         state.hits, state.new_symbols, state.prev_symbols = rows, new_syms, cur
         state.flag_hits, state.new_flag_symbols, state.prev_flag_symbols = frows, fnew, fcur
         state.cpr_hits, state.new_cpr_symbols, state.prev_cpr_symbols = crows, cnew, ccur
+        state.bounce_hits, state.new_bounce_symbols, state.prev_bounce_symbols = brows, bnew, bcur
         state.both_symbols = sorted(both)
 
         state.last_scan = time.time()
@@ -320,6 +332,7 @@ PAGE = """<!doctype html>
   <div class="tab active" id="tabSetups" onclick="showTab('setups')">200-EMA reclaim</div>
   <div class="tab" id="tabFlags" onclick="showTab('flags')">Bull flags</div>
   <div class="tab" id="tabCpr" onclick="showTab('cpr')">Narrow CPR</div>
+  <div class="tab" id="tabBounce" onclick="showTab('bounce')">Support bounce</div>
   <div class="tab" id="tabAnalyze" onclick="showTab('analyze')">Analyze a coin</div>
   <div class="tab" id="tabInfo" onclick="showTab('info')">Info</div>
 </div>
@@ -412,6 +425,36 @@ PAGE = """<!doctype html>
     <tbody id="crows"></tbody>
   </table>
   <div class="empty" id="cempty" style="display:none">No narrow-CPR setups right now. The loop keeps scanning…</div>
+</div>
+</div>
+
+<div class="view" id="viewBounce">
+<div class="status">
+  <span>Support bounce — price reversing off a strong, multi-tested support with room above</span>
+  <span id="bounceCount"></span>
+</div>
+<div class="wrap">
+  <table id="btbl">
+    <thead><tr>
+      <th data-bk="symbol">Symbol</th>
+      <th data-bk="price">Price</th>
+      <th data-bk="support">Support</th>
+      <th data-bk="touches">Touches</th>
+      <th data-bk="dist_to_support_pct">Dist %</th>
+      <th data-bk="rsi">RSI</th>
+      <th data-bk="optimal_entry">Optimal entry</th>
+      <th data-bk="sl_tight">SL tight</th>
+      <th data-bk="sl_wide">SL wide</th>
+      <th data-bk="tp1">TP1</th>
+      <th data-bk="tp2">TP2</th>
+      <th data-bk="tp3">TP3</th>
+      <th data-bk="tp4">TP4</th>
+      <th data-bk="tp5">TP5</th>
+      <th data-bk="score">Score</th>
+    </tr></thead>
+    <tbody id="brows"></tbody>
+  </table>
+  <div class="empty" id="bempty" style="display:none">No support-bounce setups right now. The loop keeps scanning…</div>
 </div>
 </div>
 
@@ -530,9 +573,26 @@ PAGE = """<!doctype html>
   side), and shows the CPR width %, where price sits (Pos: above / inside), the TC
   and BC levels, a breakout entry, both stops, and five targets.</p>
 
+  <h2>The Support bounce tab</h2>
+  <p>A fourth scan for reversals: coins <b>bouncing off a strong horizontal
+  support</b>. It finds swing-low pivots, clusters nearby lows into support
+  <b>zones</b> (a level tested more than once is stronger — that's the
+  <b>Touches</b> column), then flags the case where price has just tagged the
+  nearest zone and is turning back up, with room to a resistance above.</p>
+  <table class="def">
+    <tr><td>Support</td><td>The support level price is bouncing from.</td></tr>
+    <tr><td>Touches</td><td>How many times that level has been tested. More touches = a more significant, better-respected support.</td></tr>
+    <tr><td>Dist %</td><td>How far price currently sits above the support. Smaller = a fresher bounce, tighter entry.</td></tr>
+    <tr><td>RSI</td><td>Relative Strength Index (0–100). Bouncing from oversold (&lt;30–45) scores higher — more room to rally.</td></tr>
+    <tr><td>Score</td><td>0–100, weighting touches (30%), how fresh the bounce is (25%), room to the resistance above (20%), RSI (15%), and whether price is turning up (10%).</td></tr>
+  </table>
+  <p>Entry/optimal entry (near the support), the two ATR stops (below the zone),
+  and the five targets work exactly like the other tabs.</p>
+
   <h2>Confluence — coins on 2+ scans</h2>
-  <p>When a coin shows up on <b>two or more</b> of the three scans (reclaim, bull
-  flag, narrow CPR) at once, it's flagged with a gold <span class="bothbadge">★ BOTH</span>
+  <p>When a coin shows up on <b>two or more</b> of the four scans (200-EMA
+  reclaim, bull flag, narrow CPR, support bounce) at once, it's flagged with a
+  gold <span class="bothbadge">★ BOTH</span>
   badge and its row is highlighted gold on every tab, with a running
   "★ N confluence" count in the header. These are the highest-conviction names —
   multiple bullish signals lining up on the same chart — so they're worth a look
@@ -541,11 +601,32 @@ PAGE = """<!doctype html>
   <h2>The Analyze a coin tab</h2>
   <p>Type any MEXC ticker (e.g. <code>BTC</code>, <code>SOL</code>,
   <code>SOLUSDT</code>) and it pulls that coin's live 4h candles on demand and
-  returns a read: its <b>bias</b> (trend vs the 200 EMA), whether it currently
-  matches the reclaim or bull-flag setups, a suggested <b>entry</b> (now) and a
-  lower-risk <b>pullback entry</b> at the nearest support, a <b>stop</b> below
-  support, and three resistance <b>targets</b> each with their R:R. It's the same
-  math the scanners use, pointed at one coin of your choosing.</p>
+  returns a full read. As well as the trade plan (entry, optimal entry, both
+  stops, five targets with R:R), it reports:</p>
+  <table class="def">
+    <tr><td>Bias</td><td>Bullish / bearish / neutral, from price vs the 200 EMA and the EMA's slope.</td></tr>
+    <tr><td>Structure &amp; CHoCH</td><td>Market structure (uptrend = higher highs &amp; higher lows, downtrend = lower highs &amp; lows, or range) and any <b>Change of Character</b> — the first structural break signalling the trend may be flipping.</td></tr>
+    <tr><td>RSI (14)</td><td>Momentum, 0–100. &lt;30 oversold, &gt;70 overbought.</td></tr>
+    <tr><td>Volume</td><td>Whether recent volume is rising/steady/falling vs its average, and whether <b>buyers or sellers</b> control recent candles (up-candle vs down-candle volume).</td></tr>
+    <tr><td>Range position</td><td>Where price sits in its recent 120-bar range (0% = range low, 100% = high), plus ATR as a % of price (its volatility).</td></tr>
+    <tr><td>Supports &amp; resistances</td><td>The nearest levels above and below, and which of the four setups (if any) the coin currently matches.</td></tr>
+  </table>
+  <p>Everything is spelled out in plain English in the notes under the card.</p>
+
+  <h2>Indicators &amp; terms — glossary</h2>
+  <table class="def">
+    <tr><td>200 EMA</td><td>200-period exponential moving average — a heavily-watched long-term trend line. Above it = bullish regime, below = bearish.</td></tr>
+    <tr><td>ATR</td><td>Average True Range — the coin's typical candle range, i.e. its volatility. Stops are buffered by a fraction of ATR so they fit each coin instead of a flat %.</td></tr>
+    <tr><td>RSI</td><td>Relative Strength Index — momentum oscillator, 0–100; flags oversold/overbought.</td></tr>
+    <tr><td>Swing high / low (pivot)</td><td>A local peak/trough — a candle higher/lower than the few candles either side. These define support, resistance and structure.</td></tr>
+    <tr><td>Support / resistance</td><td>Prior swing lows (floors) / swing highs (ceilings). A level tested repeatedly is stronger.</td></tr>
+    <tr><td>Market structure</td><td>The sequence of highs and lows: higher-high/higher-low = uptrend; lower-high/lower-low = downtrend.</td></tr>
+    <tr><td>CHoCH</td><td>Change of Character — the first break of that structure (e.g. a downtrend making a higher high), an early reversal cue.</td></tr>
+    <tr><td>CPR</td><td>Central Pivot Range — Pivot, BC and TC from the prior day's H/L/C. A narrow CPR = compressed, coiled price.</td></tr>
+    <tr><td>Measured move</td><td>Projecting a pattern's own size from its breakout (a bull flag typically runs ~the height of its pole); Fib extensions (1.618×, 2×) give the further targets.</td></tr>
+    <tr><td>R:R</td><td>Reward-to-risk = potential profit ÷ potential loss = (target − entry) ÷ (entry − stop), entry = current price.</td></tr>
+    <tr><td>Confluence</td><td>The same coin appearing on 2+ scans at once — stacked signals, higher conviction.</td></tr>
+  </table>
 
   <h2>How often it updates</h2>
   <p>The server re-scans all pairs on a loop (the cadence is shown in the header)
@@ -562,6 +643,7 @@ PAGE = """<!doctype html>
 let sortKey="score", sortDir=-1, latest=[];
 let fSortKey="score", fSortDir=-1, flatest=[];
 let cSortKey="score", cSortDir=-1, clatest=[];
+let bSortKey="score", bSortDir=-1, blatest=[];
 let activeTab="setups", lastData=null;
 function fmtNum(n){ if(n===null||n===undefined) return "—";
   const a=Math.abs(n); if(a!==0&&a<0.001) return n.toExponential(2);
@@ -583,7 +665,7 @@ function tpCell(v,rr){ return v==null?'<td>—</td>'
   :`<td>${fmtNum(v)}${rr!=null?`<span class="rr">R${(+rr).toFixed(1)}</span>`:''}</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
@@ -619,6 +701,17 @@ function azCard(d){
     <div class="aztags">
       <span class="aztag ${d.ema_reclaim?'on':''}">200-EMA reclaim${d.ema_reclaim?' · '+d.ema_reclaim_score:''}</span>
       <span class="aztag ${d.bull_flag?'on':''}">Bull flag${d.bull_flag?' · '+d.bull_flag_score:''}</span>
+      <span class="aztag ${d.support_bounce?'on':''}">Support bounce${d.support_bounce?' · '+d.support_bounce_score:''}</span>
+    </div>
+    <div class="azgrid">
+      ${cell("Structure", (d.structure||'—')+(d.choch?` · ${d.choch} CHoCH`:''))}
+      ${cell("RSI (14)", d.rsi==null?'—':(+d.rsi).toFixed(0)+(d.rsi<30?' oversold':d.rsi>70?' overbought':''))}
+      ${cell("Volume", (d.vol_trend||'—')+(d.vol_ratio?` ×${d.vol_ratio}`:''))}
+      ${cell("Pressure", d.pressure||'—')}
+      ${cell("Range position", d.range_pos==null?'—':d.range_pos+'%')}
+      ${cell("ATR", d.atr_pct==null?'—':d.atr_pct+'%')}
+      ${cell("Supports", (d.supports||[]).slice(0,3).map(fmtNum).join(' · ')||'—')}
+      ${cell("Resistances", (d.resistances||[]).slice(0,3).map(fmtNum).join(' · ')||'—')}
     </div>
     <div class="azgrid">
       ${cell("Entry (now)", fmtNum(d.entry))}
@@ -640,6 +733,7 @@ function renderBanner(){
   if(activeTab==="setups"){ newSyms=(lastData&&lastData.new_symbols)||[]; what="200-EMA reclaim"; }
   else if(activeTab==="flags"){ newSyms=(lastData&&lastData.flag_new_symbols)||[]; what="bull flag"; }
   else if(activeTab==="cpr"){ newSyms=(lastData&&lastData.cpr_new_symbols)||[]; what="narrow CPR"; }
+  else if(activeTab==="bounce"){ newSyms=(lastData&&lastData.bounce_new_symbols)||[]; what="support bounce"; }
   if(!newSyms.length){ b.classList.remove("show"); b.innerHTML=""; return; }
   const chips=newSyms.map(s=>`<span class="chip"><a href="${tvLink(s)}" target="_blank" rel="noopener">${s}</a></span>`).join("");
   const label=newSyms.length===1?`new ${what} just triggered`:`new ${what} setups just triggered`;
@@ -708,6 +802,36 @@ document.querySelectorAll("th[data-ck]").forEach(th=>th.addEventListener("click"
   const k=th.dataset.ck; if(k===cSortKey) cSortDir*=-1; else {cSortKey=k; cSortDir=(k==="symbol"||k==="position")?1:-1;}
   renderCPR();
 }));
+document.querySelectorAll("th[data-bk]").forEach(th=>th.addEventListener("click",()=>{
+  const k=th.dataset.bk; if(k===bSortKey) bSortDir*=-1; else {bSortKey=k; bSortDir=(k==="symbol")?1:-1;}
+  renderBounce();
+}));
+function renderBounce(){
+  const rows=[...blatest].sort((a,b)=>{
+    const x=a[bSortKey],y=b[bSortKey];
+    if(typeof x==="string") return bSortDir*x.localeCompare(y);
+    return bSortDir*((x??0)-(y??0));
+  });
+  const tb=document.getElementById("brows"); tb.innerHTML="";
+  document.getElementById("bempty").style.display = rows.length? "none":"block";
+  for(const h of rows){
+    const tr=document.createElement("tr");
+    tr.className=rowClass(h);
+    tr.innerHTML =
+      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td>${fmtNum(h.price)}</td>`+
+      `<td>${fmtNum(h.support)}</td>`+
+      `<td>${h.touches}</td>`+
+      `<td>${(+h.dist_to_support_pct).toFixed(2)}</td>`+
+      `<td>${h.rsi==null?'—':(+h.rsi).toFixed(0)}</td>`+
+      `<td>${fmtNum(h.optimal_entry)}</td>`+
+      `<td>${fmtNum(h.sl_tight)}</td>`+
+      `<td>${fmtNum(h.sl_wide)}</td>`+
+      tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
+      `<td class="score">${(+h.score).toFixed(1)}</td>`;
+    tb.appendChild(tr);
+  }
+}
 function renderCPR(){
   const rows=[...clatest].sort((a,b)=>{
     const x=a[cSortKey],y=b[cSortKey];
@@ -741,11 +865,13 @@ async function poll(){
     latest=d.hits||[]; render();
     flatest=d.flag_hits||[]; renderFlags();
     clatest=d.cpr_hits||[]; renderCPR();
+    blatest=d.bounce_hits||[]; renderBounce();
     renderBanner();
     const nboth=(d.both_symbols||[]).length;
     const bothTxt=nboth?` · ★ ${nboth} confluence`:"";
     document.getElementById("flagCount").textContent = `${flatest.length} flag(s) · ${d.universe} pairs${bothTxt}`;
     document.getElementById("cprCount").textContent = `${clatest.length} narrow-CPR · ${d.universe} pairs${bothTxt}`;
+    document.getElementById("bounceCount").textContent = `${blatest.length} bounce(s) · ${d.universe} pairs${bothTxt}`;
     document.getElementById("meta").textContent =
       `${d.cfg.interval} chart · ${d.cfg.quote} ${d.cfg.futures_only?'· futures-listed':'spot'} · EMA${d.cfg.ema_period} · rescans every ${d.cfg.scan_every}m`;
     const dot=document.getElementById("dot");
