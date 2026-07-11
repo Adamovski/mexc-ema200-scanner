@@ -197,6 +197,34 @@ def volume_profile(volumes: list[float], closes: list[float],
     return {"vol_trend": vtrend, "vol_ratio": ratio, "pressure": pressure}
 
 
+def pct_returns(closes: list[float]) -> list[float]:
+    """Bar-over-bar percentage returns — the series used for BTC correlation."""
+    out = []
+    for i in range(1, len(closes)):
+        p = closes[i - 1]
+        out.append((closes[i] - p) / p if p else 0.0)
+    return out
+
+
+def pearson(a: list[float], b: list[float], min_n: int = 20) -> float | None:
+    """Pearson correlation of two aligned return series (most-recent aligned).
+    Returns None if there isn't enough overlapping history."""
+    n = min(len(a), len(b))
+    if n < min_n:
+        return None
+    a, b = a[-n:], b[-n:]
+    ma, mb = sum(a) / n, sum(b) / n
+    num = sum((a[i] - ma) * (b[i] - mb) for i in range(n))
+    da = (sum((x - ma) ** 2 for x in a)) ** 0.5
+    db = (sum((x - mb) ** 2 for x in b)) ** 0.5
+    if da == 0 or db == 0:
+        return None
+    return num / (da * db)
+
+
+CORR_WINDOW = 60          # ~10 days of 4h bars for the BTC-correlation estimate
+
+
 # ----------------------------------------------------------------------------
 # Setup detection
 # ----------------------------------------------------------------------------
@@ -1230,6 +1258,11 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
 
     rv = rel_volume(vols)                       # relative volume of the latest candle
     ksup = key_supports(rows, lows, closes[-1])  # next 4h / daily / weekly support
+    # BTC correlation over the recent window (how much this coin just mirrors BTC).
+    _btc_ret = cfg.get("btc_returns")
+    _corr = None
+    if _btc_ret:
+        _corr = pearson(pct_returns(closes)[-CORR_WINDOW:], _btc_ret)
     _ms = market_structure(highs, lows, closes)  # for a per-setup bias label
     if _ms["choch"] == "bullish":
         _bias = "Bullish CHoCH"
@@ -1246,7 +1279,8 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
         """Attach relative volume, multi-timeframe supports, a market-structure
         bias label, and (for momentum setups) a volume-confirmation score nudge."""
         d = {"symbol": symbol, "rvol": rv, "bias": _bias, "bias_dir": _dir,
-             "choch": _ms["choch"], **ksup, **d}
+             "choch": _ms["choch"],
+             "btc_corr": (round(_corr, 2) if _corr is not None else None), **ksup, **d}
         if boost and rv:
             factor = 1.0 + 0.15 * max(0.0, min(1.0, (rv - 1.0) / 1.5))
             d["score"] = round(min(100.0, d["score"] * factor), 1)
@@ -1381,6 +1415,16 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     ema_1d = _tf_ema("1d")
     ema_1w = _tf_ema("1w")
     atr_pct = round(a / price * 100, 2) if price else None
+    # BTC correlation over the recent window (independence vs "just follows BTC").
+    btc_corr = None
+    try:
+        braw = fetch_candles(sess, "BTCUSDT", interval, cfg.get("kline_limit", 1000), mkt)
+        if braw and len(braw) > 2:
+            bcl = [float(x[4]) for x in braw[:-1]]
+            btc_corr = pearson(pct_returns(closes)[-CORR_WINDOW:],
+                               pct_returns(bcl)[-CORR_WINDOW:])
+    except (requests.RequestException, ValueError, IndexError, TypeError):
+        btc_corr = None
     r14 = rsi(closes)
     ms = market_structure(highs, lows, closes)
     vp = volume_profile(vols, closes)
@@ -1585,6 +1629,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "struct_reason": struct_reason,
         "rsi": r14,
         "atr_pct": atr_pct,
+        "btc_corr": (round(btc_corr, 2) if btc_corr is not None else None),
         "range_pos": range_pos,
         "structure": ms["structure"],
         "choch": ms["choch"],

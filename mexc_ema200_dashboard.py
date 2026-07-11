@@ -49,7 +49,7 @@ except ImportError:
 try:
     from mexc_ema200_scanner import (
         list_symbols, scan_symbol_multi, get_session, EMA_PERIOD,
-        analyze_symbol, normalize_symbol,
+        analyze_symbol, normalize_symbol, fetch_candles, pct_returns, CORR_WINDOW,
     )
 except ImportError:
     sys.exit("Could not import mexc_ema200_scanner.py — keep both files in the "
@@ -191,6 +191,16 @@ def run_one_scan(state: State) -> None:
                  "max_above_now", "min_slope", "pole_min_gain", "flag_max_retrace",
                  "cpr_max_width_pct")}
     scan_cfg["market"] = cfg.get("market", "futures")
+    # BTC's recent returns — computed ONCE, shared by every worker so each coin's
+    # correlation to BTC can be measured (to flag coins that just follow BTC).
+    try:
+        _braw = fetch_candles(sess, "BTCUSDT", cfg["interval"], cfg["kline_limit"],
+                              scan_cfg["market"])
+        if _braw and len(_braw) > 2:
+            _bcl = [float(x[4]) for x in _braw[:-1]]
+            scan_cfg["btc_returns"] = pct_returns(_bcl)[-CORR_WINDOW:]
+    except Exception:
+        pass
     with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
         futs = {ex.submit(scan_symbol_multi, sess, s, cfg["interval"], scan_cfg): s
                 for s in symbols}
@@ -548,6 +558,10 @@ PAGE = """<!doctype html>
   .g-d{background:rgba(139,152,173,.14);color:var(--dim);border:1px solid var(--line)}
   .gscore{color:var(--dim);font-size:11.5px;font-variant-numeric:tabular-nums;margin-left:4px}
   .whycell{color:#c3ccd8;font-size:12.5px;max-width:340px}
+  .corrbadge{border-radius:6px;padding:0 6px;font-size:10.5px;font-weight:700;border:1px solid var(--line);margin-left:5px;font-variant-numeric:tabular-nums;cursor:help}
+  .corr-hi{background:rgba(210,153,34,.16);color:#d29922;border-color:rgba(210,153,34,.45)}
+  .corr-mid{background:rgba(139,152,173,.12);color:var(--dim)}
+  .corr-lo{background:rgba(63,185,80,.16);color:var(--accent);border-color:rgba(63,185,80,.45)}
   .phasepill{border-radius:6px;padding:1px 7px;font-size:11px;font-weight:700;border:1px solid var(--line)}
   .phase-broke{background:rgba(63,185,80,.16);color:var(--accent);border-color:rgba(63,185,80,.5)}
   .phase-form{background:rgba(139,152,173,.12);color:var(--dim)}
@@ -750,6 +764,7 @@ PAGE = """<!doctype html>
       <th data-sk="pct_below_ema">% &lt; EMA</th>
       <th data-sk="bars_since_cross">Bars</th>
       <th data-sk="bias">Bias</th>
+      <th data-tip="BTC correlation ρ over ~10 days. Low/negative = its own move; ≥0.85 = largely just following BTC.">BTC ρ</th>
       <th data-tip="Plain-English reasons this qualifies as a short.">Why</th>
       <th data-sk="optimal_entry">Optimal entry</th>
       <th data-sk="sl_tight">SL tight</th>
@@ -770,26 +785,27 @@ PAGE = """<!doctype html>
 
 <div class="view" id="viewTop">
 <div class="status">
-  <span>Top setups — the highest-conviction <b>LONG</b> opportunities, aggregated across every bullish scan and ranked by a composite <b>conviction rating</b> (A+ → D). Hover the rating or the "Why" to see exactly what earns the grade.</span>
+  <span>Top setups — only the highest-conviction <b>LONG</b> opportunities. Aggregated across every bullish scan, then <b>filtered for quality</b>: each must clear a real reward:risk bar and earn a solid composite <b>conviction rating</b> (A+ → D). Hover the rating or "Why" for the full reasoning.</span>
   <span id="topCount"></span>
 </div>
 <div class="wrap">
   <table id="tbtbl">
     <thead><tr>
       <th>Symbol</th>
-      <th data-tip="Composite conviction rating (A+ → D, 0–100). Blends: multi-scan confluence (35%), the best detector's own score (25%), volume confirmation via RVol (15%), market-structure alignment (15%), and the best reward:risk (10%). Higher = more evidence stacking up for a long.">Rating</th>
+      <th data-tip="Composite conviction rating (A+ → D, 0–100). Blends: multi-scan confluence (30%), realistic reward:risk (26%), the best detector's own score (18%), volume confirmation via RVol (13%), and market-structure alignment (13%). Only setups clearing a real R:R + rating bar are shown.">Rating</th>
       <th data-tip="Which bullish scans this coin currently appears on. Appearing on 2+ (★) is strong confluence.">Setups</th>
       <th data-tip="Live last-traded price (updates ~every 20s).">Price</th>
       <th data-tip="Market-structure bias from swing highs/lows.">Bias</th>
+      <th data-tip="BTC correlation ρ over ~10 days. Low/negative = an independent mover (preferred); ≥0.85 = mostly just BTC beta and gets docked in the rating.">BTC ρ</th>
       <th data-tip="Lower-risk entry — a pullback to the setup's support / EMA / breakout level.">Entry</th>
       <th data-tip="Tight stop-loss for the best setup on this coin.">SL tight</th>
-      <th data-tip="First profit target and its reward:risk.">TP1</th>
-      <th data-tip="Reward:risk to the tight stop for TP1.">RR1</th>
+      <th data-tip="The meaningful profit target (≥~2% away) used to judge the reward:risk.">Target</th>
+      <th data-tip="Realistic reward:risk to that target (capped at 8:1). This is the quality bar the setup had to clear.">R:R</th>
       <th data-tip="Plain-English summary of what earns this coin its rating.">Why it's a top setup</th>
     </tr></thead>
     <tbody id="tbrows"></tbody>
   </table>
-  <div class="empty" id="tbempty" style="display:none">No high-conviction long setups yet — the loop keeps scanning…</div>
+  <div class="empty" id="tbempty" style="display:none">No setups clear the quality bar right now — the loop keeps scanning. (Better to show nothing than a mediocre trade.)</div>
 </div>
 </div>
 
@@ -1029,16 +1045,21 @@ let activeTab="setups", lastData=null;
 // Per-tab filters so a filter on one tab never hides rows on another.
 const FILT={ setups:{bias:"all",fresh:false}, flags:{bias:"all",phase:"all"},
              cpr:{bias:"all"}, bounce:{bias:"all"},
-             wedge:{bias:"all",phase:"all"}, shorts:{bias:"all"} };
-function biasOk(h,tab){ const b=FILT[tab].bias; return b==="all"||h.bias_dir===b; }
+             wedge:{bias:"all",phase:"all"}, shorts:{bias:"all"}, top:{indep:false} };
+function biasOk(h,tab){ const b=(FILT[tab]||{}).bias; return !b||b==="all"||h.bias_dir===b; }
 function renderFilterBar(){
   const bar=document.getElementById("filterbar"); if(!bar) return;
   const t=activeTab;
   if(!FILT[t]){ bar.style.display="none"; return; }
   bar.style.display="flex";
-  const f=FILT[t]; let h="Bias: ";
-  for(const [k,l] of [["all","All"],["bullish","Bullish"],["bearish","Bearish"],["neutral","Neutral"]])
-    h+=`<span class="fbtn ${f.bias===k?'active':''}" onclick="setF('${t}','bias','${k}')">${l}</span>`;
+  const f=FILT[t]; let h="";
+  if('bias' in f){ h+="Bias: ";
+    for(const [k,l] of [["all","All"],["bullish","Bullish"],["bearish","Bearish"],["neutral","Neutral"]])
+      h+=`<span class="fbtn ${f.bias===k?'active':''}" onclick="setF('${t}','bias','${k}')">${l}</span>`;
+  }
+  if(t==="top"){
+    h+=`<span class="fbtn ${f.indep?'active':''}" onclick="setF('top','indep',${!f.indep})" data-tip="Hide coins that just follow BTC — show only setups with BTC correlation ρ below 0.6 (their own movers).">🧭 Independent movers only (ρ&lt;0.6)</span>`;
+  }
   if(t==="setups"){
     h+='<span style="color:var(--line)">|</span>';
     h+=`<span class="fbtn ${f.fresh?'active':''}" onclick="setF('setups','fresh',${!f.fresh})" data-tip="Show only reclaims that crossed the 200 EMA within the last ~24h (≤6 4h-candles).">🔵 Fresh reclaims only</span>`;
@@ -1057,7 +1078,7 @@ function renderFilterBar(){
 }
 function setF(tab,key,val){ FILT[tab][key]=val; renderFilterBar();
   ({setups:render,flags:renderFlags,cpr:renderCPR,bounce:renderBounce,
-    wedge:renderWedge,shorts:renderShorts}[tab]||(()=>{}))();
+    wedge:renderWedge,shorts:renderShorts,top:renderTop}[tab]||(()=>{}))();
 }
 let alertsOn=false, audioCtx=null, seenBreak=Math.floor(Date.now()/1000);
 function enableAlerts(){
@@ -1123,7 +1144,17 @@ function badges(h){
   if(h.sup_1d!=null) sp.push("Daily "+fmtNum(h.sup_1d)+dd(h.sup_1d));
   if(h.sup_1w!=null) sp.push("Weekly "+fmtNum(h.sup_1w)+dd(h.sup_1w));
   if(sp.length) s+=`<span class="supbadge" data-tip="Next support below (drawdown) — ${sp.join("  ·  ")}">🛟</span>`;
+  s+=corrPill(h.btc_corr);
   return s;
+}
+// BTC-correlation pill: how much this coin just mirrors BTC over the last ~10 days.
+function corrPill(c){
+  if(c==null) return '';
+  const cls = c>=0.85?'corr-hi' : c>=0.55?'corr-mid' : 'corr-lo';
+  const lbl = c>=0.85?'moves with BTC (just follows it)'
+            : c>=0.55?'partly BTC-linked'
+            : (c<0.2?'independent of BTC':'loosely BTC-linked');
+  return `<span class="corrbadge ${cls}" data-tip="BTC correlation ρ=${c.toFixed(2)} over ~10 days (60×4h bars) — ${lbl}. High ρ (≥0.85) means the move is really just BTC beta; low or negative ρ means the coin is moving on its own story.">ρ${c.toFixed(2)}</span>`;
 }
 // instant custom tooltip for the ★ confluence badge (reliable, no native delay)
 document.addEventListener("mouseover",e=>{
@@ -1203,6 +1234,7 @@ function azCard(d){
       ${cell("Rel volume", d.rvol==null?'—':(+d.rvol).toFixed(2)+'× latest bar', "The latest candle's volume ÷ its 20-bar average. Above 1× = the current move is happening on above-average participation = stronger confirmation. Below 1× = quiet, less conviction.")}
       ${cell("Range position", d.range_pos==null?'—':d.range_pos+'%', `Where price sits in its recent 120-candle range on the ${d.interval||'4h'} timeframe (0% = range low, 100% = range high).`)}
       ${cell("ATR", d.atr_pct==null?'—':d.atr_pct+'%', "Average True Range as a % of price — the coin's volatility. Stops are buffered by a fraction of this.")}
+      ${cell("BTC correlation", d.btc_corr==null?'—':('ρ '+(+d.btc_corr).toFixed(2)+(d.btc_corr>=0.85?' · just follows BTC':d.btc_corr<0.5?' · independent':' · partly linked')), "How closely this coin's 4h returns tracked BTC over the last ~10 days (Pearson ρ, −1 to +1). ρ≥0.85 means the move is largely just BTC beta — a 'breakout' here may only be BTC pulling it up. Low or negative ρ means the coin is trading on its own story, which is usually what you want for an independent setup.")}
       ${cell("Supports (distance)", (d.supports||[]).slice(0,3).map(v=>fmtNum(v)+pct(v,'-')).join(' · ')||'—', "Nearest support levels below price, with how far (%) each sits below the current price.")}
       ${cell("Resistances (distance)", (d.resistances||[]).slice(0,3).map(v=>fmtNum(v)+pct(v,'+')).join(' · ')||'—', "Nearest resistance levels above price, with how far (%) each sits above the current price.")}
       ${cell("Next support 4h·1D·1W (drawdown)", [d.sup_4h,d.sup_1d,d.sup_1w].map(v=>v==null?'—':fmtNum(v)+pct(v,'-')).join(' · '), "The next major support on the 4h, Daily and Weekly charts — your safety-net levels — with the % drawdown to each.")}
@@ -1424,46 +1456,71 @@ function ratingCell(score,why){
   const tip=esc(`Rated ${g} (${score}/100). ${why.join(' · ')}`);
   return `<td data-tip="${tip}"><span class="grade ${gradeClass(score)}">${g}</span><span class="gscore">${score}</span></td>`;
 }
+// A *realistic* reward:risk for a setup: the best R:R among its targets that sit a
+// meaningful distance away (>=2% move), capped at 8 so measured-move moonshots on
+// the flag/wedge scans can't dominate. Returns {rr, tp, move}.
+function realisticRR(h){
+  const P=h.live!=null?h.live:h.price;
+  let best={rr:0,tp:null,move:0};
+  for(let i=1;i<=5;i++){
+    const tp=h['tp'+i], rr=h['rr'+i];
+    if(tp==null||rr==null||rr<=0||!P) continue;
+    const move=Math.abs((tp-P)/P);
+    if(move>=0.02){ const c=Math.min(rr,8); if(c>best.rr) best={rr:c,tp:tp,move:move}; }
+  }
+  if(best.rr===0){ for(let i=1;i<=5;i++){ const tp=h['tp'+i],rr=h['rr'+i];
+    if(rr>0){ best={rr:Math.min(rr,8),tp:tp,move:P&&tp?Math.abs((tp-P)/P):0}; break; } } }
+  return best;
+}
+// Per-setup quality used to pick the single best setup for a coin (blends the
+// detector's own score with its realistic reward:risk).
+function setupQuality(h){ return 0.55*clamp01((h.score||0)/100)+0.45*clamp01(realisticRR(h).rr/3); }
+// Independence nudge: reward coins moving on their own, dock ones just tracking BTC.
+function indepAdj(corr){ if(corr==null) return 0; if(corr>=0.85) return -5; if(corr<=0.4) return 4; return 0; }
+function corrTd(c){ if(c==null) return '<td>—</td>';
+  const cls=c>=0.85?'corr-hi':c>=0.55?'corr-mid':'corr-lo';
+  return `<td data-tip="BTC correlation ρ over ~10 days. ≥0.85 = largely just follows BTC; low or negative = its own mover."><span class="corrbadge ${cls}">${c.toFixed(2)}</span></td>`; }
 function bullConviction(f){
-  const conf = f.nScans>=3?1 : f.nScans===2?0.7 : 0.35;                 // confluence
+  const conf = f.nScans>=3?1 : f.nScans===2?0.72 : 0.35;               // confluence
+  const rr   = clamp01((f.rrq||0)/3);                                  // realistic R:R (3:1 = full)
   const qual = clamp01((f.bestScore||0)/100);                          // detector quality
   const vol  = f.rvol? clamp01((f.rvol-1)/1.5) : 0.3;                  // volume confirmation
   const struct = (f.bias==='Bullish'||f.bias==='Bullish CHoCH')?1 : (f.choch==='bullish'?0.6:0.3);
-  const rr   = f.bestRR? clamp01(f.bestRR/3) : 0.2;                    // reward:risk
-  return Math.round(100*(0.35*conf+0.25*qual+0.15*vol+0.15*struct+0.10*rr));
+  return Math.round(100*(0.30*conf+0.26*rr+0.18*qual+0.13*vol+0.13*struct));
 }
 function bearConviction(f){
+  const rr   = clamp01((f.rrq||0)/3);
   const qual = clamp01((f.bestScore||0)/100);
   const vol  = f.rvol? clamp01((f.rvol-1)/1.5) : 0.3;
   const struct = (f.bias==='Bearish')?1 : (f.choch==='bearish'?0.6:0.3);
-  const rr   = f.bestRR? clamp01(f.bestRR/3) : 0.2;
-  const base = 0.6;                                                     // it's a confirmed breakdown+retest
-  return Math.round(100*(0.25*base+0.30*qual+0.20*struct+0.15*vol+0.10*rr));
+  const base = 0.6;                                                     // confirmed breakdown+retest
+  return Math.round(100*(0.22*base+0.28*rr+0.25*qual+0.15*struct+0.10*vol));
 }
 function bullWhy(f){
   const w=[];
   w.push(f.nScans>=2 ? `Confluence: on ${f.nScans} scans (${f.setups})`
                      : `Single setup: ${f.setups}`);
-  w.push(`Best detector score ${Math.round(f.bestScore)}/100`);
+  if(f.rrq) w.push(`Realistic R:R ${f.rrq.toFixed(2)}${f.rrMove?` to a +${(f.rrMove*100).toFixed(1)}% target`:''}`);
+  w.push(`Detector score ${Math.round(f.bestScore)}/100`);
   if(f.rvol) w.push(`Volume ${f.rvol.toFixed(2)}× ${f.rvol>=1.5?'(strong confirmation)':f.rvol>=1?'(above average)':'(light)'}`);
   w.push(`Structure: ${f.bias||'—'}${f.choch==='bullish'?' + bullish CHoCH':''}`);
-  if(f.bestRR) w.push(`Best R:R ${f.bestRR.toFixed(2)} to tight stop`);
   if(f.fresh) w.push('Fresh trigger this scan');
   return w;
 }
 function bearWhy(f){
   const w=[];
   w.push('Broke below a falling 200 EMA and retested it from below');
+  if(f.rrq) w.push(`Realistic R:R ${f.rrq.toFixed(2)}${f.rrMove?` to a −${(f.rrMove*100).toFixed(1)}% target`:''}`);
   w.push(`Detector score ${Math.round(f.bestScore)}/100`);
   w.push(`Structure: ${f.bias||'—'}${f.choch==='bearish'?' + bearish CHoCH':''}`);
   if(f.rvol) w.push(`Volume ${f.rvol.toFixed(2)}×`);
-  if(f.bestRR) w.push(`R:R ${f.bestRR.toFixed(2)} to tight stop`);
   if(f.fresh) w.push('Fresh breakdown this scan');
   return w;
 }
 function renderShorts(){
   const rows=[...slatest].map(h=>{
-    const f={bestScore:h.score||0,rvol:h.rvol,bias:h.bias,choch:h.choch,bestRR:h.rr1,fresh:h.is_new};
+    const rr=realisticRR(h);
+    const f={bestScore:h.score||0,rvol:h.rvol,bias:h.bias,choch:h.choch,rrq:rr.rr,rrMove:rr.move,fresh:h.is_new};
     return {...h, _rating:bearConviction(f), _why:bearWhy(f)};
   }).filter(h=>biasOk(h,"shorts")).sort((a,b)=>{
     if(sSortKey==="score"){ return sSortDir*((a._rating)-(b._rating)); }  // sort by rating on the Score/default
@@ -1483,6 +1540,7 @@ function renderShorts(){
       `<td>${(+h.pct_below_ema).toFixed(2)}</td>`+
       `<td>${h.bars_since_cross}</td>`+
       `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
+      corrTd(h.btc_corr)+
       `<td class="whycell" data-tip="${esc(h._why.join(' · '))}">${h._why[0]}</td>`+
       `<td data-tip="Optimal short entry — a rally back up to the 200 EMA (resistance) rather than shorting into support.">${fmtNum(h.optimal_entry)}</td>`+
       `<td data-tip="Tight stop — just ABOVE the EMA / retest high, ATR-buffered. A close back above invalidates the short.">${fmtNum(h.sl_tight)}</td>`+
@@ -1500,27 +1558,45 @@ function renderTop(){
               ["Falling wedge",lastData.wedge_hits]];
   const m={};
   for(const [lbl,list] of srcB) for(const h of (list||[])){
-    const k=h.symbol;
-    if(!m[k]) m[k]={row:h,best:h.score||0,setups:new Set(),rvol:0,rr:0,fresh:false,bias:h.bias,choch:h.choch};
+    const k=h.symbol, q=setupQuality(h);
+    if(!m[k]) m[k]={row:null,bestQ:-1,best:0,setups:new Set(),rvol:0,rr:{rr:0,tp:null,move:0},
+                    fresh:false,bias:h.bias,choch:h.choch};
     const o=m[k]; o.setups.add(lbl);
-    if((h.score||0)>=o.best){ o.best=h.score||0; o.row=h; o.bias=h.bias; o.choch=h.choch; }
+    o.best=Math.max(o.best,h.score||0);
     if(h.rvol&&h.rvol>o.rvol) o.rvol=h.rvol;
-    if(h.rr1&&h.rr1>o.rr) o.rr=h.rr1;
     if(h.is_new||h.fresh) o.fresh=true;
+    if(q>o.bestQ){ o.bestQ=q; o.row=h; o.rr=realisticRR(h); o.bias=h.bias; o.choch=h.choch; }
   }
-  const items=Object.values(m).map(o=>{
+  let items=Object.values(m).map(o=>{
     const f={nScans:o.setups.size,bestScore:o.best,rvol:o.rvol,bias:o.bias,choch:o.choch,
-             bestRR:o.rr,fresh:o.fresh,setups:[...o.setups].join(', ')};
-    o.rating=bullConviction(f); o.why=bullWhy(f); o.f=f; return o;
-  }).sort((a,b)=> b.rating-a.rating || b.best-a.best).slice(0,30);
+             rrq:o.rr.rr,rrMove:o.rr.move,fresh:o.fresh,setups:[...o.setups].join(', ')};
+    o.corr=o.row.btc_corr;
+    o.rating=Math.max(0,Math.min(100, bullConviction(f)+indepAdj(o.corr)));
+    o.why=bullWhy(f);
+    if(o.corr!=null) o.why.push(o.corr>=0.85?`⚠ Highly BTC-correlated (ρ${o.corr.toFixed(2)}) — mostly BTC beta`
+                              : o.corr<0.5?`Independent of BTC (ρ${o.corr.toFixed(2)}) — its own move`
+                              : `Moderate BTC correlation (ρ${o.corr.toFixed(2)})`);
+    o.f=f; return o;
+  });
+  // QUALITY GATE — only genuinely good longs: a real reward:risk AND a solid grade,
+  // backed by either multi-scan confluence or a strong standalone setup. Strong
+  // 3-scan confluence can pass with a slightly lower R:R.
+  items=items.filter(o=>
+      o.rating>=52 &&
+      (o.rr.rr>=1.5 || (o.f.nScans>=3 && o.rr.rr>=1.1)) &&
+      (o.f.nScans>=2 || o.best>=68)
+  );
+  if(FILT.top.indep) items=items.filter(o=> o.corr!=null && o.corr<0.6);
+  items=items.sort((a,b)=> b.rating-a.rating || b.rr.rr-a.rr.rr).slice(0,30);
   const tb=document.getElementById('tbrows'); tb.innerHTML="";
   document.getElementById('tbempty').style.display = items.length? "none":"block";
   const topEl=document.getElementById('topCount');
-  if(topEl) topEl.textContent = `${items.length} ranked long setups`;
+  if(topEl) topEl.textContent = `${items.length} high-conviction long setup(s)`;
   for(const o of items){
     const h=o.row, P=h.live!=null?h.live:h.price;
     const shortWhy = (o.f.nScans>=2? `★ ${o.f.nScans} scans (${o.f.setups})` : o.f.setups)
                    + (o.rvol? ` · vol ${o.rvol.toFixed(1)}×`:'');
+    const tgtTip = o.rr.move? esc(`Target ${fmtNum(o.rr.tp)} — a +${(o.rr.move*100).toFixed(1)}% move, the basis for the R:R.`):'';
     const tr=document.createElement('tr'); tr.className=rowClass(h);
     tr.innerHTML =
       `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
@@ -1528,10 +1604,11 @@ function renderTop(){
       `<td data-tip="${esc(o.f.setups)}">${o.f.nScans>1?'★ ':''}${o.f.nScans}</td>`+
       `<td>${fmtNum(P)}</td>`+
       `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
+      corrTd(o.corr)+
       `<td>${fmtNum(h.optimal_entry)}</td>`+
       `<td>${fmtNum(h.sl_tight)}</td>`+
-      tpCell(h.tp1,h.rr1)+
-      `<td>${h.rr1!=null?(+h.rr1).toFixed(2):'—'}</td>`+
+      `<td data-tip="${tgtTip}">${o.rr.tp!=null?fmtNum(o.rr.tp):'—'}</td>`+
+      `<td data-tip="Realistic reward:risk — to a target at least ~2% away, capped at 8:1 so measured-move projections don't inflate it.">${o.rr.rr?('<b>'+o.rr.rr.toFixed(2)+'</b>'):'—'}</td>`+
       `<td class="whycell" data-tip="${esc(o.why.join(' · '))}">${shortWhy}</td>`;
     tb.appendChild(tr);
   }
