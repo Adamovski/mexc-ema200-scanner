@@ -127,6 +127,7 @@ class State:
                     "scan_every": self.cfg["scan_every"],
                     "ema_period": EMA_PERIOD,
                     "futures_only": self.cfg.get("futures_only", True),
+                    "market": self.cfg.get("market", "futures"),
                     "telegram": bool(self.cfg.get("telegram_token") and self.cfg.get("telegram_chat")),
                 },
             }
@@ -140,7 +141,8 @@ def run_one_scan(state: State) -> None:
         state.error = ""
     try:
         symbols = list_symbols(sess, cfg["quote"],
-                               futures_only=cfg.get("futures_only", True))
+                               futures_only=cfg.get("futures_only", True),
+                               market=cfg.get("market", "futures"))
         with state.lock:
             state.universe = len(symbols)
             state.progress = (0, len(symbols))
@@ -159,6 +161,7 @@ def run_one_scan(state: State) -> None:
                 ("kline_limit", "lookback", "retest_tol", "break_tol",
                  "max_above_now", "min_slope", "pole_min_gain", "flag_max_retrace",
                  "cpr_max_width_pct")}
+    scan_cfg["market"] = cfg.get("market", "futures")
     with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
         futs = {ex.submit(scan_symbol_multi, sess, s, cfg["interval"], scan_cfg): s
                 for s in symbols}
@@ -253,12 +256,26 @@ def scan_loop(state: State) -> None:
 
 
 MEXC_PRICE_URL = "https://api.mexc.com/api/v3/ticker/price"
+MEXC_FUT_TICKER = "https://contract.mexc.com/api/v1/contract/ticker"
+
+
+def fetch_all_prices(sess, market: str) -> dict:
+    """All last-prices in ONE request, keyed by DISPLAY symbol (BTCUSDT)."""
+    if market == "futures":
+        r = sess.get(MEXC_FUT_TICKER, timeout=20)
+        r.raise_for_status()
+        return {d["symbol"].replace("_", ""): float(d["lastPrice"])
+                for d in r.json().get("data", [])}
+    r = sess.get(MEXC_PRICE_URL, timeout=20)
+    r.raise_for_status()
+    return {d["symbol"]: float(d["price"]) for d in r.json()}
 
 
 def breakout_watcher(state: State) -> None:
     """Every ~45s, pull ALL prices in one request and fire an alert the moment a
     watched bull flag trades above its breakout level. Cheap: one call per tick."""
     sess = get_session()
+    market = state.cfg.get("market", "futures")
     while True:
         time.sleep(45)
         with state.lock:
@@ -267,9 +284,7 @@ def breakout_watcher(state: State) -> None:
         if not watch:
             continue
         try:
-            r = sess.get(MEXC_PRICE_URL, timeout=20)
-            r.raise_for_status()
-            prices = {d["symbol"]: float(d["price"]) for d in r.json()}
+            prices = fetch_all_prices(sess, market)
         except Exception:
             continue
         events = []
@@ -384,6 +399,13 @@ PAGE = """<!doctype html>
   .tfpill.tf-weekly{background:rgba(240,180,41,.16);color:#f0b429;border-color:rgba(240,180,41,.5)}
   .tfpill.tf-daily{background:rgba(63,185,80,.14);color:var(--accent);border-color:rgba(63,185,80,.5)}
   .tfpill.tf-4h{background:var(--panel)}
+  /* bias pill on the support-bounce tab */
+  .biaspill2{display:inline-block;border-radius:5px;padding:1px 7px;font-size:11px;font-weight:700;
+       border:1px solid var(--line);color:var(--dim);white-space:nowrap}
+  .biaspill2.b-bullishchoch{background:rgba(240,180,41,.16);color:#f0b429;border-color:rgba(240,180,41,.55)}
+  .biaspill2.b-bullish{background:rgba(63,185,80,.14);color:var(--accent);border-color:rgba(63,185,80,.5)}
+  .biaspill2.b-bearish{background:rgba(248,81,73,.14);color:#f85149;border-color:rgba(248,81,73,.5)}
+  .biaspill2.b-range{background:var(--panel)}
   /* info panel */
   .info{max-width:900px;color:var(--txt);font-size:14px;line-height:1.65}
   .info h2{font-size:15px;margin:22px 0 8px;color:var(--txt)}
@@ -559,6 +581,7 @@ PAGE = """<!doctype html>
       <th data-bk="touches">Touches</th>
       <th data-bk="dist_to_support_pct">Dist %</th>
       <th data-bk="rsi">RSI</th>
+      <th data-bk="bias">Bias</th>
       <th data-bk="optimal_entry">Optimal entry</th>
       <th data-bk="sl_tight">SL tight</th>
       <th data-bk="sl_wide">SL wide</th>
@@ -841,7 +864,8 @@ function ago(ts){ if(!ts) return "—"; const s=Math.max(0,Math.floor(Date.now()
   return Math.floor(m/60)+"h "+(m%60)+"m ago"; }
 function until(ts){ if(!ts) return "—"; const s=Math.floor(ts-Date.now()/1000);
   if(s<=0) return "due"; const m=Math.floor(s/60); return m>0? m+"m "+(s%60)+"s" : s+"s"; }
-function tvLink(sym){ return "https://www.tradingview.com/chart/?symbol=MEXC:"+sym; }
+function tvLink(sym){ const perp=(lastData&&lastData.cfg&&lastData.cfg.market==="futures")?".P":"";
+  return "https://www.tradingview.com/chart/?symbol=MEXC:"+sym+perp; }
 function badges(h){
   let s="";
   if(h.is_new) s+='<span class="newbadge">NEW</span>';
@@ -1044,6 +1068,7 @@ function renderBounce(){
       `<td>${h.touches}</td>`+
       `<td>${(+h.dist_to_support_pct).toFixed(2)}</td>`+
       `<td>${h.rsi==null?'—':(+h.rsi).toFixed(0)}</td>`+
+      `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
       `<td>${fmtNum(h.optimal_entry)}</td>`+
       `<td>${fmtNum(h.sl_tight)}</td>`+
       `<td>${fmtNum(h.sl_wide)}</td>`+
@@ -1097,7 +1122,7 @@ async function poll(){
     document.getElementById("cprCount").textContent = `${clatest.length} narrow-CPR · ${d.universe} pairs${bothTxt}`;
     document.getElementById("bounceCount").textContent = `${blatest.length} bounce(s) · ${d.universe} pairs${bothTxt}`;
     document.getElementById("meta").textContent =
-      `${d.cfg.interval} chart · ${d.cfg.quote} ${d.cfg.futures_only?'· futures-listed':'spot'} · EMA${d.cfg.ema_period} · rescans every ${d.cfg.scan_every}m${d.cfg.telegram?' · 📲 Telegram on':''}`;
+      `${d.cfg.interval} chart · MEXC ${d.cfg.market==='futures'?'perps ⚡':'spot'} · ${d.cfg.quote} · EMA${d.cfg.ema_period} · rescans every ${d.cfg.scan_every}m${d.cfg.telegram?' · 📲 Telegram on':''}`;
     const dot=document.getElementById("dot");
     dot.className = "dot" + (d.scanning? " live":"");
     document.getElementById("scanState").textContent =
@@ -1182,8 +1207,10 @@ def main() -> None:
     p.add_argument("--cpr-max-width", type=float, default=0.75,
                    help="narrow CPR: max CPR width as %% of price (0.75 = 0.75%%)")
     p.add_argument("--include-spot-only", action="store_true",
-                   help="also scan coins NOT listed on MEXC futures "
-                        "(default: futures-listed coins only)")
+                   help="spot market: also scan coins NOT on futures")
+    p.add_argument("--market", default=os.environ.get("MARKET", "futures"),
+                   choices=["futures", "spot"],
+                   help="which MEXC market to scan (default: futures/perps)")
     args = p.parse_args()
 
     cfg = {
@@ -1195,6 +1222,7 @@ def main() -> None:
         "pole_min_gain": args.pole_min_gain, "flag_max_retrace": args.flag_max_retrace,
         "cpr_max_width_pct": args.cpr_max_width,
         "futures_only": not args.include_spot_only,
+        "market": args.market,
         "telegram_token": os.environ.get("TELEGRAM_TOKEN", "").strip(),
         "telegram_chat": os.environ.get("TELEGRAM_CHAT_ID", "").strip(),
     }
@@ -1214,8 +1242,8 @@ def main() -> None:
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(state))
     url = f"http://localhost:{args.port}"
     print(f"\n  MEXC 200-EMA cross & retest dashboard")
-    print(f"  scanning {cfg['quote']} spot on the {cfg['interval']} chart, "
-          f"every {cfg['scan_every']} min")
+    print(f"  scanning MEXC {cfg['market']} ({cfg['quote']}) on the "
+          f"{cfg['interval']} chart, every {cfg['scan_every']} min")
     print(f"  open  {url}   (Ctrl+C to stop)\n")
     try:
         srv.serve_forever()

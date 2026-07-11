@@ -686,10 +686,21 @@ def detect_support_bounce(rows: list, highs: list[float], lows: list[float],
     bundle = level_bundle(entry, sl_tight, sl_wide, res)
 
     tf_label = {"1w": "Weekly", "1d": "Daily", "4h": "4h"}[tf]
+    ms = market_structure(highs, lows, closes)
+    if ms["choch"] == "bullish":
+        bias = "Bullish CHoCH"
+    elif ms["structure"] == "uptrend":
+        bias = "Bullish"
+    elif ms["structure"] == "downtrend":
+        bias = "Bearish"
+    else:
+        bias = "Range"
     return True, {
         "price": price,
         "support": slevel,
         "tf": tf_label,
+        "bias": bias,
+        "choch": ms["choch"],
         "touches": touches,
         "dist_to_support_pct": round(dist * 100, 2),
         "rsi": r14,
@@ -744,7 +755,9 @@ def list_futures_bases(sess: requests.Session) -> set[str]:
 
 
 def list_symbols(sess: requests.Session, quote: str,
-                 futures_only: bool = False) -> list[str]:
+                 futures_only: bool = False, market: str = "spot") -> list[str]:
+    if market == "futures":
+        return list_futures_symbols(sess, quote)   # every USDT perp
     r = sess.get(f"{BASE}/api/v3/exchangeInfo", timeout=30)
     r.raise_for_status()
     data = r.json()
@@ -781,6 +794,71 @@ def list_symbols(sess: requests.Session, quote: str,
     return sorted(set(syms))
 
 
+def to_contract(display_symbol: str, quote: str = "USDT") -> str:
+    """'BTCUSDT' -> 'BTC_USDT' (MEXC futures contract symbol)."""
+    if display_symbol.endswith(quote) and "_" not in display_symbol:
+        return display_symbol[:-len(quote)] + "_" + quote
+    return display_symbol
+
+
+FUT_INTERVAL = {"1m": "Min1", "5m": "Min5", "15m": "Min15", "30m": "Min30",
+                "1h": "Min60", "4h": "Hour4", "8h": "Hour8", "1d": "Day1",
+                "1w": "Week1"}
+_FUT_SECS = {"Min1": 60, "Min5": 300, "Min15": 900, "Min30": 1800, "Min60": 3600,
+             "Hour4": 14400, "Hour8": 28800, "Day1": 86400, "Week1": 604800}
+
+
+def list_futures_symbols(sess: requests.Session, quote: str = "USDT") -> list[str]:
+    """All tradable USDT-perp contracts, as DISPLAY symbols ('BTCUSDT')."""
+    r = sess.get(f"{FUTURES_BASE}/api/v1/contract/detail", timeout=30)
+    r.raise_for_status()
+    out = []
+    for c in r.json().get("data", []):
+        if c.get("quoteCoin") != quote or c.get("isHidden"):
+            continue
+        base = str(c.get("baseCoin", "")).upper()
+        if base in STABLE_BASES or not base:
+            continue
+        out.append(base + quote)
+    return sorted(set(out))
+
+
+def fetch_futures_klines(sess: requests.Session, symbol: str, interval: str,
+                         limit: int) -> list[list] | None:
+    """Fetch futures (perp) klines and return them in the same ROW shape as the
+    spot endpoint: [openTime_ms, open, high, low, close, vol, closeTime_ms, ...]."""
+    cs = to_contract(symbol)
+    iv = FUT_INTERVAL.get(interval, "Hour4")
+    start = int(time.time()) - limit * _FUT_SECS.get(iv, 14400)
+    for attempt in range(4):
+        try:
+            r = sess.get(f"{FUTURES_BASE}/api/v1/contract/kline/{cs}",
+                         params={"interval": iv, "start": start}, timeout=30)
+            if r.status_code == 429:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            d = r.json().get("data") or {}
+            t = d.get("time") or []
+            if not t:
+                return None
+            o, h, l, c, v = d["open"], d["high"], d["low"], d["close"], d["vol"]
+            return [[t[i] * 1000, float(o[i]), float(h[i]), float(l[i]),
+                     float(c[i]), float(v[i]), t[i] * 1000, 0, 0, 0, 0, 0]
+                    for i in range(len(t))]
+        except (requests.RequestException, KeyError, ValueError):
+            time.sleep(0.6 * (attempt + 1))
+    return None
+
+
+def fetch_candles(sess: requests.Session, symbol: str, interval: str,
+                  limit: int, market: str) -> list[list] | None:
+    """Dispatch to the futures or spot kline endpoint (unified row shape)."""
+    if market == "futures":
+        return fetch_futures_klines(sess, symbol, interval, limit)
+    return fetch_klines(sess, symbol, interval, limit)
+
+
 def fetch_klines(sess: requests.Session, symbol: str, interval: str,
                  limit: int) -> list[list] | None:
     for attempt in range(4):
@@ -810,7 +888,8 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
     """Fetch klines ONCE and run all four detectors (200-EMA reclaim, bull flag,
     narrow CPR, support bounce). One request per symbol powers every scan.
     Returns (ema, flag, cpr, bounce) dicts (each with 'symbol') or None."""
-    raw = fetch_klines(sess, symbol, interval, cfg["kline_limit"])
+    raw = fetch_candles(sess, symbol, interval, cfg["kline_limit"],
+                        cfg.get("market", "spot"))
     if not raw or len(raw) < EMA_PERIOD + 2:
         return None, None, None, None
     # MEXC kline row: [openTime, open, high, low, close, volume, closeTime, ...]
@@ -903,7 +982,8 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     """On-demand technical read of one coin on the 4h chart: trend vs the 200 EMA,
     support/resistance, a suggested entry / stop / three targets with R:R, and
     whether it currently matches either scan. Technical estimate, NOT advice."""
-    raw = fetch_klines(sess, symbol, interval, cfg.get("kline_limit", 1000))
+    raw = fetch_candles(sess, symbol, interval, cfg.get("kline_limit", 1000),
+                        cfg.get("market", "spot"))
     if not raw or len(raw) < EMA_PERIOD + 2:
         return {"error": f"Not enough 4h data for '{symbol}'. Check the ticker "
                          f"is a coin listed on MEXC spot (e.g. BTCUSDT)."}
@@ -1075,8 +1155,9 @@ def main() -> None:
     p.add_argument("--max-above", type=float, default=MAX_ABOVE_NOW)
     p.add_argument("--min-slope", type=float, default=MIN_SLOPE)
     p.add_argument("--include-spot-only", action="store_true",
-                   help="also scan coins NOT listed on MEXC futures "
-                        "(default: futures-listed coins only)")
+                   help="spot market: also scan coins NOT on futures")
+    p.add_argument("--market", default="futures", choices=["futures", "spot"],
+                   help="which MEXC market to scan (default: futures/perps)")
     args = p.parse_args()
 
     cfg = {
@@ -1084,15 +1165,16 @@ def main() -> None:
         "retest_tol": args.retest_tol, "break_tol": args.break_tol,
         "max_above_now": args.max_above, "min_slope": args.min_slope,
         "pole_min_gain": 0.15, "flag_max_retrace": 0.5, "cpr_max_width_pct": 0.75,
+        "market": args.market,
     }
 
     sess = get_session()
     futures_only = not args.include_spot_only
-    print(f"Fetching {args.quote} spot symbols from MEXC "
-          f"({'futures-listed only' if futures_only else 'all spot'}) ...",
+    print(f"Fetching {args.quote} {args.market} symbols from MEXC ...",
           file=sys.stderr)
     try:
-        symbols = list_symbols(sess, args.quote, futures_only=futures_only)
+        symbols = list_symbols(sess, args.quote, futures_only=futures_only,
+                               market=args.market)
     except requests.RequestException as e:
         sys.exit(f"Could not reach MEXC: {e}")
     print(f"Scanning {len(symbols)} pairs on the {args.interval} chart "
