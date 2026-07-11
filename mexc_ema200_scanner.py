@@ -94,6 +94,16 @@ def atr(highs: list[float], lows: list[float], closes: list[float],
     return sum(recent) / len(recent) if recent else 0.0
 
 
+def rel_volume(volumes: list[float], lookback: int = 20) -> float | None:
+    """Relative volume of the latest candle vs the prior `lookback`-candle average.
+    >1 = the current bar is trading on above-average volume (confirmation)."""
+    if len(volumes) < lookback + 2:
+        return None
+    base = volumes[-lookback - 1:-1]
+    avg = sum(base) / len(base)
+    return round(volumes[-1] / avg, 2) if avg > 0 else None
+
+
 def rsi(closes: list[float], period: int = 14) -> float | None:
     """Relative Strength Index (0-100). <30 oversold, >70 overbought."""
     if len(closes) < period + 1:
@@ -800,6 +810,17 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
     except (ValueError, IndexError):
         return None, None, None, None
 
+    rv = rel_volume(vols)                       # relative volume of the latest candle
+
+    def confirmed(d: dict, boost: bool) -> dict:
+        """Attach relative volume, and (for momentum setups) nudge the score up
+        when the signal candle prints on above-average volume — confirmation."""
+        d = {"symbol": symbol, "rvol": rv, **d}
+        if boost and rv:
+            factor = 1.0 + 0.15 * max(0.0, min(1.0, (rv - 1.0) / 1.5))
+            d["score"] = round(min(100.0, d["score"] * factor), 1)
+        return d
+
     ema_hit = flag_hit = cpr_hit = bounce_hit = None
     ok, d = detect_cross_and_retest(
         highs, lows, closes,
@@ -808,7 +829,7 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
         max_above_now=cfg["max_above_now"], min_slope=cfg["min_slope"],
     )
     if ok:
-        ema_hit = {"symbol": symbol, **d}
+        ema_hit = confirmed(d, boost=True)
 
     ok2, f = detect_bull_flag(
         highs, lows, closes, vols,
@@ -816,16 +837,16 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
         max_retrace=cfg.get("flag_max_retrace", 0.5),
     )
     if ok2:
-        flag_hit = {"symbol": symbol, **f}
+        flag_hit = confirmed(f, boost=False)     # flags want volume to DRY UP
 
     ok3, c = detect_narrow_cpr(
         rows, cpr_max_width_pct=cfg.get("cpr_max_width_pct", 0.75))
     if ok3:
-        cpr_hit = {"symbol": symbol, **c}
+        cpr_hit = confirmed(c, boost=True)
 
     ok4, b = detect_support_bounce(rows, highs, lows, closes, vols)
     if ok4:
-        bounce_hit = {"symbol": symbol, **b}
+        bounce_hit = confirmed(b, boost=True)
 
     return ema_hit, flag_hit, cpr_hit, bounce_hit
 
@@ -900,6 +921,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     r14 = rsi(closes)
     ms = market_structure(highs, lows, closes)
     vp = volume_profile(vols, closes)
+    rv = rel_volume(vols)
     win = closes[-120:] if len(closes) >= 120 else closes
     hh = max(highs[-120:]) if len(highs) >= 120 else max(highs)
     ll = min(lows[-120:]) if len(lows) >= 120 else min(lows)
@@ -951,7 +973,10 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         notes.append(f"RSI(14) is {r14} ({state}).")
     notes.append(f"Volume is {vp['vol_trend']} vs its average"
                  + (f" (x{vp['vol_ratio']})" if vp['vol_ratio'] else "")
-                 + f", with {vp['pressure']} in control of recent candles.")
+                 + f", with {vp['pressure']} in control of recent candles"
+                 + (f"; the latest candle is at {rv}x average volume"
+                    + (" — confirming" if rv and rv > 1.3 else "") if rv else "")
+                 + ".")
     if range_pos is not None:
         notes.append(f"Price sits {range_pos}% up its recent range "
                      f"(0% = range low, 100% = range high); ATR ≈ {atr_pct}% of price.")
@@ -984,6 +1009,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "choch": ms["choch"],
         "vol_trend": vp["vol_trend"],
         "vol_ratio": vp["vol_ratio"],
+        "rvol": rv,
         "pressure": vp["pressure"],
         "resistances": res[:4],
         "support_bounce": bool(okB),

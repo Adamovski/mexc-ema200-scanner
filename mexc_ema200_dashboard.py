@@ -56,6 +56,22 @@ except ImportError:
 
 
 # ----------------------------------------------------------------------------
+# Telegram push alerts (optional — set TELEGRAM_TOKEN + TELEGRAM_CHAT_ID)
+# ----------------------------------------------------------------------------
+def send_telegram(cfg: dict, text: str) -> None:
+    tok = cfg.get("telegram_token")
+    chat = cfg.get("telegram_chat")
+    if not tok or not chat:
+        return
+    try:
+        requests.get(f"https://api.telegram.org/bot{tok}/sendMessage",
+                     params={"chat_id": chat, "text": text, "parse_mode": "HTML",
+                             "disable_web_page_preview": "true"}, timeout=15)
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------------------
 # Shared state (updated by the scan loop, read by the HTTP handler)
 # ----------------------------------------------------------------------------
 class State:
@@ -75,6 +91,7 @@ class State:
         self.prev_bounce_symbols: set[str] | None = None
         self.new_bounce_symbols: list[str] = []
         self.both_symbols: list[str] = []          # appear on 2+ scans (confluence)
+        self.prev_both: set[str] | None = None     # confluence set from previous scan
         self.watch: dict[str, float] = {}          # symbol -> flag breakout level (armed)
         self.watch_fired: set[str] = set()         # already-alerted breakouts
         self.breakout_events: list[dict] = []      # recent triggered breakouts
@@ -110,6 +127,7 @@ class State:
                     "scan_every": self.cfg["scan_every"],
                     "ema_period": EMA_PERIOD,
                     "futures_only": self.cfg.get("futures_only", True),
+                    "telegram": bool(self.cfg.get("telegram_token") and self.cfg.get("telegram_chat")),
                 },
             }
 
@@ -210,9 +228,19 @@ def run_one_scan(state: State) -> None:
         state.watch_fired = {s for s in state.watch_fired if s in new_watch}
         state.watch = new_watch
 
+        # newly-formed confluence coins (for Telegram) — skip the first scan
+        prev_both = state.prev_both
+        new_both = set() if prev_both is None else (both - prev_both)
+        state.prev_both = both
+
         state.last_scan = time.time()
         state.progress = (done, len(symbols))
         state.scanning = False
+
+    for s in sorted(new_both):
+        labels = conf.get(s, [])
+        send_telegram(cfg, f"⭐ <b>{s}</b> confluence — now on {len(labels)} "
+                           f"scans: {', '.join(labels)}")
 
 
 def scan_loop(state: State) -> None:
@@ -255,6 +283,10 @@ def breakout_watcher(state: State) -> None:
             with state.lock:
                 state.watch_fired = fired
                 state.breakout_events = (state.breakout_events + events)[-20:]
+            for e in events:
+                send_telegram(state.cfg,
+                    f"🚀 <b>{e['symbol']}</b> BULL-FLAG BREAKOUT\n"
+                    f"crossed {e['breakout']:.6g} — now {e['price']:.6g}")
 
 
 # ----------------------------------------------------------------------------
@@ -440,6 +472,7 @@ PAGE = """<!doctype html>
       <th data-k="tp3">TP3</th>
       <th data-k="tp4">TP4</th>
       <th data-k="tp5">TP5</th>
+      <th data-k="rvol">RVol</th>
       <th data-k="score">Score</th>
     </tr></thead>
     <tbody id="rows"></tbody>
@@ -470,6 +503,7 @@ PAGE = """<!doctype html>
       <th data-fk="tp3">TP3</th>
       <th data-fk="tp4">TP4</th>
       <th data-fk="tp5">TP5</th>
+      <th data-fk="rvol">RVol</th>
       <th data-fk="score">Score</th>
     </tr></thead>
     <tbody id="frows"></tbody>
@@ -500,6 +534,7 @@ PAGE = """<!doctype html>
       <th data-ck="tp3">TP3</th>
       <th data-ck="tp4">TP4</th>
       <th data-ck="tp5">TP5</th>
+      <th data-ck="rvol">RVol</th>
       <th data-ck="score">Score</th>
     </tr></thead>
     <tbody id="crows"></tbody>
@@ -531,6 +566,7 @@ PAGE = """<!doctype html>
       <th data-bk="tp3">TP3</th>
       <th data-bk="tp4">TP4</th>
       <th data-bk="tp5">TP5</th>
+      <th data-bk="rvol">RVol</th>
       <th data-bk="score">Score</th>
     </tr></thead>
     <tbody id="brows"></tbody>
@@ -618,6 +654,25 @@ PAGE = """<!doctype html>
   <p>These are mechanical estimates to save you eyeballing the chart, not
   recommendations. A high R:R only means the geometry is favourable, not that the
   trade will work — size and manage risk yourself.</p>
+
+  <h2>RVol — volume confirmation</h2>
+  <p>The <b>RVol</b> column is the latest candle's volume divided by its recent
+  20-bar average. Above <b>1.0×</b> means the signal is printing on
+  above-average volume — <b>confirmation</b> that real participation is behind the
+  move (values ≥ 1.5× are highlighted green). A reclaim, CPR break or support
+  bounce on high volume is more trustworthy, so those setups get a small score
+  boost when RVol is elevated. (Bull flags are the exception — they're healthiest
+  when volume <i>dries up</i> during the flag, which the Vol ratio column tracks.)</p>
+
+  <h2>Telegram push alerts 📲</h2>
+  <p>Get alerts on your phone 24/7, even with the tab closed. When the header
+  shows "📲 Telegram on", the server pushes a message whenever a <b>bull flag
+  breaks out</b> or a coin <b>newly becomes confluence</b> (lands on 2+ scans).
+  To enable it: message <code>@BotFather</code> on Telegram → <code>/newbot</code>
+  → copy the <b>token</b>; then message <code>@userinfobot</code> to get your
+  <b>chat ID</b>; and add both as environment variables
+  (<code>TELEGRAM_TOKEN</code>, <code>TELEGRAM_CHAT_ID</code>) on the host, then
+  redeploy.</p>
 
   <h2>Bull-flag breakout alerts 🔔</h2>
   <p>Click <b>Enable breakout alerts</b> (top-right) once to turn on sound and
@@ -804,6 +859,8 @@ document.addEventListener("mouseout",e=>{
 function rowClass(h){ return (h.is_new?"isnew ":"")+(h.both?"both":""); }
 function tpCell(v,rr){ return v==null?'<td>—</td>'
   :`<td>${fmtNum(v)}${rr!=null?`<span class="rr">R${(+rr).toFixed(1)}</span>`:''}</td>`; }
+function rvCell(v){ return v==null?'<td>—</td>'
+  :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
   for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["analyze","Analyze"],["info","Info"]]){
@@ -850,6 +907,7 @@ function azCard(d){
       ${cell("RSI (14)", d.rsi==null?'—':(+d.rsi).toFixed(0)+(d.rsi<30?' oversold':d.rsi>70?' overbought':''))}
       ${cell("Volume", (d.vol_trend||'—')+(d.vol_ratio?` ×${d.vol_ratio}`:''))}
       ${cell("Pressure", d.pressure||'—')}
+      ${cell("Rel volume", d.rvol==null?'—':(+d.rvol).toFixed(2)+'× latest bar')}
       ${cell("Range position", d.range_pos==null?'—':d.range_pos+'%')}
       ${cell("ATR", d.atr_pct==null?'—':d.atr_pct+'%')}
       ${cell("Supports", (d.supports||[]).slice(0,3).map(fmtNum).join(' · ')||'—')}
@@ -906,6 +964,7 @@ function renderFlags(){
       `<td>${fmtNum(h.sl_tight)}</td>`+
       `<td>${fmtNum(h.sl_wide)}</td>`+
       tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
+      rvCell(h.rvol)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
   }
@@ -930,6 +989,7 @@ function render(){
       `<td>${fmtNum(h.sl_tight)}</td>`+
       `<td>${fmtNum(h.sl_wide)}</td>`+
       tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
+      rvCell(h.rvol)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
   }
@@ -973,6 +1033,7 @@ function renderBounce(){
       `<td>${fmtNum(h.sl_tight)}</td>`+
       `<td>${fmtNum(h.sl_wide)}</td>`+
       tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
+      rvCell(h.rvol)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
   }
@@ -999,6 +1060,7 @@ function renderCPR(){
       `<td>${fmtNum(h.sl_tight)}</td>`+
       `<td>${fmtNum(h.sl_wide)}</td>`+
       tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
+      rvCell(h.rvol)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
   }
@@ -1020,7 +1082,7 @@ async function poll(){
     document.getElementById("cprCount").textContent = `${clatest.length} narrow-CPR · ${d.universe} pairs${bothTxt}`;
     document.getElementById("bounceCount").textContent = `${blatest.length} bounce(s) · ${d.universe} pairs${bothTxt}`;
     document.getElementById("meta").textContent =
-      `${d.cfg.interval} chart · ${d.cfg.quote} ${d.cfg.futures_only?'· futures-listed':'spot'} · EMA${d.cfg.ema_period} · rescans every ${d.cfg.scan_every}m`;
+      `${d.cfg.interval} chart · ${d.cfg.quote} ${d.cfg.futures_only?'· futures-listed':'spot'} · EMA${d.cfg.ema_period} · rescans every ${d.cfg.scan_every}m${d.cfg.telegram?' · 📲 Telegram on':''}`;
     const dot=document.getElementById("dot");
     dot.className = "dot" + (d.scanning? " live":"");
     document.getElementById("scanState").textContent =
@@ -1118,8 +1180,17 @@ def main() -> None:
         "pole_min_gain": args.pole_min_gain, "flag_max_retrace": args.flag_max_retrace,
         "cpr_max_width_pct": args.cpr_max_width,
         "futures_only": not args.include_spot_only,
+        "telegram_token": os.environ.get("TELEGRAM_TOKEN", "").strip(),
+        "telegram_chat": os.environ.get("TELEGRAM_CHAT_ID", "").strip(),
     }
     state = State(cfg)
+
+    if cfg["telegram_token"] and cfg["telegram_chat"]:
+        print("  Telegram alerts: ON")
+        send_telegram(cfg, "✅ MEXC scanner is live — breakout &amp; confluence "
+                           "alerts are on.")
+    else:
+        print("  Telegram alerts: off (set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)")
 
     t = threading.Thread(target=scan_loop, args=(state,), daemon=True)
     t.start()
