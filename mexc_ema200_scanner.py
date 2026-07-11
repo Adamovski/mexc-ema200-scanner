@@ -152,26 +152,31 @@ def detect_cross_and_retest(
         if closes[i] < e[i] * (1.0 - break_tol):
             return False, {}
 
-    # Look for a retest between the reclaim and now: low tags the EMA band,
-    # close holds above it. (The reclaim candle itself doesn't count.)
+    # Look for a retest between the reclaim and now: the low must TAG the EMA
+    # band — i.e. come within +/- retest_tol of the EMA — while the candle still
+    # CLOSES at/above the EMA (held as support). Requiring the low to be within
+    # the band on BOTH sides rejects violent downside wicks that plunge far
+    # below the EMA and merely close back above (common noise on illiquid names).
+    # We keep the retest whose low sits CLOSEST to the EMA (the cleanest tag).
     best_gap = None
     retest_idx = None
     for i in range(cross_idx + 1, last + 1):
         if e[i] is None:
             continue
-        low_gap = (lows[i] - e[i]) / e[i]            # how far the low sat above EMA
-        if low_gap <= retest_tol and closes[i] >= e[i]:
-            if best_gap is None or low_gap < best_gap:
+        low_gap = (lows[i] - e[i]) / e[i]            # low vs EMA (+above / -below)
+        if abs(low_gap) <= retest_tol and closes[i] >= e[i]:
+            if best_gap is None or abs(low_gap) < abs(best_gap):
                 best_gap = low_gap
                 retest_idx = i
     if retest_idx is None:
         return False, {}
 
     bars_since_cross = last - cross_idx
-    # Score: reward a tight retest, a fresh cross, and price sitting near the EMA.
+    # Score, 0-100: reward a tight retest, a fresh cross, and price sitting near
+    # the EMA. Each component is clamped to [0,1] so the total never exceeds 100.
     freshness = max(0.0, 1.0 - bars_since_cross / lookback)
-    tightness = max(0.0, 1.0 - best_gap / retest_tol)
-    proximity = max(0.0, 1.0 - pct_above / max_above_now)
+    tightness = max(0.0, min(1.0, 1.0 - abs(best_gap) / retest_tol))
+    proximity = max(0.0, min(1.0, 1.0 - pct_above / max_above_now))
     score = round(100 * (0.45 * tightness + 0.35 * freshness + 0.20 * proximity), 1)
 
     return True, {
@@ -193,6 +198,15 @@ def get_session() -> requests.Session:
     return s
 
 
+# Stablecoins / pegged assets — a "200-EMA cross" on these is meaningless
+# (they hover around $1), so we drop them from the crypto scan.
+STABLE_BASES = {
+    "USDT", "USDC", "USDD", "DAI", "TUSD", "FDUSD", "USDE", "USDP", "PYUSD",
+    "GUSD", "BUSD", "EURT", "EURS", "EUR", "USD1", "FRAX", "LUSD", "SUSD",
+    "USDJ", "USDX", "CUSD", "USTC", "AEUR", "XUSD",
+}
+
+
 def list_symbols(sess: requests.Session, quote: str) -> list[str]:
     r = sess.get(f"{BASE}/api/v3/exchangeInfo", timeout=30)
     r.raise_for_status()
@@ -204,9 +218,12 @@ def list_symbols(sess: requests.Session, quote: str) -> list[str]:
         # status is "1"/"ENABLED" for tradable spot symbols
         if str(s.get("status")) not in ("1", "ENABLED", "TRADING"):
             continue
-        # skip leveraged tokens (3L/3S/5L/5S etc.) — noisy for this scan
         base = s.get("baseAsset", "")
+        # skip leveraged tokens (3L/3S/5L/5S etc.) — noisy for this scan
         if base.endswith(("3L", "3S", "5L", "5S", "2L", "2S", "4L", "4S")):
+            continue
+        # skip stablecoin/pegged bases (no meaningful trend on a $1 peg)
+        if base.upper() in STABLE_BASES:
             continue
         syms.append(s["symbol"])
     return sorted(set(syms))
