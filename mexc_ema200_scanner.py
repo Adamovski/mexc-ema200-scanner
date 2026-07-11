@@ -238,7 +238,9 @@ def level_bundle(entry: float, sl_tight: float, sl_wide: float,
     """Package two stop scenarios and up to 5 targets, with R:R (to the tight
     stop) for each. R:R = (TP - entry) / (entry - stop) = profit / loss."""
     def rr(tp, sl):
-        return round((tp - entry) / (entry - sl), 2) if (tp and entry > sl) else None
+        # works for longs (tp/sl on the bullish side) and shorts (mirrored) —
+        # the ratio is sign-invariant: profit/loss.
+        return round((tp - entry) / (entry - sl), 2) if (tp and entry != sl) else None
     out = {"sl_tight": sl_tight, "sl_wide": sl_wide}
     padded = list(tps[:5]) + [None] * (5 - len(tps[:5]))
     for i, tp in enumerate(padded, 1):
@@ -894,6 +896,27 @@ def fetch_candles(sess: requests.Session, symbol: str, interval: str,
     return fetch_klines(sess, symbol, interval, limit)
 
 
+def fetch_live_price(sess: requests.Session, symbol: str,
+                     market: str) -> float | None:
+    """The current LIVE last-traded price for one symbol — independent of the
+    chart timeframe, so 'current price' is always up to the second."""
+    try:
+        if market == "futures":
+            r = sess.get(f"{FUTURES_BASE}/api/v1/contract/ticker",
+                         params={"symbol": to_contract(symbol)}, timeout=15)
+            r.raise_for_status()
+            d = r.json().get("data")
+            if isinstance(d, list):
+                d = d[0] if d else {}
+            return float(d["lastPrice"]) if d and d.get("lastPrice") else None
+        r = sess.get(f"{BASE}/api/v3/ticker/price",
+                     params={"symbol": symbol}, timeout=15)
+        r.raise_for_status()
+        return float(r.json()["price"])
+    except (requests.RequestException, KeyError, ValueError, TypeError):
+        return None
+
+
 _SPOT_IV = {"1h": "60m", "1w": "1W"}   # normalize to MEXC spot interval names
 
 
@@ -1048,7 +1071,10 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
 
     e = ema(closes, EMA_PERIOD)
     last = len(closes) - 1
-    price = closes[last]
+    # Current price = the LIVE last-traded price (same on every timeframe),
+    # falling back to the last closed candle if the ticker call fails.
+    live = fetch_live_price(sess, symbol, mkt)
+    price = live if live else closes[last]
     ema_now = e[last]
     if ema_now is None:
         return {"error": "Not enough data to compute the 200 EMA."}
@@ -1086,21 +1112,6 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     range_pos = round((price - ll) / (hh - ll) * 100, 1) if hh > ll else None
 
     entry = price
-    # Optimal (lower-risk) entry: pull back to the nearest support, or the EMA if
-    # price is extended above a rising EMA.
-    if sup:
-        optimal_entry = sup[0]
-    elif above:
-        optimal_entry = round(ema_now * 1.002, 10)
-    else:
-        optimal_entry = price
-    # ATR-buffered stops below real structure.
-    near_support = sup[0] if sup else (ema_now if above else price * 0.97)
-    sl_tight = near_support - 0.5 * a
-    deep_support = sup[1] if len(sup) > 1 else (sup[0] if sup else near_support)
-    sl_wide = min(deep_support - 1.0 * a, sl_tight)
-    bundle = level_bundle(entry, sl_tight, sl_wide, res)
-
     okE, dE = detect_cross_and_retest(
         highs, lows, closes, ema_period=EMA_PERIOD,
         lookback=cfg.get("lookback", 30), retest_tol=cfg.get("retest_tol", 0.02),
@@ -1138,6 +1149,41 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         short_pts += 1        # overbought — pullback risk
     net = long_pts - short_pts
     direction = "Long" if net >= 2 else ("Short" if net <= -2 else "Neutral")
+
+    # --- hover explanations for the bias / direction / structure pills ---
+    bias_reason = (f"{bias.upper()}: price is {abs(pct_vs_ema):.1f}% "
+                   f"{'above' if above else 'below'} a {trend}-sloping 200 EMA.")
+    choch_note = (f" A {ms['choch']} CHoCH means the {ms['structure']} just printed "
+                  f"its first opposite structure break — an early turn signal."
+                  if ms["choch"] else "")
+    struct_reason = (f"Market structure is {ms['structure']} on this timeframe "
+                     f"(from swing highs/lows).{choch_note}")
+    dir_reason = (f"{direction.upper()}: {long_pts} bullish vs {short_pts} bearish "
+                  f"signals across the 200-EMA side, market structure & CHoCH, RSI, "
+                  f"and active setups — the stronger side wins.")
+
+    # --- DIRECTIONAL trade plan (short = stops above, targets below) ---
+    side = "short" if direction == "Short" else "long"
+    if side == "short":
+        r0 = res[0] if res else (ema_now if not above else price * 1.03)
+        optimal_entry = r0                       # sell into the nearest resistance
+        sl_tight = r0 + 0.5 * a                   # stop ABOVE resistance
+        r1 = res[1] if len(res) > 1 else r0
+        sl_wide = max(r1 + 1.0 * a, sl_tight)
+        plan_tps = sup                            # targets = supports BELOW
+    else:
+        if sup:
+            optimal_entry = sup[0]
+        elif above:
+            optimal_entry = round(ema_now * 1.002, 10)
+        else:
+            optimal_entry = price
+        near_support = sup[0] if sup else (ema_now if above else price * 0.97)
+        sl_tight = near_support - 0.5 * a
+        deep_support = sup[1] if len(sup) > 1 else (sup[0] if sup else near_support)
+        sl_wide = min(deep_support - 1.0 * a, sl_tight)
+        plan_tps = res                            # targets = resistances ABOVE
+    bundle = level_bundle(entry, sl_tight, sl_wide, plan_tps)
 
     notes = []
     notes.append(f"Price is {abs(pct_vs_ema):.1f}% {'above' if above else 'below'} "
@@ -1195,22 +1241,36 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     # Target ladder: overhead resistances BLENDED with Fibonacci extensions of the
     # recent range, deduped and sorted — a fuller set of profit targets (up to 8).
     rng = hh - ll if hh > ll else 0.0
-    cand = [(lvl, "overhead resistance (prior swing high)") for lvl in res]
-    for ratio in (0.272, 0.414, 0.618, 1.0, 1.618, 2.0):
-        lvl = hh + rng * ratio
-        if lvl > price:
-            cand.append((lvl, f"{ratio:g}× Fibonacci extension of the recent range"))
-    cand.sort(key=lambda x: x[0])
-    picked = []
-    for lvl, kind in cand:
-        if lvl <= price:
-            continue
-        if not picked or lvl > picked[-1][0] * 1.005:
-            picked.append((lvl, kind))
+    if side == "short":                          # targets go DOWN
+        cand = [(lvl, "support (prior swing low)") for lvl in sup]
+        for ratio in (0.272, 0.414, 0.618, 1.0, 1.618, 2.0):
+            lvl = ll - rng * ratio
+            if 0 < lvl < price:
+                cand.append((lvl, f"{ratio:g}× Fibonacci downside extension"))
+        cand.sort(key=lambda x: -x[0])           # nearest below first
+        picked = []
+        for lvl, kind in cand:
+            if lvl >= price:
+                continue
+            if not picked or lvl < picked[-1][0] * 0.995:
+                picked.append((lvl, kind))
+    else:                                        # targets go UP
+        cand = [(lvl, "overhead resistance (prior swing high)") for lvl in res]
+        for ratio in (0.272, 0.414, 0.618, 1.0, 1.618, 2.0):
+            lvl = hh + rng * ratio
+            if lvl > price:
+                cand.append((lvl, f"{ratio:g}× Fibonacci extension of the recent range"))
+        cand.sort(key=lambda x: x[0])
+        picked = []
+        for lvl, kind in cand:
+            if lvl <= price:
+                continue
+            if not picked or lvl > picked[-1][0] * 1.005:
+                picked.append((lvl, kind))
     target_ladder = [{"level": lvl, "kind": kind,
                       "pct": round((lvl - entry) / entry * 100, 1),
                       "rr": round((lvl - entry) / (entry - sl_tight), 2)
-                             if entry > sl_tight else None}
+                             if entry != sl_tight else None}
                      for lvl, kind in picked[:8]]
 
     return {
@@ -1228,8 +1288,12 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "above_ema": above,
         "bias": bias,
         "direction": direction,
+        "side": side,
         "dir_long_pts": long_pts,
         "dir_short_pts": short_pts,
+        "bias_reason": bias_reason,
+        "dir_reason": dir_reason,
+        "struct_reason": struct_reason,
         "rsi": r14,
         "atr_pct": atr_pct,
         "range_pos": range_pos,
