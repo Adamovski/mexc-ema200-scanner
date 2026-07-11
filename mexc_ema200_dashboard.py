@@ -48,6 +48,7 @@ except ImportError:
 try:
     from mexc_ema200_scanner import (
         list_symbols, scan_symbol_multi, get_session, Hit, FlagHit, EMA_PERIOD,
+        analyze_symbol, normalize_symbol,
     )
 except ImportError:
     sys.exit("Could not import mexc_ema200_scanner.py — keep both files in the "
@@ -266,6 +267,37 @@ PAGE = """<!doctype html>
   .info table.def td:first-child{color:var(--accent);font-weight:600;
        white-space:nowrap;width:170px}
   .info .warn{color:var(--warn)}
+  /* analyze tab */
+  .azbar{display:flex;gap:8px;max-width:520px;margin:4px 0 8px}
+  .azbar input{flex:1;background:var(--panel);border:1px solid var(--line);
+       border-radius:8px;color:var(--txt);padding:10px 12px;font-size:14px;outline:none}
+  .azbar input:focus{border-color:var(--accent)}
+  .azbar button{background:var(--accent);color:#04140a;border:none;border-radius:8px;
+       padding:0 18px;font-weight:700;font-size:14px;cursor:pointer}
+  .azbar button:disabled{opacity:.5;cursor:default}
+  .azhint{color:var(--dim);font-size:12.5px;max-width:760px}
+  .azresult{max-width:820px}
+  .azcard{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+       padding:16px 18px;margin:6px 0 14px}
+  .azhead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:4px}
+  .azhead .sym{font-size:18px;font-weight:700}
+  .azhead a{color:var(--accent);text-decoration:none;font-size:12.5px}
+  .biaspill{border-radius:20px;padding:2px 12px;font-weight:700;font-size:12px}
+  .bias-bullish{background:rgba(63,185,80,.15);color:var(--accent);border:1px solid rgba(63,185,80,.5)}
+  .bias-bearish{background:rgba(248,81,73,.15);color:#f85149;border:1px solid rgba(248,81,73,.5)}
+  .bias-neutral{background:rgba(139,152,173,.15);color:var(--dim);border:1px solid var(--line)}
+  .azgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));
+       gap:10px;margin:12px 0}
+  .azcell{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:9px 11px}
+  .azcell .k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+  .azcell .v{font-size:15px;font-weight:650;font-variant-numeric:tabular-nums;margin-top:2px}
+  .azcell .rr{color:var(--dim);font-size:11.5px;font-weight:500}
+  .aznotes{margin:10px 0 2px;padding-left:18px}
+  .aznotes li{margin:4px 0;color:#c3ccd8}
+  .aztags{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+  .aztag{font-size:11.5px;border-radius:6px;padding:2px 8px;border:1px solid var(--line);color:var(--dim)}
+  .aztag.on{background:rgba(63,185,80,.14);color:var(--accent);border-color:rgba(63,185,80,.5);font-weight:600}
+  .azerr{color:var(--warn);padding:10px 0}
 </style></head>
 <body>
 <header>
@@ -276,6 +308,7 @@ PAGE = """<!doctype html>
 <div class="tabs">
   <div class="tab active" id="tabSetups" onclick="showTab('setups')">200-EMA reclaim</div>
   <div class="tab" id="tabFlags" onclick="showTab('flags')">Bull flags</div>
+  <div class="tab" id="tabAnalyze" onclick="showTab('analyze')">Analyze a coin</div>
   <div class="tab" id="tabInfo" onclick="showTab('info')">Info</div>
 </div>
 
@@ -298,9 +331,11 @@ PAGE = """<!doctype html>
       <th data-k="retest_gap_pct">Retest %</th>
       <th data-k="sl">Stop (SL)</th>
       <th data-k="tp1">TP1</th>
+      <th data-k="rr1">R:R 1</th>
       <th data-k="tp2">TP2</th>
+      <th data-k="rr2">R:R 2</th>
       <th data-k="tp3">TP3</th>
-      <th data-k="rr">R:R</th>
+      <th data-k="rr3">R:R 3</th>
       <th data-k="score">Score</th>
     </tr></thead>
     <tbody id="rows"></tbody>
@@ -326,14 +361,30 @@ PAGE = """<!doctype html>
       <th data-fk="breakout">Breakout</th>
       <th data-fk="sl">Stop (SL)</th>
       <th data-fk="tp1">TP1</th>
+      <th data-fk="rr1">R:R 1</th>
       <th data-fk="tp2">TP2</th>
+      <th data-fk="rr2">R:R 2</th>
       <th data-fk="tp3">TP3</th>
-      <th data-fk="rr">R:R</th>
+      <th data-fk="rr3">R:R 3</th>
       <th data-fk="score">Score</th>
     </tr></thead>
     <tbody id="frows"></tbody>
   </table>
   <div class="empty" id="fempty" style="display:none">No bull flags right now. The loop keeps scanning…</div>
+</div>
+</div>
+
+<div class="view" id="viewAnalyze">
+<div class="wrap">
+  <div class="azbar">
+    <input id="azInput" type="text" placeholder="Enter a ticker, e.g. BTC or SOLUSDT"
+           autocomplete="off" spellcheck="false" onkeydown="if(event.key==='Enter')analyze()">
+    <button id="azBtn" onclick="analyze()">Analyze</button>
+  </div>
+  <div id="azResult" class="azresult"></div>
+  <p class="azhint">4h chart read from live MEXC data: trend vs the 200 EMA, support/resistance,
+     a suggested entry, stop, and three targets with R:R. A technical estimate to speed up
+     your own analysis — not financial advice.</p>
 </div>
 </div>
 
@@ -368,7 +419,7 @@ PAGE = """<!doctype html>
     <tr><td>Retest %</td><td>How close the pullback's low came to the EMA. Near 0 = a clean tag; a small negative means the wick dipped just below the line before closing back above.</td></tr>
     <tr><td>Stop (SL)</td><td>Suggested stop-loss — just below the setup's support (the lower of the EMA and the retest low). A close below here would invalidate the reclaim.</td></tr>
     <tr><td>TP1 / TP2 / TP3</td><td>Three take-profit targets at successive overhead resistances — the nearest prior swing highs above price, in order. Scale out as each is reached. "—" means no more resistance above (blue sky).</td></tr>
-    <tr><td>R:R</td><td>Reward-to-risk ratio to <b>TP1</b> = distance to TP1 ÷ distance to the stop, with <b>entry = current price</b>. Higher is a more favourable payoff. "—" when there's no overhead target.</td></tr>
+    <tr><td>R:R 1 / 2 / 3</td><td>Reward-to-risk to each target = (TP − entry) ÷ (entry − stop), i.e. potential profit ÷ potential loss, with <b>entry = current price</b>. Shown per target so you can see the payoff of holding for TP1 vs TP2 vs TP3. Nearer targets have lower R:R; further ones higher.</td></tr>
     <tr><td>★ BOTH</td><td>Confluence flag — this coin also appears on the other scan (see below). Rows are highlighted gold.</td></tr>
     <tr><td>Score</td><td>Overall quality, 0–100 (see below).</td></tr>
   </table>
@@ -390,9 +441,13 @@ PAGE = """<!doctype html>
   chart structure:</p>
   <p><b>Entry</b> is the current price. <b>Stop (SL)</b> sits just below the
   support that would invalidate the reclaim — the lower of the 200 EMA and the
-  retest low, with a small buffer. <b>TP1/TP2/TP3</b> are the next three overhead
-  resistances (prior swing highs above price), so you can scale out. <b>R:R</b> is
-  reward per unit of risk to TP1, measured from the current price.</p>
+  <i>retest</i> low, with a small buffer (deliberately not the pre-cross low,
+  which sat below the EMA and would inflate the risk). <b>TP1/TP2/TP3</b> are the
+  next three meaningful overhead resistances, and <b>R:R 1/2/3</b> is the
+  reward-to-risk to each — potential profit ÷ potential loss from the current
+  price. Reclaim setups often have low R:R to the nearest target because you're
+  buying close to support with resistance overhead; the further targets show the
+  fuller payoff.</p>
   <p>These are mechanical estimates to save you eyeballing the chart, not
   recommendations. A high R:R only means the geometry is favourable, not that the
   trade will work — size and manage risk yourself.</p>
@@ -416,7 +471,7 @@ PAGE = """<!doctype html>
     <tr><td>Pullback %</td><td>How deeply the flag retraced the pole. Shallower (well under 50%) is healthier.</td></tr>
     <tr><td>Vol ratio</td><td>Average flag volume ÷ average pole volume. Below 1 means volume is drying up during the pause — the classic, constructive flag signature.</td></tr>
     <tr><td>Breakout</td><td>The trigger level — the top of the flag. A move above it confirms the pattern.</td></tr>
-    <tr><td>Stop / TPs / R:R</td><td>Stop sits just below the flag low. TP1 is the classic <b>measured move</b> (breakout + 1.0× the pole's height); TP2 and TP3 are the 1.618× and 2.0× pole extensions. R:R is reward ÷ risk to TP1, entry = current price.</td></tr>
+    <tr><td>Stop / TPs / R:R</td><td>Stop sits just below the flag low. TP1 is the classic <b>measured move</b> (breakout + 1.0× the pole's height); TP2 and TP3 are the 1.618× and 2.0× pole extensions. R:R 1/2/3 is reward ÷ risk to each target, entry = current price.</td></tr>
     <tr><td>Score</td><td>0–100, weighting pole strength (35%), pullback tightness (25%), volume contraction (25%), and how coiled near the breakout price is (15%).</td></tr>
   </table>
   <p>The two tabs are complementary: the 200-EMA tab catches trend <i>reclaims</i>,
@@ -429,6 +484,15 @@ PAGE = """<!doctype html>
   running "★ N on both" count. These are the highest-conviction names — a trend
   reclaim and a continuation pattern lining up on the same chart — so they're
   worth looking at first.</p>
+
+  <h2>The Analyze a coin tab</h2>
+  <p>Type any MEXC ticker (e.g. <code>BTC</code>, <code>SOL</code>,
+  <code>SOLUSDT</code>) and it pulls that coin's live 4h candles on demand and
+  returns a read: its <b>bias</b> (trend vs the 200 EMA), whether it currently
+  matches the reclaim or bull-flag setups, a suggested <b>entry</b> (now) and a
+  lower-risk <b>pullback entry</b> at the nearest support, a <b>stop</b> below
+  support, and three resistance <b>targets</b> each with their R:R. It's the same
+  math the scanners use, pointed at one coin of your choosing.</p>
 
   <h2>How often it updates</h2>
   <p>The server re-scans all pairs on a loop (the cadence is shown in the header)
@@ -462,13 +526,56 @@ function badges(h){
 }
 function rowClass(h){ return (h.is_new?"isnew ":"")+(h.both?"both":""); }
 function tpCell(v){ return `<td>${v==null?'—':fmtNum(v)}</td>`; }
+function rrCell(v){ return `<td>${v==null?'—':(+v).toFixed(2)}</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["info","Info"]]){
+  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
   renderBanner();  // banner follows the active scan tab
+}
+async function analyze(){
+  const inp=document.getElementById("azInput");
+  const btn=document.getElementById("azBtn");
+  const box=document.getElementById("azResult");
+  const sym=inp.value.trim();
+  if(!sym){ box.innerHTML='<div class="azerr">Enter a ticker, e.g. BTC.</div>'; return; }
+  btn.disabled=true; const t=btn.textContent; btn.textContent="…";
+  box.innerHTML='<div class="azhint">Fetching 4h candles from MEXC and analyzing…</div>';
+  try{
+    const r=await fetch("/analyze?symbol="+encodeURIComponent(sym),{cache:"no-store"});
+    const d=await r.json();
+    box.innerHTML = d.error ? '<div class="azerr">'+d.error+'</div>' : azCard(d);
+  }catch(e){ box.innerHTML='<div class="azerr">Analysis failed — try again.</div>'; }
+  btn.disabled=false; btn.textContent=t;
+}
+function azCard(d){
+  const cell=(k,v)=>`<div class="azcell"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+  const tp=(v,rr)=> v==null?'—':`${fmtNum(v)}${rr!=null?` <span class="rr">R:R ${(+rr).toFixed(2)}</span>`:''}`;
+  const notes=(d.notes||[]).map(n=>`<li>${n}</li>`).join("");
+  return `<div class="azcard">
+    <div class="azhead">
+      <span class="sym">${d.symbol}</span>
+      <span class="biaspill bias-${d.bias}">${d.bias.toUpperCase()}</span>
+      <span>${fmtNum(d.price)}</span>
+      <span style="color:var(--dim)">EMA200 ${fmtNum(d.ema)} · ${d.pct_vs_ema>=0?'+':''}${d.pct_vs_ema}% · trend ${d.trend}</span>
+      <a href="${tvLink(d.symbol)}" target="_blank" rel="noopener">open chart ↗</a>
+    </div>
+    <div class="aztags">
+      <span class="aztag ${d.ema_reclaim?'on':''}">200-EMA reclaim${d.ema_reclaim?' · '+d.ema_reclaim_score:''}</span>
+      <span class="aztag ${d.bull_flag?'on':''}">Bull flag${d.bull_flag?' · '+d.bull_flag_score:''}</span>
+    </div>
+    <div class="azgrid">
+      ${cell("Entry (now)", fmtNum(d.entry))}
+      ${cell("Pullback entry", fmtNum(d.pullback_entry))}
+      ${cell("Stop (SL)", fmtNum(d.sl))}
+      ${cell("TP1", tp(d.tp1,d.rr1))}
+      ${cell("TP2", tp(d.tp2,d.rr2))}
+      ${cell("TP3", tp(d.tp3,d.rr3))}
+    </div>
+    <ul class="aznotes">${notes}</ul>
+  </div>`;
 }
 function renderBanner(){
   const b=document.getElementById("banner");
@@ -501,8 +608,7 @@ function renderFlags(){
       `<td>${(+h.vol_contraction).toFixed(2)}</td>`+
       `<td>${fmtNum(h.breakout)}</td>`+
       `<td>${fmtNum(h.sl)}</td>`+
-      tpCell(h.tp1)+tpCell(h.tp2)+tpCell(h.tp3)+
-      `<td>${(+h.rr).toFixed(2)}</td>`+
+      tpCell(h.tp1)+rrCell(h.rr1)+tpCell(h.tp2)+rrCell(h.rr2)+tpCell(h.tp3)+rrCell(h.rr3)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
   }
@@ -526,8 +632,7 @@ function render(){
       `<td>${h.bars_since_cross}</td>`+
       `<td>${(+h.retest_gap_pct).toFixed(2)}</td>`+
       `<td>${fmtNum(h.sl)}</td>`+
-      tpCell(h.tp1)+tpCell(h.tp2)+tpCell(h.tp3)+
-      `<td>${h.rr==null?'—':(+h.rr).toFixed(2)}</td>`+
+      tpCell(h.tp1)+rrCell(h.rr1)+tpCell(h.tp2)+rrCell(h.rr2)+tpCell(h.tp3)+rrCell(h.rr3)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
   }
@@ -586,10 +691,28 @@ def make_handler(state: State):
             if self.path.startswith("/data"):
                 body = json.dumps(state.snapshot()).encode()
                 self._send(200, body, "application/json")
+            elif self.path.startswith("/analyze"):
+                self._analyze()
             elif self.path in ("/", "/index.html"):
                 self._send(200, PAGE.encode(), "text/html; charset=utf-8")
             else:
                 self._send(404, b"not found", "text/plain")
+
+        def _analyze(self):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            raw = (q.get("symbol") or [""])[0]
+            sym = normalize_symbol(raw, state.cfg.get("quote", "USDT"))
+            if not sym:
+                self._send(200, json.dumps({"error": "Enter a ticker, e.g. BTC."}).encode(),
+                           "application/json")
+                return
+            try:
+                sess = get_session()
+                out = analyze_symbol(sess, sym, state.cfg["interval"], state.cfg)
+            except Exception as e:
+                out = {"error": f"Analysis failed: {e}"}
+            self._send(200, json.dumps(out).encode(), "application/json")
 
     return Handler
 

@@ -94,24 +94,28 @@ class Hit:
     tp1: float | None      # 1st target: nearest overhead resistance (None = blue sky)
     tp2: float | None      # 2nd target: next resistance above
     tp3: float | None      # 3rd target: next resistance above that
-    rr: float | None       # reward:risk to TP1, entry = current price
+    rr1: float | None      # reward:risk to TP1  = (TP1-entry)/(entry-SL)
+    rr2: float | None      # reward:risk to TP2
+    rr3: float | None      # reward:risk to TP3
 
 
 def resistances_above(highs: list[float], upto: int, price: float,
                       left: int = 3, right: int = 3, window: int = 300,
-                      max_n: int = 3) -> list[float]:
+                      max_n: int = 3, min_gap: float = 0.0) -> list[float]:
     """The nearest swing-high pivots ABOVE `price`, ascending — the overhead
     resistance ceilings price would run into, in order.
 
     A pivot high is a candle whose high is >= the `left` highs before it and the
-    `right` highs after it. Near-equal levels (within 0.5%) are merged so the
-    targets are meaningfully separated. Returns up to `max_n` levels."""
+    `right` highs after it. Levels closer than `min_gap` above price are skipped
+    (trivially-close ceilings make for meaningless targets), and near-equal levels
+    (within 0.5%) are merged. Returns up to `max_n` levels."""
+    floor = price * (1.0 + min_gap)
     start = max(left, upto - window)
     res = []
     for i in range(start, upto - right + 1):
         h = highs[i]
         if all(h >= highs[i - d] for d in range(1, left + 1)) and \
-           all(h >= highs[i + d] for d in range(1, right + 1)) and h > price:
+           all(h >= highs[i + d] for d in range(1, right + 1)) and h > floor:
             res.append(h)
     res.sort()
     out: list[float] = []
@@ -216,15 +220,20 @@ def detect_cross_and_retest(
     # support: the lower of the EMA and the lowest low since the reclaim (the
     # retest low), minus a small buffer.
     entry = close_now                       # entry = current price
-    swing_low = min(lows[cross_idx:last + 1])
-    sl = min(swing_low, ema_now) * (1.0 - 0.003)
-    # Targets = the nearest overhead resistances (prior swing highs above price),
-    # in order. If price is in blue sky some/all will be None.
-    res = resistances_above(highs, last, entry, max_n=3)
+    # Stop just under the reclaimed support. Anchor to the RETEST low (which held
+    # above the EMA), not the pre-cross low that sat below the EMA — using the
+    # deep cross-candle low would blow up the risk and wreck the R:R.
+    struct_low = min(lows[retest_idx:last + 1])
+    sl = min(struct_low, ema_now) * (1.0 - 0.003)
+    # Targets = the nearest MEANINGFUL overhead resistances (prior swing highs
+    # more than ~0.8% above price), in order. Blue sky -> some/all None.
+    res = resistances_above(highs, last, entry, max_n=3, min_gap=0.008)
     tp1 = res[0] if len(res) > 0 else None
     tp2 = res[1] if len(res) > 1 else None
     tp3 = res[2] if len(res) > 2 else None
-    rr = round((tp1 - entry) / (entry - sl), 2) if (tp1 and entry > sl) else None
+
+    def _rr(tp):  # reward:risk = potential profit / potential loss, entry=current price
+        return round((tp - entry) / (entry - sl), 2) if (tp and entry > sl) else None
 
     return True, {
         "price": close_now,
@@ -237,7 +246,9 @@ def detect_cross_and_retest(
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
-        "rr": rr,
+        "rr1": _rr(tp1),
+        "rr2": _rr(tp2),
+        "rr3": _rr(tp3),
     }
 
 
@@ -257,7 +268,9 @@ class FlagHit:
     tp1: float              # measured move (breakout + 1.0x pole height)
     tp2: float              # 1.618x pole extension
     tp3: float              # 2.0x pole extension
-    rr: float               # reward:risk to TP1, entry = current price
+    rr1: float              # reward:risk to TP1 = (TP1-entry)/(entry-SL)
+    rr2: float              # reward:risk to TP2
+    rr3: float              # reward:risk to TP3
     score: float            # overall quality 0-100
 
 
@@ -343,7 +356,9 @@ def detect_bull_flag(
     tp1 = breakout + 1.000 * pole_height
     tp2 = breakout + 1.618 * pole_height
     tp3 = breakout + 2.000 * pole_height
-    rr = round((tp1 - entry) / (entry - sl), 2) if entry > sl else 0.0
+
+    def _rr(tp):  # potential profit / potential loss, entry = current price
+        return round((tp - entry) / (entry - sl), 2) if entry > sl else 0.0
 
     return True, {
         "price": close_now,
@@ -356,7 +371,9 @@ def detect_bull_flag(
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
-        "rr": rr,
+        "rr1": _rr(tp1),
+        "rr2": _rr(tp2),
+        "rr3": _rr(tp3),
         "score": round(score, 1),
     }
 
@@ -522,6 +539,145 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
         flag_hit = FlagHit(symbol=symbol, **f)
 
     return ema_hit, flag_hit
+
+
+def supports_below(lows: list[float], upto: int, price: float,
+                   left: int = 3, right: int = 3, window: int = 300,
+                   max_n: int = 3, min_gap: float = 0.0) -> list[float]:
+    """Nearest swing-low pivots BELOW `price`, nearest first — support levels."""
+    ceil = price * (1.0 - min_gap)
+    start = max(left, upto - window)
+    res = []
+    for i in range(start, upto - right + 1):
+        l = lows[i]
+        if all(l <= lows[i - d] for d in range(1, left + 1)) and \
+           all(l <= lows[i + d] for d in range(1, right + 1)) and l < ceil:
+            res.append(l)
+    res.sort(reverse=True)                       # nearest below first
+    out: list[float] = []
+    for l in res:
+        if not out or l < out[-1] * 0.995:
+            out.append(l)
+        if len(out) >= max_n:
+            break
+    return out
+
+
+def normalize_symbol(raw: str, quote: str = "USDT") -> str:
+    """Turn user input like 'btc', 'BTC/USDT', ' eth ' into 'BTCUSDT'."""
+    s = raw.strip().upper().replace("/", "").replace("-", "").replace(" ", "")
+    if not s:
+        return ""
+    if s.endswith(quote) or "_" in s:
+        return s
+    return s + quote
+
+
+def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
+                   cfg: dict) -> dict:
+    """On-demand technical read of one coin on the 4h chart: trend vs the 200 EMA,
+    support/resistance, a suggested entry / stop / three targets with R:R, and
+    whether it currently matches either scan. Technical estimate, NOT advice."""
+    raw = fetch_klines(sess, symbol, interval, cfg.get("kline_limit", 1000))
+    if not raw or len(raw) < EMA_PERIOD + 2:
+        return {"error": f"Not enough 4h data for '{symbol}'. Check the ticker "
+                         f"is a coin listed on MEXC spot (e.g. BTCUSDT)."}
+    rows = raw[:-1]
+    try:
+        highs = [float(x[2]) for x in rows]
+        lows = [float(x[3]) for x in rows]
+        closes = [float(x[4]) for x in rows]
+        vols = [float(x[5]) for x in rows]
+    except (ValueError, IndexError):
+        return {"error": "Could not parse candles."}
+
+    e = ema(closes, EMA_PERIOD)
+    last = len(closes) - 1
+    price = closes[last]
+    ema_now = e[last]
+    if ema_now is None:
+        return {"error": "Not enough data to compute the 200 EMA."}
+
+    j = max(EMA_PERIOD - 1, last - 20)
+    slope = (ema_now - e[j]) / e[j] if e[j] else 0.0
+    trend = "up" if slope > 0.003 else ("down" if slope < -0.003 else "flat")
+    above = price >= ema_now
+    pct_vs_ema = (price - ema_now) / ema_now * 100
+
+    sup = supports_below(lows, last, price, max_n=3, min_gap=0.005)
+    res = resistances_above(highs, last, price, max_n=3, min_gap=0.008)
+
+    entry = price
+    support0 = sup[0] if sup else ema_now
+    # stop below the nearest support (or the EMA if that's higher and price is above it)
+    stop_anchor = support0
+    if above and ema_now < price:
+        stop_anchor = min(support0, ema_now) if sup else ema_now
+    sl = stop_anchor * (1.0 - 0.003)
+    tp1 = res[0] if len(res) > 0 else None
+    tp2 = res[1] if len(res) > 1 else None
+    tp3 = res[2] if len(res) > 2 else None
+
+    def _rr(tp):
+        return round((tp - entry) / (entry - sl), 2) if (tp and entry > sl) else None
+
+    okE, dE = detect_cross_and_retest(
+        highs, lows, closes, ema_period=EMA_PERIOD,
+        lookback=cfg.get("lookback", 30), retest_tol=cfg.get("retest_tol", 0.02),
+        break_tol=cfg.get("break_tol", 0.005),
+        max_above_now=cfg.get("max_above_now", 0.08),
+        min_slope=cfg.get("min_slope", 0.0))
+    okF, dF = detect_bull_flag(
+        highs, lows, closes, vols,
+        pole_min_gain=cfg.get("pole_min_gain", 0.15),
+        max_retrace=cfg.get("flag_max_retrace", 0.5))
+
+    if above and trend == "up":
+        bias = "bullish"
+    elif not above and trend == "down":
+        bias = "bearish"
+    else:
+        bias = "neutral"
+
+    notes = []
+    notes.append(f"Price is {abs(pct_vs_ema):.1f}% {'above' if above else 'below'} "
+                 f"the 200 EMA, which is sloping {trend}.")
+    if okE:
+        notes.append(f"Matches the 200-EMA cross & retest setup (score {dE['score']}).")
+    if okF:
+        notes.append(f"Matches a bull flag: pole {dF['pole_gain_pct']}%, "
+                     f"{dF['flag_bars']}-bar flag, score {dF['score']}.")
+    if not okE and not okF:
+        notes.append("No active reclaim or bull-flag setup right now.")
+    if bias == "bullish":
+        notes.append("Bias is bullish while price holds above the rising 200 EMA; "
+                     "a pullback toward the EMA / nearest support is the lower-risk entry.")
+    elif bias == "bearish":
+        notes.append("Bias is bearish while price is below a falling 200 EMA; "
+                     "longs are counter-trend here.")
+    else:
+        notes.append("Bias is neutral/mixed — wait for a cleaner reclaim or flag.")
+
+    return {
+        "symbol": symbol,
+        "price": price,
+        "ema": ema_now,
+        "pct_vs_ema": round(pct_vs_ema, 2),
+        "trend": trend,
+        "above_ema": above,
+        "bias": bias,
+        "entry": entry,
+        "pullback_entry": (sup[0] if sup else ema_now),
+        "sl": sl,
+        "supports": sup,
+        "tp1": tp1, "tp2": tp2, "tp3": tp3,
+        "rr1": _rr(tp1), "rr2": _rr(tp2), "rr3": _rr(tp3),
+        "ema_reclaim": bool(okE),
+        "ema_reclaim_score": dE.get("score") if okE else None,
+        "bull_flag": bool(okF),
+        "bull_flag_score": dF.get("score") if okF else None,
+        "notes": notes,
+    }
 
 
 # ----------------------------------------------------------------------------
