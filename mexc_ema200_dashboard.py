@@ -438,6 +438,11 @@ PAGE = """<!doctype html>
   .bias-bullish{background:rgba(63,185,80,.15);color:var(--accent);border:1px solid rgba(63,185,80,.5)}
   .bias-bearish{background:rgba(248,81,73,.15);color:#f85149;border:1px solid rgba(248,81,73,.5)}
   .bias-neutral{background:rgba(139,152,173,.15);color:var(--dim);border:1px solid var(--line)}
+  .dirpill{border-radius:20px;padding:3px 14px;font-weight:800;font-size:13px;cursor:help;letter-spacing:.03em}
+  .dir-long{background:rgba(63,185,80,.2);color:var(--accent);border:1px solid var(--accent)}
+  .dir-short{background:rgba(248,81,73,.2);color:#f85149;border:1px solid #f85149}
+  .dir-neutral{background:rgba(139,152,173,.15);color:var(--dim);border:1px solid var(--line)}
+  .azcell[data-tip]{cursor:help}
   .azsec{font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;
        color:var(--accent);margin:18px 0 2px;border-bottom:1px solid var(--line);padding-bottom:5px}
   .azsec .azsub{color:var(--dim);font-weight:500;text-transform:none;letter-spacing:0;font-size:11.5px}
@@ -923,13 +928,15 @@ async function analyze(){
   btn.disabled=false; btn.textContent=t;
 }
 function azCard(d){
-  const cell=(k,v)=>`<div class="azcell"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+  const cell=(k,v,tip)=>`<div class="azcell"${tip?` data-tip="${tip}"`:''}><div class="k">${k}</div><div class="v">${v}</div></div>`;
+  const pct=(v,sign)=> d.price&&v!=null? ` <span class="rr">${sign}${(Math.abs((v-d.price)/d.price)*100).toFixed(1)}%</span>`:'';
   const tp=(v,rr)=> v==null?'—':`${fmtNum(v)}${rr!=null?` <span class="rr">R:R ${(+rr).toFixed(2)}</span>`:''}`;
   const notes=(d.notes||[]).map(n=>`<li>${n}</li>`).join("");
   return `<div class="azcard">
     <div class="azhead">
       <span class="sym">${d.symbol}</span>
-      <span class="biaspill bias-${d.bias}">${d.bias.toUpperCase()}</span>
+      <span class="dirpill dir-${(d.direction||'neutral').toLowerCase()}" data-tip="Overall trade-direction call from all signals (${d.dir_long_pts||0} long vs ${d.dir_short_pts||0} short points)">${(d.direction||'—').toUpperCase()}${d.direction==='Long'?' ▲':d.direction==='Short'?' ▼':''}</span>
+      <span class="biaspill bias-${d.bias}" data-tip="Trend bias from price vs the 200 EMA and its slope">${d.bias.toUpperCase()}</span>
       <span>${fmtNum(d.price)}</span>
       <span style="color:var(--dim)">EMA200 ${fmtNum(d.ema)} · ${d.pct_vs_ema>=0?'+':''}${d.pct_vs_ema}% · trend ${d.trend}</span>
       <a href="${tvLink(d.symbol)}" target="_blank" rel="noopener">open chart ↗</a>
@@ -941,28 +948,28 @@ function azCard(d){
     </div>
     <div class="azsec">Market read</div>
     <div class="azgrid">
-      ${cell("Structure", (d.structure||'—')+(d.choch?` · ${d.choch} CHoCH`:''))}
-      ${cell("RSI (14)", d.rsi==null?'—':(+d.rsi).toFixed(0)+(d.rsi<30?' oversold':d.rsi>70?' overbought':''))}
-      ${cell("Volume", (d.vol_trend||'—')+(d.vol_ratio?` ×${d.vol_ratio}`:''))}
-      ${cell("Pressure", d.pressure||'—')}
-      ${cell("Rel volume", d.rvol==null?'—':(+d.rvol).toFixed(2)+'× latest bar')}
-      ${cell("Range position", d.range_pos==null?'—':d.range_pos+'%')}
-      ${cell("ATR", d.atr_pct==null?'—':d.atr_pct+'%')}
-      ${cell("Supports", (d.supports||[]).slice(0,3).map(fmtNum).join(' · ')||'—')}
-      ${cell("Resistances", (d.resistances||[]).slice(0,3).map(fmtNum).join(' · ')||'—')}
-      ${cell("Next support 4h·1D·1W (drawdown)", [d.sup_4h,d.sup_1d,d.sup_1w].map(v=>v==null?'—':fmtNum(v)+(d.price?` <span class="rr">-${(((d.price-v)/d.price)*100).toFixed(1)}%</span>`:'')).join(' · '))}
+      ${cell("Structure", (d.structure||'—')+(d.choch?` · ${d.choch} CHoCH`:''), "Market structure: uptrend = higher highs & lows, downtrend = lower highs & lows, range = neither. CHoCH = a change of character, the first break of that structure (early reversal cue).")}
+      ${cell("RSI (14)", d.rsi==null?'—':(+d.rsi).toFixed(0)+(d.rsi<30?' oversold':d.rsi>70?' overbought':''), "Relative Strength Index (0-100) — momentum. Below 30 = oversold (bounce potential), above 70 = overbought (pullback risk).")}
+      ${cell("Volume", (d.vol_trend||'—')+(d.vol_ratio?` ×${d.vol_ratio}`:''), "Is recent volume rising, steady or falling vs its longer average.")}
+      ${cell("Pressure", d.pressure||'—', "Whether buyers or sellers control recent candles (up-candle vs down-candle volume).")}
+      ${cell("Rel volume", d.rvol==null?'—':(+d.rvol).toFixed(2)+'× latest bar', "The latest candle's volume vs its 20-bar average. Above 1x = above-average activity = confirmation.")}
+      ${cell("Range position", d.range_pos==null?'—':d.range_pos+'%', "Where price sits in its recent 120-bar range: 0% = range low, 100% = range high.")}
+      ${cell("ATR", d.atr_pct==null?'—':d.atr_pct+'%', "Average True Range as a % of price — the coin's volatility. Stops are buffered by a fraction of this.")}
+      ${cell("Supports (distance)", (d.supports||[]).slice(0,3).map(v=>fmtNum(v)+pct(v,'-')).join(' · ')||'—', "Nearest support levels below price, with how far (%) each sits below the current price.")}
+      ${cell("Resistances (distance)", (d.resistances||[]).slice(0,3).map(v=>fmtNum(v)+pct(v,'+')).join(' · ')||'—', "Nearest resistance levels above price, with how far (%) each sits above the current price.")}
+      ${cell("Next support 4h·1D·1W (drawdown)", [d.sup_4h,d.sup_1d,d.sup_1w].map(v=>v==null?'—':fmtNum(v)+pct(v,'-')).join(' · '), "The next major support on the 4h, Daily and Weekly charts — your safety-net levels — with the % drawdown to each.")}
     </div>
     <div class="azsec">Trade plan <span class="azsub">entry → stops → 5 targets (with R:R)</span></div>
     <div class="azgrid">
-      ${cell("Entry (now)", fmtNum(d.entry))}
-      ${cell("Optimal entry", fmtNum(d.optimal_entry))}
-      ${cell("SL tight", fmtNum(d.sl_tight))}
-      ${cell("SL wide", fmtNum(d.sl_wide))}
-      ${cell("TP1", tp(d.tp1,d.rr1))}
-      ${cell("TP2", tp(d.tp2,d.rr2))}
-      ${cell("TP3", tp(d.tp3,d.rr3))}
-      ${cell("TP4", tp(d.tp4,d.rr4))}
-      ${cell("TP5", tp(d.tp5,d.rr5))}
+      ${cell("Entry (now)", fmtNum(d.entry), "The current price — your immediate entry.")}
+      ${cell("Optimal entry", fmtNum(d.optimal_entry), "A lower-risk fill: waiting for a pullback to the nearest support / EMA instead of chasing here.")}
+      ${cell("SL tight", fmtNum(d.sl_tight), "Tighter stop-loss — just under the immediate structure, buffered by ATR. Smaller risk, easier to get stopped.")}
+      ${cell("SL wide", fmtNum(d.sl_wide), "Wider stop-loss — under a deeper swing low. More breathing room, bigger risk per unit.")}
+      ${cell("TP1", tp(d.tp1,d.rr1), "First target (nearest resistance) and its reward:risk to the tight stop.")}
+      ${cell("TP2", tp(d.tp2,d.rr2), "Second target and its reward:risk to the tight stop.")}
+      ${cell("TP3", tp(d.tp3,d.rr3), "Third target and its reward:risk to the tight stop.")}
+      ${cell("TP4", tp(d.tp4,d.rr4), "Fourth target and its reward:risk to the tight stop.")}
+      ${cell("TP5", tp(d.tp5,d.rr5), "Fifth target and its reward:risk to the tight stop.")}
     </div>
     <div class="azsec">In plain English</div>
     <ul class="aznotes">${notes}</ul>

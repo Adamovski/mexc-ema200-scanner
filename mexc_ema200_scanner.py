@@ -1058,6 +1058,25 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     else:
         bias = "neutral"
 
+    # Directional lean: weigh the bullish vs bearish evidence into Long/Short/Wait.
+    long_pts = short_pts = 0
+    long_pts += 2 if (above and trend == "up") else 0
+    short_pts += 2 if ((not above) and trend == "down") else 0
+    if ms["choch"] == "bullish":
+        long_pts += 1
+    if ms["choch"] == "bearish":
+        short_pts += 1
+    if okB:
+        long_pts += 1
+    if okE or okF:
+        long_pts += 1
+    if r14 is not None and r14 < 30:
+        long_pts += 1        # oversold — bounce potential
+    if r14 is not None and r14 > 70:
+        short_pts += 1        # overbought — pullback risk
+    net = long_pts - short_pts
+    direction = "Long" if net >= 2 else ("Short" if net <= -2 else "Neutral")
+
     notes = []
     notes.append(f"Price is {abs(pct_vs_ema):.1f}% {'above' if above else 'below'} "
                  f"the 200 EMA, which is sloping {trend} — {bias} trend bias.")
@@ -1101,6 +1120,15 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         matched.append(f"support bounce off {dB['tf']} support at {dB['support']:.6g} "
                        f"({dB['touches']} touches, score {dB['score']})")
     notes.append("Active setups: " + (", ".join(matched) if matched else "none right now") + ".")
+    if direction == "Long":
+        notes.append(f"Directional lean: <b>LONG</b> — bullish signals outweigh "
+                     f"bearish ({long_pts} vs {short_pts}).")
+    elif direction == "Short":
+        notes.append(f"Directional lean: <b>SHORT</b> — bearish signals outweigh "
+                     f"bullish ({short_pts} vs {long_pts}).")
+    else:
+        notes.append(f"Directional lean: <b>NEUTRAL</b> — signals are mixed "
+                     f"({long_pts} long vs {short_pts} short); better to wait.")
 
     return {
         "symbol": symbol,
@@ -1110,6 +1138,9 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "trend": trend,
         "above_ema": above,
         "bias": bias,
+        "direction": direction,
+        "dir_long_pts": long_pts,
+        "dir_short_pts": short_pts,
         "rsi": r14,
         "atr_pct": atr_pct,
         "range_pos": range_pos,
