@@ -377,6 +377,10 @@ PAGE = """<!doctype html>
   .tab.active{background:var(--head);color:var(--txt)}
   .view{display:none}
   .view.active{display:block}
+  .filterbar{padding:8px 22px;border-bottom:1px solid var(--line);color:var(--dim);
+       font-size:12.5px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .fbtn{padding:3px 12px;border:1px solid var(--line);border-radius:14px;cursor:pointer;color:var(--dim)}
+  .fbtn.active{background:var(--accent);color:#04140a;border-color:var(--accent);font-weight:700}
   /* NEW badge */
   .newbadge{display:inline-block;background:var(--accent);color:#04140a;
        font-size:10px;font-weight:700;border-radius:5px;padding:1px 5px;margin-left:7px;
@@ -444,6 +448,7 @@ PAGE = """<!doctype html>
   .dir-neutral{background:rgba(139,152,173,.15);color:var(--dim);border:1px solid var(--line)}
   .azcell[data-tip]{cursor:help}
   .azsec[data-tip]{cursor:help}
+  td[data-tip]{cursor:help}
   .azladder{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 4px}
   .ladchip{background:var(--bg);border:1px solid var(--line);border-radius:8px;
        padding:7px 11px;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}
@@ -480,6 +485,13 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabAnalyze" onclick="showTab('analyze')">Analyze a coin</div>
   <div class="tab" id="tabInfo" onclick="showTab('info')">Info</div>
 </div>
+<div class="filterbar">Bias filter:
+  <span class="fbtn active" data-bias="all" onclick="setBias('all')">All</span>
+  <span class="fbtn" data-bias="bullish" onclick="setBias('bullish')">Bullish</span>
+  <span class="fbtn" data-bias="bearish" onclick="setBias('bearish')">Bearish</span>
+  <span class="fbtn" data-bias="neutral" onclick="setBias('neutral')">Neutral</span>
+  <span style="color:var(--dim)">— market-structure bias of each setup</span>
+</div>
 
 <div class="view active" id="viewSetups">
 <div class="status">
@@ -496,6 +508,7 @@ PAGE = """<!doctype html>
       <th data-k="price">Price</th>
       <th data-k="pct_above_ema">% &gt; EMA</th>
       <th data-k="bars_since_cross">Bars</th>
+      <th data-k="bias">Bias</th>
       <th data-k="optimal_entry">Optimal entry</th>
       <th data-k="sl_tight">SL tight</th>
       <th data-k="sl_wide">SL wide</th>
@@ -527,6 +540,7 @@ PAGE = """<!doctype html>
       <th data-fk="flag_bars">Flag bars</th>
       <th data-fk="pullback_pct">Pullback %</th>
       <th data-fk="vol_contraction">Vol ratio</th>
+      <th data-fk="bias">Bias</th>
       <th data-fk="optimal_entry">Breakout entry</th>
       <th data-fk="sl_tight">SL tight</th>
       <th data-fk="sl_wide">SL wide</th>
@@ -556,6 +570,7 @@ PAGE = """<!doctype html>
       <th data-ck="price">Price</th>
       <th data-ck="cpr_width_pct">CPR width %</th>
       <th data-ck="position">Pos</th>
+      <th data-ck="bias">Bias</th>
       <th data-ck="tc">TC</th>
       <th data-ck="bc">BC</th>
       <th data-ck="optimal_entry">Breakout entry</th>
@@ -832,7 +847,12 @@ let sortKey="score", sortDir=-1, latest=[];
 let fSortKey="score", fSortDir=-1, flatest=[];
 let cSortKey="score", cSortDir=-1, clatest=[];
 let bSortKey="score", bSortDir=-1, blatest=[];
-let activeTab="setups", lastData=null;
+let activeTab="setups", lastData=null, biasFilter="all";
+function setBias(b){ biasFilter=b;
+  document.querySelectorAll(".fbtn").forEach(x=>x.classList.toggle("active",x.dataset.bias===b));
+  render(); renderFlags(); renderCPR(); renderBounce();
+}
+function biasOk(h){ return biasFilter==="all" || h.bias_dir===biasFilter; }
 let alertsOn=false, audioCtx=null, seenBreak=Math.floor(Date.now()/1000);
 function enableAlerts(){
   try{ if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)();
@@ -905,8 +925,10 @@ document.addEventListener("mouseout",e=>{
   if(e.target.closest&&e.target.closest("[data-tip]")){ const t=document.getElementById("tip"); if(t) t.style.display="none"; }
 });
 function rowClass(h){ return (h.is_new?"isnew ":"")+(h.both?"both":""); }
-function tpCell(v,rr){ return v==null?'<td>—</td>'
-  :`<td>${fmtNum(v)}${rr!=null?`<span class="rr">R${(+rr).toFixed(1)}</span>`:''}</td>`; }
+function tpCell(v,rr){ if(v==null) return '<td>—</td>';
+  const tip=`Take-profit target at ${fmtNum(v)} — an overhead resistance level (on the Bull-flags tab, a measured-move / Fib extension of the pole). Grey number is the reward:risk to the tight stop${rr!=null?` (${(+rr).toFixed(2)})`:''}.`;
+  return `<td data-tip="${tip}">${fmtNum(v)}${rr!=null?`<span class="rr">R${(+rr).toFixed(1)}</span>`:''}</td>`; }
+function biasPill(h){ return `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`; }
 function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
@@ -1000,7 +1022,7 @@ function renderBanner(){
   b.classList.add("show");
 }
 function renderFlags(){
-  const rows=[...flatest].sort((a,b)=>{
+  const rows=[...flatest].filter(biasOk).sort((a,b)=>{
     const x=a[fSortKey],y=b[fSortKey];
     if(typeof x==="string") return fSortDir*x.localeCompare(y);
     return fSortDir*((x??0)-(y??0));
@@ -1017,9 +1039,10 @@ function renderFlags(){
       `<td>${h.flag_bars}</td>`+
       `<td>${(+h.pullback_pct).toFixed(1)}</td>`+
       `<td>${(+h.vol_contraction).toFixed(2)}</td>`+
-      `<td>${fmtNum(h.optimal_entry)}</td>`+
-      `<td>${fmtNum(h.sl_tight)}</td>`+
-      `<td>${fmtNum(h.sl_wide)}</td>`+
+      biasPill(h)+
+      `<td data-tip="Optimal entry — the lower-risk fill: a pullback to the setup's support / EMA / breakout level rather than chasing the current price.">${fmtNum(h.optimal_entry)}</td>`+
+      `<td data-tip="Tight stop — just below the setup's immediate structure (retest low / flag low / support / CPR bottom), buffered by ATR. A close below invalidates the setup.">${fmtNum(h.sl_tight)}</td>`+
+      `<td data-tip="Wide stop — below a deeper swing low. More breathing room but larger risk per unit.">${fmtNum(h.sl_wide)}</td>`+
       tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
       rvCell(h.rvol)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
@@ -1027,7 +1050,7 @@ function renderFlags(){
   }
 }
 function render(){
-  const rows=[...latest].sort((a,b)=>{
+  const rows=[...latest].filter(biasOk).sort((a,b)=>{
     const x=a[sortKey],y=b[sortKey];
     if(typeof x==="string") return sortDir*x.localeCompare(y);
     return sortDir*((x??0)-(y??0));
@@ -1042,9 +1065,10 @@ function render(){
       `<td>${fmtNum(h.price)}</td>`+
       `<td>${(+h.pct_above_ema).toFixed(2)}</td>`+
       `<td>${h.bars_since_cross}</td>`+
-      `<td>${fmtNum(h.optimal_entry)}</td>`+
-      `<td>${fmtNum(h.sl_tight)}</td>`+
-      `<td>${fmtNum(h.sl_wide)}</td>`+
+      biasPill(h)+
+      `<td data-tip="Optimal entry — the lower-risk fill: a pullback to the setup's support / EMA / breakout level rather than chasing the current price.">${fmtNum(h.optimal_entry)}</td>`+
+      `<td data-tip="Tight stop — just below the setup's immediate structure (retest low / flag low / support / CPR bottom), buffered by ATR. A close below invalidates the setup.">${fmtNum(h.sl_tight)}</td>`+
+      `<td data-tip="Wide stop — below a deeper swing low. More breathing room but larger risk per unit.">${fmtNum(h.sl_wide)}</td>`+
       tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
       rvCell(h.rvol)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
@@ -1068,7 +1092,7 @@ document.querySelectorAll("th[data-bk]").forEach(th=>th.addEventListener("click"
   renderBounce();
 }));
 function renderBounce(){
-  const rows=[...blatest].sort((a,b)=>{
+  const rows=[...blatest].filter(biasOk).sort((a,b)=>{
     const x=a[bSortKey],y=b[bSortKey];
     if(typeof x==="string") return bSortDir*x.localeCompare(y);
     return bSortDir*((x??0)-(y??0));
@@ -1087,9 +1111,9 @@ function renderBounce(){
       `<td>${(+h.dist_to_support_pct).toFixed(2)}</td>`+
       `<td>${h.rsi==null?'—':(+h.rsi).toFixed(0)}</td>`+
       `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
-      `<td>${fmtNum(h.optimal_entry)}</td>`+
-      `<td>${fmtNum(h.sl_tight)}</td>`+
-      `<td>${fmtNum(h.sl_wide)}</td>`+
+      `<td data-tip="Optimal entry — the lower-risk fill: a pullback to the setup's support / EMA / breakout level rather than chasing the current price.">${fmtNum(h.optimal_entry)}</td>`+
+      `<td data-tip="Tight stop — just below the setup's immediate structure (retest low / flag low / support / CPR bottom), buffered by ATR. A close below invalidates the setup.">${fmtNum(h.sl_tight)}</td>`+
+      `<td data-tip="Wide stop — below a deeper swing low. More breathing room but larger risk per unit.">${fmtNum(h.sl_wide)}</td>`+
       tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
       rvCell(h.rvol)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
@@ -1097,7 +1121,7 @@ function renderBounce(){
   }
 }
 function renderCPR(){
-  const rows=[...clatest].sort((a,b)=>{
+  const rows=[...clatest].filter(biasOk).sort((a,b)=>{
     const x=a[cSortKey],y=b[cSortKey];
     if(typeof x==="string") return cSortDir*x.localeCompare(y);
     return cSortDir*((x??0)-(y??0));
@@ -1112,11 +1136,12 @@ function renderCPR(){
       `<td>${fmtNum(h.price)}</td>`+
       `<td>${(+h.cpr_width_pct).toFixed(3)}</td>`+
       `<td>${h.position}</td>`+
+      biasPill(h)+
       `<td>${fmtNum(h.tc)}</td>`+
       `<td>${fmtNum(h.bc)}</td>`+
-      `<td>${fmtNum(h.optimal_entry)}</td>`+
-      `<td>${fmtNum(h.sl_tight)}</td>`+
-      `<td>${fmtNum(h.sl_wide)}</td>`+
+      `<td data-tip="Optimal entry — the lower-risk fill: a pullback to the setup's support / EMA / breakout level rather than chasing the current price.">${fmtNum(h.optimal_entry)}</td>`+
+      `<td data-tip="Tight stop — just below the setup's immediate structure (retest low / flag low / support / CPR bottom), buffered by ATR. A close below invalidates the setup.">${fmtNum(h.sl_tight)}</td>`+
+      `<td data-tip="Wide stop — below a deeper swing low. More breathing room but larger risk per unit.">${fmtNum(h.sl_wide)}</td>`+
       tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
       rvCell(h.rvol)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;

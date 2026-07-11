@@ -939,12 +939,23 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
 
     rv = rel_volume(vols)                       # relative volume of the latest candle
     ksup = key_supports(rows, lows, closes[-1])  # next 4h / daily / weekly support
+    _ms = market_structure(highs, lows, closes)  # for a per-setup bias label
+    if _ms["choch"] == "bullish":
+        _bias = "Bullish CHoCH"
+    elif _ms["structure"] == "uptrend":
+        _bias = "Bullish"
+    elif _ms["structure"] == "downtrend":
+        _bias = "Bearish"
+    else:
+        _bias = "Range"
+    _dir = ("bullish" if _bias in ("Bullish", "Bullish CHoCH")
+            else "bearish" if _bias == "Bearish" else "neutral")
 
     def confirmed(d: dict, boost: bool) -> dict:
-        """Attach relative volume + the next multi-timeframe supports, and (for
-        momentum setups) nudge the score up when the signal candle prints on
-        above-average volume — confirmation."""
-        d = {"symbol": symbol, "rvol": rv, **ksup, **d}
+        """Attach relative volume, multi-timeframe supports, a market-structure
+        bias label, and (for momentum setups) a volume-confirmation score nudge."""
+        d = {"symbol": symbol, "rvol": rv, "bias": _bias, "bias_dir": _dir,
+             "choch": _ms["choch"], **ksup, **d}
         if boost and rv:
             factor = 1.0 + 0.15 * max(0.0, min(1.0, (rv - 1.0) / 1.5))
             d["score"] = round(min(100.0, d["score"] * factor), 1)
