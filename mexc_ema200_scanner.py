@@ -913,6 +913,7 @@ def detect_support_bounce(rows: list, highs: list[float], lows: list[float],
         "price": price,
         "support": slevel,
         "tf": tf_label,
+        "method": "swing-low pivot zone",   # how the support level was identified
         "bias": bias,
         "choch": ms["choch"],
         "touches": touches,
@@ -1537,6 +1538,7 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
 
     rv = rel_volume(vols)                       # relative volume of the latest candle
     ksup = key_supports(rows, lows, closes[-1])  # next 4h / daily / weekly support
+    _stale = not _klines_fresh(raw, interval)   # frozen on both futures & spot
     # BTC correlation over the recent window (how much this coin just mirrors BTC).
     _btc_ret = cfg.get("btc_returns")
     _corr = None
@@ -1544,6 +1546,22 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
         _corr = pearson(pct_returns(closes)[-CORR_WINDOW:], _btc_ret)
     _pp = primary_pattern(highs, lows, closes, vols)   # current chart formation
     _ms = market_structure(highs, lows, closes)  # for a per-setup bias label
+
+    def _tf_bias(H, L, C):
+        if len(C) < 12:
+            return None
+        m = market_structure(H, L, C)
+        if m["structure"] == "uptrend" or m["choch"] == "bullish":
+            return "bullish"
+        if m["structure"] == "downtrend" or m["choch"] == "bearish":
+            return "bearish"
+        return "neutral"
+    # Multi-timeframe bias: 4h from the base candles, Daily/Weekly aggregated from
+    # them (cheap — no extra API calls).
+    _tfb = {"4h": _tf_bias(highs, lows, closes)}
+    for _gd, _lbl in ((1, "1d"), (7, "1w")):
+        _hh, _ll, _cc, _vv = _agg_series(rows, _gd)
+        _tfb[_lbl] = _tf_bias(_hh, _ll, _cc)
     if _ms["choch"] == "bullish":
         _bias = "Bullish CHoCH"
     elif _ms["structure"] == "uptrend":
@@ -1561,7 +1579,8 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
         d = {"symbol": symbol, "rvol": rv, "bias": _bias, "bias_dir": _dir,
              "choch": _ms["choch"],
              "btc_corr": (round(_corr, 2) if _corr is not None else None),
-             "pattern": _pp, **ksup, **d}
+             "pattern": _pp, "data_stale": _stale, "tf_bias": _tfb,
+             **ksup, **d}
         if boost and rv:
             factor = 1.0 + 0.15 * max(0.0, min(1.0, (rv - 1.0) / 1.5))
             d["score"] = round(min(100.0, d["score"] * factor), 1)
@@ -1717,10 +1736,38 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         except (ValueError, IndexError):
             return []
         return detect_chart_patterns(H, L, C, V)
-    patterns = {"4h": detect_chart_patterns(highs, lows, closes, vols)
+    patterns = {"1h": _tf_patterns("1h"),
+                "4h": detect_chart_patterns(highs, lows, closes, vols)
                 if interval == "4h" else _tf_patterns("4h"),
                 "1d": _tf_patterns("1d"),
                 "1w": _tf_patterns("1w")}
+
+    # Multi-timeframe bias (bullish / bearish / neutral) on 1h / 4h / Daily / Weekly.
+    def _bias_of(iv, base=None):
+        H = L = C = None
+        if base is not None:
+            H, L, C = base
+        else:
+            rr = fetch_candles(sess, symbol, iv, 400, cfg.get("market", "futures"))
+            if not rr or len(rr) < 15:
+                return None
+            rws = rr[:-1]
+            try:
+                H = [float(x[2]) for x in rws]
+                L = [float(x[3]) for x in rws]
+                C = [float(x[4]) for x in rws]
+            except (ValueError, IndexError):
+                return None
+        m = market_structure(H, L, C)
+        if m["structure"] == "uptrend" or m["choch"] == "bullish":
+            return "bullish"
+        if m["structure"] == "downtrend" or m["choch"] == "bearish":
+            return "bearish"
+        return "neutral"
+    tf_bias = {"1h": _bias_of("1h"),
+               "4h": _bias_of("4h", (highs, lows, closes) if interval == "4h" else None),
+               "1d": _bias_of("1d"),
+               "1w": _bias_of("1w")}
 
     atr_pct = round(a / price * 100, 2) if price else None
     # BTC correlation over the recent window (independence vs "just follows BTC").
@@ -1957,6 +2004,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "supertrend_role": st_role,
         "data_stale": data_stale,
         "patterns": patterns,
+        "tf_bias": tf_bias,
         "range_pos": range_pos,
         "structure": ms["structure"],
         "choch": ms["choch"],
@@ -1970,6 +2018,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "support_bounce_tf": dB.get("tf") if okB else None,
         "support_bounce_support": dB.get("support") if okB else None,
         "support_bounce_touches": dB.get("touches") if okB else None,
+        "support_bounce_method": dB.get("method") if okB else None,
         "sup_4h": ksup["sup_4h"], "sup_1d": ksup["sup_1d"], "sup_1w": ksup["sup_1w"],
         "entry": entry,
         "optimal_entry": optimal_entry,

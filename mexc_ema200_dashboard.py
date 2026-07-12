@@ -578,6 +578,7 @@ PAGE = """<!doctype html>
   .pat-bull{background:rgba(63,185,80,.14);color:var(--accent);border-color:rgba(63,185,80,.4)}
   .pat-bear{background:rgba(248,81,73,.14);color:#f85149;border-color:rgba(248,81,73,.4)}
   .pat-neu{background:rgba(139,152,173,.12);color:var(--dim)}
+  .tfbias{border-radius:5px;padding:0 5px;font-size:10px;font-weight:700;border:1px solid var(--line);margin-left:4px;cursor:help;font-variant-numeric:tabular-nums}
   .patwrap{display:flex;flex-direction:column;gap:6px;margin:8px 0 2px}
   .patrow{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
   .pattf{min-width:54px;color:var(--dim);font-size:12px;font-weight:700}
@@ -1098,10 +1099,14 @@ let sSortKey="score", sSortDir=-1, slatest=[];
 let xSortKey="score", xSortDir=-1, xlatest=[];
 let activeTab="setups", lastData=null;
 // Per-tab filters so a filter on one tab never hides rows on another.
-const FILT={ setups:{bias:"all",fresh:false}, flags:{bias:"all",phase:"all"},
-             cpr:{bias:"all"}, bounce:{bias:"all"}, stb:{bias:"all"},
-             wedge:{bias:"all",phase:"all"}, shorts:{bias:"all"}, top:{indep:false} };
-function biasOk(h,tab){ const b=(FILT[tab]||{}).bias; return !b||b==="all"||h.bias_dir===b; }
+const FILT={ setups:{bias:"all",biasTf:"4h",fresh:false}, flags:{bias:"all",biasTf:"4h",phase:"all"},
+             cpr:{bias:"all",biasTf:"4h"}, bounce:{bias:"all",biasTf:"4h"}, stb:{bias:"all",biasTf:"4h"},
+             wedge:{bias:"all",biasTf:"4h",phase:"all"}, shorts:{bias:"all",biasTf:"4h"}, top:{indep:false} };
+function biasOk(h,tab){ const f=FILT[tab]||{}; const b=f.bias;
+  if(!b||b==="all") return true;
+  const tf=f.biasTf||"4h";
+  const lbl=(h.tf_bias&&h.tf_bias[tf]) || (tf==="4h"?h.bias_dir:null);
+  return lbl===b; }
 function renderFilterBar(){
   const bar=document.getElementById("filterbar"); if(!bar) return;
   const t=activeTab;
@@ -1111,6 +1116,11 @@ function renderFilterBar(){
   if('bias' in f){ h+="Bias: ";
     for(const [k,l] of [["all","All"],["bullish","Bullish"],["bearish","Bearish"],["neutral","Neutral"]])
       h+=`<span class="fbtn ${f.bias===k?'active':''}" onclick="setF('${t}','bias','${k}')">${l}</span>`;
+    if(f.bias!=="all"){
+      h+='<span style="color:var(--dim);font-size:11px">on</span>';
+      for(const [k,l] of [["4h","4h"],["1d","1D"],["1w","1W"]])
+        h+=`<span class="fbtn ${f.biasTf===k?'active':''}" onclick="setF('${t}','biasTf','${k}')" data-tip="Judge the bias on the ${l} timeframe (market structure). Lets you find coins that are, say, bullish on the 1D even if the 4h is choppy.">${l}</span>`;
+    }
   }
   if(t==="top"){
     h+=`<span class="fbtn ${f.indep?'active':''}" onclick="setF('top','indep',${!f.indep})" data-tip="Hide coins that just follow BTC — show only setups with BTC correlation ρ below 0.6 (their own movers).">🧭 Independent movers only (ρ&lt;0.6)</span>`;
@@ -1201,7 +1211,21 @@ function badges(h){
   if(sp.length) s+=`<span class="supbadge" data-tip="Next support below (drawdown) — ${sp.join("  ·  ")}">🛟</span>`;
   s+=corrPill(h.btc_corr);
   s+=patPill(h.pattern);
+  s+=tfBiasStrip(h.tf_bias);
+  if(h.data_stale) s+='<span class="patbadge pat-bear" data-tip="MEXC\\'s kline history for this coin looks frozen (both futures and spot came back stale). The indicators may be out of date — confirm on the chart.">⚠ stale</span>';
   return s;
+}
+// Compact per-timeframe bias strip (▲ bullish / ▼ bearish / – neutral on 4h·1D·1W).
+function tfBiasStrip(tb){
+  if(!tb) return '';
+  const sym={bullish:'▲',bearish:'▼',neutral:'–'};
+  const cls={bullish:'pat-bull',bearish:'pat-bear',neutral:'pat-neu'};
+  let out='';
+  for(const [k,lbl] of [['4h','4h'],['1d','1D'],['1w','1W']]){
+    const b=tb[k]; if(!b) continue;
+    out+=`<span class="tfbias ${cls[b]}" data-tip="Market-structure bias on the ${lbl} chart: ${b} (from swing highs/lows + CHoCH).">${lbl}${sym[b]}</span>`;
+  }
+  return out;
 }
 // Chart-formation pill (falling wedge, pennant, triangle, etc.) on every table.
 function patPill(p){
@@ -1273,8 +1297,17 @@ function patternsSection(p){
   const row=(k,lbl)=>{ const l=(p[k]||[]);
     const chips=l.length? l.map(one).join(' ') : '<span style="color:var(--dim)">— none clear —</span>';
     return `<div class="patrow"><span class="pattf">${lbl}</span>${chips}</div>`; };
-  return `<div class="azsec" data-tip="Chart formations detected from swing-pivot geometry on each timeframe — wedges, triangles, pennants, channels, flags, double tops/bottoms. Green = bullish, red = bearish, grey = neutral (trade the break).">Chart patterns <span class="azsub">— formations on 4h / Daily / Weekly (hover each for what it means)</span></div>`
-    + `<div class="patwrap">${row('4h','4h')}${row('1d','Daily')}${row('1w','Weekly')}</div>`;
+  return `<div class="azsec" data-tip="Chart formations detected from swing-pivot geometry on each timeframe — wedges, triangles, pennants, channels, flags, double tops/bottoms. Green = bullish, red = bearish, grey = neutral (trade the break).">Chart patterns <span class="azsub">— formations on 1h / 4h / Daily / Weekly (hover each for what it means)</span></div>`
+    + `<div class="patwrap">${row('1h','1h')}${row('4h','4h')}${row('1d','Daily')}${row('1w','Weekly')}</div>`;
+}
+function tfBiasSection(tb){
+  if(!tb) return '';
+  const one=(k,lbl)=>{ const b=tb[k]; if(!b) return '';
+    const c=b==='bullish'?'pat-bull':b==='bearish'?'pat-bear':'pat-neu';
+    const sym=b==='bullish'?'▲':b==='bearish'?'▼':'–';
+    return `<span class="patbadge ${c}" data-tip="Market-structure bias on the ${lbl} chart (from swing highs/lows + CHoCH).">${lbl} ${b} ${sym}</span>`; };
+  return `<div class="azsec" data-tip="The trend bias on each timeframe from market structure. Alignment across timeframes (all green or all red) is a stronger signal than a single timeframe.">Bias by timeframe <span class="azsub">— 1h / 4h / Daily / Weekly</span></div>`
+    + `<div class="patrow" style="margin:8px 0 2px">${one('1h','1h')}${one('4h','4h')}${one('1d','Daily')}${one('1w','Weekly')}</div>`;
 }
 function azCard(d){
   const cell=(k,v,tip)=>`<div class="azcell"${tip?` data-tip="${tip}"`:''}><div class="k">${k}</div><div class="v">${v}</div></div>`;
@@ -1294,7 +1327,7 @@ function azCard(d){
     <div class="aztags">
       <span class="aztag ${d.ema_reclaim?'on':''}">200-EMA reclaim${d.ema_reclaim?' · '+d.ema_reclaim_score:''}</span>
       <span class="aztag ${d.bull_flag?'on':''}">Bull flag${d.bull_flag?' · '+d.bull_flag_score:''}</span>
-      <span class="aztag ${d.support_bounce?'on':''}">Support bounce${d.support_bounce?` · off ${d.support_bounce_tf} support ${fmtNum(d.support_bounce_support)} · score `+d.support_bounce_score:''}</span>
+      <span class="aztag ${d.support_bounce?'on':''}" ${d.support_bounce?`data-tip="Flagged by clustering ${d.support_bounce_tf} ${d.support_bounce_method||'swing-low pivot'} levels (tested ${d.support_bounce_touches||'?'}× ). The support is the ${d.support_bounce_method||'swing-low pivot zone'} at ${fmtNum(d.support_bounce_support)}."`:''}>Support bounce${d.support_bounce?` · off ${d.support_bounce_tf} ${d.support_bounce_method||'swing-low'} ${fmtNum(d.support_bounce_support)} (${d.support_bounce_touches||'?'}×) · score `+d.support_bounce_score:''}</span>
     </div>
     <div class="azsec">Market read</div>
     <div class="azgrid">
@@ -1307,24 +1340,25 @@ function azCard(d){
       ${cell("ATR", d.atr_pct==null?'—':d.atr_pct+'%', "Average True Range as a % of price — the coin's volatility. Stops are buffered by a fraction of this.")}
       ${cell("BTC correlation", d.btc_corr==null?'—':('ρ '+(+d.btc_corr).toFixed(2)+(d.btc_corr>=0.85?' · just follows BTC':d.btc_corr<0.5?' · independent':' · partly linked')), "How closely this coin's 4h returns tracked BTC over the last ~10 days (Pearson ρ, −1 to +1). ρ≥0.85 means the move is largely just BTC beta — a 'breakout' here may only be BTC pulling it up. Low or negative ρ means the coin is trading on its own story, which is usually what you want for an independent setup.")}
       ${cell("Supertrend ("+(d.interval||'4h')+")", d.supertrend==null?'—':(fmtNum(d.supertrend)+' · '+(d.supertrend_role==='support'?'SUPPORT':'RESISTANCE')+pct(d.supertrend, d.supertrend_role==='support'?'-':'+')), `Supertrend (ATR 10×3) on the ${d.interval||'4h'} chart. When price is ABOVE the line the trend is up and the line acts as a trailing SUPPORT; when price is BELOW it the trend is down and it acts as RESISTANCE. Here it's ${d.supertrend_role||'—'} at ${d.supertrend==null?'—':fmtNum(d.supertrend)} — a level to watch for the trend flipping.`)}
-      ${cell("Supports (distance)", (d.supports||[]).slice(0,3).map(v=>fmtNum(v)+pct(v,'-')).join(' · ')||'—', "Nearest support levels below price, with how far (%) each sits below the current price.")}
-      ${cell("Resistances (distance)", (d.resistances||[]).slice(0,3).map(v=>fmtNum(v)+pct(v,'+')).join(' · ')||'—', "Nearest resistance levels above price, with how far (%) each sits above the current price.")}
-      ${cell("Next support 4h·1D·1W (drawdown)", [d.sup_4h,d.sup_1d,d.sup_1w].map(v=>v==null?'—':fmtNum(v)+pct(v,'-')).join(' · '), "The next major support on the 4h, Daily and Weekly charts — your safety-net levels — with the % drawdown to each.")}
-      ${cell("Next resistance 4h·1D·1W (upside)", [d.res_4h,d.res_1d,d.res_1w].map(v=>v==null?'—':fmtNum(v)+pct(v,'+')).join(' · '), "The next major resistance on the 4h, Daily and Weekly charts — likely ceilings — with the % upside to each.")}
+      ${cell("Supports (distance)", (d.supports||[]).slice(0,3).map(v=>fmtNum(v)+pct(v,'-')).join(' · ')||'—', "Based on: swing-low pivots — prior candle lows the market previously bounced from — on this timeframe, nearest first, with the % below current price.")}
+      ${cell("Resistances (distance)", (d.resistances||[]).slice(0,3).map(v=>fmtNum(v)+pct(v,'+')).join(' · ')||'—', "Based on: swing-high pivots — prior candle peaks that previously capped price — on this timeframe, nearest first, with the % above current price.")}
+      ${cell("Next support 4h·1D·1W (drawdown)", [d.sup_4h,d.sup_1d,d.sup_1w].map(v=>v==null?'—':fmtNum(v)+pct(v,'-')).join(' · '), "Based on: the nearest swing-low pivot on the 4h, Daily and Weekly charts (each timeframe aggregated separately) — your multi-timeframe safety-net levels — with the % drawdown to each.")}
+      ${cell("Next resistance 4h·1D·1W (upside)", [d.res_4h,d.res_1d,d.res_1w].map(v=>v==null?'—':fmtNum(v)+pct(v,'+')).join(' · '), "Based on: the nearest swing-high pivot on the 4h, Daily and Weekly charts — likely ceilings — with the % upside to each.")}
       ${cell("Dist. from 200 EMA (4h·1D·1W)", `4h ${d.pct_vs_ema>=0?'+':''}${d.pct_vs_ema}% · 1D ${d.dist_ema_1d==null?'—':(d.dist_ema_1d>=0?'+':'')+d.dist_ema_1d+'%'} · 1W ${d.dist_ema_1w==null?'—':(d.dist_ema_1w>=0?'+':'')+d.dist_ema_1w+'%'}`, "How far price sits above/below the 200 EMA on each timeframe. Above on all three = a strong multi-timeframe uptrend regime. '—' = not enough history for that EMA.")}
     </div>
+    ${tfBiasSection(d.tf_bias)}
     ${patternsSection(d.patterns)}
     <div class="azsec">Trade plan <span class="azsub">${(d.side||'long')==='short'?'SHORT — sell resistance, stops ABOVE, targets BELOW':'LONG — buy support, stops BELOW, targets ABOVE'} → 5 targets (with R:R)</span></div>
     <div class="azgrid">
-      ${cell("Entry (now)", fmtNum(d.entry), "The current price — your immediate entry.")}
-      ${cell("Optimal entry", fmtNum(d.optimal_entry), (d.side||'long')==='short'?"A better short fill: sell into the nearest resistance rather than shorting here.":"A lower-risk long fill: buy a pullback to the nearest support / EMA instead of chasing.")}
-      ${cell("SL tight", fmtNum(d.sl_tight), (d.side||'long')==='short'?"Tighter stop just ABOVE the nearest resistance (ATR-buffered) — a break above invalidates the short.":"Tighter stop just BELOW the immediate structure (ATR-buffered).")}
-      ${cell("SL wide", fmtNum(d.sl_wide), (d.side||'long')==='short'?"Wider stop above a higher resistance — more room, bigger risk.":"Wider stop below a deeper swing low — more room, bigger risk.")}
-      ${cell("TP1", tp(d.tp1,d.rr1), (d.side||'long')==='short'?"First downside target (nearest support) with its R:R to the tight stop.":"First target (nearest resistance) with its R:R to the tight stop.")}
-      ${cell("TP2", tp(d.tp2,d.rr2), "Second target with its R:R to the tight stop.")}
-      ${cell("TP3", tp(d.tp3,d.rr3), "Third target with its R:R to the tight stop.")}
-      ${cell("TP4", tp(d.tp4,d.rr4), "Fourth target with its R:R to the tight stop.")}
-      ${cell("TP5", tp(d.tp5,d.rr5), "Fifth target with its R:R to the tight stop.")}
+      ${cell("Entry (now)", fmtNum(d.entry), "Based on: the current live price — your immediate entry if you take it here.")}
+      ${cell("Optimal entry", fmtNum(d.optimal_entry), (d.side||'long')==='short'?"Based on: the nearest swing-high resistance — a better short fill is to sell into it rather than shorting here.":"Based on: the nearest swing-low support / reclaimed 200 EMA — a lower-risk long fill is to buy a pullback to it rather than chasing.")}
+      ${cell("SL tight", fmtNum(d.sl_tight), (d.side||'long')==='short'?"Based on: the nearest swing-high / retest high, buffered by 0.5× ATR ABOVE it. A close above invalidates the short.":"Based on: the immediate structure (retest low / nearest swing low), buffered by 0.5× ATR BELOW it. A close below invalidates the setup.")}
+      ${cell("SL wide", fmtNum(d.sl_wide), (d.side||'long')==='short'?"Based on: a deeper swing high + 1.0× ATR — more room, larger risk per unit.":"Based on: a deeper swing low − 1.0× ATR — more room, larger risk per unit.")}
+      ${cell("TP1", tp(d.tp1,d.rr1), (d.side||'long')==='short'?"Based on: the nearest swing-low support below. Grey = reward:risk to the tight stop.":"Based on: the nearest swing-high resistance above. Grey = reward:risk to the tight stop.")}
+      ${cell("TP2", tp(d.tp2,d.rr2), "Based on: the 2nd structural level (swing high/low) in that direction, with R:R to the tight stop.")}
+      ${cell("TP3", tp(d.tp3,d.rr3), "Based on: the 3rd structural level, with R:R to the tight stop.")}
+      ${cell("TP4", tp(d.tp4,d.rr4), "Based on: the 4th structural level (or a Fibonacci extension if structure runs out), with R:R.")}
+      ${cell("TP5", tp(d.tp5,d.rr5), "Based on: the 5th level — a further structural level or Fibonacci extension, with R:R.")}
     </div>
     <div class="azsec" data-tip="A fuller ladder of profit targets: overhead resistance levels blended with Fibonacci extensions of the recent range, in order. Each shows % upside and R:R to the tight stop.">Target ladder <span class="azsub">resistances + Fibonacci extensions (hover for more)</span></div>
     <div class="azladder">
@@ -1784,7 +1818,7 @@ const HDR_TIPS={
   cpr_width_pct:"Central Pivot Range width as % of price. Narrower = more compressed/coiled.",
   position:"Where price sits vs the CPR — above (breakout side) or inside.",
   tc:"CPR top (Top Central).", bc:"CPR bottom (Bottom Central).",
-  support:"The horizontal support level price is bouncing from.",
+  support:"The support level price is bouncing from — identified as a swing-low pivot zone (prior candle lows clustered across 4h/Daily/Weekly and tested repeatedly). The TF column shows the strongest timeframe it sits on.",
   tf:"Strongest timeframe the support sits on — Weekly (gold) > Daily (green) > 4h. Higher = more significant.",
   touches:"How many times that support level has been tested. More = stronger.",
   dist_to_support_pct:"How far price currently sits above the support (%). Smaller = fresher bounce.",
