@@ -574,6 +574,13 @@ PAGE = """<!doctype html>
   .corr-hi{background:rgba(210,153,34,.16);color:#d29922;border-color:rgba(210,153,34,.45)}
   .corr-mid{background:rgba(139,152,173,.12);color:var(--dim)}
   .corr-lo{background:rgba(63,185,80,.16);color:var(--accent);border-color:rgba(63,185,80,.45)}
+  .patbadge{border-radius:6px;padding:0 7px;font-size:10.5px;font-weight:700;border:1px solid var(--line);margin-left:5px;cursor:help;white-space:nowrap}
+  .pat-bull{background:rgba(63,185,80,.14);color:var(--accent);border-color:rgba(63,185,80,.4)}
+  .pat-bear{background:rgba(248,81,73,.14);color:#f85149;border-color:rgba(248,81,73,.4)}
+  .pat-neu{background:rgba(139,152,173,.12);color:var(--dim)}
+  .patwrap{display:flex;flex-direction:column;gap:6px;margin:8px 0 2px}
+  .patrow{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .pattf{min-width:54px;color:var(--dim);font-size:12px;font-weight:700}
   .phasepill{border-radius:6px;padding:1px 7px;font-size:11px;font-weight:700;border:1px solid var(--line)}
   .phase-broke{background:rgba(63,185,80,.16);color:var(--accent);border-color:rgba(63,185,80,.5)}
   .phase-form{background:rgba(139,152,173,.12);color:var(--dim)}
@@ -1193,7 +1200,14 @@ function badges(h){
   if(h.sup_1w!=null) sp.push("Weekly "+fmtNum(h.sup_1w)+dd(h.sup_1w));
   if(sp.length) s+=`<span class="supbadge" data-tip="Next support below (drawdown) — ${sp.join("  ·  ")}">🛟</span>`;
   s+=corrPill(h.btc_corr);
+  s+=patPill(h.pattern);
   return s;
+}
+// Chart-formation pill (falling wedge, pennant, triangle, etc.) on every table.
+function patPill(p){
+  if(!p||!p.name) return '';
+  const cls = p.bias==='bullish'?'pat-bull':p.bias==='bearish'?'pat-bear':'pat-neu';
+  return `<span class="patbadge ${cls}" data-tip="Chart formation on the 4h: ${(''+p.name)} — ${(''+(p.note||'')).replace(/"/g,'&quot;')}">◈ ${p.name}</span>`;
 }
 // BTC-correlation pill: how much this coin just mirrors BTC over the last ~10 days.
 function corrPill(c){
@@ -1253,6 +1267,15 @@ async function analyze(){
   }catch(e){ box.innerHTML='<div class="azerr">Analysis failed — try again.</div>'; }
   btn.disabled=false; btn.textContent=t;
 }
+function patternsSection(p){
+  if(!p) return '';
+  const one=x=>`<span class="patbadge ${x.bias==='bullish'?'pat-bull':x.bias==='bearish'?'pat-bear':'pat-neu'}" data-tip="${(''+(x.note||'')).replace(/"/g,'&quot;')}">${x.name}</span>`;
+  const row=(k,lbl)=>{ const l=(p[k]||[]);
+    const chips=l.length? l.map(one).join(' ') : '<span style="color:var(--dim)">— none clear —</span>';
+    return `<div class="patrow"><span class="pattf">${lbl}</span>${chips}</div>`; };
+  return `<div class="azsec" data-tip="Chart formations detected from swing-pivot geometry on each timeframe — wedges, triangles, pennants, channels, flags, double tops/bottoms. Green = bullish, red = bearish, grey = neutral (trade the break).">Chart patterns <span class="azsub">— formations on 4h / Daily / Weekly (hover each for what it means)</span></div>`
+    + `<div class="patwrap">${row('4h','4h')}${row('1d','Daily')}${row('1w','Weekly')}</div>`;
+}
 function azCard(d){
   const cell=(k,v,tip)=>`<div class="azcell"${tip?` data-tip="${tip}"`:''}><div class="k">${k}</div><div class="v">${v}</div></div>`;
   const pct=(v,sign)=> d.price&&v!=null? ` <span class="rr">${sign}${(Math.abs((v-d.price)/d.price)*100).toFixed(1)}%</span>`:'';
@@ -1271,7 +1294,7 @@ function azCard(d){
     <div class="aztags">
       <span class="aztag ${d.ema_reclaim?'on':''}">200-EMA reclaim${d.ema_reclaim?' · '+d.ema_reclaim_score:''}</span>
       <span class="aztag ${d.bull_flag?'on':''}">Bull flag${d.bull_flag?' · '+d.bull_flag_score:''}</span>
-      <span class="aztag ${d.support_bounce?'on':''}">Support bounce${d.support_bounce?` · ${d.support_bounce_tf} support · `+d.support_bounce_score:''}</span>
+      <span class="aztag ${d.support_bounce?'on':''}">Support bounce${d.support_bounce?` · off ${d.support_bounce_tf} support ${fmtNum(d.support_bounce_support)} · score `+d.support_bounce_score:''}</span>
     </div>
     <div class="azsec">Market read</div>
     <div class="azgrid">
@@ -1290,6 +1313,7 @@ function azCard(d){
       ${cell("Next resistance 4h·1D·1W (upside)", [d.res_4h,d.res_1d,d.res_1w].map(v=>v==null?'—':fmtNum(v)+pct(v,'+')).join(' · '), "The next major resistance on the 4h, Daily and Weekly charts — likely ceilings — with the % upside to each.")}
       ${cell("Dist. from 200 EMA (4h·1D·1W)", `4h ${d.pct_vs_ema>=0?'+':''}${d.pct_vs_ema}% · 1D ${d.dist_ema_1d==null?'—':(d.dist_ema_1d>=0?'+':'')+d.dist_ema_1d+'%'} · 1W ${d.dist_ema_1w==null?'—':(d.dist_ema_1w>=0?'+':'')+d.dist_ema_1w+'%'}`, "How far price sits above/below the 200 EMA on each timeframe. Above on all three = a strong multi-timeframe uptrend regime. '—' = not enough history for that EMA.")}
     </div>
+    ${patternsSection(d.patterns)}
     <div class="azsec">Trade plan <span class="azsub">${(d.side||'long')==='short'?'SHORT — sell resistance, stops ABOVE, targets BELOW':'LONG — buy support, stops BELOW, targets ABOVE'} → 5 targets (with R:R)</span></div>
     <div class="azgrid">
       ${cell("Entry (now)", fmtNum(d.entry), "The current price — your immediate entry.")}

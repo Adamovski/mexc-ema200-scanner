@@ -236,6 +236,112 @@ def volume_profile(volumes: list[float], closes: list[float],
     return {"vol_trend": vtrend, "vol_ratio": ratio, "pressure": pressure}
 
 
+def _line_slope(pivots):
+    """Slope of a line through the first & last pivot (index, price)."""
+    (i0, p0), (i1, p1) = pivots[0], pivots[-1]
+    return (p1 - p0) / (i1 - i0) if i1 != i0 else None
+
+
+def detect_chart_patterns(highs: list[float], lows: list[float],
+                          closes: list[float], volumes: list[float], *,
+                          window: int = 60) -> list[dict]:
+    """Classify the chart formation(s) currently in play from swing-pivot geometry:
+    wedges, triangles (ascending / descending / symmetrical = pennant), channels,
+    rectangles, flags/pennants after a pole, and double tops/bottoms. Returns a list
+    of {name, bias, note}, most salient first (empty if nothing clean)."""
+    n = len(closes)
+    if n < 25:
+        return []
+    last = n - 1
+    price = closes[last] or 1.0
+    sh, sl = swing_points(highs, lows, window=window)
+    out: list[dict] = []
+
+    def add(name, bias, note):
+        out.append({"name": name, "bias": bias, "note": note})
+
+    # --- Flag / pennant after a strong pole (momentum continuation) ---
+    look = min(len(closes) - 1, 24)
+    if look >= 6:
+        seg = closes[-look:]
+        lo_i = seg.index(min(seg))
+        hi_i = seg.index(max(seg))
+        run_up = (max(seg) - seg[0]) / seg[0] if seg[0] else 0
+        run_dn = (seg[0] - min(seg)) / seg[0] if seg[0] else 0
+        tail = closes[-5:]
+        tail_range = (max(tail) - min(tail)) / price
+        if run_up > 0.18 and hi_i < look - 2 and tail_range < 0.10 and price > seg[0] * 1.05:
+            add("Bull flag / pennant", "bullish",
+                "A strong up-impulse (pole) followed by a tight pullback — a continuation setup that tends to break upward.")
+        elif run_dn > 0.18 and lo_i < look - 2 and tail_range < 0.10 and price < seg[0] * 0.95:
+            add("Bear flag / pennant", "bearish",
+                "A sharp drop (pole) followed by a shallow bounce — a continuation setup that tends to break downward.")
+
+    # --- Trendline geometry: wedges / triangles / channels / rectangle ---
+    if len(sh) >= 2 and len(sl) >= 2:
+        ph = sh[-3:] if len(sh) >= 3 else sh[-2:]
+        pl = sl[-3:] if len(sl) >= 3 else sl[-2:]
+        us, ls = _line_slope(ph), _line_slope(pl)
+        if us is not None and ls is not None:
+            un, ln = us / price, ls / price               # per-bar % slopes
+            flat = 0.0010
+            w_start = ph[0][1] - pl[0][1]
+            w_end = ph[-1][1] - pl[-1][1]
+            converging = 0 < w_end < w_start * 0.92
+            diverging = w_end > w_start * 1.12
+
+            def cls(s):
+                return "up" if s > flat else ("down" if s < -flat else "flat")
+            uc, lc = cls(un), cls(ln)
+            if uc == "down" and lc == "down" and converging:
+                add("Falling wedge", "bullish",
+                    "Both boundaries slope down and converge (highs falling faster) — a bullish reversal that usually breaks up.")
+            elif uc == "up" and lc == "up" and converging:
+                add("Rising wedge", "bearish",
+                    "Both boundaries slope up and converge (lows rising faster) — a bearish reversal that usually breaks down.")
+            elif uc == "flat" and lc == "up" and converging:
+                add("Ascending triangle", "bullish",
+                    "Flat resistance with rising support — buyers pressing up into a ceiling; bullish breakout bias.")
+            elif uc == "down" and lc == "flat" and converging:
+                add("Descending triangle", "bearish",
+                    "Falling resistance on flat support — sellers pressing down onto a floor; bearish breakdown bias.")
+            elif uc == "down" and lc == "up" and converging:
+                add("Symmetrical triangle (pennant)", "neutral",
+                    "Highs falling and lows rising into an apex — a coil that can break either way; trade the break.")
+            elif uc == "up" and lc == "up" and not converging and not diverging:
+                add("Ascending channel", "bullish",
+                    "Parallel rising trendlines — an orderly uptrend; buy the lower rail, watch the upper.")
+            elif uc == "down" and lc == "down" and not converging and not diverging:
+                add("Descending channel", "bearish",
+                    "Parallel falling trendlines — an orderly downtrend; sell the upper rail.")
+            elif uc == "flat" and lc == "flat":
+                add("Rectangle / range", "neutral",
+                    "Flat highs and lows — sideways range between horizontal support and resistance.")
+            elif diverging and uc == "up" and lc == "down":
+                add("Broadening formation", "neutral",
+                    "Widening highs and lows — rising volatility and indecision; unstable, prone to whipsaws.")
+
+    # --- Double top / double bottom (fallbacks — only if nothing else matched) ---
+    if not out and len(sh) >= 2:
+        h1, h2 = sh[-2][1], sh[-1][1]
+        if abs(h1 - h2) / max(h1, h2) < 0.03 and price < min(h1, h2) * 0.995:
+            add("Double top", "bearish",
+                "Two peaks at a similar level with price rolling over — a reversal pattern; a break of the middle trough confirms.")
+    if not out and len(sl) >= 2:
+        l1, l2 = sl[-2][1], sl[-1][1]
+        if abs(l1 - l2) / max(l1, l2) < 0.03 and price > max(l1, l2) * 1.005:
+            add("Double bottom", "bullish",
+                "Two troughs at a similar level with price turning up — a reversal pattern; a break of the middle peak confirms.")
+
+    return out[:3]
+
+
+def primary_pattern(highs, lows, closes, volumes) -> dict | None:
+    """The single most salient chart pattern (or None) — used for a compact badge."""
+    pats = detect_chart_patterns(highs, lows, closes, volumes)
+    return pats[0] if pats else None
+
+
 def pct_returns(closes: list[float]) -> list[float]:
     """Bar-over-bar percentage returns — the series used for BTC correlation."""
     out = []
@@ -1310,11 +1416,32 @@ def fetch_futures_klines(sess: requests.Session, symbol: str, interval: str,
     return None
 
 
+def _klines_fresh(rows: list[list] | None, interval: str) -> bool:
+    """True if the most recent candle is recent enough (guards against MEXC's
+    futures kline REST endpoint serving stale/frozen data for some contracts)."""
+    if not rows:
+        return False
+    try:
+        last_ts = float(rows[-1][0]) / 1000.0        # ms → s
+    except (ValueError, IndexError, TypeError):
+        return False
+    secs = _FUT_SECS.get(FUT_INTERVAL.get(interval, "Hour4"), 14400)
+    return (time.time() - last_ts) < secs * 3        # within ~3 candles of now
+
+
 def fetch_candles(sess: requests.Session, symbol: str, interval: str,
                   limit: int, market: str) -> list[list] | None:
-    """Dispatch to the futures or spot kline endpoint (unified row shape)."""
+    """Dispatch to the futures or spot kline endpoint (unified row shape).
+    If the futures endpoint returns stale/frozen data (as MEXC sometimes does for
+    certain contracts), fall back to the spot klines, which stay current."""
     if market == "futures":
-        return fetch_futures_klines(sess, symbol, interval, limit)
+        rows = fetch_futures_klines(sess, symbol, interval, limit)
+        if _klines_fresh(rows, interval):
+            return rows
+        spot = fetch_klines(sess, symbol, interval, limit)   # fresher fallback
+        if spot:
+            return spot
+        return rows                                          # nothing better
     return fetch_klines(sess, symbol, interval, limit)
 
 
@@ -1415,6 +1542,7 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
     _corr = None
     if _btc_ret:
         _corr = pearson(pct_returns(closes)[-CORR_WINDOW:], _btc_ret)
+    _pp = primary_pattern(highs, lows, closes, vols)   # current chart formation
     _ms = market_structure(highs, lows, closes)  # for a per-setup bias label
     if _ms["choch"] == "bullish":
         _bias = "Bullish CHoCH"
@@ -1432,7 +1560,8 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
         bias label, and (for momentum setups) a volume-confirmation score nudge."""
         d = {"symbol": symbol, "rvol": rv, "bias": _bias, "bias_dir": _dir,
              "choch": _ms["choch"],
-             "btc_corr": (round(_corr, 2) if _corr is not None else None), **ksup, **d}
+             "btc_corr": (round(_corr, 2) if _corr is not None else None),
+             "pattern": _pp, **ksup, **d}
         if boost and rv:
             factor = 1.0 + 0.15 * max(0.0, min(1.0, (rv - 1.0) / 1.5))
             d["score"] = round(min(100.0, d["score"] * factor), 1)
@@ -1531,6 +1660,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     if not raw or len(raw) < EMA_PERIOD + 2:
         return {"error": f"Not enough 4h data for '{symbol}'. Check it's a coin "
                          f"listed on MEXC {mkt} (e.g. BTC, SOL, ETHUSDT)."}
+    data_stale = not _klines_fresh(raw, interval)   # both futures & spot came back old
     rows = raw[:-1]
     try:
         highs = [float(x[2]) for x in rows]
@@ -1572,6 +1702,26 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         return ev[-1]
     ema_1d = _tf_ema("1d")
     ema_1w = _tf_ema("1w")
+
+    # Chart formations on each timeframe (4h / Daily / Weekly).
+    def _tf_patterns(iv):
+        rr = fetch_candles(sess, symbol, iv, 400, cfg.get("market", "futures"))
+        if not rr or len(rr) < 30:
+            return []
+        rws = rr[:-1]
+        try:
+            H = [float(x[2]) for x in rws]
+            L = [float(x[3]) for x in rws]
+            C = [float(x[4]) for x in rws]
+            V = [float(x[5]) for x in rws]
+        except (ValueError, IndexError):
+            return []
+        return detect_chart_patterns(H, L, C, V)
+    patterns = {"4h": detect_chart_patterns(highs, lows, closes, vols)
+                if interval == "4h" else _tf_patterns("4h"),
+                "1d": _tf_patterns("1d"),
+                "1w": _tf_patterns("1w")}
+
     atr_pct = round(a / price * 100, 2) if price else None
     # BTC correlation over the recent window (independence vs "just follows BTC").
     btc_corr = None
@@ -1716,6 +1866,10 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     bundle = level_bundle(entry, sl_tight, sl_wide, plan_tps)
 
     notes = []
+    if data_stale:
+        notes.append("⚠ MEXC's kline history for this coin looks stale (the latest "
+                     "candle isn't recent), so the indicators below may be out of "
+                     "date — confirm on the chart before trusting them.")
     notes.append(f"Price is {abs(pct_vs_ema):.1f}% {'above' if above else 'below'} "
                  f"the 200 EMA, which is sloping {trend} — {bias} trend bias.")
     notes.append(f"Market structure is {ms['structure']}"
@@ -1801,6 +1955,8 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "supertrend": st_val,
         "supertrend_dir": st_dir,
         "supertrend_role": st_role,
+        "data_stale": data_stale,
+        "patterns": patterns,
         "range_pos": range_pos,
         "structure": ms["structure"],
         "choch": ms["choch"],
