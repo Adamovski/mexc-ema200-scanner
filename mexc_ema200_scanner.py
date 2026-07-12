@@ -94,6 +94,45 @@ def atr(highs: list[float], lows: list[float], closes: list[float],
     return sum(recent) / len(recent) if recent else 0.0
 
 
+def supertrend(highs: list[float], lows: list[float], closes: list[float],
+               period: int = 10, mult: float = 3.0) -> tuple[float | None, str | None]:
+    """Supertrend (ATR trend-following) — returns (line_value, direction) at the
+    latest closed candle. direction 'up' = the line sits BELOW price and acts as a
+    trailing SUPPORT; 'down' = it sits ABOVE price and acts as RESISTANCE."""
+    n = len(closes)
+    if n < period + 2:
+        return None, None
+    tr = [0.0] * n
+    for i in range(1, n):
+        tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]),
+                    abs(lows[i] - closes[i - 1]))
+    atr_s: list[float | None] = [None] * n
+    atr_s[period] = sum(tr[1:period + 1]) / period            # Wilder ATR seed
+    for i in range(period + 1, n):
+        atr_s[i] = (atr_s[i - 1] * (period - 1) + tr[i]) / period
+    fu = [0.0] * n
+    fl = [0.0] * n
+    st = [0.0] * n
+    d = [1] * n
+    for i in range(period, n):
+        hl2 = (highs[i] + lows[i]) / 2
+        bu = hl2 + mult * atr_s[i]
+        bl = hl2 - mult * atr_s[i]
+        if i == period:
+            fu[i], fl[i], st[i], d[i] = bu, bl, bl, 1
+            continue
+        fu[i] = bu if (bu < fu[i - 1] or closes[i - 1] > fu[i - 1]) else fu[i - 1]
+        fl[i] = bl if (bl > fl[i - 1] or closes[i - 1] < fl[i - 1]) else fl[i - 1]
+        if closes[i] > fu[i - 1]:
+            d[i] = 1
+        elif closes[i] < fl[i - 1]:
+            d[i] = -1
+        else:
+            d[i] = d[i - 1]
+        st[i] = fl[i] if d[i] == 1 else fu[i]
+    return st[n - 1], ("up" if d[n - 1] == 1 else "down")
+
+
 def rel_volume(volumes: list[float], lookback: int = 20) -> float | None:
     """Relative volume of the latest candle vs the prior `lookback`-candle average.
     >1 = the current bar is trading on above-average volume (confirmation)."""
@@ -1051,7 +1090,8 @@ def list_futures_bases(sess: requests.Session) -> set[str]:
             data = r.json().get("data", [])
             bases = {str(c.get("baseCoin", "")).upper()
                      for c in data
-                     if c.get("quoteCoin") == "USDT" and not c.get("isHidden")}
+                     if c.get("quoteCoin") == "USDT" and not c.get("isHidden")
+                     and not _is_tradfi_contract(c)}
             if bases:
                 return bases
         except requests.RequestException as e:
@@ -1115,8 +1155,29 @@ _FUT_SECS = {"Min1": 60, "Min5": 300, "Min15": 900, "Min30": 1800, "Min60": 3600
              "Hour4": 14400, "Hour8": 28800, "Day1": 86400, "Week1": 604800}
 
 
+# MEXC tags tokenized stocks / ETFs / other TradFi perps (Amazon, Apple, iShares
+# ETFs, etc.) with contract type==2 and these "concept plate" zones. They are NOT
+# crypto, barely move in USDT terms, and pollute the scan — so we drop them.
+_TRADFI_PLATES = {
+    "mc-trade-zone-Stock", "mc-trade-zone-tradfi", "mc-trade-zone-ETF",
+    "mc-trade-zone-stockindex", "mc-trade-zone-Forex", "mc-trade-zone-commodities",
+}
+
+
+def _is_tradfi_contract(c: dict) -> bool:
+    """True for tokenized stocks / ETFs / forex / commodities (non-crypto)."""
+    if c.get("type") == 2:                    # MEXC marks TradFi contracts as type 2
+        return True
+    plates = c.get("conceptPlate") or []
+    if any(p in _TRADFI_PLATES for p in plates):
+        return True
+    base = str(c.get("baseCoin", "")).upper()
+    return base.endswith("STOCK")             # belt-and-suspenders for stock tokens
+
+
 def list_futures_symbols(sess: requests.Session, quote: str = "USDT") -> list[str]:
-    """All tradable USDT-perp contracts, as DISPLAY symbols ('BTCUSDT')."""
+    """All tradable USDT-perp CRYPTO contracts, as DISPLAY symbols ('BTCUSDT').
+    Stablecoins and tokenized stocks/ETFs/other TradFi are filtered out."""
     r = sess.get(f"{FUTURES_BASE}/api/v1/contract/detail", timeout=30)
     r.raise_for_status()
     out = []
@@ -1125,6 +1186,8 @@ def list_futures_symbols(sess: requests.Session, quote: str = "USDT") -> list[st
             continue
         base = str(c.get("baseCoin", "")).upper()
         if base in STABLE_BASES or not base:
+            continue
+        if _is_tradfi_contract(c):             # skip non-crypto (stocks/ETFs/etc.)
             continue
         out.append(base + quote)
     return sorted(set(out))
@@ -1426,6 +1489,10 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     except (requests.RequestException, ValueError, IndexError, TypeError):
         btc_corr = None
     r14 = rsi(closes)
+    st_val, st_dir = supertrend(highs, lows, closes)          # 4h Supertrend (or the selected TF)
+    st_role = None
+    if st_val is not None:
+        st_role = "support" if st_dir == "up" else "resistance"
     ms = market_structure(highs, lows, closes)
     vp = volume_profile(vols, closes)
     rv = rel_volume(vols)
@@ -1562,6 +1629,12 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     if r14 is not None:
         state = ("oversold" if r14 < 30 else "overbought" if r14 > 70 else "neutral")
         notes.append(f"RSI(14) is {r14} ({state}).")
+    if st_val is not None:
+        notes.append(
+            f"Supertrend ({interval}) is at <b>{st_val:.6g}</b>, "
+            f"{'below' if st_role == 'support' else 'above'} price — trend is "
+            f"{'up, so it acts as a trailing <b>support</b>' if st_role == 'support' else 'down, so it acts as <b>resistance</b>'}; "
+            f"a flip through it would signal the {interval} trend changing.")
     notes.append(f"Volume is {vp['vol_trend']} vs its average"
                  + (f" (x{vp['vol_ratio']})" if vp['vol_ratio'] else "")
                  + f", with {vp['pressure']} in control of recent candles"
@@ -1630,6 +1703,9 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "rsi": r14,
         "atr_pct": atr_pct,
         "btc_corr": (round(btc_corr, 2) if btc_corr is not None else None),
+        "supertrend": st_val,
+        "supertrend_dir": st_dir,
+        "supertrend_role": st_role,
         "range_pos": range_pos,
         "structure": ms["structure"],
         "choch": ms["choch"],
