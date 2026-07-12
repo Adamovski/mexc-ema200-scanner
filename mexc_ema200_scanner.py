@@ -1059,6 +1059,95 @@ def detect_breakdown_and_retest(
 
 
 # ----------------------------------------------------------------------------
+# Supertrend support bounce — bouncing off the Supertrend line as support,
+# considered across 4h / Daily / Weekly.
+# ----------------------------------------------------------------------------
+def detect_supertrend_bounce(rows: list, highs: list[float], lows: list[float],
+                             closes: list[float], volumes: list[float], *,
+                             near_tol: float = 0.04, recent: int = 6
+                             ) -> tuple[bool, dict]:
+    """Price bouncing off its Supertrend line used as SUPPORT, checked on 4h,
+    DAILY and WEEKLY. On each timeframe where Supertrend is in 'up' mode the line
+    sits below price and acts as a trailing support; the setup fires when price is
+    holding just above the nearest such line, has recently tagged it, and is
+    turning back up. A higher-timeframe Supertrend support is stronger."""
+    n = len(closes)
+    if n < 60:
+        return False, {}
+    last = n - 1
+    price = closes[last]
+
+    frames = [("4h", highs, lows, closes)]
+    for gd, lbl in ((1, "Daily"), (7, "Weekly")):
+        h, l, c, _v = _agg_series(rows, gd)
+        if len(c) >= 15:
+            frames.append((lbl, h, l, c))
+
+    rank = {"4h": 0, "Daily": 1, "Weekly": 2}
+    tf_strength = {"4h": 0.45, "Daily": 0.72, "Weekly": 1.0}
+    up_count = 0
+    supports = []                       # (tf_label, st_value) where ST is a support
+    for lbl, h, l, c in frames:
+        v, d = supertrend(h, l, c)
+        if v is None:
+            continue
+        if d == "up":
+            up_count += 1
+            if v <= price * 1.005:      # line sits at/below price → support
+                supports.append((lbl, v))
+    if not supports:
+        return False, {}
+
+    # Nearest Supertrend support below price (highest value ≤ price); ties → higher TF.
+    slabel, slevel = max(supports, key=lambda x: (x[1], rank[x[0]]))
+    dist = (price - slevel) / price
+    if dist > near_tol:                 # too far above the line = not a fresh bounce
+        return False, {}
+    if price < slevel * (1 - 0.005):    # closed below the Supertrend support = broken
+        return False, {}
+
+    tagged = any(lows[i] <= slevel * (1 + 0.012)
+                 for i in range(max(0, last - recent + 1), last + 1))
+    turning = closes[last] > closes[last - 1] or (
+        last - 2 >= 0 and closes[last] > closes[last - 2])
+    r14 = rsi(closes) or 50.0
+    res = resistances_above(highs, last, price, max_n=5, min_gap=0.005)
+
+    tf_s = tf_strength[slabel]
+    fresh_s = 1.0 if dist < 0.01 else max(0.0, 1.0 - dist / near_tol)
+    align_s = min(1.0, up_count / 3.0)          # how many TFs are Supertrend-up
+    turn_s = 1.0 if turning else 0.3
+    tag_s = 1.0 if tagged else 0.4
+    room_s = min(1.0, ((res[-1] - price) / price) / 0.30) if res else 0.0
+    rsi_s = 1.0 if r14 < 45 else (0.5 if r14 < 60 else 0.0)
+    score = round(100 * (0.24 * tf_s + 0.2 * fresh_s + 0.18 * align_s +
+                         0.12 * tag_s + 0.1 * turn_s + 0.08 * room_s + 0.08 * rsi_s), 1)
+
+    entry = price
+    a = atr(highs, lows, closes)
+    optimal_entry = round(slevel * 1.003, 10)   # buy near the Supertrend line
+    sl_tight = slevel - 0.5 * a                  # stop just below the line
+    sl_wide = slevel - 1.5 * a
+    bundle = level_bundle(entry, sl_tight, sl_wide, res)
+    ms = market_structure(highs, lows, closes)
+    return True, {
+        "price": price,
+        "supertrend": slevel,
+        "tf": slabel,
+        "tf_up": up_count,
+        "dist_to_st_pct": round(dist * 100, 2),
+        "tagged": bool(tagged),
+        "turning_up": bool(turning),
+        "rsi": r14,
+        "choch": ms["choch"],
+        "entry": entry,
+        "optimal_entry": optimal_entry,
+        "score": score,
+        **bundle,
+    }
+
+
+# ----------------------------------------------------------------------------
 # MEXC API
 # ----------------------------------------------------------------------------
 def get_session() -> requests.Session:
@@ -1303,12 +1392,12 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
                       cfg: dict) -> tuple:
     """Fetch klines ONCE and run every detector (200-EMA reclaim, bull flag,
     narrow CPR, support bounce, falling wedge, bearish breakdown/retest). One
-    request per symbol powers every scan. Returns a 6-tuple of dicts (each with
-    'symbol') or None: (ema, flag, cpr, bounce, wedge, short)."""
+    request per symbol powers every scan. Returns a 7-tuple of dicts (each with
+    'symbol') or None: (ema, flag, cpr, bounce, wedge, short, st_bounce)."""
     raw = fetch_candles(sess, symbol, interval, cfg["kline_limit"],
                         cfg.get("market", "spot"))
     if not raw or len(raw) < EMA_PERIOD + 2:
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
     # MEXC kline row: [openTime, open, high, low, close, volume, closeTime, ...]
     rows = raw[:-1]                       # drop the still-forming candle
     try:
@@ -1317,7 +1406,7 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
         closes = [float(x[4]) for x in rows]
         vols = [float(x[5]) for x in rows]
     except (ValueError, IndexError):
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     rv = rel_volume(vols)                       # relative volume of the latest candle
     ksup = key_supports(rows, lows, closes[-1])  # next 4h / daily / weekly support
@@ -1391,7 +1480,13 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
         short_hit = confirmed(s, boost=True)
         short_hit["bias_dir"] = "bearish"        # a short is bearish by definition
 
-    return ema_hit, flag_hit, cpr_hit, bounce_hit, wedge_hit, short_hit
+    st_bounce_hit = None
+    ok7, sb = detect_supertrend_bounce(rows, highs, lows, closes, vols)
+    if ok7:
+        st_bounce_hit = confirmed(sb, boost=True)
+
+    return (ema_hit, flag_hit, cpr_hit, bounce_hit, wedge_hit, short_hit,
+            st_bounce_hit)
 
 
 def supports_below(lows: list[float], upto: int, price: float,

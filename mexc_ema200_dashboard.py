@@ -99,6 +99,9 @@ class State:
         self.short_hits: list[dict] = []           # bearish breakdown/retest (shorts)
         self.prev_short_symbols: set[str] | None = None
         self.new_short_symbols: list[str] = []
+        self.stb_hits: list[dict] = []             # supertrend support bounce (multi-TF)
+        self.prev_stb_symbols: set[str] | None = None
+        self.new_stb_symbols: list[str] = []
         self.both_symbols: list[str] = []          # appear on 2+ scans (confluence)
         self.prev_both: set[str] | None = None     # confluence set from previous scan
         self.watch: dict[str, float] = {}          # symbol -> flag breakout level (armed)
@@ -145,6 +148,8 @@ class State:
                 "wedge_new_symbols": list(self.new_wedge_symbols),
                 "short_hits": withlive(self.short_hits),
                 "short_new_symbols": list(self.new_short_symbols),
+                "stb_hits": withlive(self.stb_hits),
+                "stb_new_symbols": list(self.new_stb_symbols),
                 "both_symbols": list(self.both_symbols),
                 "breakout_events": list(self.breakout_events),
                 "error": self.error,
@@ -185,6 +190,7 @@ def run_one_scan(state: State) -> None:
     bounces: list[dict] = []
     wedges: list[dict] = []
     shorts: list[dict] = []
+    st_bounces: list[dict] = []
     done = 0
     scan_cfg = {k: cfg[k] for k in
                 ("kline_limit", "lookback", "retest_tol", "break_tol",
@@ -210,9 +216,9 @@ def run_one_scan(state: State) -> None:
                 with state.lock:
                     state.progress = (done, len(symbols))
             try:
-                h, f, c, b, w, sh = fut.result()
+                h, f, c, b, w, sh, sb = fut.result()
             except Exception:
-                h, f, c, b, w, sh = None, None, None, None, None, None
+                h, f, c, b, w, sh, sb = (None,) * 7
             if h:
                 hits.append(h)
             if f:
@@ -225,6 +231,8 @@ def run_one_scan(state: State) -> None:
                 wedges.append(w)
             if sh:
                 shorts.append(sh)
+            if sb:
+                st_bounces.append(sb)
 
     # Persist recently broken-out flags on the list (tagged) so the Bull-flags tab
     # doesn't "reset" the moment a flag triggers. The forming flags are recorded
@@ -248,6 +256,7 @@ def run_one_scan(state: State) -> None:
     bounces.sort(key=lambda h: h["score"], reverse=True)
     wedges.sort(key=lambda h: h["score"], reverse=True)
     shorts.sort(key=lambda h: h["score"], reverse=True)
+    st_bounces.sort(key=lambda h: h["score"], reverse=True)
 
     def tag_new(items, prev):
         """Return (rows, new_syms, cur_syms) with an is_new flag per row."""
@@ -265,6 +274,7 @@ def run_one_scan(state: State) -> None:
         "Narrow CPR": {h["symbol"] for h in cprs},
         "Support bounce": {h["symbol"] for h in bounces},
         "Falling wedge": {h["symbol"] for h in wedges},
+        "Supertrend bounce": {h["symbol"] for h in st_bounces},
     }
     conf: dict[str, list[str]] = {}          # symbol -> list of scan labels it's in
     for label, members in scan_members.items():
@@ -279,7 +289,8 @@ def run_one_scan(state: State) -> None:
         brows, bnew, bcur = tag_new(bounces, state.prev_bounce_symbols)
         wrows, wnew, wcur = tag_new(wedges, state.prev_wedge_symbols)
         srows, snew, scur = tag_new(shorts, state.prev_short_symbols)
-        for d in rows + frows + crows + brows + wrows + srows:
+        sbrows, sbnew, sbcur = tag_new(st_bounces, state.prev_stb_symbols)
+        for d in rows + frows + crows + brows + wrows + srows + sbrows:
             labels = conf.get(d["symbol"], [])
             d["both"] = len(labels) >= 2
             d["both_count"] = len(labels)
@@ -290,6 +301,7 @@ def run_one_scan(state: State) -> None:
         state.bounce_hits, state.new_bounce_symbols, state.prev_bounce_symbols = brows, bnew, bcur
         state.wedge_hits, state.new_wedge_symbols, state.prev_wedge_symbols = wrows, wnew, wcur
         state.short_hits, state.new_short_symbols, state.prev_short_symbols = srows, snew, scur
+        state.stb_hits, state.new_stb_symbols, state.prev_stb_symbols = sbrows, sbnew, sbcur
         state.both_symbols = sorted(both)
 
         # Arm breakout alerts for the current bull flags (their breakout level).
@@ -580,6 +592,7 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabFlags" onclick="showTab('flags')">Bull flags</div>
   <div class="tab" id="tabCpr" onclick="showTab('cpr')">Narrow CPR</div>
   <div class="tab" id="tabBounce" onclick="showTab('bounce')">Support bounce</div>
+  <div class="tab" id="tabStb" onclick="showTab('stb')">Supertrend support bounce</div>
   <div class="tab" id="tabWedge" onclick="showTab('wedge')">Falling wedge</div>
   <div class="tab" id="tabShorts" onclick="showTab('shorts')">Shorts</div>
   <div class="tab" id="tabTop" onclick="showTab('top')">⭐ Top setups</div>
@@ -715,6 +728,40 @@ PAGE = """<!doctype html>
     <tbody id="brows"></tbody>
   </table>
   <div class="empty" id="bempty" style="display:none">No support-bounce setups right now. The loop keeps scanning…</div>
+</div>
+</div>
+
+<div class="view" id="viewStb">
+<div class="status">
+  <span>Supertrend support bounce — price bouncing off its <b>Supertrend</b> line used as support, checked on 4h / Daily / Weekly. Fires when price holds just above the nearest up-trending Supertrend line, has tagged it, and is turning back up. A higher-timeframe line is stronger.</span>
+  <span id="stbCount"></span>
+</div>
+<div class="wrap">
+  <table id="sbtbl">
+    <thead><tr>
+      <th data-xk="symbol">Symbol</th>
+      <th data-xk="price">Price</th>
+      <th data-xk="supertrend">Supertrend</th>
+      <th data-xk="tf">TF</th>
+      <th data-xk="tf_up">TFs up</th>
+      <th data-xk="dist_to_st_pct">Dist %</th>
+      <th data-xk="rsi">RSI</th>
+      <th data-xk="bias">Bias</th>
+      <th data-tip="BTC correlation ρ over ~10 days. Low/negative = its own mover.">BTC ρ</th>
+      <th data-xk="optimal_entry">Optimal entry</th>
+      <th data-xk="sl_tight">SL tight</th>
+      <th data-xk="sl_wide">SL wide</th>
+      <th data-xk="tp1">TP1</th>
+      <th data-xk="tp2">TP2</th>
+      <th data-xk="tp3">TP3</th>
+      <th data-xk="tp4">TP4</th>
+      <th data-xk="tp5">TP5</th>
+      <th data-xk="rvol">RVol</th>
+      <th data-xk="score">Score</th>
+    </tr></thead>
+    <tbody id="sbrows"></tbody>
+  </table>
+  <div class="empty" id="sbempty" style="display:none">No Supertrend support bounces right now. The loop keeps scanning…</div>
 </div>
 </div>
 
@@ -1041,10 +1088,11 @@ let cSortKey="score", cSortDir=-1, clatest=[];
 let bSortKey="score", bSortDir=-1, blatest=[];
 let wSortKey="score", wSortDir=-1, wlatest=[];
 let sSortKey="score", sSortDir=-1, slatest=[];
+let xSortKey="score", xSortDir=-1, xlatest=[];
 let activeTab="setups", lastData=null;
 // Per-tab filters so a filter on one tab never hides rows on another.
 const FILT={ setups:{bias:"all",fresh:false}, flags:{bias:"all",phase:"all"},
-             cpr:{bias:"all"}, bounce:{bias:"all"},
+             cpr:{bias:"all"}, bounce:{bias:"all"}, stb:{bias:"all"},
              wedge:{bias:"all",phase:"all"}, shorts:{bias:"all"}, top:{indep:false} };
 function biasOk(h,tab){ const b=(FILT[tab]||{}).bias; return !b||b==="all"||h.bias_dir===b; }
 function renderFilterBar(){
@@ -1078,7 +1126,7 @@ function renderFilterBar(){
 }
 function setF(tab,key,val){ FILT[tab][key]=val; renderFilterBar();
   ({setups:render,flags:renderFlags,cpr:renderCPR,bounce:renderBounce,
-    wedge:renderWedge,shorts:renderShorts,top:renderTop}[tab]||(()=>{}))();
+    wedge:renderWedge,shorts:renderShorts,top:renderTop,stb:renderStb}[tab]||(()=>{}))();
 }
 let alertsOn=false, audioCtx=null, seenBreak=Math.floor(Date.now()/1000);
 function enableAlerts(){
@@ -1178,7 +1226,7 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["wedge","Wedge"],["shorts","Shorts"],["top","Top"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["wedge","Wedge"],["shorts","Shorts"],["top","Top"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
@@ -1269,6 +1317,7 @@ function renderBanner(){
   else if(activeTab==="flags"){ newSyms=(lastData&&lastData.flag_new_symbols)||[]; what="bull flag"; }
   else if(activeTab==="cpr"){ newSyms=(lastData&&lastData.cpr_new_symbols)||[]; what="narrow CPR"; }
   else if(activeTab==="bounce"){ newSyms=(lastData&&lastData.bounce_new_symbols)||[]; what="support bounce"; }
+  else if(activeTab==="stb"){ newSyms=(lastData&&lastData.stb_new_symbols)||[]; what="supertrend bounce"; }
   else if(activeTab==="wedge"){ newSyms=(lastData&&lastData.wedge_new_symbols)||[]; what="falling wedge"; }
   else if(activeTab==="shorts"){ newSyms=(lastData&&lastData.short_new_symbols)||[]; what="short setup"; }
   if(!newSyms.length){ b.classList.remove("show"); b.innerHTML=""; return; }
@@ -1414,6 +1463,40 @@ document.querySelectorAll("th[data-sk]").forEach(th=>th.addEventListener("click"
   const k=th.dataset.sk; if(k===sSortKey) sSortDir*=-1; else {sSortKey=k; sSortDir=(k==="symbol")?1:-1;}
   renderShorts();
 }));
+document.querySelectorAll("th[data-xk]").forEach(th=>th.addEventListener("click",()=>{
+  const k=th.dataset.xk; if(k===xSortKey) xSortDir*=-1; else {xSortKey=k; xSortDir=(k==="symbol"||k==="tf")?1:-1;}
+  renderStb();
+}));
+function renderStb(){
+  const rows=[...xlatest].filter(h=>biasOk(h,"stb")).sort((a,b)=>{
+    const x=a[xSortKey],y=b[xSortKey];
+    if(typeof x==="string") return xSortDir*x.localeCompare(y);
+    return xSortDir*((x??0)-(y??0));
+  });
+  const tb=document.getElementById("sbrows"); tb.innerHTML="";
+  document.getElementById("sbempty").style.display = rows.length? "none":"block";
+  for(const h of rows){
+    const tr=document.createElement("tr");
+    tr.className=rowClass(h);
+    tr.innerHTML =
+      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
+      `<td data-tip="The Supertrend line value on the strongest confirming timeframe — acting as support below price.">${fmtNum(h.supertrend)}</td>`+
+      `<td><span class="tfpill tf-${(h.tf||'').toLowerCase()}">${h.tf||'4h'}</span></td>`+
+      `<td data-tip="How many of 4h / Daily / Weekly currently have Supertrend in up-mode. More = stronger multi-timeframe trend support.">${h.tf_up==null?'—':h.tf_up+'/3'}</td>`+
+      `<td>${h.dist_to_st_pct==null?'—':(+h.dist_to_st_pct).toFixed(2)}</td>`+
+      `<td>${h.rsi==null?'—':(+h.rsi).toFixed(0)}</td>`+
+      `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
+      corrTd(h.btc_corr)+
+      `<td data-tip="Optimal entry — a fill near the Supertrend line rather than chasing.">${fmtNum(h.optimal_entry)}</td>`+
+      `<td data-tip="Tight stop — just below the Supertrend line, ATR-buffered. A close below flips the trend and invalidates the setup.">${fmtNum(h.sl_tight)}</td>`+
+      `<td data-tip="Wide stop — further below the line.">${fmtNum(h.sl_wide)}</td>`+
+      tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
+      rvCell(h.rvol)+
+      `<td class="score">${(+h.score).toFixed(1)}</td>`;
+    tb.appendChild(tr);
+  }
+}
 function wedgePhase(h){ return h.broken_out
   ? '<span class="phasepill phase-broke">🚀 Broke out</span>'
   : '<span class="phasepill phase-form">Coiling</span>'; }
@@ -1556,7 +1639,7 @@ function renderTop(){
   if(!lastData) return;
   const srcB=[["200-EMA reclaim",lastData.hits],["Bull flag",lastData.flag_hits],
               ["Narrow CPR",lastData.cpr_hits],["Support bounce",lastData.bounce_hits],
-              ["Falling wedge",lastData.wedge_hits]];
+              ["Falling wedge",lastData.wedge_hits],["Supertrend bounce",lastData.stb_hits]];
   const m={};
   for(const [lbl,list] of srcB) for(const h of (list||[])){
     const k=h.symbol, q=setupQuality(h);
@@ -1622,6 +1705,7 @@ async function poll(){
     flatest=d.flag_hits||[]; renderFlags();
     clatest=d.cpr_hits||[]; renderCPR();
     blatest=d.bounce_hits||[]; renderBounce();
+    xlatest=d.stb_hits||[]; renderStb();
     wlatest=d.wedge_hits||[]; renderWedge();
     slatest=d.short_hits||[]; renderShorts();
     renderTop();
@@ -1633,6 +1717,7 @@ async function poll(){
     document.getElementById("flagCount").textContent = `${flatest.length} flag(s) · ${d.universe} pairs${bothTxt}`;
     document.getElementById("cprCount").textContent = `${clatest.length} narrow-CPR · ${d.universe} pairs${bothTxt}`;
     document.getElementById("bounceCount").textContent = `${blatest.length} bounce(s) · ${d.universe} pairs${bothTxt}`;
+    document.getElementById("stbCount").textContent = `${xlatest.length} supertrend bounce(s) · ${d.universe} pairs${bothTxt}`;
     document.getElementById("wedgeCount").textContent = `${wlatest.length} wedge(s) · ${d.universe} pairs${bothTxt}`;
     document.getElementById("shortCount").textContent = `${slatest.length} short setup(s) · ${d.universe} pairs`;
     // topCount is set inside renderTop() (it knows the deduped long count).
@@ -1682,11 +1767,14 @@ const HDR_TIPS={
   rsi:"RSI(14) momentum, 0–100. Below 30 = oversold (bounce potential), above 70 = overbought.",
   conv_pct:"How far the two wedge lines have converged toward the apex. Higher = tighter coil, nearer resolution.",
   phase:"Coiling = still forming inside the wedge. Broke out = price has pushed above the upper (descending) line.",
-  pct_below_ema:"How far price sits BELOW the falling 200 EMA (%). This is a short: closer to the line = tighter entry."
+  pct_below_ema:"How far price sits BELOW the falling 200 EMA (%). This is a short: closer to the line = tighter entry.",
+  supertrend:"The Supertrend (ATR 10×3) line on the strongest confirming timeframe — sitting below price and acting as a trailing support.",
+  tf_up:"How many of 4h / Daily / Weekly currently have Supertrend in up-mode. More = stronger multi-timeframe trend backing.",
+  dist_to_st_pct:"How far price sits above the Supertrend line (%). Smaller = a fresher bounce, tighter entry."
 };
 function applyHeaderTips(){
-  document.querySelectorAll("th[data-k],th[data-fk],th[data-ck],th[data-bk],th[data-wk],th[data-sk]").forEach(th=>{
-    const k=th.dataset.k||th.dataset.fk||th.dataset.ck||th.dataset.bk||th.dataset.wk||th.dataset.sk;
+  document.querySelectorAll("th[data-k],th[data-fk],th[data-ck],th[data-bk],th[data-wk],th[data-sk],th[data-xk]").forEach(th=>{
+    const k=th.dataset.k||th.dataset.fk||th.dataset.ck||th.dataset.bk||th.dataset.wk||th.dataset.sk||th.dataset.xk;
     if(HDR_TIPS[k]) th.setAttribute("data-tip",HDR_TIPS[k]);
   });
 }
