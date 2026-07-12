@@ -50,6 +50,7 @@ try:
     from mexc_ema200_scanner import (
         list_symbols, scan_symbol_multi, get_session, EMA_PERIOD,
         analyze_symbol, normalize_symbol, fetch_candles, pct_returns, CORR_WINDOW,
+        bias_on_tf,
     )
 except ImportError:
     sys.exit("Could not import mexc_ema200_scanner.py — keep both files in the "
@@ -257,6 +258,26 @@ def run_one_scan(state: State) -> None:
     wedges.sort(key=lambda h: h["score"], reverse=True)
     shorts.sort(key=lambda h: h["score"], reverse=True)
     st_bounces.sort(key=lambda h: h["score"], reverse=True)
+
+    # Enrich ONLY the flagged coins with a 1h bias (a separate fetch each — cheap
+    # since it's just the few dozen hits, not the whole ~500-coin universe). This
+    # completes the 1h/4h/1D/1W multi-timeframe bias strip on every displayed row.
+    all_rows = (hits + flags + cprs + bounces + wedges + shorts + st_bounces)
+    hit_syms = sorted({r["symbol"] for r in all_rows})
+    if hit_syms:
+        mkt = cfg.get("market", "futures")
+        bias1h: dict[str, str | None] = {}
+        with ThreadPoolExecutor(max_workers=min(12, cfg["workers"])) as ex:
+            futs = {ex.submit(bias_on_tf, sess, s, "1h", mkt): s for s in hit_syms}
+            for fut in as_completed(futs):
+                try:
+                    bias1h[futs[fut]] = fut.result()
+                except Exception:
+                    bias1h[futs[fut]] = None
+        for r in all_rows:
+            tb = r.get("tf_bias")
+            if isinstance(tb, dict):
+                tb["1h"] = bias1h.get(r["symbol"])
 
     def tag_new(items, prev):
         """Return (rows, new_syms, cur_syms) with an is_new flag per row."""
@@ -1118,7 +1139,7 @@ function renderFilterBar(){
       h+=`<span class="fbtn ${f.bias===k?'active':''}" onclick="setF('${t}','bias','${k}')">${l}</span>`;
     if(f.bias!=="all"){
       h+='<span style="color:var(--dim);font-size:11px">on</span>';
-      for(const [k,l] of [["4h","4h"],["1d","1D"],["1w","1W"]])
+      for(const [k,l] of [["1h","1h"],["4h","4h"],["1d","1D"],["1w","1W"]])
         h+=`<span class="fbtn ${f.biasTf===k?'active':''}" onclick="setF('${t}','biasTf','${k}')" data-tip="Judge the bias on the ${l} timeframe (market structure). Lets you find coins that are, say, bullish on the 1D even if the 4h is choppy.">${l}</span>`;
     }
   }
@@ -1221,7 +1242,7 @@ function tfBiasStrip(tb){
   const sym={bullish:'▲',bearish:'▼',neutral:'–'};
   const cls={bullish:'pat-bull',bearish:'pat-bear',neutral:'pat-neu'};
   let out='';
-  for(const [k,lbl] of [['4h','4h'],['1d','1D'],['1w','1W']]){
+  for(const [k,lbl] of [['1h','1h'],['4h','4h'],['1d','1D'],['1w','1W']]){
     const b=tb[k]; if(!b) continue;
     out+=`<span class="tfbias ${cls[b]}" data-tip="Market-structure bias on the ${lbl} chart: ${b} (from swing highs/lows + CHoCH).">${lbl}${sym[b]}</span>`;
   }
@@ -1290,6 +1311,12 @@ async function analyze(){
     box.innerHTML = d.error ? '<div class="azerr">'+d.error+'</div>' : azCard(d);
   }catch(e){ box.innerHTML='<div class="azerr">Analysis failed — try again.</div>'; }
   btn.disabled=false; btn.textContent=t;
+}
+function stopsSection(list,side){
+  if(!list||!list.length) return '';
+  const chips=list.map(s=>`<span class="ladchip" data-tip="${(''+s.basis).replace(/"/g,'&quot;')} — a ${side==='short'?'short':'long'} stop here risks ${Math.abs(s.pct).toFixed(1)}% from the current price.">${fmtNum(s.level)} <span class="rr">${s.pct>=0?'+':''}${s.pct}% · ${s.basis}</span></span>`).join('');
+  return `<div class="azsec" data-tip="Candidate stop-loss levels, each anchored to a specific structure (swing high/low, the Supertrend line, the 200 EMA, or a higher-timeframe support/resistance) and buffered by a fraction of ATR. Pick the one that fits your risk and thesis — tighter = smaller risk but easier to get wicked out; wider = more room.">Stop-loss options <span class="azsub">— ${side==='short'?'above':'below'} price, each with what it\\'s based on</span></div>`
+    + `<div class="azladder">${chips}</div>`;
 }
 function patternsSection(p){
   if(!p) return '';
@@ -1360,6 +1387,7 @@ function azCard(d){
       ${cell("TP4", tp(d.tp4,d.rr4), "Based on: the 4th structural level (or a Fibonacci extension if structure runs out), with R:R.")}
       ${cell("TP5", tp(d.tp5,d.rr5), "Based on: the 5th level — a further structural level or Fibonacci extension, with R:R.")}
     </div>
+    ${stopsSection(d.stop_levels, d.side||'long')}
     <div class="azsec" data-tip="A fuller ladder of profit targets: overhead resistance levels blended with Fibonacci extensions of the recent range, in order. Each shows % upside and R:R to the tight stop.">Target ladder <span class="azsub">resistances + Fibonacci extensions (hover for more)</span></div>
     <div class="azladder">
       ${(d.target_ladder||[]).map((t,i)=>`<span class="ladchip" data-tip="Target ${i+1}: ${t.kind} at ${fmtNum(t.level)} — ${t.pct>=0?'+':''}${t.pct}% move, R:R ${t.rr!=null?t.rr:'—'} to the tight stop.">T${i+1} ${fmtNum(t.level)} <span class="rr">${t.pct>=0?'+':''}${t.pct}%${t.rr!=null?` · R${t.rr}`:''}</span></span>`).join('') || '<span style="color:var(--dim)">No further targets that side.</span>'}

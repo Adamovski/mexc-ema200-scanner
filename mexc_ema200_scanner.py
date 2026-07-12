@@ -1446,6 +1446,28 @@ def fetch_candles(sess: requests.Session, symbol: str, interval: str,
     return fetch_klines(sess, symbol, interval, limit)
 
 
+def bias_on_tf(sess: requests.Session, symbol: str, interval: str,
+               market: str) -> str | None:
+    """Market-structure bias ('bullish' / 'bearish' / 'neutral') on one timeframe —
+    used to enrich hits with a 1h read (which can't be aggregated from 4h candles)."""
+    rr = fetch_candles(sess, symbol, interval, 400, market)
+    if not rr or len(rr) < 15:
+        return None
+    rws = rr[:-1]
+    try:
+        H = [float(x[2]) for x in rws]
+        L = [float(x[3]) for x in rws]
+        C = [float(x[4]) for x in rws]
+    except (ValueError, IndexError):
+        return None
+    m = market_structure(H, L, C)
+    if m["structure"] == "uptrend" or m["choch"] == "bullish":
+        return "bullish"
+    if m["structure"] == "downtrend" or m["choch"] == "bearish":
+        return "bearish"
+    return "neutral"
+
+
 def _futures_live_price(sess: requests.Session, symbol: str) -> float | None:
     r = sess.get(f"{FUTURES_BASE}/api/v1/contract/ticker",
                  params={"symbol": to_contract(symbol)}, timeout=15)
@@ -1864,6 +1886,55 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         deep_support = sup[1] if len(sup) > 1 else (sup[0] if sup else near_support)
         sl_wide = min(deep_support - 1.0 * a, sl_tight)
 
+    # --- Candidate stop-loss levels, each labelled by what defines it ----------
+    # For a long these sit BELOW price (under swings / Supertrend / EMA); for a
+    # short they sit ABOVE. Buffered by a fraction of ATR so a normal wick doesn't
+    # trip them. The trader picks the one that matches their risk & thesis.
+    stop_levels = []
+
+    def _add_stop(level, basis):
+        if level is None or level <= 0:
+            return
+        if side == "short" and level <= price:
+            return
+        if side != "short" and level >= price:
+            return
+        stop_levels.append({"level": round(level, 10), "basis": basis,
+                            "pct": round((level - price) / price * 100, 2)})
+
+    if side == "short":
+        if res:
+            _add_stop(res[0] + 0.3 * a, "Above the nearest swing high")
+            if len(res) > 1:
+                _add_stop(res[1] + 0.5 * a, "Above a deeper swing high")
+        if st_val and st_role == "resistance":
+            _add_stop(st_val + 0.2 * a, f"Above the {interval} Supertrend line")
+        if not above:
+            _add_stop(ema_now + 0.2 * a, f"Above the 200 EMA ({interval})")
+        if kres.get("res_1d"):
+            _add_stop(kres["res_1d"] + 0.3 * a, "Above the Daily swing-high resistance")
+    else:
+        if sup:
+            _add_stop(sup[0] - 0.3 * a, "Below the nearest swing low")
+            if len(sup) > 1:
+                _add_stop(sup[1] - 0.5 * a, "Below a deeper swing low")
+        if st_val and st_role == "support":
+            _add_stop(st_val - 0.2 * a, f"Below the {interval} Supertrend line")
+        if above:
+            _add_stop(ema_now - 0.2 * a, f"Below the 200 EMA ({interval})")
+        if ksup.get("sup_1d"):
+            _add_stop(ksup["sup_1d"] - 0.3 * a, "Below the Daily swing-low support")
+        if ksup.get("sup_1w"):
+            _add_stop(ksup["sup_1w"] - 0.3 * a, "Below the Weekly swing-low support")
+    # nearest to price first, dedupe near-equal levels
+    stop_levels.sort(key=lambda s: abs(s["level"] - price))
+    _sd, _seen = [], []
+    for s in stop_levels:
+        if all(abs(s["level"] - x) / price > 0.004 for x in _seen):
+            _sd.append(s)
+            _seen.append(s["level"])
+    stop_levels = _sd[:6]
+
     # Target ladder — structural levels (supports for shorts / resistances for
     # longs) blended with Fibonacci extensions, deduped, up to 8. ALWAYS yields
     # targets: if structure runs out (coin at its highs/lows) it falls back to
@@ -2005,6 +2076,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "data_stale": data_stale,
         "patterns": patterns,
         "tf_bias": tf_bias,
+        "stop_levels": stop_levels,
         "range_pos": range_pos,
         "structure": ms["structure"],
         "choch": ms["choch"],
