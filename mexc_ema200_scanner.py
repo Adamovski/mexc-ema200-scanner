@@ -964,6 +964,37 @@ def key_supports(rows: list, lows: list[float], price: float) -> dict:
     }
 
 
+def tf_levels_for(sess, symbol: str, price: float, cfg: dict) -> dict:
+    """Nearest swing-low support BELOW price and swing-high resistance ABOVE price
+    on EACH timeframe (1h / 4h / 1d / 1w), each computed from that timeframe's own
+    candles. This is what lets the entry engine reason across timeframes: a support
+    confirmed on the Daily/Weekly chart is STRONGER and gets hit FIRST on a pullback,
+    so price usually turns there before reaching a deeper lower-timeframe level — and
+    a smart long should buy that higher-timeframe level rather than a fantasy dip
+    below it that may never fill. Returns {tf: {sup, res}} with None where a coin
+    lacks history (common on weekly for newer alts)."""
+    mkt = cfg.get("market", "futures")
+    out: dict[str, dict] = {}
+    for tf in ("1h", "4h", "1d", "1w"):
+        rr = fetch_candles(sess, symbol, tf, 400, mkt)
+        if not rr or len(rr) < 30:
+            out[tf] = {"sup": None, "res": None}
+            continue
+        rws = rr[:-1]
+        try:
+            H = [float(x[2]) for x in rws]
+            L = [float(x[3]) for x in rws]
+        except (ValueError, IndexError):
+            out[tf] = {"sup": None, "res": None}
+            continue
+        n = len(L) - 1
+        sdn = supports_below(L, n, price, max_n=1, min_gap=0.004)
+        rup = resistances_above(H, n, price, max_n=1, min_gap=0.004)
+        out[tf] = {"sup": (sdn[0] if sdn else None),
+                   "res": (rup[0] if rup else None)}
+    return out
+
+
 def detect_support_bounce(rows: list, highs: list[float], lows: list[float],
                           closes: list[float], volumes: list[float], *,
                           zone_tol: float = 0.015, touch_tol: float = 0.015,
@@ -2138,6 +2169,9 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     res = resistances_above(highs, last, price, max_n=12, min_gap=0.008)
     ksup = key_supports(rows, lows, price)       # next 4h / daily / weekly support
     kres = key_resistances(rows, highs, price)   # next 4h / daily / weekly resistance
+    # Per-timeframe nearest support/resistance (each from its own candles) so the
+    # entry engine can prefer a stronger higher-TF level price reaches first.
+    tf_levels = tf_levels_for(sess, symbol, price, cfg)
     a = atr(highs, lows, closes)
 
     # 200 EMA on the daily & weekly frames (fetched separately; None if the coin
@@ -2543,6 +2577,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "support_bounce_touches": dB.get("touches") if okB else None,
         "support_bounce_method": dB.get("method") if okB else None,
         "sup_4h": ksup["sup_4h"], "sup_1d": ksup["sup_1d"], "sup_1w": ksup["sup_1w"],
+        "tf_levels": tf_levels,
         "entry": entry,
         "optimal_entry": optimal_entry,
         "retest_entry": _active_retest,

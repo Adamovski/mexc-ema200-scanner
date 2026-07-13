@@ -760,6 +760,9 @@ PAGE = """<!doctype html>
   .vitem i{font-style:normal;color:var(--dim2);font-size:9.5px;text-transform:uppercase;
        letter-spacing:.06em;margin-right:5px;font-family:"Inter",sans-serif;font-weight:600}
   .vitem b{color:var(--accent);font-weight:700}
+  .tfsrc{font-family:"Inter",sans-serif;font-size:9.5px;font-weight:700;letter-spacing:.03em;
+       color:var(--accent);background:rgba(63,185,80,.13);border:1px solid rgba(63,185,80,.35);
+       border-radius:5px;padding:0 5px;margin-left:5px;vertical-align:middle;cursor:help}
   .vsep{width:1px;height:20px;background:var(--line2)}
   .azsec{border-top:1px solid var(--line);margin-top:18px;padding-top:14px;
        font-weight:800;color:var(--txt);letter-spacing:.02em;font-size:13px;text-transform:uppercase}
@@ -1809,22 +1812,43 @@ function recTargets(d, entry, stopLevel){
 // rally. We score each candidate entry by the trade it produces (expected value
 // of the best >=1.5 R:R target from there) with a mild preference for fills that
 // are more likely to actually print (closer, in ATR terms).
+// Timeframe strength ladder — a level confirmed higher up is more reliable and
+// gets hit first on a pullback. Used to (a) nudge the entry score toward stronger
+// TFs and (b) build the "shield": price should turn at the nearest strong HTF
+// level before reaching anything deeper.
+const TFRANK={'1h':1,'4h':2,'1d':3,'1w':4};
+const TFNAME={'1h':'1h','4h':'4h','1d':'Daily','1w':'Weekly'};
 function pickEntry(d){
   const side=(d.side||'long'), long=side!=='short', price=d.price, atr=d.atr_pct||0;
   if(price==null) return null;
+  const viewTf=d.interval||'4h', viewRank=TFRANK[viewTf]||2;
   const cands=[];
-  const add=(lvl,basis)=>{ if(lvl==null||lvl<=0) return; if(long? lvl>=price : lvl<=price) return;
-    if(cands.some(c=>Math.abs(c.level-lvl)/lvl<0.003)) return; cands.push({level:lvl,basis}); };
-  add(d.retest_entry,'retest level'); add(d.optimal_entry,'optimal fill');
-  if(long){ (d.supports||[]).slice(0,3).forEach(s=>add(s,'swing-low support'));
-            add(d.sup_1d,'Daily swing-low support'); add(d.sup_1w,'Weekly swing-low support');
-            if(d.ema!=null&&d.ema<price) add(d.ema*1.002,'200-EMA retest');
-            if(d.supertrend!=null&&d.supertrend_role==='support'&&d.supertrend<price) add(d.supertrend*1.003,'Supertrend retest'); }
-  else    { (d.resistances||[]).slice(0,3).forEach(s=>add(s,'swing-high resistance'));
-            add(d.res_1d,'Daily swing-high resistance'); add(d.res_1w,'Weekly swing-high resistance');
-            if(d.ema!=null&&d.ema>price) add(d.ema*0.998,'200-EMA retest');
-            if(d.supertrend!=null&&d.supertrend_role==='resistance'&&d.supertrend>price) add(d.supertrend*0.997,'Supertrend retest'); }
+  const add=(lvl,basis,tf)=>{ if(lvl==null||lvl<=0) return; if(long? lvl>=price : lvl<=price) return;
+    if(cands.some(c=>Math.abs(c.level-lvl)/lvl<0.003)) return; cands.push({level:lvl,basis,tf:tf||viewTf}); };
+  add(d.retest_entry,'retest level',viewTf); add(d.optimal_entry,'optimal fill',viewTf);
+  // Cross-timeframe swing levels — each from its own chart (1h / 4h / Daily / Weekly).
+  const tl=d.tf_levels||{};
+  ['1h','4h','1d','1w'].forEach(tf=>{ const L=tl[tf]; if(!L) return;
+    if(long){ if(L.sup!=null) add(L.sup, TFNAME[tf]+' swing-low support', tf); }
+    else    { if(L.res!=null) add(L.res, TFNAME[tf]+' swing-high resistance', tf); } });
+  if(long){ (d.supports||[]).slice(0,3).forEach(s=>add(s,'swing-low support',viewTf));
+            add(d.sup_1d,'Daily swing-low support','1d'); add(d.sup_1w,'Weekly swing-low support','1w');
+            if(d.ema!=null&&d.ema<price) add(d.ema*1.002,'200-EMA retest',viewTf);
+            if(d.supertrend!=null&&d.supertrend_role==='support'&&d.supertrend<price) add(d.supertrend*1.003,'Supertrend retest',viewTf); }
+  else    { (d.resistances||[]).slice(0,3).forEach(s=>add(s,'swing-high resistance',viewTf));
+            add(d.res_1d,'Daily swing-high resistance','1d'); add(d.res_1w,'Weekly swing-high resistance','1w');
+            if(d.ema!=null&&d.ema>price) add(d.ema*0.998,'200-EMA retest',viewTf);
+            if(d.supertrend!=null&&d.supertrend_role==='resistance'&&d.supertrend>price) add(d.supertrend*0.997,'Supertrend retest',viewTf); }
   if(!cands.length) return null;
+  // The SHIELD: the nearest STRONG level (a TF at least as high as the one being
+  // viewed, and Daily+ counts everywhere) that price hits first on the pullback.
+  // Price tends to turn there, so a deeper entry beyond it is unlikely to fill —
+  // this is exactly "if the Daily support is higher than the 4h one, take the
+  // Daily", generalised across every timeframe.
+  let shield=null, shieldTf=null;
+  for(const c of cands){ const rank=TFRANK[c.tf]||2;
+    if(rank<Math.max(3,viewRank)) continue;                   // Daily/Weekly (or >= the viewed TF if viewing high)
+    if(long? (shield==null||c.level>shield) : (shield==null||c.level<shield)){ shield=c.level; shieldTf=c.tf; } }
   const pot=potentialScore(d, side);
   let best=null;
   for(const c of cands){
@@ -1832,17 +1856,28 @@ function pickEntry(d){
     if(!ee || !ee.rtg || !ee.rtg.primary) continue;           // must yield a real >=1.5 R:R trade w/ a menu stop
     const distATR=atr? Math.abs((c.level-price)/price*100)/atr : 0;
     if(distATR > 8) continue;                                 // absurdly far — not part of this move
+    const rank=TFRANK[c.tf]||2;
     // A DEEP pullback can be the right entry — in a strong trend, or at a major
     // level (200 EMA / HTF support / Supertrend), waiting for it is smart, not
     // wrong. So instead of a hard depth cap, widen the "realistic fill" horizon
     // with potential and for major levels; shallow entries still win when the
     // setup is weak or the level is minor.
-    const major=/200[- ]?EMA|Daily|Weekly|Supertrend/i.test(c.basis||'');
+    const major=/200[- ]?EMA|Daily|Weekly|Supertrend/i.test(c.basis||'') || rank>=3;
     const horizon=2.5 + pot*3.5 + (major?1.5:0);             // ATRs of pullback that's realistic to wait for
     const fill=1/(1+Math.pow(distATR/horizon,1.8));
-    const score=ee.rtg.primary.ev*surviveProb(ee.stop.atrx)*(0.35+0.65*fill);
-    if(!best || score>best.score) best={level:c.level, basis:c.basis, score, rt:ee.rtg, rs:ee.stop,
-        distPct:Math.abs((c.level-price)/price*100), distATR};
+    // Higher-TF levels are more reliable → a modest score boost (never enough to
+    // override a genuinely better R:R, just to break ties toward the stronger TF).
+    const tfBoost=1 + 0.06*(rank-2);
+    // Beyond the shield: this entry sits past a strong HTF level price should turn
+    // at first, so it probably never fills — penalise by how far past (in ATR).
+    let shieldPen=1;
+    if(shield!=null){ const past = long ? (c.level < shield*0.999) : (c.level > shield*1.001);
+      if(past){ const beyond=atr? Math.abs((c.level-shield)/price*100)/atr : 0;
+        shieldPen=Math.max(0.12, 1/(1+Math.pow(beyond/0.75,1.6))); } }
+    const score=ee.rtg.primary.ev*surviveProb(ee.stop.atrx)*(0.35+0.65*fill)*tfBoost*shieldPen;
+    if(!best || score>best.score) best={level:c.level, basis:c.basis, tf:c.tf, score, rt:ee.rtg, rs:ee.stop,
+        distPct:Math.abs((c.level-price)/price*100), distATR,
+        shieldTf:(shield!=null&&Math.abs(c.level-shield)/shield<0.003)?shieldTf:null};
   }
   return (best&&best.score>0)?best:null;
 }
@@ -1884,6 +1919,12 @@ function azCard(d0){
   else { recE=(d.retest_entry!=null?d.retest_entry:(d.optimal_entry!=null?d.optimal_entry:d.entry));
          const ee=evalEntry(d, recE);
          rstop=ee?ee.stop:null; rtg=ee?ee.rtg:recTargets(d, recE, rstop?rstop.level:d.sl_tight); }
+  // When the winning entry comes from a HIGHER timeframe than the one being viewed,
+  // say so — that's the whole "take the Daily support over the deeper 4h dip" idea.
+  const viewRankAz=TFRANK[d.interval||'4h']||2;
+  const beHigherTf=(be&&be.tf&&(TFRANK[be.tf]||2)>viewRankAz);
+  const crossTfTag=beHigherTf?` <span class="tfsrc" data-tip="This entry level is the ${TFNAME[be.tf]} chart's support — a higher, stronger timeframe than the ${d.interval||'4h'} you're viewing. Price should turn there first, so it's the smarter fill.">${TFNAME[be.tf]}</span>`:'';
+  const crossTfNote=beHigherTf?` · <b style="color:var(--accent)">from the ${TFNAME[be.tf]} chart</b> — a stronger level price should reach first, so it beats waiting for a deeper ${d.interval||'4h'} dip that may never fill`:'';
   const rec=(rtg&&rtg.primary)?{tp:rtg.primary.lvl, rr:rtg.primary.rr, move:rtg.primary.move, p:rtg.primary.p}:{tp:null};
   const isRec=(lvl)=> rec.tp!=null && lvl!=null && Math.abs(lvl-rec.tp)/(rec.tp||1) < 0.004;
   const sgn=(d.side||'long')==='short'?'+':'−';         // stop/entry sign relative to price for this side
@@ -1944,7 +1985,7 @@ function azCard(d0){
       ${rec.tp!=null?`
         <span class="vbadge v-${(d.side||'long')==='short'?'short':'long'}">${(d.side||'long')==='short'?'SHORT ▼':'LONG ▲'}</span>
         <span class="vgrade">Grade ${planGrade}</span><span class="vsep"></span>
-        <span class="vitem"><i>Entry</i>${fmtNum(recE)}</span>
+        <span class="vitem"><i>Entry</i>${fmtNum(recE)}${crossTfTag}</span>
         <span class="vitem"><i>Stop</i>${rstop?fmtNum(rstop.level):'—'}${rstop&&rstop.atrx?` <span style="color:var(--dim2)">${rstop.atrx.toFixed(1)}×</span>`:''}</span>
         <span class="vitem"><i>Target</i>${fmtNum(rec.tp)}</span>
         <span class="vitem"><i>R:R</i><b>${rec.rr.toFixed(2)}</b></span>
@@ -1989,7 +2030,7 @@ function azCard(d0){
       ${aztp(d,4)}
       ${aztp(d,5)}
     </div>
-    ${be?`<div class="azrec" data-tip="The smartest place to get IN — not necessarily near the current price. If price is extended or correcting, a deeper pullback (a support / EMA / Supertrend retest) makes a better, more realistic trade; a short can wait to sell into a higher rally. Chosen to maximise the resulting reward:risk while staying a fill that's likely to actually print. Based on: ${esc(be.basis)}.">🎯 Recommended entry: <b>${fmtNum(recE)}</b> <span class="rr">${sgn}${be.distPct.toFixed(1)}%${be.distATR?` · ${be.distATR.toFixed(1)}×ATR`:''} ${(d.side||'long')==='short'?'above':'below'} price</span> <span style="color:var(--dim)">— ${esc(be.basis)}${(be.distATR&&be.distATR>2)?' · patient fill — wait for it, don\\'t chase':''}</span></div>`:''}
+    ${be?`<div class="azrec" data-tip="The smartest place to get IN — not necessarily near the current price. If price is extended or correcting, a deeper pullback (a support / EMA / Supertrend retest) makes a better, more realistic trade; a short can wait to sell into a higher rally. Chosen to maximise the resulting reward:risk while staying a fill that's likely to actually print. Based on: ${esc(be.basis)}.">🎯 Recommended entry: <b>${fmtNum(recE)}</b> <span class="rr">${sgn}${be.distPct.toFixed(1)}%${be.distATR?` · ${be.distATR.toFixed(1)}×ATR`:''} ${(d.side||'long')==='short'?'above':'below'} price</span> <span style="color:var(--dim)">— ${esc(be.basis)}${crossTfNote}${(be.distATR&&be.distATR>2)?' · patient fill — wait for it, don\\'t chase':''}</span></div>`:''}
     ${rstop?`<div class="azrec azstop" data-tip="The recommended stop, judged for THIS chart — not a fixed % or a blanket 'go wide'. It sits just beyond the nearest real level that would invalidate the setup (swing low, Supertrend, EMA, HTF support), once clear of noise (≥ max(1.5%, 1.1× ATR)). Distance is shown in ×ATR because that's the honest measure of 'tight' — a big % on a volatile coin can still be only ~1.5× ATR. ${rstop.note?esc(rstop.note.charAt(0).toUpperCase()+rstop.note.slice(1))+'. ':''}It's the stop the recommended R:R is measured against. Based on: ${esc(rstop.basis)}">🛑 Recommended stop-loss: <b>${fmtNum(rstop.level)}</b> <span class="rr">${sgn}${rstop.pct.toFixed(1)}%${rstop.atrx?` · ${rstop.atrx.toFixed(1)}×ATR`:''} from entry</span> <span style="color:var(--dim)">— ${esc(rstop.basis)}${rstop.note?' · '+esc(rstop.note):''}</span></div>`:''}
     ${rec.tp!=null?`<div class="azrec" data-tip="Recommended by EXPECTED VALUE, not raw ratio: reward:risk × how reachable the target is. Reachability decays with distance (in ATR units) but stretches out when the trend, momentum and volume back the move — so a far target isn't dismissed if the setup is strong, and a nearby one isn't over-rated if it's weak. Measured from the recommended entry (${fmtNum(recE)}) over the recommended stop (${rstop?fmtNum(rstop.level):'—'}), capped 8:1, and only shown because it clears the 1.5:1 floor. Grade blends R:R and reachability.">⭐ Recommended take-profit: <b>${fmtNum(rec.tp)}</b> <span class="rr">${(d.side||'long')==='short'?'−':'+'}${(rec.move*100).toFixed(1)}% · R:R <b>${rec.rr.toFixed(2)}</b> · ~${Math.round(rec.p*100)}% reach · grade <b>${planGrade}</b></span></div>
     <div class="sidenote" data-tip="A sensible way to take the trade off: bank part at the nearest solid target to de-risk, hold the core to the base target, leave a runner for the stretch if momentum carries.">Scale-out: 🔒 Secure <b>${fmtNum(rtg.secure.lvl)}</b> (R${rtg.secure.rr.toFixed(1)}) · 🎯 Base <b>${fmtNum(rtg.primary.lvl)}</b> (R${rtg.primary.rr.toFixed(1)})${rtg.stretch?` · 🚀 Stretch <b>${fmtNum(rtg.stretch.lvl)}</b> (R${rtg.stretch.rr.toFixed(1)})`:''}</div>
