@@ -32,8 +32,16 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 import time
+
+# Which MEXC universe to scan:
+#   "crypto" (default) — normal crypto perps, tokenized stocks/commodities excluded
+#   "tradfi"           — ONLY the tokenized stocks / ETFs / forex / metals / energy
+#                        (gold, silver, oil, Apple, etc.) — the "stocks & commodities" site
+#   "all"              — everything
+SCAN_UNIVERSE = os.environ.get("SCAN_UNIVERSE", "crypto").strip().lower()
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 
@@ -1675,8 +1683,10 @@ def _is_tradfi_contract(c: dict) -> bool:
 
 
 def list_futures_symbols(sess: requests.Session, quote: str = "USDT") -> list[str]:
-    """All tradable USDT-perp CRYPTO contracts, as DISPLAY symbols ('BTCUSDT').
-    Stablecoins and tokenized stocks/ETFs/other TradFi are filtered out."""
+    """Tradable USDT-perp contracts as DISPLAY symbols ('BTCUSDT'). The universe
+    depends on SCAN_UNIVERSE: 'crypto' (default) drops tokenized stocks/ETFs/
+    commodities; 'tradfi' keeps ONLY those (gold/silver/oil/stocks); 'all' keeps
+    everything. Stablecoins are always dropped."""
     r = sess.get(f"{FUTURES_BASE}/api/v1/contract/detail", timeout=30)
     r.raise_for_status()
     out = []
@@ -1686,8 +1696,11 @@ def list_futures_symbols(sess: requests.Session, quote: str = "USDT") -> list[st
         base = str(c.get("baseCoin", "")).upper()
         if base in STABLE_BASES or not base:
             continue
-        if _is_tradfi_contract(c):             # skip non-crypto (stocks/ETFs/etc.)
-            continue
+        is_tf = _is_tradfi_contract(c)
+        if SCAN_UNIVERSE == "crypto" and is_tf:
+            continue                            # drop non-crypto (stocks/ETFs/etc.)
+        if SCAN_UNIVERSE == "tradfi" and not is_tf:
+            continue                            # keep ONLY stocks/commodities/forex
         out.append(base + quote)
     return sorted(set(out))
 

@@ -1376,30 +1376,36 @@ function setAzSide(s){
 function stopsSection(list,side,recLevel){
   if(!list||!list.length) return '';
   const isR=(lvl)=> recLevel!=null && lvl!=null && Math.abs(lvl-recLevel)/(recLevel||1) < 0.004;
-  const chips=list.map(s=>`<span class="ladchip${isR(s.level)?' ladrecstop':''}" data-tip="${esc((''+s.basis)+' — a '+(side==='short'?'short':'long')+' stop here risks '+Math.abs(s.pct).toFixed(1)+'% from the current price.'+(isR(s.level)?' 🛑 Recommended stop — safety-first: a well-defended level that gives the trade room, not the tightest.':''))}">${isR(s.level)?'🛑 ':''}${fmtNum(s.level)} <span class="rr">${s.pct>=0?'+':''}${s.pct}% · ${s.basis}</span></span>`).join('');
+  const chips=list.map(s=>`<span class="ladchip${isR(s.level)?' ladrecstop':''}" data-tip="${esc((''+s.basis)+' — a '+(side==='short'?'short':'long')+' stop here risks '+Math.abs(s.pct).toFixed(1)+'% from the current price.'+(isR(s.level)?' 🛑 Recommended stop — the nearest real structure beyond the noise (best balance of safety and reward:risk for this chart).':''))}">${isR(s.level)?'🛑 ':''}${fmtNum(s.level)} <span class="rr">${s.pct>=0?'+':''}${s.pct}% · ${s.basis}</span></span>`).join('');
   return `<div class="azsec" data-tip="Candidate stop-loss levels, each anchored to a specific structure (swing high/low, the Supertrend line, the 200 EMA, or a higher-timeframe support/resistance) and buffered by a fraction of ATR. Pick the one that fits your risk and thesis — tighter = smaller risk but easier to get wicked out; wider = more room. 🛑 = recommended.">Stop-loss options <span class="azsub">— ${side==='short'?'above':'below'} price, each with what it\\'s based on · 🛑 = recommended</span></div>`
     + `<div class="azladder">${chips}</div>`;
 }
-// The recommended stop: SAFETY-first. Among the structural stop levels on the
-// correct side that clear the noise floor (>= max(2.5%, 1.5x ATR) from the
-// intended entry), prefer the WIDEST — the most-defended level (a deeper swing
-// low / HTF support) that gives the trade room to breathe — but cap it at a
-// sane, volatility-scaled ceiling (max(6%, 3x ATR)) so it's never reckless. If
-// every level is beyond that ceiling, take the least-wide of them. A real
-// structural level, deliberately roomy. Falls back to the tight stop.
+// The recommended stop — chosen with judgement, not a fixed rule. The idea: put
+// the stop just beyond the nearest REAL structural level that would actually
+// invalidate the thesis, once it's clear of normal noise. Steps:
+//   1) Noise floor = max(2%, 1.2× ATR) from the entry — volatility-aware, so a
+//      choppy/high-ATR coin demands more room and a calm one less. Anything
+//      tighter than this is inside the wick range and rejected (not too tight).
+//   2) Prefer STRUCTURAL levels (swing low/high, Supertrend, 200 EMA, HTF
+//      support/resistance, range extreme) over blunt ATR-multiple stops.
+//   3) Among those, take the NEAREST that clears the floor — the closest
+//      defended level beyond the noise. That's the best reward:risk while still
+//      sitting on real structure (not lazily the widest).
+//   4) Only if no structural level qualifies do we fall back to a volatility
+//      (ATR) stop, then to the wide/tight stop.
 function recStop(d, entry){
   const side=(d.side||'long');
   const E=(entry!=null)?entry:(d.retest_entry!=null?d.retest_entry:(d.optimal_entry!=null?d.optimal_entry:d.price));
   const list=(d.stop_levels||[]);
-  const floorPct=Math.max(2.5, 1.5*(d.atr_pct||0));
-  const capPct=Math.max(6, 3*(d.atr_pct||0));
+  const floorPct=Math.max(2.0, 1.2*(d.atr_pct||0));
   const distE=(lvl)=> (E&&lvl)? Math.abs((lvl-E)/E)*100 : 0;
   const onSide=(lvl)=> side==='short'? lvl>E : lvl<E;
+  const isVol=(b)=> /ATR/i.test(b||'');                       // ATR-multiple = fallback only
   const valid=list.filter(s=> onSide(s.level) && distE(s.level)>=floorPct);
+  const structural=valid.filter(s=> !isVol(s.basis));
+  const pool=structural.length? structural : valid;          // real structure first; ATR stop only if nothing else
   let pick=null;
-  const withinCap=valid.filter(s=> distE(s.level)<=capPct);
-  if(withinCap.length){ pick=withinCap.reduce((a,b)=> distE(a.level)>=distE(b.level)?a:b); }   // widest within the sane ceiling = safest
-  else if(valid.length){ pick=valid.reduce((a,b)=> distE(a.level)<=distE(b.level)?a:b); }        // all beyond cap → least-wide
+  if(pool.length){ pick=pool.reduce((a,b)=> distE(a.level)<=distE(b.level)?a:b); }   // nearest defended level beyond the noise
   if(pick) return {level:pick.level, basis:pick.basis, pct:distE(pick.level)};
   if(d.sl_wide!=null) return {level:d.sl_wide, basis:(d.sl_wide_basis||'the deeper structural stop'), pct:distE(d.sl_wide)};
   if(d.sl_tight!=null) return {level:d.sl_tight, basis:(d.sl_tight_basis||'the floored structural tight stop'), pct:distE(d.sl_tight)};
@@ -1433,22 +1439,31 @@ function azCard(d0){
   const cell=(k,v,tip)=>`<div class="azcell"${tip?` data-tip="${tip}"`:''}><div class="k">${k}</div><div class="v">${v}</div></div>`;
   const pct=(v,sign)=> d.price&&v!=null? ` <span class="rr">${sign}${(Math.abs((v-d.price)/d.price)*100).toFixed(1)}%</span>`:'';
   const tp=(v,rr)=> v==null?'—':`${fmtNum(v)}${rr!=null?` <span class="rr">R:R ${(+rr).toFixed(2)}</span>`:''}`;
-  // A trade-plan TP cell that uses the target's own per-coin basis and flags the
-  // 200-EMA reclaim target with ◎.
-  const aztp=(d,n)=>{
-    const v=d['tp'+n], rr=d['rr'+n], basis=d['tp'+n+'_basis'], ema=d['tp'+n+'_ema'];
-    const side=(d.side||'long')==='short';
-    const fb=side?"The next structural support level below, with R:R to the tight stop.":"The next structural resistance level above, with R:R to the tight stop.";
-    const tip=esc((basis?('Based on: '+basis):fb)+' Grey = reward:risk to the tight stop.');
-    const lbl='TP'+n+(ema?' <span class="emastar">◎</span>':'');
-    return `<div class="azcell${ema?' ematp':''}" data-tip="${tip}"><div class="k">${lbl}</div><div class="v">${tp(v,rr)}</div></div>`;
-  };
   const notes=(d.notes||[]).map(n=>`<li>${n}</li>`).join("");
   const recE=d.retest_entry!=null?d.retest_entry:(d.optimal_entry!=null?d.optimal_entry:d.entry);
-  const rstop=recStop(d, recE);     // recommended stop = tightest sensible structural level
+  const rstop=recStop(d, recE);     // context-aware recommended stop (nearest real structure beyond noise)
   const recSrc=rstop?Object.assign({},d,{sl_tight:rstop.level}):d;
   const rec=realisticRR(recSrc, recE);   // best realistic target from the retest entry, over the recommended stop
   const isRec=(lvl)=> rec.tp!=null && lvl!=null && Math.abs(lvl-rec.tp)/(rec.tp||1) < 0.004;
+  // Reward:risk of a target measured from the retest entry over a given stop
+  // (side-aware, only counts targets on the right side, capped at 8:1).
+  const rrOn=(tpv,stop)=>{ if(tpv==null||recE==null||stop==null||recE===stop) return null;
+    const long=(d.side||'long')!=='short'; if(long? tpv<=recE : tpv>=recE) return null;
+    return Math.min(Math.abs(tpv-recE)/Math.abs(recE-stop),8); };
+  const recRR=(tpv)=> rrOn(tpv, rstop?rstop.level:d.sl_tight);
+  const tightRR=(tpv)=> rrOn(tpv, d.sl_tight);
+  // A trade-plan TP cell: R:R to the RECOMMENDED stop (what we advise), tight-stop
+  // R:R in the hover. ◎ flags the 200-EMA reclaim target.
+  const aztp=(dd,n)=>{
+    const v=dd['tp'+n], basis=dd['tp'+n+'_basis'], ema=dd['tp'+n+'_ema'];
+    const side=(d.side||'long')==='short';
+    const rrR=recRR(v), rrT=tightRR(v);
+    const fb=side?"The next structural support level below.":"The next structural resistance level above.";
+    const tip=esc((basis?('Based on: '+basis):fb)+` R:R ${rrR!=null?rrR.toFixed(2):'—'} to the recommended stop`+(rrT!=null?`, ${rrT.toFixed(2)} to the tight stop`:'')+'.');
+    const lbl='TP'+n+(ema?' <span class="emastar">◎</span>':'');
+    const val=v==null?'—':`${fmtNum(v)}${rrR!=null?` <span class="rr">R:R ${rrR.toFixed(2)}</span>`:''}`;
+    return `<div class="azcell${ema?' ematp':''}" data-tip="${tip}"><div class="k">${lbl}</div><div class="v">${val}</div></div>`;
+  };
   return `<div class="azcard">
     <div class="azhead">
       <span class="sym">${d.symbol}</span>
@@ -1488,7 +1503,7 @@ function azCard(d0){
     </div>
     ${tfBiasSection(d.tf_bias)}
     ${patternsSection(d.patterns)}
-    <div class="azsec">Trade plan <span class="azsub">${(d.side||'long')==='short'?'SHORT — sell resistance, stops ABOVE, targets BELOW':'LONG — buy support, stops BELOW, targets ABOVE'} → 5 targets (with R:R)</span></div>
+    <div class="azsec">Trade plan <span class="azsub">${(d.side||'long')==='short'?'SHORT — sell resistance, stops ABOVE, targets BELOW':'LONG — buy support, stops BELOW, targets ABOVE'} → 5 targets · R:R to the 🛑 recommended stop (tight-stop R:R in hover)</span></div>
     <div class="azgrid">
       ${cell("Entry (now)", fmtNum(d.entry), "Based on: the current live price — your immediate entry if you take it here.")}
       ${cell("Retest entry", fmtNum(d.retest_entry!=null?d.retest_entry:d.optimal_entry), (d.side||'long')==='short'?"A proper pullback fill — wait for a rally back UP to the nearest swing-high / EMA / Supertrend ABOVE price and short the retest, rather than chasing the drop.":"A proper pullback fill — wait for a dip DOWN to the nearest swing-low support / reclaimed EMA / Supertrend BELOW price and buy the retest, rather than chasing the candle. This is the entry the recommended R:R uses.")}
@@ -1501,12 +1516,12 @@ function azCard(d0){
       ${aztp(d,4)}
       ${aztp(d,5)}
     </div>
-    ${rstop?`<div class="azrec azstop" data-tip="The recommended stop-loss: SAFETY-first. The most-defended structural level (a deeper swing low / higher-timeframe support) that gives the trade room to breathe, capped at a sane volatility-scaled ceiling (max 6% / 3× ATR) so it's never reckless. Wider than the tight stop on purpose — you're less likely to get wicked out. It's the stop the recommended R:R is measured against. Based on: ${esc(rstop.basis)}">🛑 Recommended stop-loss: <b>${fmtNum(rstop.level)}</b> <span class="rr">${(d.side||'long')==='short'?'+':'−'}${rstop.pct.toFixed(1)}% from retest entry</span> <span style="color:var(--dim)">— ${esc(rstop.basis)} · gives room</span></div>`:''}
+    ${rstop?`<div class="azrec azstop" data-tip="The recommended stop-loss, chosen with judgement for THIS chart — not a fixed % or a blanket 'go wide'. It sits just beyond the nearest real structural level that would invalidate the setup (a swing low, Supertrend, EMA or higher-timeframe support), once that level is clear of normal noise (≥ max(2%, 1.2× ATR) — so a high-volatility coin gets more room, a calm one less). Structure is preferred over a blunt ATR-multiple. Close enough for a workable reward:risk, far enough not to get wicked out. It's the stop the recommended R:R is measured against. Based on: ${esc(rstop.basis)}">🛑 Recommended stop-loss: <b>${fmtNum(rstop.level)}</b> <span class="rr">${(d.side||'long')==='short'?'+':'−'}${rstop.pct.toFixed(1)}% from retest entry</span> <span style="color:var(--dim)">— ${esc(rstop.basis)}</span></div>`:''}
     ${rec.tp!=null?`<div class="azrec" data-tip="The most realistic worthwhile take-profit: the target with the best reward:risk that still sits a meaningful (≥2%) move away, measured from the RETEST entry (${fmtNum(recE)}) over the RECOMMENDED stop (${rstop?fmtNum(rstop.level):fmtNum(d.sl_tight)}) and capped at 8:1. R:R = |target − entry| ÷ |entry − stop|. This is the same basis the Top-setups tab uses.">⭐ Recommended take-profit: <b>${fmtNum(rec.tp)}</b> <span class="rr">${(d.side||'long')==='short'?'−':'+'}${(rec.move*100).toFixed(1)}% · R:R <b>${rec.rr.toFixed(2)}</b></span> <span style="color:var(--dim)">from retest entry ${fmtNum(recE)}</span></div>`:''}
     ${stopsSection(d.stop_levels, d.side||'long', rstop?rstop.level:null)}
-    <div class="azsec" data-tip="A fuller ladder of profit targets: overhead resistance levels blended with Fibonacci extensions of the recent range, in order. Each shows % upside and R:R to the tight stop. The ⭐ chip is the recommended (best realistic R:R) target.">Target ladder <span class="azsub">resistances + Fibonacci extensions · ⭐ = recommended</span></div>
+    <div class="azsec" data-tip="A fuller ladder of profit targets: overhead resistance levels blended with Fibonacci extensions of the recent range, in order. Each shows % move and R:R — R = to the 🛑 recommended stop, Rt = to the tight stop. The ⭐ chip is the recommended (best realistic R:R) target.">Target ladder <span class="azsub">resistances + Fibonacci extensions · R = to recommended stop · Rt = to tight stop · ⭐ = recommended</span></div>
     <div class="azladder">
-      ${(d.target_ladder||[]).map((t,i)=>`<span class="ladchip${isRec(t.level)?' ladrec':''}" data-tip="Target ${i+1}: ${t.kind} at ${fmtNum(t.level)} — ${t.pct>=0?'+':''}${t.pct}% move, R:R ${t.rr!=null?t.rr:'—'} to the tight stop.${isRec(t.level)?' ⭐ Recommended — best realistic reward:risk.':''}">${isRec(t.level)?'⭐ ':''}T${i+1} ${fmtNum(t.level)} <span class="rr">${t.pct>=0?'+':''}${t.pct}%${t.rr!=null?` · R${t.rr}`:''}</span></span>`).join('') || '<span style="color:var(--dim)">No further targets that side.</span>'}
+      ${(d.target_ladder||[]).map((t,i)=>{const rR=recRR(t.level),rT=tightRR(t.level);return `<span class="ladchip${isRec(t.level)?' ladrec':''}" data-tip="Target ${i+1}: ${t.kind} at ${fmtNum(t.level)} — ${t.pct>=0?'+':''}${t.pct}% move. R:R ${rR!=null?rR.toFixed(2):'—'} to the recommended stop${rT!=null?`, ${rT.toFixed(2)} to the tight stop`:''}.${isRec(t.level)?' ⭐ Recommended — best realistic reward:risk.':''}">${isRec(t.level)?'⭐ ':''}T${i+1} ${fmtNum(t.level)} <span class="rr">${t.pct>=0?'+':''}${t.pct}%${rR!=null?` · R${rR.toFixed(1)}`:''}${rT!=null?` · Rt${rT.toFixed(1)}`:''}</span></span>`;}).join('') || '<span style="color:var(--dim)">No further targets that side.</span>'}
     </div>
     <div class="azsec">In plain English</div>
     <ul class="aznotes">${notes}</ul>
