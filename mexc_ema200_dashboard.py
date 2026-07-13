@@ -437,10 +437,17 @@ def breakout_watcher(state: State) -> None:
 PAGE = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MEXC 200-EMA cross &amp; retest</title>
+<title>MEXC Scanner</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
 <style>
-  :root{--bg:#0b0e14;--panel:#141924;--line:#232a38;--txt:#e6edf3;--dim:#8b98ad;
-        --accent:#3fb950;--warn:#d29922;--head:#1b2130;}
+  :root{--bg:#0a0d13;--bg2:#0d1119;--panel:#141a26;--panel2:#171e2c;--line:#222b3b;
+        --line2:#2c3648;--txt:#eaf0f7;--dim:#8593a8;--dim2:#5f6b80;
+        --accent:#3fb950;--accent-d:#2ea043;--blue:#58a6ff;--red:#f85149;--warn:#d29922;
+        --head:#151c29;--radius:12px;
+        --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+        --shadow:0 10px 40px rgba(0,0,0,.45);}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--txt);
        font:14px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
@@ -644,67 +651,124 @@ PAGE = """<!doctype html>
   .phasepill{border-radius:6px;padding:1px 7px;font-size:11px;font-weight:700;border:1px solid var(--line)}
   .phase-broke{background:rgba(63,185,80,.16);color:var(--accent);border-color:rgba(63,185,80,.5)}
   .phase-form{background:rgba(139,152,173,.12);color:var(--dim)}
-  /* ============ UX POLISH PASS (overrides above) ============ */
-  html{-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
-  body{background:radial-gradient(1200px 600px at 78% -10%,rgba(63,185,80,.05),transparent 60%),var(--bg);
-       letter-spacing:.01em}
-  ::selection{background:rgba(63,185,80,.28)}
-  /* thin, dark custom scrollbars */
-  *{scrollbar-width:thin;scrollbar-color:#2a3242 transparent}
-  *::-webkit-scrollbar{width:10px;height:10px}
-  *::-webkit-scrollbar-thumb{background:#2a3242;border-radius:8px;border:2px solid var(--bg)}
-  *::-webkit-scrollbar-thumb:hover{background:#3a4458}
-  /* smooth micro-interactions */
-  .tab,.fbtn,.tfbtn,.azbtn,.wstar,.wlbtn,.alertbtn,.ladchip,.azbar button,.chip a,td.sym a{
-       transition:background .15s ease,color .15s ease,border-color .15s ease,transform .12s ease,box-shadow .15s ease}
-  /* header: sleeker brand bar */
-  header{background:linear-gradient(180deg,rgba(20,25,36,.55),transparent)}
-  h1{letter-spacing:-.01em}
-  .alertbtn:hover{border-color:var(--accent);color:var(--accent)}
-  /* tabs: pill row, clear active state */
-  .tab{border-radius:9px;border-bottom:1px solid var(--line);background:rgba(20,25,36,.6)}
-  .tab:hover{color:var(--txt);border-color:#33405a;transform:translateY(-1px)}
-  .tab.active{background:linear-gradient(180deg,rgba(63,185,80,.16),var(--head));color:#fff;
-       border-color:rgba(63,185,80,.5);box-shadow:0 2px 10px rgba(63,185,80,.12)}
-  .fbtn:hover{border-color:var(--accent);color:var(--txt)}
+  /* ================= PREMIUM DESIGN SYSTEM (overrides above) ================= */
+  html{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;text-rendering:optimizeLegibility}
+  body{font-family:"Inter",-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+       background:
+         radial-gradient(1100px 520px at 82% -12%,rgba(63,185,80,.07),transparent 55%),
+         radial-gradient(900px 500px at 8% -8%,rgba(88,166,255,.05),transparent 55%),
+         linear-gradient(180deg,var(--bg2),var(--bg));
+       letter-spacing:.005em}
+  ::selection{background:rgba(63,185,80,.30);color:#fff}
+  *{scrollbar-width:thin;scrollbar-color:#2b3446 transparent}
+  *::-webkit-scrollbar{width:11px;height:11px}
+  *::-webkit-scrollbar-thumb{background:#2b3446;border-radius:9px;border:3px solid transparent;background-clip:padding-box}
+  *::-webkit-scrollbar-thumb:hover{background:#3b4761;background-clip:padding-box}
+  @media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+  a,button,.tab,.fbtn,.tfbtn,.azbtn,.wstar,.wlbtn,.alertbtn,.ladchip,.azcell,.chip a,td.sym a,.biaspill2,tbody tr{
+       transition:background .16s ease,color .16s ease,border-color .16s ease,transform .13s cubic-bezier(.2,.7,.3,1),box-shadow .16s ease,filter .16s ease}
+  /* ---- header: glassy brand bar ---- */
+  header{padding:14px 26px;background:linear-gradient(180deg,rgba(15,20,30,.82),rgba(15,20,30,.35));
+       backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+       border-bottom:1px solid var(--line);position:sticky;top:0;z-index:70;align-items:center}
+  h1{font-size:15px;font-weight:800;letter-spacing:-.01em;display:flex;align-items:center;gap:9px}
+  h1::before{content:"";width:11px;height:11px;border-radius:3px;
+       background:linear-gradient(135deg,var(--accent),#2f81f7);box-shadow:0 0 12px rgba(63,185,80,.7)}
+  .sub{color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums}
+  .alertbtn{border-radius:9px;font-weight:600}
+  .alertbtn:hover{border-color:var(--accent);color:var(--accent);transform:translateY(-1px)}
+  /* ---- tabs: segmented nav ---- */
+  .tabs{gap:6px;padding:14px 26px 0;flex-wrap:wrap}
+  .tab{border:1px solid var(--line);border-radius:10px;background:rgba(21,28,41,.7);
+       padding:8px 15px;font-weight:600;font-size:12.5px;color:var(--dim)}
+  .tab:hover{color:var(--txt);border-color:var(--line2);transform:translateY(-1px);background:rgba(28,36,52,.8)}
+  .tab.active{color:#eafff0;border-color:rgba(63,185,80,.55);
+       background:linear-gradient(180deg,rgba(63,185,80,.22),rgba(63,185,80,.07));
+       box-shadow:0 4px 16px rgba(63,185,80,.18),inset 0 1px 0 rgba(255,255,255,.06)}
+  /* ---- filter bar ---- */
+  .filterbar{padding:11px 26px}
+  .fbtn{border-radius:16px;padding:4px 13px}
+  .fbtn:hover{border-color:var(--accent);color:var(--txt);transform:translateY(-1px)}
+  .tfbtn{border-radius:16px}
   .tfbtn:hover{border-color:var(--accent);color:var(--txt)}
-  /* tables: zebra, richer hover, refined sticky header */
-  .wrap{padding:14px 22px 60px}
-  thead th{top:0;z-index:40;background:var(--head);border-bottom:1px solid #2b3444;
-       box-shadow:0 2px 8px rgba(0,0,0,.35);padding-top:10px;padding-bottom:10px;
-       text-transform:uppercase;letter-spacing:.04em;font-size:11px}
+  /* ---- status strip ---- */
+  .status{padding:11px 26px;font-size:12px}
+  /* ---- tables ---- */
+  .wrap{padding:16px 26px 70px}
+  table{border-spacing:0}
+  tbody td{font-family:var(--mono);font-size:12.5px;font-weight:500}
+  td.sym{font-family:"Inter",sans-serif}
+  th,td{padding:10px 14px}
+  thead th{top:0;z-index:40;background:rgba(21,28,41,.92);backdrop-filter:blur(8px);
+       -webkit-backdrop-filter:blur(8px);border-bottom:1px solid var(--line2);
+       box-shadow:0 4px 14px rgba(0,0,0,.4);padding-top:11px;padding-bottom:11px;
+       text-transform:uppercase;letter-spacing:.05em;font-size:10.5px;font-weight:700;color:var(--dim2)}
   thead th:hover{color:var(--txt)}
-  tbody tr{transition:background .1s ease}
-  tbody tr:nth-child(even) td{background:rgba(255,255,255,.014)}
-  tbody tr:hover td{background:rgba(63,185,80,.06)}
+  tbody tr:nth-child(even) td{background:rgba(255,255,255,.012)}
+  tbody tr:hover td{background:rgba(63,185,80,.07)}
   tbody tr:hover td:first-child{box-shadow:inset 3px 0 0 var(--accent)}
-  td.sym a:hover{text-decoration:underline}
-  .score{font-variant-numeric:tabular-nums}
-  /* active-sort arrow */
-  th[data-sort]::after{margin-left:5px;color:var(--accent);font-size:10px}
+  td .rr{font-family:var(--mono);color:var(--dim);font-size:10.5px;margin-left:4px}
+  td.sym a{font-weight:700;letter-spacing:.01em}
+  td.sym a:hover{color:var(--accent)}
+  .score{font-family:var(--mono);font-weight:700}
+  th[data-sort]::after{margin-left:6px;color:var(--accent);font-size:9px;vertical-align:middle}
   th[data-sort="asc"]::after{content:"▲"}
   th[data-sort="desc"]::after{content:"▼"}
-  /* pills / badges: subtle depth */
-  .biaspill2,.tfpill,.patbadge,.corrbadge,.pill{transition:transform .12s ease}
+  /* ---- badges / pills ---- */
+  .biaspill2,.tfpill,.pill,.phasepill{border-radius:6px;font-weight:700;letter-spacing:.02em}
   tr:hover .biaspill2{transform:translateY(-1px)}
-  /* analyze card: lift + accent edge */
-  .azcard{box-shadow:0 8px 30px rgba(0,0,0,.35);border-color:#28324a;
-       background:linear-gradient(180deg,#161c28,#141924)}
-  .azsec{border-top:1px solid var(--line);margin-top:16px;padding-top:12px;
-       font-weight:700;color:var(--txt);letter-spacing:.02em}
-  .azsec:first-of-type{border-top:none}
-  .azcell{transition:border-color .15s ease,background .15s ease}
-  .azcell:hover{border-color:#33405a;background:#131926}
-  .ladchip:hover{border-color:var(--accent);color:var(--txt);transform:translateY(-1px)}
-  .azbar input{transition:border-color .15s ease,box-shadow .15s ease}
-  .azbar input:focus{box-shadow:0 0 0 3px rgba(63,185,80,.15)}
-  .azbar button:hover:not(:disabled){filter:brightness(1.08)}
-  /* nicer empty state */
-  .empty{font-size:13px;opacity:.9}
-  /* tooltip: softer */
-  #tip{border-color:#33405a;box-shadow:0 10px 30px rgba(0,0,0,.55);border-radius:9px}
-  @media(max-width:640px){ .wrap{padding:10px 12px 50px} header,.status,.tabs,.filterbar{padding-left:12px;padding-right:12px}
-       thead th{top:0} .tabs{top:0} .filterbar{position:static} }
+  .newbadge,.bothbadge,.freshbadge{box-shadow:0 2px 8px rgba(0,0,0,.35)}
+  .patbadge{border-radius:6px;font-weight:600}
+  /* ---- banners ---- */
+  .banner{border-radius:12px;box-shadow:var(--shadow);backdrop-filter:blur(6px)}
+  /* ---- empty state ---- */
+  .empty{font-size:13.5px;opacity:.85;padding:56px 0}
+  .empty::before{content:"◎";display:block;font-size:30px;color:var(--line2);margin-bottom:10px}
+  /* ---- analyze: search + tf ---- */
+  .azbar{max-width:560px}
+  .azbar input{border-radius:11px;padding:12px 14px;background:var(--panel2);font-size:14px}
+  .azbar input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(63,185,80,.16)}
+  .azbar button{border-radius:11px;font-weight:700;box-shadow:0 4px 14px rgba(63,185,80,.25)}
+  .azbar button:hover:not(:disabled){filter:brightness(1.08);transform:translateY(-1px)}
+  .tfbtn.active,.fbtn.active{box-shadow:0 3px 12px rgba(63,185,80,.28)}
+  /* ---- analyze card ---- */
+  .azcard{border-radius:16px;border:1px solid var(--line2);padding:20px 22px;
+       background:linear-gradient(180deg,#171e2c,#131824);box-shadow:var(--shadow);position:relative;overflow:hidden}
+  .azcard::before{content:"";position:absolute;inset:0 0 auto 0;height:2px;
+       background:linear-gradient(90deg,var(--accent),transparent 60%);opacity:.7}
+  .azhead .sym{font-size:20px;font-weight:800;letter-spacing:-.01em}
+  .azsec{border-top:1px solid var(--line);margin-top:18px;padding-top:14px;
+       font-weight:800;color:var(--txt);letter-spacing:.02em;font-size:13px;text-transform:uppercase}
+  .azsec .azsub{text-transform:none;font-weight:500}
+  .azsec:first-of-type{border-top:none;margin-top:6px}
+  .azgrid{gap:10px}
+  .azcell{border-radius:11px;border:1px solid var(--line);background:var(--panel2);padding:11px 13px}
+  .azcell:hover{border-color:var(--line2);background:#151d2b;transform:translateY(-1px)}
+  .azcell .k{font-size:10.5px;letter-spacing:.04em;text-transform:uppercase;color:var(--dim2)}
+  .azcell .v{font-family:var(--mono);font-weight:700;font-size:15px;margin-top:3px}
+  .azrec{border-radius:11px;padding:11px 14px;margin:9px 0;background:rgba(63,185,80,.06);
+       border:1px solid rgba(63,185,80,.18)}
+  .azrec.azstop{background:rgba(248,81,73,.06);border-color:rgba(248,81,73,.2)}
+  .azrec b{font-family:var(--mono)}
+  .sidenote{border-radius:10px;padding:9px 13px;background:rgba(255,255,255,.02);border:1px solid var(--line);margin:7px 0}
+  .ladchip{border-radius:9px}
+  .ladchip:hover{border-color:var(--accent);color:var(--txt);transform:translateY(-1px);background:rgba(63,185,80,.06)}
+  .ladchip .rr,.azcell .rr{font-family:var(--mono)}
+  /* ---- tooltip ---- */
+  #tip{border-color:var(--line2);box-shadow:0 14px 40px rgba(0,0,0,.6);border-radius:11px;
+       background:rgba(13,17,25,.97);backdrop-filter:blur(6px);font-size:12px;line-height:1.5;padding:9px 12px}
+  /* ---- info tab ---- */
+  .info h2{font-weight:800;letter-spacing:.01em}
+  .info code{font-family:var(--mono);font-size:12px}
+  /* ---- watchlist buttons ---- */
+  .wlbtn{border-radius:8px}
+  .wlbtn:hover{transform:translateY(-1px)}
+  /* ---- responsive ---- */
+  @media(max-width:680px){
+    header,.status,.tabs,.filterbar,.wrap{padding-left:14px;padding-right:14px}
+    .tabs{gap:5px;padding-top:10px}.tab{padding:7px 11px;font-size:12px}
+    th,td{padding:8px 9px}.wrap{padding-bottom:60px}
+  }
 </style></head>
 <body>
 <header>
@@ -990,17 +1054,21 @@ PAGE = """<!doctype html>
 
 <div class="view" id="viewWatch">
 <div class="status">
-  <span>📌 Watchlist — coins you've starred. Add or remove from any tab (☆/★ next to the symbol) or from Analyze. Saved in this browser. Live price & bias update every scan; click Analyze for the full plan.</span>
+  <span>📌 Watchlist — coins you've starred. Add/remove from any tab (☆/★) or Analyze. Saved in this browser. Each coin auto-pulls its <b>LONG</b> plan — bias, active setups, recommended entry, stop and best take-profit. Click a row's ⚲ / Analyze for the full breakdown.</span>
   <span id="watchCount"></span>
+  <span class="wlbtn" onclick="loadWatch(true)" style="cursor:pointer">↻ Refresh plans</span>
 </div>
 <div class="wrap">
   <table id="wltbl">
     <thead><tr>
       <th>Symbol</th>
-      <th>Price</th>
-      <th>Bias</th>
-      <th>On scans</th>
-      <th>BTC ρ</th>
+      <th data-tip="Live last-traded price.">Price</th>
+      <th data-tip="Market-structure bias (auto direction) on the 4h chart.">Bias</th>
+      <th data-tip="Active scanner setups + the strongest chart pattern found.">Setups</th>
+      <th data-tip="Recommended LONG entry — a proper pullback fill, not chasing.">🎯 Entry</th>
+      <th data-tip="Recommended stop-loss (the level that invalidates the long), with ×ATR distance.">🛑 Stop</th>
+      <th data-tip="Best realistic take-profit by expected value, with R:R and a plan grade.">⭐ Best TP</th>
+      <th data-tip="BTC correlation ρ over ~10 days. Low/negative = its own mover.">BTC ρ</th>
       <th>Actions</th>
     </tr></thead>
     <tbody id="wlrows"></tbody>
@@ -1355,7 +1423,7 @@ function toggleWatch(sym, ev){ if(ev){ ev.stopPropagation(); ev.preventDefault()
   document.querySelectorAll('.wstar[data-sym="'+sym+'"]').forEach(el=>{
     const on=WATCH.has(sym); el.classList.toggle('on',on); el.textContent=on?'★':'☆';
     el.title=on?'Remove from watchlist':'Add to watchlist'; });
-  renderWatch();
+  renderWatch(); loadWatch();
   const wc=document.getElementById('tabWatch'); if(wc) wc.textContent=`📌 Watchlist${WATCH.size?' ('+WATCH.size+')':''}`;
 }
 function watchStar(sym){ const on=WATCH.has(sym);
@@ -1373,6 +1441,40 @@ function watchLookup(sym){
   for(const [lst,nm] of names){ for(const h of (lst||[])){ if(h.symbol===sym){ if(!found) found=h; on.push(nm); break; } } }
   return {row:found, on};
 }
+// Full analyze data per watched coin, fetched on demand and cached.
+let watchData={};   // sym -> {d, ts}
+async function loadWatch(force){
+  const syms=[...WATCH];
+  for(const sym of syms){
+    const c=watchData[sym];
+    if(!force && c && (Date.now()-c.ts)<120000) continue;   // fresh enough
+    try{ const r=await fetch("/analyze?symbol="+encodeURIComponent(sym)+"&interval=4h",{cache:"no-store"});
+      const d=await r.json();
+      if(!d.error){ watchData[sym]={d, ts:Date.now()}; renderWatch(); }
+    }catch(e){}
+  }
+}
+// The recommended LONG plan for a watched coin (uses the same engine as Analyze).
+function watchRec(d){
+  const dd=(d.plans&&d.plans.long)?Object.assign({},d,d.plans.long):d;
+  const be=pickEntry(dd);
+  const recE=be?be.level:(dd.retest_entry!=null?dd.retest_entry:(dd.optimal_entry!=null?dd.optimal_entry:dd.entry));
+  const rstop=be?be.rs:recStop(dd,recE);
+  const rtg=be?be.rt:recTargets(dd,recE,rstop?rstop.level:dd.sl_tight);
+  const rec=(rtg&&rtg.primary)?rtg.primary:null;
+  const grade=rec?(rec.rr>=3&&rec.p>=.45?'A+':rec.rr>=2.5&&rec.p>=.35?'A':rec.rr>=2&&rec.p>=.3?'B':'C'):'—';
+  return {recE, rstop, rec, grade};
+}
+function setupsCell(d, on){
+  const tags=[];
+  if(d){ if(d.ema_reclaim) tags.push('200-EMA reclaim'); if(d.bull_flag) tags.push('Bull flag');
+    if(d.support_bounce) tags.push('Support bounce'); }
+  for(const nm of on){ if(!tags.includes(nm)) tags.push(nm); }
+  let pat='';
+  if(d&&d.patterns){ for(const tf of ['4h','1d','1h','1w']){ const arr=d.patterns[tf]||[]; if(arr.length){ pat=`${arr[0].name} · ${tf==='1d'?'1D':tf==='1w'?'1W':tf}`; break; } } }
+  const t=tags.length?tags.slice(0,2).join(', ')+(tags.length>2?` +${tags.length-2}`:''):'<span style="color:var(--dim2)">— none active —</span>';
+  return `<td style="text-align:left;white-space:normal;max-width:230px">${t}${pat?`<div style="color:var(--dim);font-size:11px;margin-top:2px">◈ ${pat}</div>`:''}</td>`;
+}
 function renderWatch(){
   const tb=document.getElementById('wlrows'); if(!tb) return;
   const syms=[...WATCH].sort();
@@ -1381,17 +1483,25 @@ function renderWatch(){
   tb.innerHTML='';
   for(const sym of syms){
     const {row,on}=watchLookup(sym);
-    const price=row? (row.live!=null?row.live:row.price) : null;
-    const bias=row? (row.bias||'—') : '—';
-    const corr=row? row.btc_corr : null;
+    const cache=watchData[sym]; const d=cache?cache.d:null;
+    const price=(d&&d.live!=null)?d.live:(d?d.price:(row?(row.live!=null?row.live:row.price):null));
+    const bias=d?(d.bias||'—'):(row?(row.bias||'—'):'—');
+    const corr=d?d.btc_corr:(row?row.btc_corr:null);
+    let entryC='<td><span style="color:var(--dim2)">loading…</span></td>', stopC='<td>—</td>', tpC='<td>—</td>';
+    if(d){
+      const R=watchRec(d);
+      entryC=`<td>${R.recE!=null?fmtNum(R.recE):'—'}</td>`;
+      stopC=R.rstop?`<td>${fmtNum(R.rstop.level)}<span class="rr">${R.rstop.atrx?R.rstop.atrx.toFixed(1)+'×':''}</span></td>`:'<td>—</td>';
+      tpC=R.rec?`<td class="revtp">${fmtNum(R.rec.lvl)}<span class="rr">R${R.rec.rr.toFixed(1)}·${R.grade}</span></td>`
+                :'<td><span style="color:var(--warn)">no ≥1.5 R:R</span></td>';
+    }
     const tr=document.createElement('tr');
     tr.innerHTML =
-      `<td class="sym">${watchStar(sym)}<a href="${tvLink(sym)}" target="_blank" rel="noopener">${dispSym(sym)}</a></td>`+
-      `<td>${price!=null?fmtNum(price):'<span style=\\'color:var(--dim)\\'>—</span>'}</td>`+
+      `<td class="sym">${watchStar(sym)}<a href="${tvLink(sym)}" target="_blank" rel="noopener">${dispSym(sym)}</a>${analyzeBtn(sym)}</td>`+
+      `<td>${price!=null?fmtNum(price):'<span style="color:var(--dim)">—</span>'}</td>`+
       `<td><span class="biaspill2 b-${(bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${bias}</span></td>`+
-      `<td>${on.length? on.join(', ') : '<span style=\\'color:var(--dim)\\'>not on a scan now</span>'}</td>`+
-      corrTd(corr)+
-      `<td><span class="wlbtn" onclick="analyzeFromWatch('${sym}')">Analyze</span><a class="wlbtn" href="${tvLink(sym)}" target="_blank" rel="noopener">Chart ↗</a><span class="wlbtn" onclick="toggleWatch('${sym}',event)">Remove</span></td>`;
+      setupsCell(d,on)+ entryC+ stopC+ tpC+ corrTd(corr)+
+      `<td><span class="wlbtn" onclick="analyzeFromWatch('${sym}')">Analyze</span><span class="wlbtn" onclick="toggleWatch('${sym}',event)">Remove</span></td>`;
     tb.appendChild(tr);
   }
 }
@@ -1496,7 +1606,7 @@ function showTab(which){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
-  if(which==="watch") renderWatch();
+  if(which==="watch"){ renderWatch(); loadWatch(); }
   renderBanner();  // banner follows the active scan tab
   renderFilterBar();  // filters are per-tab
 }
