@@ -2130,8 +2130,12 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     above = price >= ema_now
     pct_vs_ema = (price - ema_now) / ema_now * 100
 
-    sup = supports_below(lows, last, price, max_n=4, min_gap=0.005)
-    res = resistances_above(highs, last, price, max_n=5, min_gap=0.008)
+    sup = supports_below(lows, last, price, max_n=6, min_gap=0.005)
+    # Pull MORE overhead swing highs (not just the nearest few) so the target
+    # ladder doesn't leave a big gap between the near-term ceilings and the
+    # Fibonacci measured-move targets — it should surface the mid-range shelves
+    # (e.g. a prior consolidation zone well above price) too.
+    res = resistances_above(highs, last, price, max_n=12, min_gap=0.008)
     ksup = key_supports(rows, lows, price)       # next 4h / daily / weekly support
     kres = key_resistances(rows, highs, price)   # next 4h / daily / weekly resistance
     a = atr(highs, lows, closes)

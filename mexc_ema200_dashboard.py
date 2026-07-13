@@ -713,6 +713,11 @@ PAGE = """<!doctype html>
   td.sym a{font-weight:700;letter-spacing:.01em}
   td.sym a:hover{color:var(--accent)}
   .score{font-family:var(--mono);font-weight:700}
+  /* freeze the Symbol column so you never lose track of which coin a row is */
+  td.sym{position:sticky;left:0;z-index:30;background:var(--bg2);
+       box-shadow:8px 0 12px -8px rgba(0,0,0,.55)}
+  tbody tr:hover td.sym{background:#121a28}
+  thead th:first-child{position:sticky;left:0;z-index:46;background:rgba(21,28,41,.98)}
   th[data-sort]::after{margin-left:6px;color:var(--accent);font-size:9px;vertical-align:middle}
   th[data-sort="asc"]::after{content:"▲"}
   th[data-sort="desc"]::after{content:"▼"}
@@ -739,6 +744,23 @@ PAGE = """<!doctype html>
   .azcard::before{content:"";position:absolute;inset:0 0 auto 0;height:2px;
        background:linear-gradient(90deg,var(--accent),transparent 60%);opacity:.7}
   .azhead .sym{font-size:20px;font-weight:800;letter-spacing:-.01em}
+  /* verdict bar — the bottom line, up top */
+  .azverdict{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;margin:12px 0 4px;
+       padding:13px 16px;border-radius:13px;border:1px solid var(--line2);
+       background:linear-gradient(90deg,rgba(63,185,80,.12),rgba(20,25,36,.35))}
+  .azverdict.short{background:linear-gradient(90deg,rgba(248,81,73,.12),rgba(20,25,36,.35))}
+  .azverdict.none{background:linear-gradient(90deg,rgba(227,179,65,.12),rgba(20,25,36,.35))}
+  .vbadge{font-weight:800;padding:5px 13px;border-radius:9px;font-size:13px;letter-spacing:.02em}
+  .v-long{background:rgba(63,185,80,.22);color:var(--accent);border:1px solid rgba(63,185,80,.55)}
+  .v-short{background:rgba(248,81,73,.22);color:#ff6b63;border:1px solid rgba(248,81,73,.55)}
+  .v-none{background:rgba(227,179,65,.22);color:var(--warn);border:1px solid rgba(227,179,65,.55)}
+  .vgrade{font-weight:800;font-size:13px;color:#fff;background:rgba(255,255,255,.06);
+       border:1px solid var(--line2);border-radius:8px;padding:4px 10px}
+  .vitem{font-size:13.5px;color:var(--txt);font-family:var(--mono);font-weight:600}
+  .vitem i{font-style:normal;color:var(--dim2);font-size:9.5px;text-transform:uppercase;
+       letter-spacing:.06em;margin-right:5px;font-family:"Inter",sans-serif;font-weight:600}
+  .vitem b{color:var(--accent);font-weight:700}
+  .vsep{width:1px;height:20px;background:var(--line2)}
   .azsec{border-top:1px solid var(--line);margin-top:18px;padding-top:14px;
        font-weight:800;color:var(--txt);letter-spacing:.02em;font-size:13px;text-transform:uppercase}
   .azsec .azsub{text-transform:none;font-weight:500}
@@ -1476,10 +1498,24 @@ function setupsCell(d, on){
   if(d){ if(d.ema_reclaim) tags.push('200-EMA reclaim'); if(d.bull_flag) tags.push('Bull flag');
     if(d.support_bounce) tags.push('Support bounce'); }
   for(const nm of on){ if(!tags.includes(nm)) tags.push(nm); }
-  let pat='';
-  if(d&&d.patterns){ for(const tf of ['4h','1d','1h','1w']){ const arr=d.patterns[tf]||[]; if(arr.length){ pat=`${arr[0].name} · ${tf==='1d'?'1D':tf==='1w'?'1W':tf}`; break; } } }
-  const t=tags.length?tags.slice(0,2).join(', ')+(tags.length>2?` +${tags.length-2}`:''):'<span style="color:var(--dim2)">— none active —</span>';
-  return `<td style="text-align:left;white-space:normal;max-width:230px">${t}${pat?`<div style="color:var(--dim);font-size:11px;margin-top:2px">◈ ${pat}</div>`:''}</td>`;
+  const tfs=[['1h','1h'],['4h','4h'],['1d','1D'],['1w','1W']];
+  const t=tags.length?tags.slice(0,3).join(', ')+(tags.length>3?` +${tags.length-3}`:''):'<span style="color:var(--dim2)">— no active scan setup —</span>';
+  // Chart patterns across EVERY timeframe (1h / 4h / Daily / Weekly), not just 4h.
+  let pats='';
+  if(d&&d.patterns){ const parts=[];
+    for(const [k,lbl] of tfs){ const a=d.patterns[k]||[]; if(a.length){
+      const b=a[0].bias, c=b==='bullish'?'var(--accent)':b==='bearish'?'#f85149':'var(--dim)';
+      parts.push(`<span style="color:${c}">${a[0].name}·${lbl}</span>`); } }
+    if(parts.length) pats=`<div style="font-size:11px;margin-top:3px;color:var(--dim)">◈ ${parts.join(' · ')}</div>`;
+  }
+  // Multi-timeframe bias strip.
+  let bstrip='';
+  if(d&&d.tf_bias){ const sy={bullish:'▲',bearish:'▼',neutral:'–'},
+        co={bullish:'var(--accent)',bearish:'#f85149',neutral:'var(--dim2)'}; const parts=[];
+    for(const [k,lbl] of tfs){ const b=d.tf_bias[k]; if(b) parts.push(`<span style="color:${co[b]||'var(--dim2)'}">${lbl}${sy[b]||'–'}</span>`); }
+    if(parts.length) bstrip=`<div style="font-size:11px;margin-top:3px;font-family:var(--mono);letter-spacing:.02em">${parts.join('  ')}</div>`;
+  }
+  return `<td style="text-align:left;white-space:normal;max-width:280px;line-height:1.4">${t}${pats}${bstrip}</td>`;
 }
 function renderWatch(){
   const tb=document.getElementById('wlrows'); if(!tb) return;
@@ -1873,6 +1909,10 @@ function azCard(d0){
     return Math.min(Math.abs(tpv-recE)/Math.abs(recE-stop),8); };
   const recRR=(tpv)=> rrOn(tpv, rstop?rstop.level:d.sl_tight);
   const tightRR=(tpv)=> rrOn(tpv, d.sl_tight);
+  // R:R if you enter NOW at the current market price (over the recommended stop).
+  const cmpRR=(tpv)=>{ const stop=rstop?rstop.level:d.sl_tight; if(tpv==null||cmpE==null||stop==null||cmpE===stop) return null;
+    const long=(d.side||'long')!=='short'; if(long? tpv<=cmpE : tpv>=cmpE) return null;
+    return Math.min(Math.abs(tpv-cmpE)/Math.abs(cmpE-stop),8); };
   // A trade-plan TP cell: R:R to the RECOMMENDED stop (what we advise), tight-stop
   // R:R in the hover. ◎ flags the 200-EMA reclaim target.
   const aztp=(dd,n)=>{
@@ -1900,6 +1940,18 @@ function azCard(d0){
       </span>`:''}
     </div>
     ${(d0.plans&&activeSide!==auto)?`<div class="sidenote">Showing the <b>${activeSide.toUpperCase()}</b> perspective — a ${activeSide==='long'?'reversal/counter-trend long':'counter-trend short'}. The coin's own lean is <b>${auto.toUpperCase()}</b>, so treat this as the plan <i>if</i> it turns; the entries, stops, targets and R:R below are all for a ${activeSide}.</div>`:''}
+    <div class="azverdict ${rec.tp!=null?((d.side||'long')==='short'?'short':'long'):'none'}" data-tip="The bottom line for this coin, at a glance. Everything below is the detail behind it.">
+      ${rec.tp!=null?`
+        <span class="vbadge v-${(d.side||'long')==='short'?'short':'long'}">${(d.side||'long')==='short'?'SHORT ▼':'LONG ▲'}</span>
+        <span class="vgrade">Grade ${planGrade}</span><span class="vsep"></span>
+        <span class="vitem"><i>Entry</i>${fmtNum(recE)}</span>
+        <span class="vitem"><i>Stop</i>${rstop?fmtNum(rstop.level):'—'}${rstop&&rstop.atrx?` <span style="color:var(--dim2)">${rstop.atrx.toFixed(1)}×</span>`:''}</span>
+        <span class="vitem"><i>Target</i>${fmtNum(rec.tp)}</span>
+        <span class="vitem"><i>R:R</i><b>${rec.rr.toFixed(2)}</b></span>
+        <span class="vitem"><i>Reach</i>${Math.round(rec.p*100)}%</span>`
+      :`<span class="vbadge v-none">⛔ NO TRADE</span>
+        <span class="vitem" style="font-family:'Inter'">Best realistic R:R is only <b>${rtg?rtg.bestRR.toFixed(2):'—'}</b> — under the 1.5 floor. Wait for a better entry or setup.</span>`}
+    </div>
     <div class="aztags">
       <span class="aztag ${d.ema_reclaim?'on':''}">200-EMA reclaim${d.ema_reclaim?' · '+d.ema_reclaim_score:''}</span>
       <span class="aztag ${d.bull_flag?'on':''}">Bull flag${d.bull_flag?' · '+d.bull_flag_score:''}</span>
@@ -1944,9 +1996,9 @@ function azCard(d0){
     <div class="sidenote" data-tip="How the same trade looks if you enter NOW at the current market price instead of waiting for the 🎯 recommended pullback — same stop and target, worse fill, so a lower R:R. Use it to decide: take it now, or wait for the better entry.">⚡ Enter now at market (CMP ${fmtNum(cmpE)}): ${rrAt(cmpE)!=null?`R:R <b>${rrAt(cmpE).toFixed(2)}</b> to the base target`:'stop is already in the way — no clean entry here'} <span style="color:var(--dim)">vs ${rec.rr.toFixed(2)} waiting for ${fmtNum(recE)}${(rrAt(cmpE)!=null&&rrAt(cmpE)<1.5)?' — under 1.5:1 now, better to wait for the pullback':(cmpE!=null&&recE!=null&&Math.abs(cmpE-recE)/recE<0.005?' — basically at the entry already':'')}</span></div>`
     :`<div class="azrec" style="color:#f0b429" data-tip="No target on the correct side clears a 1.5:1 reward:risk from a sensible stop. In crypto a sub-1.5 R:R trade isn't worth the risk — this is a 'no trade / wait' call, not a setup. Wait for a deeper entry (better R:R), a tighter valid stop level, or a different coin.">⛔ No trade here — best realistic R:R is only <b>${rtg?rtg.bestRR.toFixed(2):'—'}</b>, under the 1.5 minimum. Wait for a better entry or setup.</div>`}
     ${stopsSection(d.stop_levels, d.side||'long', rstop?rstop.level:null)}
-    <div class="azsec" data-tip="A fuller ladder of profit targets: overhead resistance levels blended with Fibonacci extensions of the recent range, in order. Each shows % move and R:R — R = to the 🛑 recommended stop, Rt = to the tight stop. The ⭐ chip is the recommended (best realistic R:R) target.">Target ladder <span class="azsub">resistances + Fibonacci extensions · R = to recommended stop · Rt = to tight stop · ⭐ = recommended</span></div>
+    <div class="azsec" data-tip="A fuller ladder of profit targets: overhead resistance levels blended with Fibonacci extensions of the recent range, in order. Each shows % move and three reward:risk numbers — R = from the recommended (pullback) entry, Rc = if you enter NOW at market, both over the recommended stop; Rt = to the tighter stop. The ⭐ chip is the recommended target.">Target ladder <span class="azsub">R = recommended entry · Rc = enter now (CMP) · Rt = tight stop · ⭐ = recommended</span></div>
     <div class="azladder">
-      ${(d.target_ladder||[]).map((t,i)=>{const rR=recRR(t.level),rT=tightRR(t.level);return `<span class="ladchip${isRec(t.level)?' ladrec':''}" data-tip="Target ${i+1}: ${t.kind} at ${fmtNum(t.level)} — ${t.pct>=0?'+':''}${t.pct}% move. R:R ${rR!=null?rR.toFixed(2):'—'} to the recommended stop${rT!=null?`, ${rT.toFixed(2)} to the tight stop`:''}.${isRec(t.level)?' ⭐ Recommended — best realistic reward:risk.':''}">${isRec(t.level)?'⭐ ':''}T${i+1} ${fmtNum(t.level)} <span class="rr">${t.pct>=0?'+':''}${t.pct}%${rR!=null?` · R${rR.toFixed(1)}`:''}${rT!=null?` · Rt${rT.toFixed(1)}`:''}</span></span>`;}).join('') || '<span style="color:var(--dim)">No further targets that side.</span>'}
+      ${(d.target_ladder||[]).map((t,i)=>{const rR=recRR(t.level),rC=cmpRR(t.level),rT=tightRR(t.level);return `<span class="ladchip${isRec(t.level)?' ladrec':''}" data-tip="Target ${i+1}: ${t.kind} at ${fmtNum(t.level)} — ${t.pct>=0?'+':''}${t.pct}% move. R:R ${rR!=null?rR.toFixed(2):'—'} from the recommended entry, ${rC!=null?rC.toFixed(2):'—'} if you enter now at market, ${rT!=null?rT.toFixed(2):'—'} to the tight stop.${isRec(t.level)?' ⭐ Recommended — best realistic reward:risk.':''}">${isRec(t.level)?'⭐ ':''}T${i+1} ${fmtNum(t.level)} <span class="rr">${t.pct>=0?'+':''}${t.pct}%${rR!=null?` · R${rR.toFixed(1)}`:''}${rC!=null?` · Rc${rC.toFixed(1)}`:''}${rT!=null?` · Rt${rT.toFixed(1)}`:''}</span></span>`;}).join('') || '<span style="color:var(--dim)">No further targets that side.</span>'}
     </div>
     <div class="azsec">In plain English</div>
     <ul class="aznotes">${notes}</ul>
