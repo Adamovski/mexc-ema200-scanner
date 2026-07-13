@@ -713,11 +713,17 @@ PAGE = """<!doctype html>
   td.sym a{font-weight:700;letter-spacing:.01em}
   td.sym a:hover{color:var(--accent)}
   .score{font-family:var(--mono);font-weight:700}
-  /* freeze the Symbol column so you never lose track of which coin a row is */
+  /* freeze the Symbol column so you never lose track of which coin a row is.
+     Cap its width and let the badge cluster (patterns / TF bias / support / confluence)
+     WRAP inside the cell — otherwise the pinned column grows very wide and overlaps
+     the columns that scroll underneath it. */
   td.sym{position:sticky;left:0;z-index:30;background:var(--bg2);
-       box-shadow:8px 0 12px -8px rgba(0,0,0,.55)}
+       box-shadow:8px 0 12px -8px rgba(0,0,0,.55);
+       white-space:normal;max-width:250px;vertical-align:middle;overflow:hidden}
+  td.sym .wstar,td.sym>a{vertical-align:middle}
   tbody tr:hover td.sym{background:#121a28}
-  thead th:first-child{position:sticky;left:0;z-index:46;background:rgba(21,28,41,.98)}
+  thead th:first-child{position:sticky;left:0;z-index:46;background:rgba(21,28,41,.98);
+       white-space:normal;max-width:250px}
   th[data-sort]::after{margin-left:6px;color:var(--accent);font-size:9px;vertical-align:middle}
   th[data-sort="asc"]::after{content:"▲"}
   th[data-sort="desc"]::after{content:"▼"}
@@ -805,7 +811,6 @@ PAGE = """<!doctype html>
 <header>
   <h1>Apex<span class="brandsub">MEXC Futures Scanner</span></h1>
   <span class="sub" id="meta"></span>
-  <button id="alertBtn" class="alertbtn" onclick="enableAlerts()">🔔 Enable breakout alerts</button>
 </header>
 <div id="tip"></div>
 <div class="bkbanner" id="bkbanner"></div>
@@ -1092,14 +1097,14 @@ PAGE = """<!doctype html>
 <div class="wrap">
   <table id="wltbl">
     <thead><tr>
-      <th>Symbol</th>
-      <th data-tip="Live last-traded price.">Price</th>
-      <th data-tip="Market-structure bias (auto direction) on the 4h chart.">Bias</th>
-      <th data-tip="Active scanner setups + the strongest chart pattern found.">Setups</th>
-      <th data-tip="Recommended LONG entry — a proper pullback fill, not chasing.">🎯 Entry</th>
-      <th data-tip="Recommended stop-loss (the level that invalidates the long), with ×ATR distance.">🛑 Stop</th>
-      <th data-tip="Best realistic take-profit by expected value, with R:R and a plan grade.">⭐ Best TP</th>
-      <th data-tip="BTC correlation ρ over ~10 days. Low/negative = its own mover.">BTC ρ</th>
+      <th data-wk="sym" onclick="sortWatch('sym')" style="cursor:pointer">Symbol</th>
+      <th data-wk="price" onclick="sortWatch('price')" style="cursor:pointer" data-tip="Live last-traded price. Click to sort.">Price</th>
+      <th data-wk="bias" onclick="sortWatch('bias')" style="cursor:pointer" data-tip="Market-structure bias (auto direction) on the 4h chart. Click to sort bullish→bearish.">Bias</th>
+      <th data-wk="setups" onclick="sortWatch('setups')" style="cursor:pointer" data-tip="Active scanner setups + the strongest chart pattern found. Click to sort by how many setups are firing.">Setups</th>
+      <th data-wk="entry" onclick="sortWatch('entry')" style="cursor:pointer" data-tip="Recommended LONG entry — a proper pullback fill, not chasing. Click to sort.">🎯 Entry</th>
+      <th data-wk="stop" onclick="sortWatch('stop')" style="cursor:pointer" data-tip="Recommended stop-loss (the level that invalidates the long), with ×ATR distance. Click to sort.">🛑 Stop</th>
+      <th data-wk="rating" onclick="sortWatch('rating')" style="cursor:pointer" data-tip="Best realistic take-profit by expected value, with R:R and a plan grade. The list is sorted by this rating (best first) by default — click to reverse, or click any other header to sort by it.">⭐ Best TP</th>
+      <th data-wk="corr" onclick="sortWatch('corr')" style="cursor:pointer" data-tip="BTC correlation ρ over ~10 days. Low/negative = its own mover. Click to sort.">BTC ρ</th>
       <th>Actions</th>
     </tr></thead>
     <tbody id="wlrows"></tbody>
@@ -1520,9 +1525,50 @@ function setupsCell(d, on){
   }
   return `<td style="text-align:left;white-space:normal;max-width:280px;line-height:1.4">${t}${pats}${bstrip}</td>`;
 }
+// Watchlist sort — defaults to the setup RATING (best plan first); every column
+// header is clickable to sort by it (click again to reverse).
+let watchSort={key:'rating', dir:-1};
+const WGRANK={'A+':5,'A':4,'B':3,'C':2,'—':0};
+function watchVal(sym,key){
+  const cache=watchData[sym]; const d=cache?cache.d:null;
+  const {row,on}=watchLookup(sym);
+  if(key==='sym') return dispSym(sym);
+  const price=(d&&d.live!=null)?d.live:(d?d.price:(row?(row.live!=null?row.live:row.price):null));
+  if(key==='price') return price!=null?price:-Infinity;
+  if(key==='bias'){ const b=(d?(d.bias||''):(row?(row.bias||''):'')).toLowerCase();
+    return ({bullish:2,neutral:1,bearish:0})[b]!=null?({bullish:2,neutral:1,bearish:0})[b]:-1; }
+  if(key==='corr'){ const c=d?d.btc_corr:(row?row.btc_corr:null); return c!=null?c:-Infinity; }
+  if(key==='setups'){ let n=(on||[]).length; if(d){ if(d.ema_reclaim)n++; if(d.bull_flag)n++; if(d.support_bounce)n++; } return n; }
+  if(!d) return -Infinity;
+  const R=watchRec(d);
+  if(key==='entry') return R.recE!=null?R.recE:-Infinity;
+  if(key==='stop') return R.rstop?R.rstop.level:-Infinity;
+  if(key==='rating'||key==='tp'){ if(!R.rec) return -Infinity; return (WGRANK[R.grade]||0)*1000 + R.rec.rr; }
+  return -Infinity;
+}
+function sortWatch(key){
+  if(watchSort.key===key) watchSort.dir*=-1;
+  else { watchSort.key=key; watchSort.dir=(key==='sym')?1:-1; }
+  renderWatch();
+}
+function setWatchArrows(){
+  document.querySelectorAll('#wltbl thead th[data-wk]').forEach(th=>{
+    const base=th.getAttribute('data-label')||th.textContent.replace(/[▲▼]\s*$/,'').trim();
+    th.setAttribute('data-label', base);
+    const arrow=(th.dataset.wk===watchSort.key)?(watchSort.dir<0?' ▼':' ▲'):'';
+    th.childNodes[0].nodeValue = base + arrow;
+  });
+}
 function renderWatch(){
   const tb=document.getElementById('wlrows'); if(!tb) return;
-  const syms=[...WATCH].sort();
+  const syms=[...WATCH].sort((a,b)=>{
+    const va=watchVal(a,watchSort.key), vb=watchVal(b,watchSort.key);
+    let c; if(typeof va==='string'||typeof vb==='string') c=(''+va).localeCompare(''+vb);
+    else c=(va>vb?1:va<vb?-1:0);
+    if(c===0) c=dispSym(a).localeCompare(dispSym(b));   // stable tiebreak by symbol
+    return watchSort.dir*c;
+  });
+  setWatchArrows();
   document.getElementById('wlempty').style.display = syms.length? 'none':'block';
   document.getElementById('watchCount').textContent = syms.length? `${syms.length} coin(s)`:'';
   tb.innerHTML='';
@@ -1925,6 +1971,12 @@ function azCard(d0){
   const beHigherTf=(be&&be.tf&&(TFRANK[be.tf]||2)>viewRankAz);
   const crossTfTag=beHigherTf?` <span class="tfsrc" data-tip="This entry level is the ${TFNAME[be.tf]} chart's support — a higher, stronger timeframe than the ${d.interval||'4h'} you're viewing. Price should turn there first, so it's the smarter fill.">${TFNAME[be.tf]}</span>`:'';
   const crossTfNote=beHigherTf?` · <b style="color:var(--accent)">from the ${TFNAME[be.tf]} chart</b> — a stronger level price should reach first, so it beats waiting for a deeper ${d.interval||'4h'} dip that may never fill`:'';
+  // Small colored bull/bear/neutral marker for a timeframe, from tf_bias.
+  const tfMark=(tf)=>{ const b=(d.tf_bias||{})[tf];
+    const co=b==='bullish'?'var(--accent)':b==='bearish'?'#f85149':'var(--dim2)';
+    const sy=b==='bullish'?'▲':b==='bearish'?'▼':'–';
+    return `<span style="color:${co};font-weight:700" title="${tf.toUpperCase()} market-structure bias: ${b||'n/a'}">${sy}</span>`; };
+  const tfSup=(tf,v,sign)=>`${tf==='1d'?'1D':tf==='1w'?'1W':tf} ${tfMark(tf)} ${v==null?'—':fmtNum(v)+pct(v,sign)}`;
   const rec=(rtg&&rtg.primary)?{tp:rtg.primary.lvl, rr:rtg.primary.rr, move:rtg.primary.move, p:rtg.primary.p}:{tp:null};
   const isRec=(lvl)=> rec.tp!=null && lvl!=null && Math.abs(lvl-rec.tp)/(rec.tp||1) < 0.004;
   const sgn=(d.side||'long')==='short'?'+':'−';         // stop/entry sign relative to price for this side
@@ -2011,9 +2063,9 @@ function azCard(d0){
       ${cell("Supertrend ("+(d.interval||'4h')+")", d.supertrend==null?'—':(fmtNum(d.supertrend)+' · '+(d.supertrend_role==='support'?'SUPPORT':'RESISTANCE')+pct(d.supertrend, d.supertrend_role==='support'?'-':'+')), `Supertrend (ATR 10×3) on the ${d.interval||'4h'} chart. When price is ABOVE the line the trend is up and the line acts as a trailing SUPPORT; when price is BELOW it the trend is down and it acts as RESISTANCE. Here it's ${d.supertrend_role||'—'} at ${d.supertrend==null?'—':fmtNum(d.supertrend)} — a level to watch for the trend flipping.`)}
       ${cell("Supports (distance)", (d.supports||[]).slice(0,3).map(v=>fmtNum(v)+pct(v,'-')).join(' · ')||'—', "Based on: swing-low pivots — prior candle lows the market previously bounced from — on this timeframe, nearest first, with the % below current price.")}
       ${cell("Resistances (distance)", (d.resistances||[]).slice(0,3).map(v=>fmtNum(v)+pct(v,'+')).join(' · ')||'—', "Based on: swing-high pivots — prior candle peaks that previously capped price — on this timeframe, nearest first, with the % above current price.")}
-      ${cell("Next support 4h·1D·1W (drawdown)", [d.sup_4h,d.sup_1d,d.sup_1w].map(v=>v==null?'—':fmtNum(v)+pct(v,'-')).join(' · '), "Based on: the nearest swing-low pivot on the 4h, Daily and Weekly charts (each timeframe aggregated separately) — your multi-timeframe safety-net levels — with the % drawdown to each.")}
-      ${cell("Next resistance 4h·1D·1W (upside)", [d.res_4h,d.res_1d,d.res_1w].map(v=>v==null?'—':fmtNum(v)+pct(v,'+')).join(' · '), "Based on: the nearest swing-high pivot on the 4h, Daily and Weekly charts — likely ceilings — with the % upside to each.")}
-      ${cell("Dist. from 200 EMA (4h·1D·1W)", `4h ${d.pct_vs_ema>=0?'+':''}${d.pct_vs_ema}% · 1D ${d.dist_ema_1d==null?'—':(d.dist_ema_1d>=0?'+':'')+d.dist_ema_1d+'%'} · 1W ${d.dist_ema_1w==null?'—':(d.dist_ema_1w>=0?'+':'')+d.dist_ema_1w+'%'}`, "How far price sits above/below the 200 EMA on each timeframe. Above on all three = a strong multi-timeframe uptrend regime. '—' = not enough history for that EMA.")}
+      ${cell("Next support 4h·1D·1W (drawdown)", `${tfSup('4h',d.sup_4h,'-')} · ${tfSup('1d',d.sup_1d,'-')} · ${tfSup('1w',d.sup_1w,'-')}`, "Based on: the nearest swing-low pivot on the 4h, Daily and Weekly charts — your multi-timeframe safety-net levels — with the % drawdown to each. The ▲/▼/– before each is that timeframe's trend bias (green = bullish, red = bearish).")}
+      ${cell("Next resistance 4h·1D·1W (upside)", `${tfSup('4h',d.res_4h,'+')} · ${tfSup('1d',d.res_1d,'+')} · ${tfSup('1w',d.res_1w,'+')}`, "Based on: the nearest swing-high pivot on the 4h, Daily and Weekly charts — likely ceilings — with the % upside to each. The ▲/▼/– before each is that timeframe's trend bias.")}
+      ${cell("Dist. from 200 EMA (4h·1D·1W)", `4h ${tfMark('4h')} ${d.pct_vs_ema>=0?'+':''}${d.pct_vs_ema}% · 1D ${tfMark('1d')} ${d.dist_ema_1d==null?'—':(d.dist_ema_1d>=0?'+':'')+d.dist_ema_1d+'%'} · 1W ${tfMark('1w')} ${d.dist_ema_1w==null?'—':(d.dist_ema_1w>=0?'+':'')+d.dist_ema_1w+'%'}`, "How far price sits above/below the 200 EMA on each timeframe, with each timeframe's trend bias (▲ bull / ▼ bear / – neutral). Above the EMA on all three = a strong multi-timeframe uptrend. '—' = not enough history for that EMA.")}
     </div>
     ${tfBiasSection(d.tf_bias)}
     ${patternsSection(d.patterns)}
@@ -2502,8 +2554,15 @@ async function poll(){
     document.getElementById("shortCount").textContent = `${slatest.length} short setup(s) · ${d.universe} pairs`;
     document.getElementById("earlyCount").textContent = `${eelatest.length} early setup(s) · ${d.universe} pairs — unconfirmed`;
     // topCount is set inside renderTop() (it knows the deduped long count).
-    document.getElementById("meta").textContent =
-      `${d.cfg.interval} chart · MEXC ${d.cfg.market==='futures'?'perps ⚡':'spot'} · ${d.cfg.quote} · EMA${d.cfg.ema_period} · rescans every ${d.cfg.scan_every}m${d.cfg.telegram?' · 📲 Telegram on':''}`;
+    { const mb=(t,tip)=>`<span class="metabit" data-tip="${tip}">${t}</span>`;
+      const mkt=d.cfg.market==='futures'?'perps ⚡':'spot';
+      document.getElementById("meta").innerHTML =
+        mb(`${d.cfg.interval} chart`, `The candle timeframe the scanners run on — every setup is detected on this chart's closes. Use the Analyze tab to look at any coin on 1h / 4h / Daily / Weekly.`)
+        +' · '+ mb(`MEXC ${mkt}`, `Data source: MEXC ${d.cfg.market==='futures'?'perpetual futures (perps) — leveraged contracts':'spot market'}. All prices, volume, levels and R:R come from this market.`)
+        +' · '+ mb(d.cfg.quote, `Quote currency — every pair is priced in ${d.cfg.quote} (e.g. BTC${d.cfg.quote}).`)
+        +' · '+ mb(`EMA${d.cfg.ema_period}`, `The ${d.cfg.ema_period}-period exponential moving average — the core trend filter. Price above it = uptrend regime (longs favoured), below = downtrend (shorts favoured).`)
+        +' · '+ mb(`rescans every ${d.cfg.scan_every}m`, `How often the scanner re-pulls MEXC in the background and refreshes every tab automatically. You never need to reload.`)
+        + (d.cfg.telegram?(' · '+mb('📲 Telegram on','Breakout & confluence alerts are being pushed to your Telegram.')):''); }
     const dot=document.getElementById("dot");
     dot.className = "dot" + (d.scanning? " live":"");
     document.getElementById("scanState").textContent =
@@ -2566,6 +2625,236 @@ applyHeaderTips();
 poll(); setInterval(poll, 3000);
 </script>
 </body></html>"""
+
+
+# ===========================================================================
+# MEMBERSHIP: accounts, access codes, sessions, per-user watchlists.
+# Durable storage lives in Upstash Redis (free, no expiry) via its HTTPS REST
+# API — set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN. With those unset
+# the app still boots on an in-memory store (fine for local dev; NOT durable).
+# ===========================================================================
+import hashlib
+import hmac
+import secrets
+import urllib.request as _urlreq
+from urllib.parse import urlparse, parse_qs
+
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+SIGNUP_OPEN = os.environ.get("SIGNUP_OPEN", "1").strip() not in ("0", "false", "no", "")
+BRAND = "Apex"
+
+
+class Store:
+    """Tiny KV wrapper. Upstash Redis REST when configured, else in-memory."""
+
+    def __init__(self):
+        self.url = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
+        self.token = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
+        self.mem: dict[str, str] = {}
+        self.durable = bool(self.url and self.token)
+
+    def _cmd(self, *args):
+        body = json.dumps(list(args)).encode()
+        req = _urlreq.Request(self.url, data=body, method="POST")
+        req.add_header("Authorization", f"Bearer {self.token}")
+        req.add_header("Content-Type", "application/json")
+        with _urlreq.urlopen(req, timeout=12) as r:
+            return json.loads(r.read().decode()).get("result")
+
+    def get(self, key):
+        if not self.durable:
+            return self.mem.get(key)
+        try:
+            return self._cmd("GET", key)
+        except Exception:
+            return None
+
+    def set(self, key, val):
+        if not self.durable:
+            self.mem[key] = val
+            return True
+        try:
+            self._cmd("SET", key, val)
+            return True
+        except Exception:
+            return False
+
+    def setex(self, key, ttl, val):
+        if not self.durable:
+            self.mem[key] = val
+            return True
+        try:
+            self._cmd("SET", key, val, "EX", str(int(ttl)))
+            return True
+        except Exception:
+            return False
+
+    def delete(self, key):
+        if not self.durable:
+            self.mem.pop(key, None)
+            return True
+        try:
+            self._cmd("DEL", key)
+            return True
+        except Exception:
+            return False
+
+    def keys(self, pattern):
+        if not self.durable:
+            import fnmatch
+            return [k for k in list(self.mem) if fnmatch.fnmatch(k, pattern)]
+        try:
+            return self._cmd("KEYS", pattern) or []
+        except Exception:
+            return []
+
+
+STORE = Store()
+
+
+def _now() -> int:
+    return int(time.time())
+
+
+def _hash_pw(pw: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 200_000).hex()
+
+
+def _norm_email(e: str) -> str:
+    return (e or "").strip().lower()
+
+
+def load_user(email: str) -> dict | None:
+    email = _norm_email(email)
+    if not email:
+        return None
+    raw = STORE.get(f"user:{email}")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def save_user(u: dict) -> bool:
+    return STORE.set(f"user:{_norm_email(u['email'])}", json.dumps(u))
+
+
+def is_admin(u: dict | None) -> bool:
+    return bool(u and (u.get("admin") or (ADMIN_EMAIL and _norm_email(u.get("email")) == ADMIN_EMAIL)))
+
+
+def user_active(u: dict | None) -> bool:
+    """Admins are always active; everyone else until their active_until epoch."""
+    if not u:
+        return False
+    if is_admin(u):
+        return True
+    return int(u.get("active_until", 0)) > _now()
+
+
+def days_left(u: dict | None) -> int | None:
+    if not u or is_admin(u):
+        return None
+    secs = int(u.get("active_until", 0)) - _now()
+    return max(0, secs // 86400)
+
+
+def create_user(email: str, pw: str, admin: bool = False) -> tuple[dict | None, str]:
+    email = _norm_email(email)
+    if not email or "@" not in email:
+        return None, "Enter a valid email."
+    if len(pw) < 6:
+        return None, "Password must be at least 6 characters."
+    if load_user(email):
+        return None, "An account with that email already exists."
+    salt = secrets.token_hex(16)
+    u = {"email": email, "salt": salt, "phash": _hash_pw(pw, salt),
+         "active_until": 0, "created": _now(), "admin": bool(admin), "watch": []}
+    save_user(u)
+    return u, ""
+
+
+def verify_login(email: str, pw: str) -> dict | None:
+    u = load_user(email)
+    if not u:
+        return None
+    if _hash_pw(pw, u.get("salt", "")) == u.get("phash"):
+        return u
+    return None
+
+
+def new_session(email: str) -> str:
+    tok = secrets.token_urlsafe(32)
+    STORE.setex(f"sess:{tok}", 60 * 60 * 24 * 30, _norm_email(email))  # 30-day session
+    return tok
+
+
+def session_user(cookie_header: str | None) -> dict | None:
+    if not cookie_header:
+        return None
+    tok = None
+    for part in cookie_header.split(";"):
+        p = part.strip()
+        if p.startswith("sid="):
+            tok = p[4:]
+            break
+    if not tok:
+        return None
+    email = STORE.get(f"sess:{tok}")
+    if not email:
+        return None
+    return load_user(email)
+
+
+def end_session(cookie_header: str | None):
+    if not cookie_header:
+        return
+    for part in cookie_header.split(";"):
+        p = part.strip()
+        if p.startswith("sid="):
+            STORE.delete(f"sess:{p[4:]}")
+
+
+# ---- access codes -----------------------------------------------------------
+def gen_code(days: int) -> str:
+    code = "APX-" + "-".join(secrets.token_hex(2).upper() for _ in range(3))
+    STORE.set(f"code:{code}", json.dumps({"days": int(days), "used_by": None, "created": _now()}))
+    return code
+
+
+def redeem_code(u: dict, code: str) -> tuple[bool, str]:
+    code = (code or "").strip().upper()
+    raw = STORE.get(f"code:{code}")
+    if not raw:
+        return False, "That code isn't valid."
+    try:
+        c = json.loads(raw)
+    except Exception:
+        return False, "That code isn't valid."
+    if c.get("used_by"):
+        return False, "That code has already been used."
+    base = max(int(u.get("active_until", 0)), _now())   # extend, never shorten
+    u["active_until"] = base + int(c["days"]) * 86400
+    save_user(u)
+    c["used_by"] = u["email"]
+    c["used_at"] = _now()
+    STORE.set(f"code:{code}", json.dumps(c))
+    return True, f"Added {c['days']} days. Access now runs to {datetime.fromtimestamp(u['active_until'], timezone.utc):%Y-%m-%d}."
+
+
+def ensure_admin_bootstrap():
+    """If ADMIN_EMAIL/PASSWORD are set and no such account exists yet, create it."""
+    if ADMIN_EMAIL and ADMIN_PASSWORD:
+        if not load_user(ADMIN_EMAIL):
+            create_user(ADMIN_EMAIL, ADMIN_PASSWORD, admin=True)
+        else:
+            u = load_user(ADMIN_EMAIL)
+            if u and not u.get("admin"):
+                u["admin"] = True
+                save_user(u)
 
 
 def make_handler(state: State):

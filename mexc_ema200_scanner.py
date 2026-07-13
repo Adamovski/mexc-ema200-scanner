@@ -2361,6 +2361,14 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
                 _add_stop(ema_now + 0.2 * a, f"Above the 200 EMA ({interval})")
             if kres.get("res_1d"):
                 _add_stop(kres["res_1d"] + 0.3 * a, "Above the Daily swing-high resistance")
+            # Cross-timeframe structural stops — a swing high on ANY chart is a real
+            # invalidation level, so the stop can be anchored to the best one across
+            # timeframes, not just the viewed chart. (deduped below)
+            _sn = {"1h": "1h", "4h": "4h", "1d": "Daily", "1w": "Weekly"}
+            for _tf in ("1h", "4h", "1d", "1w"):
+                _lv = (tf_levels.get(_tf) or {}).get("res")
+                if _lv and _lv > price:
+                    _add_stop(_lv + 0.3 * a, f"Above the {_sn[_tf]} swing high")
         else:
             if sup:
                 _add_stop(sup[0] - 0.3 * a, "Below the nearest swing low")
@@ -2374,6 +2382,14 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
                 _add_stop(ksup["sup_1d"] - 0.3 * a, "Below the Daily swing-low support")
             if ksup.get("sup_1w"):
                 _add_stop(ksup["sup_1w"] - 0.3 * a, "Below the Weekly swing-low support")
+            # Cross-timeframe structural stops — a swing low on ANY chart is a real
+            # invalidation level, so the stop can be anchored to the best one across
+            # timeframes, not just the viewed chart. (deduped below)
+            _sn = {"1h": "1h", "4h": "4h", "1d": "Daily", "1w": "Weekly"}
+            for _tf in ("1h", "4h", "1d", "1w"):
+                _lv = (tf_levels.get(_tf) or {}).get("sup")
+                if _lv and _lv < price:
+                    _add_stop(_lv - 0.3 * a, f"Below the {_sn[_tf]} swing low")
         # Always-available candidates so the menu is never bare (e.g. a coin sitting
         # below all its higher-TF supports): the recent range extreme plus two
         # volatility (ATR) stops giving graduated risk choices.
@@ -2397,9 +2413,21 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
 
         # Target ladder — structural levels blended with Fibonacci extensions,
         # deduped, up to 8. ALWAYS yields targets (falls back to measured % steps).
+        # Take-profits are pulled from EVERY timeframe's chart (1h/4h/Daily/Weekly),
+        # not just the one being viewed — a Daily or Weekly swing high/low is a real
+        # ceiling/floor worth targeting, so it belongs on the ladder too.
+        _tfn = {"1h": "1h", "4h": "4h", "1d": "Daily", "1w": "Weekly"}
         rng = hh - ll if hh > ll else 0.0
         if side == "short":                          # targets go DOWN
             cand = [(lvl, "support (prior swing low)") for lvl in sup]
+            for _tf in ("1h", "4h", "1d", "1w"):     # cross-timeframe supports below price
+                _s = (tf_levels.get(_tf) or {}).get("sup")
+                if _s and _s < price:
+                    cand.append((_s, f"{_tfn[_tf]} chart support (swing low)"))
+            if ksup.get("sup_1d") and ksup["sup_1d"] < price:
+                cand.append((ksup["sup_1d"], "Daily swing-low support"))
+            if ksup.get("sup_1w") and ksup["sup_1w"] < price:
+                cand.append((ksup["sup_1w"], "Weekly swing-low support"))
             for ratio in (0.272, 0.414, 0.618, 1.0, 1.618, 2.0):
                 lvl = ll - rng * ratio
                 if 0 < lvl < price:
@@ -2416,6 +2444,14 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
                           for p in (0.1, 0.2, 0.3, 0.4, 0.5)]
         else:                                        # targets go UP
             cand = [(lvl, "overhead resistance (prior swing high)") for lvl in res]
+            for _tf in ("1h", "4h", "1d", "1w"):     # cross-timeframe resistances above price
+                _r = (tf_levels.get(_tf) or {}).get("res")
+                if _r and _r > price:
+                    cand.append((_r, f"{_tfn[_tf]} chart resistance (swing high)"))
+            if kres.get("res_1d") and kres["res_1d"] > price:
+                cand.append((kres["res_1d"], "Daily swing-high resistance"))
+            if kres.get("res_1w") and kres["res_1w"] > price:
+                cand.append((kres["res_1w"], "Weekly swing-high resistance"))
             for ratio in (0.272, 0.414, 0.618, 1.0, 1.618, 2.0):
                 lvl = hh + rng * ratio
                 if lvl > price:
