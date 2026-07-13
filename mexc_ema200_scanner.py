@@ -443,10 +443,39 @@ def resistances_above(highs: list[float], upto: int, price: float,
     return out
 
 
+def _apply_stop_floor(entry: float, sl_tight: float, sl_wide: float, atr=None):
+    """Enforce a volatility floor so a stop never sits inside normal noise.
+
+    A 1%-away stop is far too tight for a high-conviction swing: it gets wicked
+    out on ordinary chop AND it artificially inflates R:R (a tiny risk
+    denominator makes any target look like a huge ratio). So we require the
+    TIGHT stop to be at least max(1.5 x ATR, 2.5% of entry) away from entry.
+    Structure-based stops that already clear that floor are left untouched; only
+    the too-tight ones are pushed out to the floor. The wide stop is kept at
+    least as far as the (possibly widened) tight stop."""
+    if not entry or sl_tight is None:
+        return sl_tight, sl_wide
+    long_side = sl_tight < entry           # stop below entry => long
+    floor_dist = 0.025 * entry             # 2.5% hard minimum
+    if atr:
+        floor_dist = max(floor_dist, 1.5 * atr)
+    if long_side:
+        sl_tight = min(sl_tight, entry - floor_dist)
+        sl_wide = sl_tight if sl_wide is None else min(sl_wide, sl_tight)
+    else:
+        sl_tight = max(sl_tight, entry + floor_dist)
+        sl_wide = sl_tight if sl_wide is None else max(sl_wide, sl_tight)
+    return round(sl_tight, 10), round(sl_wide, 10)
+
+
 def level_bundle(entry: float, sl_tight: float, sl_wide: float,
-                 tps: list) -> dict:
+                 tps: list, atr=None) -> dict:
     """Package two stop scenarios and up to 5 targets, with R:R (to the tight
-    stop) for each. R:R = (TP - entry) / (entry - stop) = profit / loss."""
+    stop) for each. R:R = (TP - entry) / (entry - stop) = profit / loss.
+
+    `atr` (if given) activates a volatility floor on the tight stop so thin
+    stops can't inflate R:R — see _apply_stop_floor."""
+    sl_tight, sl_wide = _apply_stop_floor(entry, sl_tight, sl_wide, atr)
     def rr(tp, sl):
         # works for longs (tp/sl on the bullish side) and shorts (mirrored) —
         # the ratio is sign-invariant: profit/loss.
@@ -569,7 +598,7 @@ def detect_cross_and_retest(
     sl_wide = min(wide_struct - 1.0 * a, sl_tight)
     # Up to 5 overhead resistances (skip trivially-close ceilings) as targets.
     res = resistances_above(highs, last, entry, max_n=5, min_gap=0.008)
-    bundle = level_bundle(entry, sl_tight, sl_wide, res)
+    bundle = level_bundle(entry, sl_tight, sl_wide, res, atr=a)
 
     return True, {
         "price": close_now,
@@ -676,7 +705,7 @@ def detect_bull_flag(
     # Five continuation targets: measured move then Fib extensions of the pole,
     # so proper breakouts have higher targets to run to.
     tps = [breakout + m * pole_height for m in (1.0, 1.618, 2.0, 2.618, 3.0)]
-    bundle = level_bundle(entry, sl_tight, sl_wide, tps)
+    bundle = level_bundle(entry, sl_tight, sl_wide, tps, atr=a)
 
     return True, {
         "price": close_now,
@@ -766,7 +795,7 @@ def detect_narrow_cpr(rows: list, *, cpr_max_width_pct: float = 0.75,
     sl_tight = BC - 0.5 * a                     # below the CPR bottom
     sl_wide = min(dl - 0.5 * a, sl_tight)       # below yesterday's low
     res = resistances_above(highs, len(closes) - 1, entry, max_n=5, min_gap=0.005)
-    bundle = level_bundle(entry, sl_tight, sl_wide, res)
+    bundle = level_bundle(entry, sl_tight, sl_wide, res, atr=a)
 
     return True, {
         "price": price,
@@ -934,7 +963,7 @@ def detect_support_bounce(rows: list, highs: list[float], lows: list[float],
     lower = [z["level"] for z in zones if z["level"] < slevel * 0.99]
     wide_anchor = max(lower) if lower else slevel
     sl_wide = min(wide_anchor - 1.0 * a, sl_tight)
-    bundle = level_bundle(entry, sl_tight, sl_wide, res)
+    bundle = level_bundle(entry, sl_tight, sl_wide, res, atr=a)
 
     tf_label = {"1w": "Weekly", "1d": "Daily", "4h": "4h"}[tf]
     ms = market_structure(highs, lows, closes)
@@ -1065,7 +1094,7 @@ def detect_falling_wedge(highs: list[float], lows: list[float],
         if k not in seen:
             seen.add(k)
             dedup.append(t)
-    bundle = level_bundle(entry, sl_tight, sl_wide, dedup[:5])
+    bundle = level_bundle(entry, sl_tight, sl_wide, dedup[:5], atr=a)
     ms = market_structure(highs, lows, closes)
     return True, {
         "price": price,
@@ -1186,7 +1215,7 @@ def detect_breakdown_and_retest(
     sl_tight = tight_struct + 0.5 * a              # stop ABOVE structure
     sl_wide = max(wide_struct + 1.0 * a, sl_tight)
     sup = supports_below(lows, last, entry, max_n=5, min_gap=0.008)
-    bundle = level_bundle(entry, sl_tight, sl_wide, sup)   # rr sign-invariant
+    bundle = level_bundle(entry, sl_tight, sl_wide, sup, atr=a)   # rr sign-invariant
     return True, {
         "price": close_now,
         "ema": ema_now,
@@ -1272,7 +1301,7 @@ def detect_supertrend_bounce(rows: list, highs: list[float], lows: list[float],
     optimal_entry = round(slevel * 1.003, 10)   # buy near the Supertrend line
     sl_tight = slevel - 0.5 * a                  # stop just below the line
     sl_wide = slevel - 1.5 * a
-    bundle = level_bundle(entry, sl_tight, sl_wide, res)
+    bundle = level_bundle(entry, sl_tight, sl_wide, res, atr=a)
     ms = market_structure(highs, lows, closes)
     return True, {
         "price": price,
@@ -1370,7 +1399,7 @@ def detect_early_setup(rows: list, highs: list[float], lows: list[float],
         if k not in seen:
             seen.add(k)
             ded.append(t)
-    bundle = level_bundle(entry, sl_tight, sl_wide, ded[:5])
+    bundle = level_bundle(entry, sl_tight, sl_wide, ded[:5], atr=a)
     return True, {
         "price": price,
         "support": support,
@@ -2080,6 +2109,11 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         sl_tight = near_support - 0.5 * a
         deep_support = sup[1] if len(sup) > 1 else (sup[0] if sup else near_support)
         sl_wide = min(deep_support - 1.0 * a, sl_tight)
+
+    # Volatility floor on the tight stop: for a high-conviction swing a stop
+    # must clear normal noise (else it gets wicked out AND inflates R:R). Push
+    # it out to at least max(1.5x ATR, 2.5%) if the structure stop is tighter.
+    sl_tight, sl_wide = _apply_stop_floor(entry, sl_tight, sl_wide, a)
 
     # --- Candidate stop-loss levels, each labelled by what defines it ----------
     # For a long these sit BELOW price (under swings / Supertrend / EMA); for a
