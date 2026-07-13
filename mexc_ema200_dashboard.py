@@ -1273,6 +1273,10 @@ function until(ts){ if(!ts) return "—"; const s=Math.floor(ts-Date.now()/1000)
 // Some contracts are listed on TradingView under a different ticker than MEXC's
 // futures symbol — map those so the chart link resolves (e.g. AIGENSYN = AI).
 const TV_ALIAS={AIGENSYNUSDT:"AIUSDT"};
+// Some coins are listed under a different ticker than MEXC's futures symbol —
+// show the ticker people actually know (e.g. AIGENSYN is "AI" on MEXC).
+const SYM_ALIAS={AIGENSYNUSDT:"AIUSDT"};
+function dispSym(s){ return SYM_ALIAS[s]||s; }
 function tvLink(sym){ const s=TV_ALIAS[sym]||sym; const perp=(lastData&&lastData.cfg&&lastData.cfg.market==="futures")?".P":"";
   return "https://www.tradingview.com/chart/?symbol=MEXC:"+s+perp; }
 // ---- Watchlist (saved in this browser via localStorage) --------------------
@@ -1313,7 +1317,7 @@ function renderWatch(){
     const corr=row? row.btc_corr : null;
     const tr=document.createElement('tr');
     tr.innerHTML =
-      `<td class="sym">${watchStar(sym)}<a href="${tvLink(sym)}" target="_blank" rel="noopener">${sym}</a></td>`+
+      `<td class="sym">${watchStar(sym)}<a href="${tvLink(sym)}" target="_blank" rel="noopener">${dispSym(sym)}</a></td>`+
       `<td>${price!=null?fmtNum(price):'<span style=\\'color:var(--dim)\\'>—</span>'}</td>`+
       `<td><span class="biaspill2 b-${(bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${bias}</span></td>`+
       `<td>${on.length? on.join(', ') : '<span style=\\'color:var(--dim)\\'>not on a scan now</span>'}</td>`+
@@ -1692,7 +1696,7 @@ function azCard(d0){
   };
   return `<div class="azcard">
     <div class="azhead">
-      <span class="sym">${watchStar(d.symbol)}${d.symbol}</span>
+      <span class="sym">${watchStar(d.symbol)}${dispSym(d.symbol)}</span>
       <span style="color:var(--dim);font-size:12px;border:1px solid var(--line);border-radius:6px;padding:1px 7px">${(d.interval||'4h')} chart</span>
       <span class="dirpill dir-${(d.direction||'neutral').toLowerCase()}" data-tip="${d.dir_reason||''}">${(d.direction||'—').toUpperCase()}${d.direction==='Long'?' ▲':d.direction==='Short'?' ▼':''}</span>
       <span class="biaspill bias-${d.bias}" data-tip="${d.bias_reason||''}">${d.bias.toUpperCase()}</span>
@@ -1761,7 +1765,7 @@ function renderBanner(){
   const b=document.getElementById("banner");
   // Highest-priority alert: a coin just entered ⭐ Top setups (show on any tab).
   if(topNew&&topNew.length){
-    const chips=topNew.map(s=>`<span class="chip"><a href="${tvLink(s)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${s}</a></span>`).join("");
+    const chips=topNew.map(s=>`<span class="chip"><a href="${tvLink(s)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${dispSym(s)}</a></span>`).join("");
     b.innerHTML=`<b>🌟 ${topNew.length} coin${topNew.length>1?'s':''} just entered ⭐ Top setups</b>: ${chips} <span style="color:var(--dim)">— click Top setups to see the plan</span>`;
     b.classList.add("show"); return;
   }
@@ -1774,7 +1778,7 @@ function renderBanner(){
   else if(activeTab==="stb"){ newSyms=(lastData&&lastData.stb_new_symbols)||[]; what="supertrend bounce"; }
   else if(activeTab==="shorts"){ newSyms=(lastData&&lastData.short_new_symbols)||[]; what="short setup"; }
   if(!newSyms.length){ b.classList.remove("show"); b.innerHTML=""; return; }
-  const chips=newSyms.map(s=>`<span class="chip"><a href="${tvLink(s)}" target="_blank" rel="noopener">${s}</a></span>`).join("");
+  const chips=newSyms.map(s=>`<span class="chip"><a href="${tvLink(s)}" target="_blank" rel="noopener">${dispSym(s)}</a></span>`).join("");
   const label=newSyms.length===1?`new ${what} just triggered`:`new ${what} setups just triggered`;
   b.innerHTML=`<b>🆕 ${newSyms.length} ${label}</b> since the last scan: ${chips}`;
   b.classList.add("show");
@@ -1793,7 +1797,7 @@ function renderFlags(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${badges(h)}</td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.pole_gain_pct).toFixed(1)}</td>`+
       `<td>${h.flag_bars}</td>`+
@@ -1821,7 +1825,7 @@ function render(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${badges(h)}</td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.pct_above_ema).toFixed(2)}</td>`+
       `<td>${h.bars_since_cross}</td>`+
@@ -1863,7 +1867,7 @@ function renderBounce(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${badges(h)}</td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${fmtNum(h.support)}</td>`+
       `<td><span class="tfpill tf-${(h.tf||'').toLowerCase()}">${h.tf||'—'}</span></td>`+
@@ -1892,7 +1896,7 @@ function renderCPR(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${badges(h)}</td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.cpr_width_pct).toFixed(3)}</td>`+
       `<td>${h.position}</td>`+
@@ -1932,7 +1936,7 @@ function renderEarly(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${badges(h)}</td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td data-tip="The strong support the coin is coiling on (daily/weekly swing low or base low).">${fmtNum(h.support)}</td>`+
       `<td data-tip="How far below its recent 120-bar high the coin is trading — how beaten down it is.">${h.drawdown_pct==null?'—':(+h.drawdown_pct).toFixed(0)}%</td>`+
@@ -1963,7 +1967,7 @@ function renderStb(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${badges(h)}</td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td data-tip="The Supertrend line value on the strongest confirming timeframe — acting as support below price.">${fmtNum(h.supertrend)}</td>`+
       `<td><span class="tfpill tf-${(h.tf||'').toLowerCase()}">${h.tf||'4h'}</span></td>`+
@@ -2092,7 +2096,7 @@ function renderShorts(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${badges(h)}</td>`+
       ratingCell(h._rating,h._why)+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.pct_below_ema).toFixed(2)}</td>`+
@@ -2165,7 +2169,7 @@ function renderTop(){
     const tgtTip = o.rr.move? esc(`Target ${fmtNum(o.rr.tp)} — a +${(o.rr.move*100).toFixed(1)}% move, the basis for the R:R.`):'';
     const tr=document.createElement('tr'); tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${badges(h)}</td>`+
       ratingCell(o.rating,o.why)+
       `<td data-tip="${esc(o.f.setups)}">${o.f.nScans>1?'★ ':''}${o.f.nScans}</td>`+
       `<td>${fmtNum(P)}</td>`+
