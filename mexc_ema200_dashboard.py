@@ -583,6 +583,8 @@ PAGE = """<!doctype html>
   .azcell[data-tip]{cursor:help}
   .azsec[data-tip]{cursor:help}
   td[data-tip]{cursor:help}
+  td.ematp{background:rgba(88,166,255,.13);box-shadow:inset 2px 0 0 #58a6ff}
+  .emastar{color:#58a6ff;font-weight:800;margin-left:3px;cursor:help}
   .azladder{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 4px}
   .azrec{margin:10px 0 2px;font-size:14px;color:#e6edf3}
   .azrec b{color:var(--accent)}
@@ -900,9 +902,9 @@ PAGE = """<!doctype html>
       <th data-ek="optimal_entry">Optimal entry</th>
       <th data-ek="sl_tight">SL tight</th>
       <th data-ek="sl_wide">SL wide</th>
-      <th data-ek="tp1">TP1 (EMA)</th>
+      <th data-ek="tp1" data-tip="Targets in order. The 200-EMA reclaim (the mean-reversion goal) is highlighted with ◎ wherever it falls in the ladder — nearer resistances come first.">TP1</th>
       <th data-ek="tp2">TP2</th>
-      <th data-ek="tp3">TP3</th>
+      <th data-ek="tp3">TP3 <span style="opacity:.6">◎=EMA</span></th>
       <th data-ek="rvol">RVol</th>
       <th data-ek="score">Score</th>
     </tr></thead>
@@ -1339,9 +1341,17 @@ document.addEventListener("mouseout",e=>{
   if(e.target.closest&&e.target.closest("[data-tip]")){ const t=document.getElementById("tip"); if(t) t.style.display="none"; }
 });
 function rowClass(h){ return (h.is_new?"isnew ":"")+(h.both?"both":""); }
-function tpCell(v,rr){ if(v==null) return '<td>—</td>';
-  const tip=`Take-profit target at ${fmtNum(v)} — an overhead resistance level (on the Bull-flags tab, a measured-move / Fib extension of the pole). Grey number is the reward:risk to the tight stop${rr!=null?` (${(+rr).toFixed(2)})`:''}.`;
-  return `<td data-tip="${tip}">${fmtNum(v)}${rr!=null?`<span class="rr">R${(+rr).toFixed(1)}</span>`:''}</td>`; }
+function esc(s){ return (''+s).replace(/"/g,'&quot;'); }
+function tpCell(v,rr,basis,isEma){ if(v==null) return '<td>—</td>';
+  const what = basis || 'an overhead resistance level (prior swing high).';
+  const tip=`Take-profit at ${fmtNum(v)} — ${what} Grey number is the reward:risk to the tight stop${rr!=null?` (${(+rr).toFixed(2)})`:''}.`;
+  const star=isEma?'<span class="emastar" data-tip="This target IS the 200-EMA reclaim — the mean-reversion objective that confirms the setup.">◎</span>':'';
+  return `<td class="${isEma?'ematp':''}" data-tip="${esc(tip)}">${fmtNum(v)}${star}${rr!=null?`<span class="rr">R${(+rr).toFixed(1)}</span>`:''}</td>`; }
+// Render TP1..TPn cells for a hit, each with its own per-coin basis + EMA flag.
+function tpsCells(h,n){ let s=''; for(let i=1;i<=n;i++){ s+=tpCell(h['tp'+i],h['rr'+i],h['tp'+i+'_basis'],h['tp'+i+'_ema']); } return s; }
+// Stop cells driven by the per-coin basis the backend computed.
+function slTightCell(h){ const b=h.sl_tight_basis||"The setup's immediate invalidation level, ATR-buffered."; return `<td data-tip="${esc('Tight stop at '+fmtNum(h.sl_tight)+' — '+b)}">${fmtNum(h.sl_tight)}</td>`; }
+function slWideCell(h){ const b=h.sl_wide_basis||"A deeper structural level for more room, ATR-buffered."; return `<td data-tip="${esc('Wide stop at '+fmtNum(h.sl_wide)+' — '+b)}">${fmtNum(h.sl_wide)}</td>`; }
 function biasPill(h){ return `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`; }
 function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
@@ -1402,6 +1412,16 @@ function azCard(d){
   const cell=(k,v,tip)=>`<div class="azcell"${tip?` data-tip="${tip}"`:''}><div class="k">${k}</div><div class="v">${v}</div></div>`;
   const pct=(v,sign)=> d.price&&v!=null? ` <span class="rr">${sign}${(Math.abs((v-d.price)/d.price)*100).toFixed(1)}%</span>`:'';
   const tp=(v,rr)=> v==null?'—':`${fmtNum(v)}${rr!=null?` <span class="rr">R:R ${(+rr).toFixed(2)}</span>`:''}`;
+  // A trade-plan TP cell that uses the target's own per-coin basis and flags the
+  // 200-EMA reclaim target with ◎.
+  const aztp=(d,n)=>{
+    const v=d['tp'+n], rr=d['rr'+n], basis=d['tp'+n+'_basis'], ema=d['tp'+n+'_ema'];
+    const side=(d.side||'long')==='short';
+    const fb=side?"The next structural support level below, with R:R to the tight stop.":"The next structural resistance level above, with R:R to the tight stop.";
+    const tip=esc((basis?('Based on: '+basis):fb)+' Grey = reward:risk to the tight stop.');
+    const lbl='TP'+n+(ema?' <span class="emastar">◎</span>':'');
+    return `<div class="azcell${ema?' ematp':''}" data-tip="${tip}"><div class="k">${lbl}</div><div class="v">${tp(v,rr)}</div></div>`;
+  };
   const notes=(d.notes||[]).map(n=>`<li>${n}</li>`).join("");
   const recE=d.retest_entry!=null?d.retest_entry:(d.optimal_entry!=null?d.optimal_entry:d.entry);
   const rec=realisticRR(d, recE);   // best realistic target from the retest entry
@@ -1445,13 +1465,13 @@ function azCard(d){
       ${cell("Entry (now)", fmtNum(d.entry), "Based on: the current live price — your immediate entry if you take it here.")}
       ${cell("Retest entry", fmtNum(d.retest_entry!=null?d.retest_entry:d.optimal_entry), (d.side||'long')==='short'?"A proper pullback fill — wait for a rally back UP to the nearest swing-high / EMA / Supertrend ABOVE price and short the retest, rather than chasing the drop.":"A proper pullback fill — wait for a dip DOWN to the nearest swing-low support / reclaimed EMA / Supertrend BELOW price and buy the retest, rather than chasing the candle. This is the entry the recommended R:R uses.")}
       ${cell("Optimal entry", fmtNum(d.optimal_entry), (d.side||'long')==='short'?"Based on: the nearest swing-high resistance — a better short fill is to sell into it rather than shorting here.":"Based on: the nearest swing-low support / reclaimed 200 EMA — a lower-risk long fill is to buy a pullback to it rather than chasing.")}
-      ${cell("SL tight", fmtNum(d.sl_tight), (d.side||'long')==='short'?"Based on: the nearest swing-high / retest high, buffered by 0.5× ATR ABOVE it. A close above invalidates the short.":"Based on: the immediate structure (retest low / nearest swing low), buffered by 0.5× ATR BELOW it. A close below invalidates the setup.")}
-      ${cell("SL wide", fmtNum(d.sl_wide), (d.side||'long')==='short'?"Based on: a deeper swing high + 1.0× ATR — more room, larger risk per unit.":"Based on: a deeper swing low − 1.0× ATR — more room, larger risk per unit.")}
-      ${cell("TP1", tp(d.tp1,d.rr1), (d.side||'long')==='short'?"Based on: the nearest swing-low support below. Grey = reward:risk to the tight stop.":"Based on: the nearest swing-high resistance above. Grey = reward:risk to the tight stop.")}
-      ${cell("TP2", tp(d.tp2,d.rr2), "Based on: the 2nd structural level (swing high/low) in that direction, with R:R to the tight stop.")}
-      ${cell("TP3", tp(d.tp3,d.rr3), "Based on: the 3rd structural level, with R:R to the tight stop.")}
-      ${cell("TP4", tp(d.tp4,d.rr4), "Based on: the 4th structural level (or a Fibonacci extension if structure runs out), with R:R.")}
-      ${cell("TP5", tp(d.tp5,d.rr5), "Based on: the 5th level — a further structural level or Fibonacci extension, with R:R.")}
+      ${cell("SL tight", fmtNum(d.sl_tight), esc(d.sl_tight_basis||((d.side||'long')==='short'?"The nearest swing-high / retest high, buffered by 0.5× ATR ABOVE it.":"The immediate structure (retest low / nearest swing low), buffered by 0.5× ATR BELOW it.")))}
+      ${cell("SL wide", fmtNum(d.sl_wide), esc(d.sl_wide_basis||((d.side||'long')==='short'?"A deeper swing high + 1.0× ATR — more room, larger risk per unit.":"A deeper swing low − 1.0× ATR — more room, larger risk per unit.")))}
+      ${aztp(d,1)}
+      ${aztp(d,2)}
+      ${aztp(d,3)}
+      ${aztp(d,4)}
+      ${aztp(d,5)}
     </div>
     ${rec.tp!=null?`<div class="azrec" data-tip="The most realistic worthwhile take-profit: the target with the best reward:risk that still sits a meaningful (≥2%) move away, measured from the RETEST entry (${fmtNum(recE)}) over the tight stop (${fmtNum(d.sl_tight)}) and capped at 8:1. R:R = |target − entry| ÷ |entry − stop|. This is the same basis the Top-setups tab uses.">⭐ Recommended take-profit: <b>${fmtNum(rec.tp)}</b> <span class="rr">${(d.side||'long')==='short'?'−':'+'}${(rec.move*100).toFixed(1)}% · R:R <b>${rec.rr.toFixed(2)}</b></span> <span style="color:var(--dim)">from retest entry ${fmtNum(recE)}</span></div>`:''}
     ${stopsSection(d.stop_levels, d.side||'long')}
@@ -1508,9 +1528,9 @@ function renderFlags(){
       `<td>${(+h.vol_contraction).toFixed(2)}</td>`+
       biasPill(h)+
       `<td data-tip="Optimal entry — the lower-risk fill: a pullback to the setup's support / EMA / breakout level rather than chasing the current price.">${fmtNum(h.optimal_entry)}</td>`+
-      `<td data-tip="Tight stop — just below the setup's immediate structure (retest low / flag low / support / CPR bottom), buffered by ATR. A close below invalidates the setup.">${fmtNum(h.sl_tight)}</td>`+
-      `<td data-tip="Wide stop — below a deeper swing low. More breathing room but larger risk per unit.">${fmtNum(h.sl_wide)}</td>`+
-      tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
+      slTightCell(h)+
+      slWideCell(h)+
+      tpsCells(h,5)+
       rvCell(h.rvol)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
@@ -1534,9 +1554,9 @@ function render(){
       `<td>${h.bars_since_cross}</td>`+
       biasPill(h)+
       `<td data-tip="Optimal entry — the lower-risk fill: a pullback to the setup's support / EMA / breakout level rather than chasing the current price.">${fmtNum(h.optimal_entry)}</td>`+
-      `<td data-tip="Tight stop — just below the setup's immediate structure (retest low / flag low / support / CPR bottom), buffered by ATR. A close below invalidates the setup.">${fmtNum(h.sl_tight)}</td>`+
-      `<td data-tip="Wide stop — below a deeper swing low. More breathing room but larger risk per unit.">${fmtNum(h.sl_wide)}</td>`+
-      tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
+      slTightCell(h)+
+      slWideCell(h)+
+      tpsCells(h,5)+
       rvCell(h.rvol)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
@@ -1579,9 +1599,9 @@ function renderBounce(){
       `<td>${h.rsi==null?'—':(+h.rsi).toFixed(0)}</td>`+
       `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
       `<td data-tip="Optimal entry — the lower-risk fill: a pullback to the setup's support / EMA / breakout level rather than chasing the current price.">${fmtNum(h.optimal_entry)}</td>`+
-      `<td data-tip="Tight stop — just below the setup's immediate structure (retest low / flag low / support / CPR bottom), buffered by ATR. A close below invalidates the setup.">${fmtNum(h.sl_tight)}</td>`+
-      `<td data-tip="Wide stop — below a deeper swing low. More breathing room but larger risk per unit.">${fmtNum(h.sl_wide)}</td>`+
-      tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
+      slTightCell(h)+
+      slWideCell(h)+
+      tpsCells(h,5)+
       rvCell(h.rvol)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
@@ -1607,9 +1627,9 @@ function renderCPR(){
       `<td>${fmtNum(h.tc)}</td>`+
       `<td>${fmtNum(h.bc)}</td>`+
       `<td data-tip="Optimal entry — the lower-risk fill: a pullback to the setup's support / EMA / breakout level rather than chasing the current price.">${fmtNum(h.optimal_entry)}</td>`+
-      `<td data-tip="Tight stop — just below the setup's immediate structure (retest low / flag low / support / CPR bottom), buffered by ATR. A close below invalidates the setup.">${fmtNum(h.sl_tight)}</td>`+
-      `<td data-tip="Wide stop — below a deeper swing low. More breathing room but larger risk per unit.">${fmtNum(h.sl_wide)}</td>`+
-      tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
+      slTightCell(h)+
+      slWideCell(h)+
+      tpsCells(h,5)+
       rvCell(h.rvol)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
@@ -1653,9 +1673,9 @@ function renderEarly(){
       `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
       corrTd(h.btc_corr)+
       `<td data-tip="Optimal entry — a fill near the support rather than chasing.">${fmtNum(h.optimal_entry)}</td>`+
-      `<td data-tip="Tight stop — just below the support, ATR-buffered. A close below breaks the base.">${fmtNum(h.sl_tight)}</td>`+
-      `<td data-tip="Wide stop — below the base low.">${fmtNum(h.sl_wide)}</td>`+
-      tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+
+      slTightCell(h)+
+      slWideCell(h)+
+      tpsCells(h,3)+
       rvCell(h.rvol)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
@@ -1683,9 +1703,9 @@ function renderStb(){
       `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
       corrTd(h.btc_corr)+
       `<td data-tip="Optimal entry — a fill near the Supertrend line rather than chasing.">${fmtNum(h.optimal_entry)}</td>`+
-      `<td data-tip="Tight stop — just below the Supertrend line, ATR-buffered. A close below flips the trend and invalidates the setup.">${fmtNum(h.sl_tight)}</td>`+
-      `<td data-tip="Wide stop — further below the line.">${fmtNum(h.sl_wide)}</td>`+
-      tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
+      slTightCell(h)+
+      slWideCell(h)+
+      tpsCells(h,5)+
       rvCell(h.rvol)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
@@ -1716,9 +1736,9 @@ function renderWedge(){
       `<td>${h.touches==null?'—':h.touches}</td>`+
       `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
       `<td data-tip="Breakout entry — a break/retest of the upper (descending) wedge line rather than chasing.">${fmtNum(h.optimal_entry)}</td>`+
-      `<td data-tip="Tight stop — just below the wedge low, ATR-buffered. A close below invalidates the wedge.">${fmtNum(h.sl_tight)}</td>`+
-      `<td data-tip="Wide stop — below a deeper swing low.">${fmtNum(h.sl_wide)}</td>`+
-      tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
+      slTightCell(h)+
+      slWideCell(h)+
+      tpsCells(h,5)+
       rvCell(h.rvol)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
@@ -1844,9 +1864,9 @@ function renderShorts(){
       corrTd(h.btc_corr)+
       `<td class="whycell" data-tip="${esc(h._why.join(' · '))}">${h._why[0]}</td>`+
       `<td data-tip="Optimal short entry — a rally back up to the 200 EMA (resistance) rather than shorting into support.">${fmtNum(h.optimal_entry)}</td>`+
-      `<td data-tip="Tight stop — just ABOVE the EMA / retest high, ATR-buffered. A close back above invalidates the short.">${fmtNum(h.sl_tight)}</td>`+
-      `<td data-tip="Wide stop — above a deeper swing high.">${fmtNum(h.sl_wide)}</td>`+
-      tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+tpCell(h.tp4,h.rr4)+tpCell(h.tp5,h.rr5)+
+      slTightCell(h)+
+      slWideCell(h)+
+      tpsCells(h,5)+
       rvCell(h.rvol)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
@@ -1915,7 +1935,7 @@ function renderTop(){
       `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
       corrTd(o.corr)+
       `<td data-tip="Retest entry — a pullback level to wait for (nearest swing-low support / reclaimed EMA / Supertrend below price), not chasing the current candle. The R:R is measured from here.">${fmtNum(planEntry(h))}</td>`+
-      `<td>${fmtNum(h.sl_tight)}</td>`+
+      slTightCell(h)+
       `<td data-tip="${tgtTip}">${o.rr.tp!=null?fmtNum(o.rr.tp):'—'}</td>`+
       `<td data-tip="Realistic reward:risk — to a target at least ~2% away, capped at 8:1 so measured-move projections don't inflate it.">${o.rr.rr?('<b>'+o.rr.rr.toFixed(2)+'</b>'):'—'}</td>`+
       `<td class="whycell" data-tip="${esc(o.why.join(' · '))}">${shortWhy}</td>`;

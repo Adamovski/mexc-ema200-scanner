@@ -469,24 +469,62 @@ def _apply_stop_floor(entry: float, sl_tight: float, sl_wide: float, atr=None):
 
 
 def level_bundle(entry: float, sl_tight: float, sl_wide: float,
-                 tps: list, atr=None) -> dict:
+                 tps: list, atr=None,
+                 sl_tight_basis: str = None, sl_wide_basis: str = None) -> dict:
     """Package two stop scenarios and up to 5 targets, with R:R (to the tight
     stop) for each. R:R = (TP - entry) / (entry - stop) = profit / loss.
 
+    Each element of `tps` may be a bare number, or a `(level, basis)` /
+    `(level, basis, is_ema)` tuple. `basis` is a short per-coin explanation of
+    what that target IS (a swing high, a Fib extension, the 200-EMA reclaim …);
+    `is_ema` flags the 200-EMA reclaim target so the UI can highlight it. The
+    emitted dict carries tp{i}_basis and tp{i}_ema alongside each tp{i}.
+
+    `sl_tight_basis` / `sl_wide_basis` are per-coin explanations of each stop.
+
     `atr` (if given) activates a volatility floor on the tight stop so thin
     stops can't inflate R:R — see _apply_stop_floor."""
-    sl_tight, sl_wide = _apply_stop_floor(entry, sl_tight, sl_wide, atr)
+    floored = _apply_stop_floor(entry, sl_tight, sl_wide, atr)
+    sl_tight, sl_wide = floored
     def rr(tp, sl):
         # works for longs (tp/sl on the bullish side) and shorts (mirrored) —
         # the ratio is sign-invariant: profit/loss.
         return round((tp - entry) / (entry - sl), 2) if (tp and entry != sl) else None
-    out = {"sl_tight": sl_tight, "sl_wide": sl_wide}
-    padded = list(tps[:5]) + [None] * (5 - len(tps[:5]))
-    for i, tp in enumerate(padded, 1):
+    floor_note = (" It's held at least 1.5×ATR / 2.5% from entry so a "
+                  "normal wick can't trip it.")
+    st_basis = (sl_tight_basis or "The setup's immediate invalidation level, "
+                "buffered by ~0.5×ATR.") + floor_note
+    sw_basis = (sl_wide_basis or "A deeper structural level for more room, "
+                "buffered by ~1×ATR.")
+    out = {"sl_tight": sl_tight, "sl_wide": sl_wide,
+           "sl_tight_basis": st_basis, "sl_wide_basis": sw_basis}
+    norm = []
+    for t in tps[:5]:
+        if isinstance(t, (tuple, list)):
+            lvl = t[0]
+            basis = t[1] if len(t) > 1 else None
+            is_ema = bool(t[2]) if len(t) > 2 else False
+        else:
+            lvl, basis, is_ema = t, None, False
+        norm.append((lvl, basis, is_ema))
+    padded = norm + [(None, None, False)] * (5 - len(norm))
+    for i, (tp, basis, is_ema) in enumerate(padded, 1):
         out[f"tp{i}"] = tp
+        out[f"tp{i}_basis"] = basis
+        out[f"tp{i}_ema"] = is_ema
         out[f"rr{i}"] = rr(tp, sl_tight)
         out[f"rrw{i}"] = rr(tp, sl_wide)   # R:R against the wider stop
     return out
+
+
+def _res_targets(levels, kind: str = "a prior swing high the move must clear"):
+    """Wrap overhead-resistance target levels with a per-coin basis string."""
+    return [(r, f"Overhead resistance at {r:.6g} — {kind}.", False) for r in levels]
+
+
+def _sup_targets(levels, kind: str = "a prior swing low (downside target)"):
+    """Wrap support target levels (for shorts) with a per-coin basis string."""
+    return [(s, f"Support at {s:.6g} — {kind}.", False) for s in levels]
 
 
 def detect_cross_and_retest(
@@ -598,7 +636,13 @@ def detect_cross_and_retest(
     sl_wide = min(wide_struct - 1.0 * a, sl_tight)
     # Up to 5 overhead resistances (skip trivially-close ceilings) as targets.
     res = resistances_above(highs, last, entry, max_n=5, min_gap=0.008)
-    bundle = level_bundle(entry, sl_tight, sl_wide, res, atr=a)
+    bundle = level_bundle(
+        entry, sl_tight, sl_wide, _res_targets(res), atr=a,
+        sl_tight_basis=(f"Just below the reclaimed 200 EMA / retest low at "
+                        f"{tight_struct:.6g}, buffered by ~0.5×ATR. A close back "
+                        f"below the EMA voids the reclaim."),
+        sl_wide_basis=(f"Below the deeper swing low of the whole reclaim move at "
+                       f"{wide_struct:.6g}, ~1×ATR buffer."))
 
     return True, {
         "price": close_now,
@@ -704,8 +748,19 @@ def detect_bull_flag(
     sl_wide = min(pole_low - 0.5 * a, sl_tight)
     # Five continuation targets: measured move then Fib extensions of the pole,
     # so proper breakouts have higher targets to run to.
-    tps = [breakout + m * pole_height for m in (1.0, 1.618, 2.0, 2.618, 3.0)]
-    bundle = level_bundle(entry, sl_tight, sl_wide, tps, atr=a)
+    _mults = (1.0, 1.618, 2.0, 2.618, 3.0)
+    tps = [(breakout + m * pole_height,
+            (f"Measured move — the flag breakout at {breakout:.6g} plus 1× the "
+             f"pole height ({pole_height:.6g}), the classic flag projection."
+             if m == 1.0 else
+             f"{m:g}× Fibonacci extension of the pole projected from the breakout."),
+            False) for m in _mults]
+    bundle = level_bundle(
+        entry, sl_tight, sl_wide, tps, atr=a,
+        sl_tight_basis=(f"Just below the flag low at {flag_lo:.6g}, buffered by "
+                        f"~0.5×ATR. A close below the flag breaks the pattern."),
+        sl_wide_basis=(f"Below the pole's base at {pole_low:.6g} — full "
+                       f"invalidation of the flag structure."))
 
     return True, {
         "price": close_now,
@@ -795,7 +850,12 @@ def detect_narrow_cpr(rows: list, *, cpr_max_width_pct: float = 0.75,
     sl_tight = BC - 0.5 * a                     # below the CPR bottom
     sl_wide = min(dl - 0.5 * a, sl_tight)       # below yesterday's low
     res = resistances_above(highs, len(closes) - 1, entry, max_n=5, min_gap=0.005)
-    bundle = level_bundle(entry, sl_tight, sl_wide, res, atr=a)
+    bundle = level_bundle(
+        entry, sl_tight, sl_wide, _res_targets(res), atr=a,
+        sl_tight_basis=(f"Below the CPR bottom (BC) at {BC:.6g}, buffered by "
+                        f"~0.5×ATR — losing the pivot range breaks the setup."),
+        sl_wide_basis=(f"Below yesterday's low at {dl:.6g} — the full daily range "
+                       f"is void."))
 
     return True, {
         "price": price,
@@ -963,7 +1023,13 @@ def detect_support_bounce(rows: list, highs: list[float], lows: list[float],
     lower = [z["level"] for z in zones if z["level"] < slevel * 0.99]
     wide_anchor = max(lower) if lower else slevel
     sl_wide = min(wide_anchor - 1.0 * a, sl_tight)
-    bundle = level_bundle(entry, sl_tight, sl_wide, res, atr=a)
+    bundle = level_bundle(
+        entry, sl_tight, sl_wide, _res_targets(res), atr=a,
+        sl_tight_basis=(f"Just below the {tf} swing-low support zone at "
+                        f"{slevel:.6g} (the level being defended), ~0.5×ATR "
+                        f"buffer. A close below means support failed."),
+        sl_wide_basis=(f"Below the next support zone down at {wide_anchor:.6g}, "
+                       f"~1×ATR buffer."))
 
     tf_label = {"1w": "Weekly", "1d": "Daily", "4h": "4h"}[tf]
     ms = market_structure(highs, lows, closes)
@@ -1087,14 +1153,26 @@ def detect_falling_wedge(highs: list[float], lows: list[float],
         sl_wide = sl_tight
     mm = upper_now + w_start                       # measured move = wedge height
     res = resistances_above(highs, last, entry, max_n=4, min_gap=0.008)
-    tps = [t for t in ([upper_now * 1.002] + res + [mm]) if t > price]
+    labelled = ([(upper_now * 1.002,
+                  f"The wedge's upper trendline at {upper_now:.6g} — the breakout "
+                  f"level itself, first objective.", False)]
+                + _res_targets(res, "a prior swing high above the wedge")
+                + [(mm, f"Measured move at {mm:.6g} — breakout plus the wedge's "
+                        f"height ({w_start:.6g}), the classic wedge target.", False)])
+    labelled = [t for t in labelled if t[0] > price]
     seen, dedup = set(), []
-    for t in sorted(tps):
-        k = round(t, 8)
+    for t in sorted(labelled, key=lambda x: x[0]):
+        k = round(t[0], 8)
         if k not in seen:
             seen.add(k)
             dedup.append(t)
-    bundle = level_bundle(entry, sl_tight, sl_wide, dedup[:5], atr=a)
+    bundle = level_bundle(
+        entry, sl_tight, sl_wide, dedup[:5], atr=a,
+        sl_tight_basis=(f"Just below the wedge's lower line / recent low at "
+                        f"{min(lower_now, wedge_lo):.6g}, ~0.5×ATR buffer. A close "
+                        f"below breaks the wedge."),
+        sl_wide_basis=(f"Below the wedge low at {wedge_lo:.6g} — full pattern "
+                       f"invalidation."))
     ms = market_structure(highs, lows, closes)
     return True, {
         "price": price,
@@ -1215,7 +1293,14 @@ def detect_breakdown_and_retest(
     sl_tight = tight_struct + 0.5 * a              # stop ABOVE structure
     sl_wide = max(wide_struct + 1.0 * a, sl_tight)
     sup = supports_below(lows, last, entry, max_n=5, min_gap=0.008)
-    bundle = level_bundle(entry, sl_tight, sl_wide, sup, atr=a)   # rr sign-invariant
+    bundle = level_bundle(   # rr sign-invariant (mirrored for shorts)
+        entry, sl_tight, sl_wide,
+        _sup_targets(sup, "a prior swing low — a downside cover target"), atr=a,
+        sl_tight_basis=(f"Just ABOVE the rejected 200 EMA / retest high at "
+                        f"{tight_struct:.6g}, ~0.5×ATR buffer. A close back above "
+                        f"invalidates the short."),
+        sl_wide_basis=(f"Above the deeper swing high of the move at "
+                       f"{wide_struct:.6g}, ~1×ATR buffer."))
     return True, {
         "price": close_now,
         "ema": ema_now,
@@ -1301,7 +1386,13 @@ def detect_supertrend_bounce(rows: list, highs: list[float], lows: list[float],
     optimal_entry = round(slevel * 1.003, 10)   # buy near the Supertrend line
     sl_tight = slevel - 0.5 * a                  # stop just below the line
     sl_wide = slevel - 1.5 * a
-    bundle = level_bundle(entry, sl_tight, sl_wide, res, atr=a)
+    bundle = level_bundle(
+        entry, sl_tight, sl_wide, _res_targets(res), atr=a,
+        sl_tight_basis=(f"Just below the {slabel} Supertrend line at {slevel:.6g} "
+                        f"(the support being bounced), ~0.5×ATR buffer. A close "
+                        f"below flips the Supertrend and voids the setup."),
+        sl_wide_basis=(f"Further below the {slabel} Supertrend line at "
+                       f"{slevel:.6g} (~1.5×ATR) for more room."))
     ms = market_structure(highs, lows, closes)
     return True, {
         "price": price,
@@ -1390,16 +1481,42 @@ def detect_early_setup(rows: list, highs: list[float], lows: list[float],
     sl_wide = base_low - 1.5 * a
     if sl_wide > sl_tight:
         sl_wide = sl_tight
-    # Targets: first the 200-EMA reclaim (mean reversion), then overhead resistances.
-    res = resistances_above(highs, last, price, max_n=4, min_gap=0.01)
-    tps = ([ema_now] if ema_now > price * 1.01 else []) + [r for r in res if r > price]
+    # Per-coin stop explanations (which support / base this level rides).
+    _sup_src = ("the weekly swing-low support" if support == ksup.get("sup_1w")
+                else "the daily swing-low support" if support == ksup.get("sup_1d")
+                else "the 30-bar base low")
+    st_basis = (f"Just below {_sup_src} at {support:.6g} that the coil is "
+                f"holding, buffered by ~0.5×ATR. A close below breaks the base "
+                f"and voids the early thesis.")
+    sw_basis = (f"Below the 30-bar base low at {base_low:.6g} with a ~1.5×ATR "
+                f"buffer — full invalidation of the accumulation range.")
+    # Targets, each with its own per-coin basis. The 200-EMA reclaim is the
+    # mean-reversion thesis, so it's ALWAYS included and flagged (is_ema=True).
+    res = resistances_above(highs, last, price, max_n=5, min_gap=0.01)
+    tps: list = []
+    for r in res:                                   # nearest resistances first
+        if price * 1.01 < r < ema_now * 0.999:      # rungs on the way up to the EMA
+            tps.append((r, f"Overhead resistance at {r:.6g} — a prior swing high "
+                           f"the bounce has to clear on the way up.", False))
+        if len([1 for x in tps if not x[2]]) >= 3:
+            break
+    if ema_now > price * 1.01:
+        tps.append((ema_now, f"200-EMA reclaim at {ema_now:.6g} — the mean-reversion "
+                             f"target that confirms the early setup. This is the "
+                             f"'(EMA)' target.", True))
+    for r in res:                                   # stretch targets beyond the EMA
+        if r > ema_now * 1.001:
+            tps.append((r, f"Overhead resistance at {r:.6g} above the 200 EMA — an "
+                           f"extended target once the reclaim holds.", False))
+    tps.sort(key=lambda x: x[0])
     seen, ded = set(), []
-    for t in sorted(tps):
-        k = round(t, 10)
+    for t in tps:
+        k = round(t[0], 10)
         if k not in seen:
             seen.add(k)
             ded.append(t)
-    bundle = level_bundle(entry, sl_tight, sl_wide, ded[:5], atr=a)
+    bundle = level_bundle(entry, sl_tight, sl_wide, ded[:5], atr=a,
+                          sl_tight_basis=st_basis, sl_wide_basis=sw_basis)
     return True, {
         "price": price,
         "support": support,
@@ -2208,9 +2325,20 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
                              if entry != sl_tight else None}
                      for lvl, kind in picked]
     # Trade-plan TP1..TP5 = the first five ladder targets — always populated and
-    # consistent with the ladder shown below.
-    plan_tps = [t["level"] for t in target_ladder[:5]]
-    bundle = level_bundle(entry, sl_tight, sl_wide, plan_tps)
+    # consistent with the ladder shown below. Carry each target's own basis, and
+    # flag the one that IS the 200-EMA reclaim so the UI highlights it.
+    plan_tps = [(t["level"],
+                 f"{t['kind']} at {t['level']:.6g}.",
+                 abs(t["level"] - ema_now) / ema_now < 0.002 if ema_now else False)
+                for t in target_ladder[:5]]
+    _st_basis = (f"Above the nearest resistance / rejected level at {sl_tight:.6g}"
+                 if side == "short" else
+                 f"Below the nearest support / structure at {sl_tight:.6g}")
+    bundle = level_bundle(
+        entry, sl_tight, sl_wide, plan_tps,
+        sl_tight_basis=_st_basis + ", ATR-buffered.",
+        sl_wide_basis=(f"A deeper structural level at {sl_wide:.6g} for more room, "
+                       f"ATR-buffered."))
 
     notes = []
     if data_stale:
