@@ -1545,6 +1545,30 @@ def detect_early_setup(rows: list, highs: list[float], lows: list[float],
     _slt = bundle["sl_tight"]
     ema_target_rr = (round((ema_now - entry) / (entry - _slt), 2)
                      if (ema_now > entry and entry != _slt) else None)
+    # Recommended REVERSAL take-profit: the realistic "good" target for this
+    # accumulation/reversal — the best reward:risk among the 200-EMA reclaim and
+    # the overhead resistances, weighted by reachability (a generous horizon,
+    # since a proper reversal can travel), and only if it clears 1.5:1 R:R.
+    _risk = entry - _slt
+    _atrp = (a / price * 100.0) if price else 0.0
+    rev_tp = rev_rr = rev_pct = None
+    if _risk > 0:
+        _cands = ([ema_now] if ema_now > entry * 1.01 else []) + \
+                 [r for r in res if r > entry * 1.015]
+        _best_ev = -1.0
+        for _lvl in _cands:
+            _rr = (_lvl - entry) / _risk
+            if _rr < 1.5:
+                continue
+            _move = (_lvl - entry) / entry
+            _datr = (_move * 100.0 / _atrp) if _atrp else 4.0
+            _reach = 1.0 / (1.0 + (_datr / 9.0) ** 1.8)   # generous — reversals run
+            _ev = min(_rr, 8.0) * _reach
+            if _ev > _best_ev:
+                _best_ev = _ev
+                rev_tp = round(_lvl, 10)
+                rev_rr = round(min(_rr, 8.0), 2)
+                rev_pct = round(_move * 100.0, 1)
     return True, {
         "price": price,
         "support": support,
@@ -1558,6 +1582,7 @@ def detect_early_setup(rows: list, highs: list[float], lows: list[float],
         "optimal_entry": optimal_entry,
         "ema_target": round(ema_now, 10),
         "ema_target_tf": "4h",
+        "rev_tp": rev_tp, "rev_tp_rr": rev_rr, "rev_tp_pct": rev_pct,
         "ema_target_pct": round((ema_now - price) / price * 100, 1),
         "ema_target_rr": ema_target_rr,
         "score": score,

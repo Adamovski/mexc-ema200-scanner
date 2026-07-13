@@ -584,7 +584,10 @@ PAGE = """<!doctype html>
   .azsec[data-tip]{cursor:help}
   td[data-tip]{cursor:help}
   td.ematp{background:rgba(88,166,255,.13);box-shadow:inset 2px 0 0 #58a6ff}
+  td.revtp{background:rgba(63,185,80,.12);box-shadow:inset 2px 0 0 var(--accent);font-weight:600}
   .emastar{color:#58a6ff;font-weight:800;margin-left:3px;cursor:help}
+  .azbtn{cursor:pointer;margin-left:6px;color:var(--dim);font-size:13px;user-select:none;vertical-align:middle;border:1px solid var(--line);border-radius:5px;padding:0 5px}
+  .azbtn:hover{color:var(--accent);border-color:var(--accent)}
   .wstar{cursor:pointer;margin-right:6px;color:var(--dim);font-size:15px;user-select:none;vertical-align:middle}
   .wstar:hover{color:#f0b429}
   .wstar.on{color:#f0b429}
@@ -888,6 +891,7 @@ PAGE = """<!doctype html>
       <th data-ek="tp2">TP2</th>
       <th data-ek="tp3">TP3</th>
       <th data-ek="ema_target" data-tip="The 200-EMA reclaim on the 4h chart — the mean-reversion target that confirms this early setup. Always shown here (◎) even when several nearer resistances sit below it. Grey = reward:risk to the tight stop.">◎ 200 EMA (4h)</th>
+      <th data-ek="rev_tp_rr" data-tip="Recommended REVERSAL take-profit — the realistic 'good' target for this accumulation/reversal: the best reward:risk (expected value) among the 200-EMA reclaim and the overhead resistances, only if it clears 1.5:1. Click to rank by this R:R.">🎯 Best TP</th>
       <th data-ek="rvol">RVol</th>
       <th data-ek="score">Score</th>
     </tr></thead>
@@ -1295,7 +1299,11 @@ function toggleWatch(sym, ev){ if(ev){ ev.stopPropagation(); ev.preventDefault()
 }
 function watchStar(sym){ const on=WATCH.has(sym);
   return `<span class="wstar${on?' on':''}" data-sym="${sym}" title="${on?'Remove from watchlist':'Add to watchlist'}" onclick="toggleWatch('${sym}',event)">${on?'★':'☆'}</span>`; }
-function analyzeFromWatch(sym){ const inp=document.getElementById('azInput'); if(inp){ inp.value=sym; } showTab('analyze'); analyze(); }
+function goAnalyze(sym, ev){ if(ev){ ev.stopPropagation(); ev.preventDefault(); }
+  const inp=document.getElementById('azInput'); if(inp){ inp.value=sym; } showTab('analyze'); analyze(); }
+function analyzeFromWatch(sym){ goAnalyze(sym); }
+// A little "analyse this coin" button for any row — opens the Analyze tab for it.
+function analyzeBtn(sym){ return `<span class="azbtn" title="Analyze ${dispSym(sym)} — full trade plan" onclick="goAnalyze('${sym}',event)">⚲</span>`; }
 // Look up the freshest row we have for a symbol across all scan lists (for price/bias).
 function watchLookup(sym){
   const lists=[latest,flatest,clatest,blatest,xlatest,slatest,eelatest];
@@ -1408,6 +1416,12 @@ function emaTargetCell(h){
   const pct=(h.ema_target_pct!=null)?`${h.ema_target_pct>=0?'+':''}${h.ema_target_pct}%`:'';
   const tip=`200-EMA reclaim on the 4h chart at ${fmtNum(h.ema_target)} — the mean-reversion target that confirms this early setup${pct?` (${pct} away)`:''}. Grey = reward:risk to the tight stop${h.ema_target_rr!=null?` (${(+h.ema_target_rr).toFixed(2)})`:''}.`;
   return `<td class="ematp" data-tip="${esc(tip)}"><span class="emastar">◎</span>${fmtNum(h.ema_target)}${h.ema_target_rr!=null?`<span class="rr">R${(+h.ema_target_rr).toFixed(1)}</span>`:''}</td>`;
+}
+// The recommended realistic reversal target for an Early setup (best EV target).
+function revTpCell(h){
+  if(h.rev_tp==null) return '<td><span style="color:var(--dim)">—</span></td>';
+  const tip=`Recommended reversal target: ${fmtNum(h.rev_tp)} — the best realistic reward:risk (R:R ${h.rev_tp_rr}) among the 200-EMA reclaim and overhead resistances, ${h.rev_tp_pct>=0?'+':''}${h.rev_tp_pct}% away. A proper reversal target, not just the nearest rung.`;
+  return `<td class="revtp" data-tip="${esc(tip)}">🎯 ${fmtNum(h.rev_tp)}${h.rev_tp_rr!=null?`<span class="rr">R${(+h.rev_tp_rr).toFixed(1)}</span>`:''}</td>`;
 }
 // Stop cells driven by the per-coin basis the backend computed.
 function slTightCell(h){ const b=h.sl_tight_basis||"The setup's immediate invalidation level, ATR-buffered."; return `<td data-tip="${esc('Tight stop at '+fmtNum(h.sl_tight)+' — '+b)}">${fmtNum(h.sl_tight)}</td>`; }
@@ -1797,7 +1811,7 @@ function renderFlags(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.pole_gain_pct).toFixed(1)}</td>`+
       `<td>${h.flag_bars}</td>`+
@@ -1825,7 +1839,7 @@ function render(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.pct_above_ema).toFixed(2)}</td>`+
       `<td>${h.bars_since_cross}</td>`+
@@ -1839,20 +1853,23 @@ function render(){
     tb.appendChild(tr);
   }
 }
+// Clicking a TP column header ranks by that target's REWARD:RISK (not its price)
+// — so you can surface the best-R:R setups. Maps tpN -> rrN for sorting.
+function remapTp(k){ return /^tp\d$/.test(k) ? 'rr'+k.slice(2) : k; }
 document.querySelectorAll("th[data-k]").forEach(th=>th.addEventListener("click",()=>{
-  const k=th.dataset.k; if(k===sortKey) sortDir*=-1; else {sortKey=k; sortDir=(k==="symbol")?1:-1;}
+  const k=remapTp(th.dataset.k); if(k===sortKey) sortDir*=-1; else {sortKey=k; sortDir=(k==="symbol")?1:-1;}
   render();
 }));
 document.querySelectorAll("th[data-fk]").forEach(th=>th.addEventListener("click",()=>{
-  const k=th.dataset.fk; if(k===fSortKey) fSortDir*=-1; else {fSortKey=k; fSortDir=(k==="symbol")?1:-1;}
+  const k=remapTp(th.dataset.fk); if(k===fSortKey) fSortDir*=-1; else {fSortKey=k; fSortDir=(k==="symbol")?1:-1;}
   renderFlags();
 }));
 document.querySelectorAll("th[data-ck]").forEach(th=>th.addEventListener("click",()=>{
-  const k=th.dataset.ck; if(k===cSortKey) cSortDir*=-1; else {cSortKey=k; cSortDir=(k==="symbol"||k==="position")?1:-1;}
+  const k=remapTp(th.dataset.ck); if(k===cSortKey) cSortDir*=-1; else {cSortKey=k; cSortDir=(k==="symbol"||k==="position")?1:-1;}
   renderCPR();
 }));
 document.querySelectorAll("th[data-bk]").forEach(th=>th.addEventListener("click",()=>{
-  const k=th.dataset.bk; if(k===bSortKey) bSortDir*=-1; else {bSortKey=k; bSortDir=(k==="symbol")?1:-1;}
+  const k=remapTp(th.dataset.bk); if(k===bSortKey) bSortDir*=-1; else {bSortKey=k; bSortDir=(k==="symbol")?1:-1;}
   renderBounce();
 }));
 function renderBounce(){
@@ -1867,7 +1884,7 @@ function renderBounce(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${fmtNum(h.support)}</td>`+
       `<td><span class="tfpill tf-${(h.tf||'').toLowerCase()}">${h.tf||'—'}</span></td>`+
@@ -1896,7 +1913,7 @@ function renderCPR(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.cpr_width_pct).toFixed(3)}</td>`+
       `<td>${h.position}</td>`+
@@ -1913,15 +1930,15 @@ function renderCPR(){
   }
 }
 document.querySelectorAll("th[data-sk]").forEach(th=>th.addEventListener("click",()=>{
-  const k=th.dataset.sk; if(k===sSortKey) sSortDir*=-1; else {sSortKey=k; sSortDir=(k==="symbol")?1:-1;}
+  const k=remapTp(th.dataset.sk); if(k===sSortKey) sSortDir*=-1; else {sSortKey=k; sSortDir=(k==="symbol")?1:-1;}
   renderShorts();
 }));
 document.querySelectorAll("th[data-xk]").forEach(th=>th.addEventListener("click",()=>{
-  const k=th.dataset.xk; if(k===xSortKey) xSortDir*=-1; else {xSortKey=k; xSortDir=(k==="symbol"||k==="tf")?1:-1;}
+  const k=remapTp(th.dataset.xk); if(k===xSortKey) xSortDir*=-1; else {xSortKey=k; xSortDir=(k==="symbol"||k==="tf")?1:-1;}
   renderStb();
 }));
 document.querySelectorAll("th[data-ek]").forEach(th=>th.addEventListener("click",()=>{
-  const k=th.dataset.ek; if(k===eeSortKey) eeSortDir*=-1; else {eeSortKey=k; eeSortDir=(k==="symbol")?1:-1;}
+  const k=remapTp(th.dataset.ek); if(k===eeSortKey) eeSortDir*=-1; else {eeSortKey=k; eeSortDir=(k==="symbol")?1:-1;}
   renderEarly();
 }));
 function renderEarly(){
@@ -1936,7 +1953,7 @@ function renderEarly(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td data-tip="The strong support the coin is coiling on (daily/weekly swing low or base low).">${fmtNum(h.support)}</td>`+
       `<td data-tip="How far below its recent 120-bar high the coin is trading — how beaten down it is.">${h.drawdown_pct==null?'—':(+h.drawdown_pct).toFixed(0)}%</td>`+
@@ -1950,6 +1967,7 @@ function renderEarly(){
       slWideCell(h)+
       tpsCells(h,3)+
       emaTargetCell(h)+
+      revTpCell(h)+
       rvCell(h.rvol)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
@@ -1967,7 +1985,7 @@ function renderStb(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td data-tip="The Supertrend line value on the strongest confirming timeframe — acting as support below price.">${fmtNum(h.supertrend)}</td>`+
       `<td><span class="tfpill tf-${(h.tf||'').toLowerCase()}">${h.tf||'4h'}</span></td>`+
@@ -2096,7 +2114,7 @@ function renderShorts(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</td>`+
       ratingCell(h._rating,h._why)+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.pct_below_ema).toFixed(2)}</td>`+
@@ -2169,7 +2187,7 @@ function renderTop(){
     const tgtTip = o.rr.move? esc(`Target ${fmtNum(o.rr.tp)} — a +${(o.rr.move*100).toFixed(1)}% move, the basis for the R:R.`):'';
     const tr=document.createElement('tr'); tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</td>`+
       ratingCell(o.rating,o.why)+
       `<td data-tip="${esc(o.f.setups)}">${o.f.nScans>1?'★ ':''}${o.f.nScans}</td>`+
       `<td>${fmtNum(P)}</td>`+
