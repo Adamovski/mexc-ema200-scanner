@@ -342,6 +342,43 @@ def primary_pattern(highs, lows, closes, volumes) -> dict | None:
     return pats[0] if pats else None
 
 
+# How "noteworthy" each formation is — reversal/continuation patterns rank above
+# generic ranges, so the badge shows the most meaningful one across timeframes.
+_PAT_SALIENCE = {
+    "Falling wedge": 3, "Rising wedge": 3, "Ascending triangle": 3,
+    "Descending triangle": 3, "Symmetrical triangle (pennant)": 3,
+    "Bull flag / pennant": 3, "Bear flag / pennant": 3,
+    "Double top": 2, "Double bottom": 2,
+    "Ascending channel": 2, "Descending channel": 2,
+    "Broadening formation": 1, "Rectangle / range": 1,
+}
+_TF_RANK = {"1W": 3, "1D": 2, "4h": 1, "1h": 0}
+
+
+def primary_pattern_mtf(rows, highs, lows, closes, volumes) -> list[dict]:
+    """Primary chart pattern on EACH timeframe (4h from the base candles, Daily and
+    Weekly aggregated from them). Returns a list of {name,bias,note,tf}."""
+    out = []
+    p = primary_pattern(highs, lows, closes, volumes)
+    if p:
+        out.append({**p, "tf": "4h"})
+    for gd, lbl in ((1, "1D"), (7, "1W")):
+        h, l, c, v = _agg_series(rows, gd)
+        if len(c) >= 30:
+            pp = primary_pattern(h, l, c, v)
+            if pp:
+                out.append({**pp, "tf": lbl})
+    return out
+
+
+def best_pattern(pats: list[dict]) -> dict | None:
+    """Most salient pattern across timeframes (ties → higher timeframe)."""
+    if not pats:
+        return None
+    return max(pats, key=lambda p: (_PAT_SALIENCE.get(p.get("name"), 0),
+                                    _TF_RANK.get(p.get("tf"), 0)))
+
+
 def pct_returns(closes: list[float]) -> list[float]:
     """Bar-over-bar percentage returns — the series used for BTC correlation."""
     out = []
@@ -1255,6 +1292,102 @@ def detect_supertrend_bounce(rows: list, highs: list[float], lows: list[float],
 
 
 # ----------------------------------------------------------------------------
+# Early / potential setups — accumulation BEFORE the confirmation fires
+# ----------------------------------------------------------------------------
+def detect_early_setup(rows: list, highs: list[float], lows: list[float],
+                       closes: list[float], volumes: list[float]
+                       ) -> tuple[bool, dict]:
+    """Catch coins EARLY — while they're still basing, before the 200-EMA reclaim /
+    Supertrend flip confirms. Looks for: a beaten-down coin (well off its recent
+    high) that is COILING (volatility contraction / squeeze) on a strong, defended
+    higher-timeframe support, still below the 200 EMA, and oversold or carving a
+    higher low. Higher risk / earlier entry than the confirmed scans — tag it as
+    'unconfirmed'."""
+    n = len(closes)
+    if n < 80:
+        return False, {}
+    last = n - 1
+    price = closes[last]
+    e = ema(closes, EMA_PERIOD)
+    ema_now = e[last]
+    if ema_now is None or ema_now <= 0:
+        return False, {}
+
+    # 1. Beaten down — at least ~22% off the recent (120-bar) high.
+    hi = max(highs[-120:]) if n >= 120 else max(highs)
+    drawdown = (hi - price) / hi if hi else 0.0
+    if drawdown < 0.22:
+        return False, {}
+    # 2. EARLY — still below / around the 200 EMA (not yet a confirmed reclaim).
+    if price > ema_now * 1.03:
+        return False, {}
+    # 3. Volatility contraction (a coil): recent ATR well under its prior average.
+    a_recent = atr(highs[-20:], lows[-20:], closes[-20:])
+    a_base = atr(highs[-60:-20], lows[-60:-20], closes[-60:-20]) \
+        if n >= 60 else a_recent
+    contraction = (a_recent / a_base) if a_base else 1.0
+    if contraction >= 0.8:                     # not coiling tightly enough
+        return False, {}
+    # 4. On a strong, still-defended support (daily/weekly swing low or base low).
+    ksup = key_supports(rows, lows, price)
+    base_low = min(lows[-30:])
+    cands = [s for s in (ksup.get("sup_1d"), ksup.get("sup_1w"), base_low)
+             if s and s <= price * 1.02]
+    support = max(cands) if cands else None
+    if support is None:
+        return False, {}
+    dist_sup = (price - support) / price
+    if dist_sup > 0.12 or price < base_low * 0.985:   # extended, or broke the base
+        return False, {}
+    # 5. Bottoming — oversold or a bullish change-of-character (higher low / break).
+    r14 = rsi(closes) or 50.0
+    ms = market_structure(highs, lows, closes)
+    if not (r14 < 50 or ms["choch"] == "bullish"):
+        return False, {}
+
+    c01 = lambda v: max(0.0, min(1.0, v))
+    contr_s = c01(1.0 - contraction)
+    sup_s = 1.0 if dist_sup < 0.03 else c01(1.0 - dist_sup / 0.12)
+    rsi_s = 1.0 if r14 < 35 else (0.6 if r14 < 45 else 0.3)
+    dd_s = c01(drawdown / 0.5)
+    turn_s = 1.0 if ms["choch"] == "bullish" else 0.4
+    score = round(100 * (0.30 * contr_s + 0.25 * sup_s + 0.20 * rsi_s +
+                         0.15 * dd_s + 0.10 * turn_s), 1)
+
+    entry = price
+    a = atr(highs, lows, closes)
+    optimal_entry = round(support * 1.005, 10)
+    sl_tight = support - 0.5 * a
+    sl_wide = base_low - 1.5 * a
+    if sl_wide > sl_tight:
+        sl_wide = sl_tight
+    # Targets: first the 200-EMA reclaim (mean reversion), then overhead resistances.
+    res = resistances_above(highs, last, price, max_n=4, min_gap=0.01)
+    tps = ([ema_now] if ema_now > price * 1.01 else []) + [r for r in res if r > price]
+    seen, ded = set(), []
+    for t in sorted(tps):
+        k = round(t, 10)
+        if k not in seen:
+            seen.add(k)
+            ded.append(t)
+    bundle = level_bundle(entry, sl_tight, sl_wide, ded[:5])
+    return True, {
+        "price": price,
+        "support": support,
+        "drawdown_pct": round(drawdown * 100, 1),
+        "contraction": round(contraction, 2),
+        "pct_below_ema": round((ema_now - price) / ema_now * 100, 2),
+        "dist_to_support_pct": round(dist_sup * 100, 2),
+        "rsi": r14,
+        "choch": ms["choch"],
+        "entry": entry,
+        "optimal_entry": optimal_entry,
+        "score": score,
+        **bundle,
+    }
+
+
+# ----------------------------------------------------------------------------
 # MEXC API
 # ----------------------------------------------------------------------------
 def get_session() -> requests.Session:
@@ -1468,6 +1601,30 @@ def bias_on_tf(sess: requests.Session, symbol: str, interval: str,
     return "neutral"
 
 
+def enrich_1h(sess: requests.Session, symbol: str, market: str) -> tuple:
+    """One 1h fetch → (bias_label, primary_1h_pattern). Used to enrich flagged
+    coins with a 1h read (bias + formation) that can't be aggregated from 4h."""
+    rr = fetch_candles(sess, symbol, "1h", 400, market)
+    if not rr or len(rr) < 15:
+        return None, None
+    rws = rr[:-1]
+    try:
+        H = [float(x[2]) for x in rws]
+        L = [float(x[3]) for x in rws]
+        C = [float(x[4]) for x in rws]
+        V = [float(x[5]) for x in rws]
+    except (ValueError, IndexError):
+        return None, None
+    m = market_structure(H, L, C)
+    bias = ("bullish" if (m["structure"] == "uptrend" or m["choch"] == "bullish")
+            else "bearish" if (m["structure"] == "downtrend" or m["choch"] == "bearish")
+            else "neutral")
+    pat = primary_pattern(H, L, C, V)
+    if pat:
+        pat = {**pat, "tf": "1h"}
+    return bias, pat
+
+
 def _futures_live_price(sess: requests.Session, symbol: str) -> float | None:
     r = sess.get(f"{FUTURES_BASE}/api/v1/contract/ticker",
                  params={"symbol": to_contract(symbol)}, timeout=15)
@@ -1538,16 +1695,41 @@ def scan_symbol(sess: requests.Session, symbol: str, interval: str,
     return scan_symbol_multi(sess, symbol, interval, cfg)[0]
 
 
+def retest_level(highs: list[float], lows: list[float], price: float,
+                 side: str = "long", ema_now: float | None = None,
+                 st_val: float | None = None) -> float | None:
+    """A proper RETEST entry — a pullback you wait for rather than chasing the
+    candle. For a long it sits BELOW price (nearest swing-low support / a reclaimed
+    EMA or Supertrend below price); for a short it sits ABOVE. Returns None only if
+    there's nothing sensible, in which case callers fall back to a small % pullback."""
+    last = len(highs) - 1
+    if side == "short":
+        cand = [r for r in resistances_above(highs, last, price, max_n=3, min_gap=0.004)
+                if r > price]
+        if ema_now and ema_now > price:
+            cand.append(ema_now)
+        if st_val and st_val > price:
+            cand.append(st_val)
+        return round(min(cand) * 0.998, 10) if cand else round(price * 1.02, 10)
+    cand = [s for s in supports_below(lows, last, price, max_n=3, min_gap=0.004)
+            if s < price]
+    if ema_now and ema_now < price:
+        cand.append(ema_now)
+    if st_val and st_val < price:
+        cand.append(st_val)
+    return round(max(cand) * 1.002, 10) if cand else round(price * 0.98, 10)
+
+
 def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
                       cfg: dict) -> tuple:
     """Fetch klines ONCE and run every detector (200-EMA reclaim, bull flag,
     narrow CPR, support bounce, falling wedge, bearish breakdown/retest). One
-    request per symbol powers every scan. Returns a 7-tuple of dicts (each with
-    'symbol') or None: (ema, flag, cpr, bounce, wedge, short, st_bounce)."""
+    request per symbol powers every scan. Returns an 8-tuple of dicts (each with
+    'symbol') or None: (ema, flag, cpr, bounce, wedge, short, st_bounce, early)."""
     raw = fetch_candles(sess, symbol, interval, cfg["kline_limit"],
                         cfg.get("market", "spot"))
     if not raw or len(raw) < EMA_PERIOD + 2:
-        return None, None, None, None, None, None, None
+        return (None,) * 8
     # MEXC kline row: [openTime, open, high, low, close, volume, closeTime, ...]
     rows = raw[:-1]                       # drop the still-forming candle
     try:
@@ -1556,7 +1738,7 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
         closes = [float(x[4]) for x in rows]
         vols = [float(x[5]) for x in rows]
     except (ValueError, IndexError):
-        return None, None, None, None, None, None, None
+        return (None,) * 8
 
     rv = rel_volume(vols)                       # relative volume of the latest candle
     ksup = key_supports(rows, lows, closes[-1])  # next 4h / daily / weekly support
@@ -1566,7 +1748,8 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
     _corr = None
     if _btc_ret:
         _corr = pearson(pct_returns(closes)[-CORR_WINDOW:], _btc_ret)
-    _pp = primary_pattern(highs, lows, closes, vols)   # current chart formation
+    _pats = primary_pattern_mtf(rows, highs, lows, closes, vols)  # 4h/1D/1W formations
+    _pp = best_pattern(_pats)                          # most salient across TFs
     _ms = market_structure(highs, lows, closes)  # for a per-setup bias label
 
     def _tf_bias(H, L, C):
@@ -1594,14 +1777,21 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
         _bias = "Range"
     _dir = ("bullish" if _bias in ("Bullish", "Bullish CHoCH")
             else "bearish" if _bias == "Bearish" else "neutral")
+    _e = ema(closes, EMA_PERIOD)
+    _ema_now = _e[-1] if _e else None
+    _stv, _std = supertrend(highs, lows, closes)          # for a retest anchor
 
     def confirmed(d: dict, boost: bool) -> dict:
         """Attach relative volume, multi-timeframe supports, a market-structure
-        bias label, and (for momentum setups) a volume-confirmation score nudge."""
+        bias label, a proper (non-chasing) retest entry, and — for momentum setups —
+        a volume-confirmation score nudge."""
+        _side = d.get("side", "long")
+        _rt = retest_level(highs, lows, closes[-1], _side, _ema_now, _stv)
         d = {"symbol": symbol, "rvol": rv, "bias": _bias, "bias_dir": _dir,
              "choch": _ms["choch"],
              "btc_corr": (round(_corr, 2) if _corr is not None else None),
-             "pattern": _pp, "data_stale": _stale, "tf_bias": _tfb,
+             "pattern": _pp, "patterns_mtf": _pats,
+             "data_stale": _stale, "tf_bias": _tfb, "retest_entry": _rt,
              **ksup, **d}
         if boost and rv:
             factor = 1.0 + 0.15 * max(0.0, min(1.0, (rv - 1.0) / 1.5))
@@ -1655,8 +1845,13 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
     if ok7:
         st_bounce_hit = confirmed(sb, boost=True)
 
+    early_hit = None
+    ok8, el = detect_early_setup(rows, highs, lows, closes, vols)
+    if ok8:
+        early_hit = confirmed(el, boost=False)   # early = coiling, volume not required
+
     return (ema_hit, flag_hit, cpr_hit, bounce_hit, wedge_hit, short_hit,
-            st_bounce_hit)
+            st_bounce_hit, early_hit)
 
 
 def supports_below(lows: list[float], upto: int, price: float,
@@ -2094,6 +2289,8 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "sup_4h": ksup["sup_4h"], "sup_1d": ksup["sup_1d"], "sup_1w": ksup["sup_1w"],
         "entry": entry,
         "optimal_entry": optimal_entry,
+        "retest_entry": retest_level(highs, lows, price, side, ema_now,
+                                     st_val if st_role else None),
         "supports": sup,
         "ema_reclaim": bool(okE),
         "ema_reclaim_score": dE.get("score") if okE else None,

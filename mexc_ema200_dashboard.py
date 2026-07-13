@@ -50,7 +50,7 @@ try:
     from mexc_ema200_scanner import (
         list_symbols, scan_symbol_multi, get_session, EMA_PERIOD,
         analyze_symbol, normalize_symbol, fetch_candles, pct_returns, CORR_WINDOW,
-        bias_on_tf,
+        bias_on_tf, enrich_1h, best_pattern,
     )
 except ImportError:
     sys.exit("Could not import mexc_ema200_scanner.py — keep both files in the "
@@ -103,6 +103,9 @@ class State:
         self.stb_hits: list[dict] = []             # supertrend support bounce (multi-TF)
         self.prev_stb_symbols: set[str] | None = None
         self.new_stb_symbols: list[str] = []
+        self.early_hits: list[dict] = []           # early / pre-breakout accumulation
+        self.prev_early_symbols: set[str] | None = None
+        self.new_early_symbols: list[str] = []
         self.both_symbols: list[str] = []          # appear on 2+ scans (confluence)
         self.prev_both: set[str] | None = None     # confluence set from previous scan
         self.watch: dict[str, float] = {}          # symbol -> flag breakout level (armed)
@@ -151,6 +154,8 @@ class State:
                 "short_new_symbols": list(self.new_short_symbols),
                 "stb_hits": withlive(self.stb_hits),
                 "stb_new_symbols": list(self.new_stb_symbols),
+                "early_hits": withlive(self.early_hits),
+                "early_new_symbols": list(self.new_early_symbols),
                 "both_symbols": list(self.both_symbols),
                 "breakout_events": list(self.breakout_events),
                 "error": self.error,
@@ -192,6 +197,7 @@ def run_one_scan(state: State) -> None:
     wedges: list[dict] = []
     shorts: list[dict] = []
     st_bounces: list[dict] = []
+    earlies: list[dict] = []
     done = 0
     scan_cfg = {k: cfg[k] for k in
                 ("kline_limit", "lookback", "retest_tol", "break_tol",
@@ -217,9 +223,11 @@ def run_one_scan(state: State) -> None:
                 with state.lock:
                     state.progress = (done, len(symbols))
             try:
-                h, f, c, b, w, sh, sb = fut.result()
+                h, f, c, b, w, sh, sb, el = fut.result()
             except Exception:
-                h, f, c, b, w, sh, sb = (None,) * 7
+                h, f, c, b, w, sh, sb, el = (None,) * 8
+            if el:
+                earlies.append(el)
             if h:
                 hits.append(h)
             if f:
@@ -258,26 +266,33 @@ def run_one_scan(state: State) -> None:
     wedges.sort(key=lambda h: h["score"], reverse=True)
     shorts.sort(key=lambda h: h["score"], reverse=True)
     st_bounces.sort(key=lambda h: h["score"], reverse=True)
+    earlies.sort(key=lambda h: h["score"], reverse=True)
 
-    # Enrich ONLY the flagged coins with a 1h bias (a separate fetch each — cheap
-    # since it's just the few dozen hits, not the whole ~500-coin universe). This
-    # completes the 1h/4h/1D/1W multi-timeframe bias strip on every displayed row.
-    all_rows = (hits + flags + cprs + bounces + wedges + shorts + st_bounces)
+    # Enrich ONLY the flagged coins with a 1h read (bias + formation) — a single 1h
+    # fetch each, cheap since it's just the few dozen hits (not the ~500 universe).
+    # This completes the 1h/4h/1D/1W bias strip AND the multi-timeframe pattern set.
+    all_rows = (hits + flags + cprs + bounces + wedges + shorts + st_bounces + earlies)
     hit_syms = sorted({r["symbol"] for r in all_rows})
     if hit_syms:
         mkt = cfg.get("market", "futures")
-        bias1h: dict[str, str | None] = {}
+        one: dict[str, tuple] = {}
         with ThreadPoolExecutor(max_workers=min(12, cfg["workers"])) as ex:
-            futs = {ex.submit(bias_on_tf, sess, s, "1h", mkt): s for s in hit_syms}
+            futs = {ex.submit(enrich_1h, sess, s, mkt): s for s in hit_syms}
             for fut in as_completed(futs):
                 try:
-                    bias1h[futs[fut]] = fut.result()
+                    one[futs[fut]] = fut.result()
                 except Exception:
-                    bias1h[futs[fut]] = None
+                    one[futs[fut]] = (None, None)
         for r in all_rows:
+            b1h, p1h = one.get(r["symbol"], (None, None))
             tb = r.get("tf_bias")
             if isinstance(tb, dict):
-                tb["1h"] = bias1h.get(r["symbol"])
+                tb["1h"] = b1h
+            if p1h:
+                mtf = [x for x in (r.get("patterns_mtf") or []) if x.get("tf") != "1h"]
+                mtf = [p1h] + mtf
+                r["patterns_mtf"] = mtf
+                r["pattern"] = best_pattern(mtf)          # may now include 1h
 
     def tag_new(items, prev):
         """Return (rows, new_syms, cur_syms) with an is_new flag per row."""
@@ -311,7 +326,8 @@ def run_one_scan(state: State) -> None:
         wrows, wnew, wcur = tag_new(wedges, state.prev_wedge_symbols)
         srows, snew, scur = tag_new(shorts, state.prev_short_symbols)
         sbrows, sbnew, sbcur = tag_new(st_bounces, state.prev_stb_symbols)
-        for d in rows + frows + crows + brows + wrows + srows + sbrows:
+        elrows, elnew, elcur = tag_new(earlies, state.prev_early_symbols)
+        for d in rows + frows + crows + brows + wrows + srows + sbrows + elrows:
             labels = conf.get(d["symbol"], [])
             d["both"] = len(labels) >= 2
             d["both_count"] = len(labels)
@@ -323,6 +339,7 @@ def run_one_scan(state: State) -> None:
         state.wedge_hits, state.new_wedge_symbols, state.prev_wedge_symbols = wrows, wnew, wcur
         state.short_hits, state.new_short_symbols, state.prev_short_symbols = srows, snew, scur
         state.stb_hits, state.new_stb_symbols, state.prev_stb_symbols = sbrows, sbnew, sbcur
+        state.early_hits, state.new_early_symbols, state.prev_early_symbols = elrows, elnew, elcur
         state.both_symbols = sorted(both)
 
         # Arm breakout alerts for the current bull flags (their breakout level).
@@ -567,6 +584,9 @@ PAGE = """<!doctype html>
   .azsec[data-tip]{cursor:help}
   td[data-tip]{cursor:help}
   .azladder{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 4px}
+  .azrec{margin:10px 0 2px;font-size:14px;color:#e6edf3}
+  .azrec b{color:var(--accent)}
+  .ladrec{border-color:var(--accent)!important;background:rgba(63,185,80,.12)!important;box-shadow:0 0 0 1px rgba(63,185,80,.35)}
   .ladchip{background:var(--bg);border:1px solid var(--line);border-radius:8px;
        padding:7px 11px;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;cursor:help}
   .azsec{font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;
@@ -624,6 +644,7 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabStb" onclick="showTab('stb')">Supertrend support bounce</div>
   <div class="tab" id="tabWedge" onclick="showTab('wedge')">Falling wedge</div>
   <div class="tab" id="tabShorts" onclick="showTab('shorts')">Shorts</div>
+  <div class="tab" id="tabEarly" onclick="showTab('early')">⏳ Early</div>
   <div class="tab" id="tabTop" onclick="showTab('top')">⭐ Top setups</div>
   <div class="tab" id="tabAnalyze" onclick="showTab('analyze')">Analyze a coin</div>
   <div class="tab" id="tabInfo" onclick="showTab('info')">Info</div>
@@ -859,6 +880,38 @@ PAGE = """<!doctype html>
 </div>
 </div>
 
+<div class="view" id="viewEarly">
+<div class="status">
+  <span>⏳ Early / potential — <b>pre-breakout accumulation</b>. Beaten-down coins that are <b>coiling</b> (volatility contraction) on a strong higher-timeframe support, still below the 200 EMA, oversold or carving a higher low — <i>before</i> the reclaim/Supertrend flip confirms. Earlier entry, higher risk: treat as <b>unconfirmed</b>. First target is the 200-EMA reclaim.</span>
+  <span id="earlyCount"></span>
+</div>
+<div class="wrap">
+  <table id="etbl">
+    <thead><tr>
+      <th data-ek="symbol">Symbol</th>
+      <th data-ek="price">Price</th>
+      <th data-ek="support">Support</th>
+      <th data-ek="drawdown_pct">Off high %</th>
+      <th data-ek="contraction">Coil</th>
+      <th data-ek="pct_below_ema">% &lt; EMA</th>
+      <th data-ek="rsi">RSI</th>
+      <th data-ek="bias">Bias</th>
+      <th data-tip="BTC correlation ρ over ~10 days. Low/negative = its own mover.">BTC ρ</th>
+      <th data-ek="optimal_entry">Optimal entry</th>
+      <th data-ek="sl_tight">SL tight</th>
+      <th data-ek="sl_wide">SL wide</th>
+      <th data-ek="tp1">TP1 (EMA)</th>
+      <th data-ek="tp2">TP2</th>
+      <th data-ek="tp3">TP3</th>
+      <th data-ek="rvol">RVol</th>
+      <th data-ek="score">Score</th>
+    </tr></thead>
+    <tbody id="erows"></tbody>
+  </table>
+  <div class="empty" id="eempty" style="display:none">No early/accumulation setups right now. The loop keeps scanning…</div>
+</div>
+</div>
+
 <div class="view" id="viewTop">
 <div class="status">
   <span>Top setups — only the highest-conviction <b>LONG</b> opportunities. Aggregated across every bullish scan, then <b>filtered for quality</b>: each must clear a real reward:risk bar and earn a solid composite <b>conviction rating</b> (A+ → D). Hover the rating or "Why" for the full reasoning.</span>
@@ -873,7 +926,7 @@ PAGE = """<!doctype html>
       <th data-tip="Live last-traded price (updates ~every 20s).">Price</th>
       <th data-tip="Market-structure bias from swing highs/lows.">Bias</th>
       <th data-tip="BTC correlation ρ over ~10 days. Low/negative = an independent mover (preferred); ≥0.85 = mostly just BTC beta and gets docked in the rating.">BTC ρ</th>
-      <th data-tip="Lower-risk entry — a pullback to the setup's support / EMA / breakout level.">Entry</th>
+      <th data-tip="Retest entry — a proper pullback level to wait for (nearest swing-low support / reclaimed EMA / Supertrend below price), rather than chasing the current candle. The R:R is measured from here over the tight stop.">Retest entry</th>
       <th data-tip="Tight stop-loss for the best setup on this coin.">SL tight</th>
       <th data-tip="The meaningful profit target (≥~2% away) used to judge the reward:risk.">Target</th>
       <th data-tip="Realistic reward:risk to that target (capped at 8:1). This is the quality bar the setup had to clear.">R:R</th>
@@ -1118,11 +1171,14 @@ let bSortKey="score", bSortDir=-1, blatest=[];
 let wSortKey="score", wSortDir=-1, wlatest=[];
 let sSortKey="score", sSortDir=-1, slatest=[];
 let xSortKey="score", xSortDir=-1, xlatest=[];
+let eeSortKey="score", eeSortDir=-1, eelatest=[];
 let activeTab="setups", lastData=null;
+let topSyms=null, topNew=[];   // track coins newly entering Top setups
 // Per-tab filters so a filter on one tab never hides rows on another.
 const FILT={ setups:{bias:"all",biasTf:"4h",fresh:false}, flags:{bias:"all",biasTf:"4h",phase:"all"},
              cpr:{bias:"all",biasTf:"4h"}, bounce:{bias:"all",biasTf:"4h"}, stb:{bias:"all",biasTf:"4h"},
-             wedge:{bias:"all",biasTf:"4h",phase:"all"}, shorts:{bias:"all",biasTf:"4h"}, top:{indep:false} };
+             wedge:{bias:"all",biasTf:"4h",phase:"all"}, shorts:{bias:"all",biasTf:"4h"},
+             early:{bias:"all",biasTf:"4h"}, top:{indep:false} };
 function biasOk(h,tab){ const f=FILT[tab]||{}; const b=f.bias;
   if(!b||b==="all") return true;
   const tf=f.biasTf||"4h";
@@ -1164,7 +1220,8 @@ function renderFilterBar(){
 }
 function setF(tab,key,val){ FILT[tab][key]=val; renderFilterBar();
   ({setups:render,flags:renderFlags,cpr:renderCPR,bounce:renderBounce,
-    wedge:renderWedge,shorts:renderShorts,top:renderTop,stb:renderStb}[tab]||(()=>{}))();
+    wedge:renderWedge,shorts:renderShorts,top:renderTop,stb:renderStb,
+    early:renderEarly}[tab]||(()=>{}))();
 }
 let alertsOn=false, audioCtx=null, seenBreak=Math.floor(Date.now()/1000);
 function enableAlerts(){
@@ -1231,9 +1288,10 @@ function badges(h){
   if(h.sup_1w!=null) sp.push("Weekly "+fmtNum(h.sup_1w)+dd(h.sup_1w));
   if(sp.length) s+=`<span class="supbadge" data-tip="Next support below (drawdown) — ${sp.join("  ·  ")}">🛟</span>`;
   s+=corrPill(h.btc_corr);
-  s+=patPill(h.pattern);
+  s+=patPill(h.pattern, h.patterns_mtf);
   s+=tfBiasStrip(h.tf_bias);
   if(h.data_stale) s+='<span class="patbadge pat-bear" data-tip="MEXC\\'s kline history for this coin looks frozen (both futures and spot came back stale). The indicators may be out of date — confirm on the chart.">⚠ stale</span>';
+  if(stopBreached(h)) s+='<span class="patbadge pat-bear" data-tip="The live price has already moved through this setup\\'s tight stop — the ~10-min-old levels are stale and the setup is effectively invalidated. Wait for a fresh signal.">⚠ stop hit</span>';
   return s;
 }
 // Compact per-timeframe bias strip (▲ bullish / ▼ bearish / – neutral on 4h·1D·1W).
@@ -1248,11 +1306,15 @@ function tfBiasStrip(tb){
   }
   return out;
 }
-// Chart-formation pill (falling wedge, pennant, triangle, etc.) on every table.
-function patPill(p){
+// Chart-formation pill — shows the most salient formation across 1h/4h/1D/1W and
+// which timeframe it's on; the hover lists the pattern on every timeframe.
+function patPill(p,mtf){
   if(!p||!p.name) return '';
   const cls = p.bias==='bullish'?'pat-bull':p.bias==='bearish'?'pat-bear':'pat-neu';
-  return `<span class="patbadge ${cls}" data-tip="Chart formation on the 4h: ${(''+p.name)} — ${(''+(p.note||'')).replace(/"/g,'&quot;')}">◈ ${p.name}</span>`;
+  const all=(mtf&&mtf.length)? mtf.map(x=>`${x.tf}: ${x.name}`).join(' · ') : '';
+  const tip=`Chart formation — strongest is on the ${p.tf||'4h'}: ${p.name} (${p.bias}). ${(''+(p.note||''))}`
+          + (all? `  ||  All timeframes → ${all}` : '');
+  return `<span class="patbadge ${cls}" data-tip="${(''+tip).replace(/"/g,'&quot;')}">◈ ${p.name} · ${p.tf||'4h'}</span>`;
 }
 // BTC-correlation pill: how much this coin just mirrors BTC over the last ~10 days.
 function corrPill(c){
@@ -1285,7 +1347,7 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["wedge","Wedge"],["shorts","Shorts"],["top","Top"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["wedge","Wedge"],["shorts","Shorts"],["early","Early"],["top","Top"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
@@ -1341,6 +1403,9 @@ function azCard(d){
   const pct=(v,sign)=> d.price&&v!=null? ` <span class="rr">${sign}${(Math.abs((v-d.price)/d.price)*100).toFixed(1)}%</span>`:'';
   const tp=(v,rr)=> v==null?'—':`${fmtNum(v)}${rr!=null?` <span class="rr">R:R ${(+rr).toFixed(2)}</span>`:''}`;
   const notes=(d.notes||[]).map(n=>`<li>${n}</li>`).join("");
+  const recE=d.retest_entry!=null?d.retest_entry:(d.optimal_entry!=null?d.optimal_entry:d.entry);
+  const rec=realisticRR(d, recE);   // best realistic target from the retest entry
+  const isRec=(lvl)=> rec.tp!=null && lvl!=null && Math.abs(lvl-rec.tp)/(rec.tp||1) < 0.004;
   return `<div class="azcard">
     <div class="azhead">
       <span class="sym">${d.symbol}</span>
@@ -1378,6 +1443,7 @@ function azCard(d){
     <div class="azsec">Trade plan <span class="azsub">${(d.side||'long')==='short'?'SHORT — sell resistance, stops ABOVE, targets BELOW':'LONG — buy support, stops BELOW, targets ABOVE'} → 5 targets (with R:R)</span></div>
     <div class="azgrid">
       ${cell("Entry (now)", fmtNum(d.entry), "Based on: the current live price — your immediate entry if you take it here.")}
+      ${cell("Retest entry", fmtNum(d.retest_entry!=null?d.retest_entry:d.optimal_entry), (d.side||'long')==='short'?"A proper pullback fill — wait for a rally back UP to the nearest swing-high / EMA / Supertrend ABOVE price and short the retest, rather than chasing the drop.":"A proper pullback fill — wait for a dip DOWN to the nearest swing-low support / reclaimed EMA / Supertrend BELOW price and buy the retest, rather than chasing the candle. This is the entry the recommended R:R uses.")}
       ${cell("Optimal entry", fmtNum(d.optimal_entry), (d.side||'long')==='short'?"Based on: the nearest swing-high resistance — a better short fill is to sell into it rather than shorting here.":"Based on: the nearest swing-low support / reclaimed 200 EMA — a lower-risk long fill is to buy a pullback to it rather than chasing.")}
       ${cell("SL tight", fmtNum(d.sl_tight), (d.side||'long')==='short'?"Based on: the nearest swing-high / retest high, buffered by 0.5× ATR ABOVE it. A close above invalidates the short.":"Based on: the immediate structure (retest low / nearest swing low), buffered by 0.5× ATR BELOW it. A close below invalidates the setup.")}
       ${cell("SL wide", fmtNum(d.sl_wide), (d.side||'long')==='short'?"Based on: a deeper swing high + 1.0× ATR — more room, larger risk per unit.":"Based on: a deeper swing low − 1.0× ATR — more room, larger risk per unit.")}
@@ -1387,10 +1453,11 @@ function azCard(d){
       ${cell("TP4", tp(d.tp4,d.rr4), "Based on: the 4th structural level (or a Fibonacci extension if structure runs out), with R:R.")}
       ${cell("TP5", tp(d.tp5,d.rr5), "Based on: the 5th level — a further structural level or Fibonacci extension, with R:R.")}
     </div>
+    ${rec.tp!=null?`<div class="azrec" data-tip="The most realistic worthwhile take-profit: the target with the best reward:risk that still sits a meaningful (≥2%) move away, measured from the RETEST entry (${fmtNum(recE)}) over the tight stop (${fmtNum(d.sl_tight)}) and capped at 8:1. R:R = |target − entry| ÷ |entry − stop|. This is the same basis the Top-setups tab uses.">⭐ Recommended take-profit: <b>${fmtNum(rec.tp)}</b> <span class="rr">${(d.side||'long')==='short'?'−':'+'}${(rec.move*100).toFixed(1)}% · R:R <b>${rec.rr.toFixed(2)}</b></span> <span style="color:var(--dim)">from retest entry ${fmtNum(recE)}</span></div>`:''}
     ${stopsSection(d.stop_levels, d.side||'long')}
-    <div class="azsec" data-tip="A fuller ladder of profit targets: overhead resistance levels blended with Fibonacci extensions of the recent range, in order. Each shows % upside and R:R to the tight stop.">Target ladder <span class="azsub">resistances + Fibonacci extensions (hover for more)</span></div>
+    <div class="azsec" data-tip="A fuller ladder of profit targets: overhead resistance levels blended with Fibonacci extensions of the recent range, in order. Each shows % upside and R:R to the tight stop. The ⭐ chip is the recommended (best realistic R:R) target.">Target ladder <span class="azsub">resistances + Fibonacci extensions · ⭐ = recommended</span></div>
     <div class="azladder">
-      ${(d.target_ladder||[]).map((t,i)=>`<span class="ladchip" data-tip="Target ${i+1}: ${t.kind} at ${fmtNum(t.level)} — ${t.pct>=0?'+':''}${t.pct}% move, R:R ${t.rr!=null?t.rr:'—'} to the tight stop.">T${i+1} ${fmtNum(t.level)} <span class="rr">${t.pct>=0?'+':''}${t.pct}%${t.rr!=null?` · R${t.rr}`:''}</span></span>`).join('') || '<span style="color:var(--dim)">No further targets that side.</span>'}
+      ${(d.target_ladder||[]).map((t,i)=>`<span class="ladchip${isRec(t.level)?' ladrec':''}" data-tip="Target ${i+1}: ${t.kind} at ${fmtNum(t.level)} — ${t.pct>=0?'+':''}${t.pct}% move, R:R ${t.rr!=null?t.rr:'—'} to the tight stop.${isRec(t.level)?' ⭐ Recommended — best realistic reward:risk.':''}">${isRec(t.level)?'⭐ ':''}T${i+1} ${fmtNum(t.level)} <span class="rr">${t.pct>=0?'+':''}${t.pct}%${t.rr!=null?` · R${t.rr}`:''}</span></span>`).join('') || '<span style="color:var(--dim)">No further targets that side.</span>'}
     </div>
     <div class="azsec">In plain English</div>
     <ul class="aznotes">${notes}</ul>
@@ -1398,8 +1465,15 @@ function azCard(d){
 }
 function renderBanner(){
   const b=document.getElementById("banner");
+  // Highest-priority alert: a coin just entered ⭐ Top setups (show on any tab).
+  if(topNew&&topNew.length){
+    const chips=topNew.map(s=>`<span class="chip"><a href="${tvLink(s)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${s}</a></span>`).join("");
+    b.innerHTML=`<b>🌟 ${topNew.length} coin${topNew.length>1?'s':''} just entered ⭐ Top setups</b>: ${chips} <span style="color:var(--dim)">— click Top setups to see the plan</span>`;
+    b.classList.add("show"); return;
+  }
   let newSyms=[], what="";
   if(activeTab==="setups"){ newSyms=(lastData&&lastData.new_symbols)||[]; what="200-EMA reclaim"; }
+  else if(activeTab==="early"){ newSyms=(lastData&&lastData.early_new_symbols)||[]; what="early/accumulation"; }
   else if(activeTab==="flags"){ newSyms=(lastData&&lastData.flag_new_symbols)||[]; what="bull flag"; }
   else if(activeTab==="cpr"){ newSyms=(lastData&&lastData.cpr_new_symbols)||[]; what="narrow CPR"; }
   else if(activeTab==="bounce"){ newSyms=(lastData&&lastData.bounce_new_symbols)||[]; what="support bounce"; }
@@ -1553,6 +1627,40 @@ document.querySelectorAll("th[data-xk]").forEach(th=>th.addEventListener("click"
   const k=th.dataset.xk; if(k===xSortKey) xSortDir*=-1; else {xSortKey=k; xSortDir=(k==="symbol"||k==="tf")?1:-1;}
   renderStb();
 }));
+document.querySelectorAll("th[data-ek]").forEach(th=>th.addEventListener("click",()=>{
+  const k=th.dataset.ek; if(k===eeSortKey) eeSortDir*=-1; else {eeSortKey=k; eeSortDir=(k==="symbol")?1:-1;}
+  renderEarly();
+}));
+function renderEarly(){
+  const rows=[...eelatest].filter(h=>biasOk(h,"early")).sort((a,b)=>{
+    const x=a[eeSortKey],y=b[eeSortKey];
+    if(typeof x==="string") return eeSortDir*x.localeCompare(y);
+    return eeSortDir*((x??0)-(y??0));
+  });
+  const tb=document.getElementById("erows"); tb.innerHTML="";
+  document.getElementById("eempty").style.display = rows.length? "none":"block";
+  for(const h of rows){
+    const tr=document.createElement("tr");
+    tr.className=rowClass(h);
+    tr.innerHTML =
+      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td data-tip="Live last-traded price — refreshes ~every 20s.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
+      `<td data-tip="The strong support the coin is coiling on (daily/weekly swing low or base low).">${fmtNum(h.support)}</td>`+
+      `<td data-tip="How far below its recent 120-bar high the coin is trading — how beaten down it is.">${h.drawdown_pct==null?'—':(+h.drawdown_pct).toFixed(0)}%</td>`+
+      `<td data-tip="Volatility contraction — recent ATR ÷ its prior average. Lower = a tighter coil, closer to expanding.">${h.contraction==null?'—':(+h.contraction).toFixed(2)}×</td>`+
+      `<td>${h.pct_below_ema==null?'—':(+h.pct_below_ema).toFixed(1)}</td>`+
+      `<td>${h.rsi==null?'—':(+h.rsi).toFixed(0)}</td>`+
+      `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
+      corrTd(h.btc_corr)+
+      `<td data-tip="Optimal entry — a fill near the support rather than chasing.">${fmtNum(h.optimal_entry)}</td>`+
+      `<td data-tip="Tight stop — just below the support, ATR-buffered. A close below breaks the base.">${fmtNum(h.sl_tight)}</td>`+
+      `<td data-tip="Wide stop — below the base low.">${fmtNum(h.sl_wide)}</td>`+
+      tpCell(h.tp1,h.rr1)+tpCell(h.tp2,h.rr2)+tpCell(h.tp3,h.rr3)+
+      rvCell(h.rvol)+
+      `<td class="score">${(+h.score).toFixed(1)}</td>`;
+    tb.appendChild(tr);
+  }
+}
 function renderStb(){
   const rows=[...xlatest].filter(h=>biasOk(h,"stb")).sort((a,b)=>{
     const x=a[xSortKey],y=b[xSortKey];
@@ -1629,22 +1737,45 @@ function ratingCell(score,why){
 // A *realistic* reward:risk for a setup: the best R:R among its targets that sit a
 // meaningful distance away (>=2% move), capped at 8 so measured-move moonshots on
 // the flag/wedge scans can't dominate. Returns {rr, tp, move}.
-function realisticRR(h){
-  const P=h.live!=null?h.live:h.price;
-  let best={rr:0,tp:null,move:0};
-  for(let i=1;i<=5;i++){
-    const tp=h['tp'+i], rr=h['rr'+i];
-    if(tp==null||rr==null||rr<=0||!P) continue;
-    const move=Math.abs((tp-P)/P);
-    if(move>=0.02){ const c=Math.min(rr,8); if(c>best.rr) best={rr:c,tp:tp,move:move}; }
-  }
-  if(best.rr===0){ for(let i=1;i<=5;i++){ const tp=h['tp'+i],rr=h['rr'+i];
-    if(rr>0){ best={rr:Math.min(rr,8),tp:tp,move:P&&tp?Math.abs((tp-P)/P):0}; break; } } }
+// The best *realistic* target and its reward:risk — recomputed from the entry we
+// actually display (the optimal fill) and the tight stop, so R:R = |target−entry| ÷
+// |entry−stop| ALWAYS reconciles with the row. Side-aware (longs target up, shorts
+// down); only counts targets a meaningful (>=2%) move away; capped at 8:1.
+function realisticRR(h, entryArg){
+  const E = (entryArg!=null)? entryArg
+          : (h.optimal_entry!=null? h.optimal_entry : (h.live!=null?h.live:h.price));
+  const sl = h.sl_tight;
+  if(E==null || sl==null || E===sl) return {rr:0,tp:null,move:0,entry:E};
+  const long = sl < E;                       // stop below entry = long
+  const risk = Math.abs(E - sl);
+  let best={rr:0,tp:null,move:0,entry:E};
+  const consider=(tp)=>{
+    if(tp==null) return; if(long? tp<=E : tp>=E) return;
+    const move=Math.abs((tp-E)/E);
+    if(move>=0.02){ const rr=Math.min(Math.abs(tp-E)/risk,8);
+      if(rr>best.rr) best={rr:rr,tp:tp,move:move,entry:E}; }
+  };
+  for(let i=1;i<=5;i++) consider(h['tp'+i]);
+  if(best.rr===0){ for(let i=1;i<=5;i++){ const tp=h['tp'+i];
+    if(tp!=null && (long?tp>E:tp<E)){ best={rr:Math.min(Math.abs(tp-E)/risk,8),tp:tp,
+      move:Math.abs((tp-E)/E),entry:E}; break; } } }
   return best;
+}
+// Has the LIVE price already breached the setup's tight stop? (For a long that
+// means price fell to/below the stop; for a short it rallied to/above it.) If so
+// the setup is invalidated — the ~10-min-old levels are stale and it shouldn't
+// still be presented as a clean, high-conviction play.
+function stopBreached(h){
+  const P=(h.live!=null?h.live:h.price);
+  const sl=h.sl_tight, e=(h.optimal_entry!=null?h.optimal_entry:h.entry);
+  if(P==null||sl==null||e==null||e===sl) return false;
+  return (sl < e) ? (P <= sl) : (P >= sl);
 }
 // Per-setup quality used to pick the single best setup for a coin (blends the
 // detector's own score with its realistic reward:risk).
-function setupQuality(h){ return 0.55*clamp01((h.score||0)/100)+0.45*clamp01(realisticRR(h).rr/3); }
+function planEntry(h){ return h.retest_entry!=null? h.retest_entry
+                       : (h.optimal_entry!=null? h.optimal_entry : (h.live!=null?h.live:h.price)); }
+function setupQuality(h){ return 0.55*clamp01((h.score||0)/100)+0.45*clamp01(realisticRR(h,planEntry(h)).rr/3); }
 // Independence nudge: reward coins moving on their own, dock ones just tracking BTC.
 function indepAdj(corr){ if(corr==null) return 0; if(corr>=0.85) return -5; if(corr<=0.4) return 4; return 0; }
 function corrTd(c){ if(c==null) return '<td>—</td>';
@@ -1735,7 +1866,7 @@ function renderTop(){
     o.best=Math.max(o.best,h.score||0);
     if(h.rvol&&h.rvol>o.rvol) o.rvol=h.rvol;
     if(h.is_new||h.fresh) o.fresh=true;
-    if(q>o.bestQ){ o.bestQ=q; o.row=h; o.rr=realisticRR(h); o.bias=h.bias; o.choch=h.choch; }
+    if(q>o.bestQ){ o.bestQ=q; o.row=h; o.rr=realisticRR(h,planEntry(h)); o.bias=h.bias; o.choch=h.choch; }
   }
   let items=Object.values(m).map(o=>{
     const f={nScans:o.setups.size,bestScore:o.best,rvol:o.rvol,bias:o.bias,choch:o.choch,
@@ -1752,12 +1883,20 @@ function renderTop(){
   // backed by either multi-scan confluence or a strong standalone setup. Strong
   // 3-scan confluence can pass with a slightly lower R:R.
   items=items.filter(o=>
+      !stopBreached(o.row) &&               // live price already broke the stop → drop it
       o.rating>=52 &&
       (o.rr.rr>=1.5 || (o.f.nScans>=3 && o.rr.rr>=1.1)) &&
       (o.f.nScans>=2 || o.best>=68)
   );
   if(FILT.top.indep) items=items.filter(o=> o.corr!=null && o.corr<0.6);
   items=items.sort((a,b)=> b.rating-a.rating || b.rr.rr-a.rr.rr).slice(0,30);
+  // Detect coins newly entering Top setups (for the banner + tab badge).
+  const curTop=new Set(items.map(o=>o.row.symbol));
+  topNew = topSyms ? [...curTop].filter(s=>!topSyms.has(s)) : [];
+  topSyms = curTop;
+  const tabTop=document.getElementById('tabTop');
+  if(tabTop) tabTop.innerHTML = '⭐ Top setups' + (topNew.length?` <span class="newbadge">${topNew.length} NEW</span>`:'');
+  if(topNew.length && activeTab!=='top') renderBanner();   // surface even off-tab
   const tb=document.getElementById('tbrows'); tb.innerHTML="";
   document.getElementById('tbempty').style.display = items.length? "none":"block";
   const topEl=document.getElementById('topCount');
@@ -1775,7 +1914,7 @@ function renderTop(){
       `<td>${fmtNum(P)}</td>`+
       `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
       corrTd(o.corr)+
-      `<td>${fmtNum(h.optimal_entry)}</td>`+
+      `<td data-tip="Retest entry — a pullback level to wait for (nearest swing-low support / reclaimed EMA / Supertrend below price), not chasing the current candle. The R:R is measured from here.">${fmtNum(planEntry(h))}</td>`+
       `<td>${fmtNum(h.sl_tight)}</td>`+
       `<td data-tip="${tgtTip}">${o.rr.tp!=null?fmtNum(o.rr.tp):'—'}</td>`+
       `<td data-tip="Realistic reward:risk — to a target at least ~2% away, capped at 8:1 so measured-move projections don't inflate it.">${o.rr.rr?('<b>'+o.rr.rr.toFixed(2)+'</b>'):'—'}</td>`+
@@ -1792,6 +1931,7 @@ async function poll(){
     clatest=d.cpr_hits||[]; renderCPR();
     blatest=d.bounce_hits||[]; renderBounce();
     xlatest=d.stb_hits||[]; renderStb();
+    eelatest=d.early_hits||[]; renderEarly();
     wlatest=d.wedge_hits||[]; renderWedge();
     slatest=d.short_hits||[]; renderShorts();
     renderTop();
@@ -1806,6 +1946,7 @@ async function poll(){
     document.getElementById("stbCount").textContent = `${xlatest.length} supertrend bounce(s) · ${d.universe} pairs${bothTxt}`;
     document.getElementById("wedgeCount").textContent = `${wlatest.length} wedge(s) · ${d.universe} pairs${bothTxt}`;
     document.getElementById("shortCount").textContent = `${slatest.length} short setup(s) · ${d.universe} pairs`;
+    document.getElementById("earlyCount").textContent = `${eelatest.length} early setup(s) · ${d.universe} pairs — unconfirmed`;
     // topCount is set inside renderTop() (it knows the deduped long count).
     document.getElementById("meta").textContent =
       `${d.cfg.interval} chart · MEXC ${d.cfg.market==='futures'?'perps ⚡':'spot'} · ${d.cfg.quote} · EMA${d.cfg.ema_period} · rescans every ${d.cfg.scan_every}m${d.cfg.telegram?' · 📲 Telegram on':''}`;
@@ -1856,11 +1997,14 @@ const HDR_TIPS={
   pct_below_ema:"How far price sits BELOW the falling 200 EMA (%). This is a short: closer to the line = tighter entry.",
   supertrend:"The Supertrend (ATR 10×3) line on the strongest confirming timeframe — sitting below price and acting as a trailing support.",
   tf_up:"How many of 4h / Daily / Weekly currently have Supertrend in up-mode. More = stronger multi-timeframe trend backing.",
-  dist_to_st_pct:"How far price sits above the Supertrend line (%). Smaller = a fresher bounce, tighter entry."
+  dist_to_st_pct:"How far price sits above the Supertrend line (%). Smaller = a fresher bounce, tighter entry.",
+  drawdown_pct:"How far below its recent 120-bar high the coin trades — how beaten down / mean-reversion room it has.",
+  contraction:"Volatility contraction: recent ATR ÷ its prior average. Well under 1 = a tight coil, close to expanding.",
+  support:"The support the coin is coiling on (daily/weekly swing low or base low) — identified from swing-low pivots."
 };
 function applyHeaderTips(){
-  document.querySelectorAll("th[data-k],th[data-fk],th[data-ck],th[data-bk],th[data-wk],th[data-sk],th[data-xk]").forEach(th=>{
-    const k=th.dataset.k||th.dataset.fk||th.dataset.ck||th.dataset.bk||th.dataset.wk||th.dataset.sk||th.dataset.xk;
+  document.querySelectorAll("th[data-k],th[data-fk],th[data-ck],th[data-bk],th[data-wk],th[data-sk],th[data-xk],th[data-ek]").forEach(th=>{
+    const k=th.dataset.k||th.dataset.fk||th.dataset.ck||th.dataset.bk||th.dataset.wk||th.dataset.sk||th.dataset.xk||th.dataset.ek;
     if(HDR_TIPS[k]) th.setAttribute("data-tip",HDR_TIPS[k]);
   });
 }
