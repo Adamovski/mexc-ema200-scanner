@@ -884,7 +884,7 @@ PAGE = """<!doctype html>
 
 <div class="view" id="viewEarly">
 <div class="status">
-  <span>⏳ Early / potential — <b>pre-breakout accumulation</b>. Beaten-down coins that are <b>coiling</b> (volatility contraction) on a strong higher-timeframe support, still below the 200 EMA, oversold or carving a higher low — <i>before</i> the reclaim/Supertrend flip confirms. Earlier entry, higher risk: treat as <b>unconfirmed</b>. First target is the 200-EMA reclaim.</span>
+  <span>⏳ Early / potential — <b>pre-breakout accumulation</b>. Beaten-down coins that are <b>coiling</b> (volatility contraction) on a strong higher-timeframe support, still below the 200 EMA, oversold or carving a higher low — <i>before</i> the reclaim/Supertrend flip confirms. Earlier entry, higher risk: treat as <b>unconfirmed</b>. TP1–3 are the nearer structural rungs; the <b>◎ 200 EMA (4h)</b> column is the mean-reversion goal that confirms the setup. All indicators here are on the 4h chart.</span>
   <span id="earlyCount"></span>
 </div>
 <div class="wrap">
@@ -895,16 +895,17 @@ PAGE = """<!doctype html>
       <th data-ek="support">Support</th>
       <th data-ek="drawdown_pct">Off high %</th>
       <th data-ek="contraction">Coil</th>
-      <th data-ek="pct_below_ema">% &lt; EMA</th>
+      <th data-ek="pct_below_ema" data-tip="How far below the 200 EMA (on the 4h chart) the price is trading. The scanner runs on 4h candles, so this — and the EMA target — are the 4h 200 EMA.">% &lt; EMA (4h)</th>
       <th data-ek="rsi">RSI</th>
       <th data-ek="bias">Bias</th>
       <th data-tip="BTC correlation ρ over ~10 days. Low/negative = its own mover.">BTC ρ</th>
       <th data-ek="optimal_entry">Optimal entry</th>
       <th data-ek="sl_tight">SL tight</th>
       <th data-ek="sl_wide">SL wide</th>
-      <th data-ek="tp1" data-tip="Targets in order. The 200-EMA reclaim (the mean-reversion goal) is highlighted with ◎ wherever it falls in the ladder — nearer resistances come first.">TP1</th>
+      <th data-ek="tp1" data-tip="Nearer structural targets in order — prior swing highs the bounce must clear on the way up to the 200 EMA. The dedicated EMA column at right is the mean-reversion goal.">TP1</th>
       <th data-ek="tp2">TP2</th>
-      <th data-ek="tp3">TP3 <span style="opacity:.6">◎=EMA</span></th>
+      <th data-ek="tp3">TP3</th>
+      <th data-ek="ema_target" data-tip="The 200-EMA reclaim on the 4h chart — the mean-reversion target that confirms this early setup. Always shown here (◎) even when several nearer resistances sit below it. Grey = reward:risk to the tight stop.">◎ 200 EMA (4h)</th>
       <th data-ek="rvol">RVol</th>
       <th data-ek="score">Score</th>
     </tr></thead>
@@ -1349,6 +1350,13 @@ function tpCell(v,rr,basis,isEma){ if(v==null) return '<td>—</td>';
   return `<td class="${isEma?'ematp':''}" data-tip="${esc(tip)}">${fmtNum(v)}${star}${rr!=null?`<span class="rr">R${(+rr).toFixed(1)}</span>`:''}</td>`; }
 // Render TP1..TPn cells for a hit, each with its own per-coin basis + EMA flag.
 function tpsCells(h,n){ let s=''; for(let i=1;i<=n;i++){ s+=tpCell(h['tp'+i],h['rr'+i],h['tp'+i+'_basis'],h['tp'+i+'_ema']); } return s; }
+// The explicit 200-EMA (4h) reclaim target for Early setups — always visible.
+function emaTargetCell(h){
+  if(h.ema_target==null) return '<td>—</td>';
+  const pct=(h.ema_target_pct!=null)?`${h.ema_target_pct>=0?'+':''}${h.ema_target_pct}%`:'';
+  const tip=`200-EMA reclaim on the 4h chart at ${fmtNum(h.ema_target)} — the mean-reversion target that confirms this early setup${pct?` (${pct} away)`:''}. Grey = reward:risk to the tight stop${h.ema_target_rr!=null?` (${(+h.ema_target_rr).toFixed(2)})`:''}.`;
+  return `<td class="ematp" data-tip="${esc(tip)}"><span class="emastar">◎</span>${fmtNum(h.ema_target)}${h.ema_target_rr!=null?`<span class="rr">R${(+h.ema_target_rr).toFixed(1)}</span>`:''}</td>`;
+}
 // Stop cells driven by the per-coin basis the backend computed.
 function slTightCell(h){ const b=h.sl_tight_basis||"The setup's immediate invalidation level, ATR-buffered."; return `<td data-tip="${esc('Tight stop at '+fmtNum(h.sl_tight)+' — '+b)}">${fmtNum(h.sl_tight)}</td>`; }
 function slWideCell(h){ const b=h.sl_wide_basis||"A deeper structural level for more room, ATR-buffered."; return `<td data-tip="${esc('Wide stop at '+fmtNum(h.sl_wide)+' — '+b)}">${fmtNum(h.sl_wide)}</td>`; }
@@ -1676,6 +1684,7 @@ function renderEarly(){
       slTightCell(h)+
       slWideCell(h)+
       tpsCells(h,3)+
+      emaTargetCell(h)+
       rvCell(h.rvol)+
       `<td class="score">${(+h.score).toFixed(1)}</td>`;
     tb.appendChild(tr);
