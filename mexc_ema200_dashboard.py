@@ -437,7 +437,7 @@ def breakout_watcher(state: State) -> None:
 PAGE = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MEXC Scanner</title>
+<title>Apex — MEXC Futures Scanner</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
@@ -671,9 +671,11 @@ PAGE = """<!doctype html>
   header{padding:14px 26px;background:linear-gradient(180deg,rgba(15,20,30,.82),rgba(15,20,30,.35));
        backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
        border-bottom:1px solid var(--line);position:sticky;top:0;z-index:70;align-items:center}
-  h1{font-size:15px;font-weight:800;letter-spacing:-.01em;display:flex;align-items:center;gap:9px}
-  h1::before{content:"";width:11px;height:11px;border-radius:3px;
-       background:linear-gradient(135deg,var(--accent),#2f81f7);box-shadow:0 0 12px rgba(63,185,80,.7)}
+  h1{font-size:17px;font-weight:800;letter-spacing:-.02em;display:flex;align-items:center;gap:10px}
+  h1::before{content:"";width:13px;height:13px;border-radius:4px;
+       background:linear-gradient(135deg,var(--accent),#2f81f7);box-shadow:0 0 14px rgba(63,185,80,.7)}
+  .brandsub{font-size:11.5px;font-weight:600;color:var(--dim);letter-spacing:.02em;
+       padding-left:11px;margin-left:2px;border-left:1px solid var(--line2)}
   .sub{color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums}
   .alertbtn{border-radius:9px;font-weight:600}
   .alertbtn:hover{border-color:var(--accent);color:var(--accent);transform:translateY(-1px)}
@@ -741,11 +743,15 @@ PAGE = """<!doctype html>
        font-weight:800;color:var(--txt);letter-spacing:.02em;font-size:13px;text-transform:uppercase}
   .azsec .azsub{text-transform:none;font-weight:500}
   .azsec:first-of-type{border-top:none;margin-top:6px}
-  .azgrid{gap:10px}
-  .azcell{border-radius:11px;border:1px solid var(--line);background:var(--panel2);padding:11px 13px}
+  .azgrid{gap:12px;grid-template-columns:repeat(auto-fit,minmax(165px,1fr))}
+  .azcell{border-radius:11px;border:1px solid var(--line);background:var(--panel2);padding:12px 14px}
   .azcell:hover{border-color:var(--line2);background:#151d2b;transform:translateY(-1px)}
-  .azcell .k{font-size:10.5px;letter-spacing:.04em;text-transform:uppercase;color:var(--dim2)}
-  .azcell .v{font-family:var(--mono);font-weight:700;font-size:15px;margin-top:3px}
+  .azcell .k{font-size:10px;letter-spacing:.05em;text-transform:uppercase;color:var(--dim2);font-weight:600}
+  /* values are Inter (readable for mixed text like "downtrend · bullish CHoCH"),
+     with tabular figures so pure numbers still align. Mono is ONLY for tables. */
+  .azcell .v{font-family:"Inter",sans-serif;font-weight:700;font-size:14.5px;line-height:1.45;
+       margin-top:5px;font-variant-numeric:tabular-nums;word-break:normal;overflow-wrap:anywhere;color:var(--txt)}
+  .azcell .v .rr{font-family:var(--mono);font-size:11px}
   .azrec{border-radius:11px;padding:11px 14px;margin:9px 0;background:rgba(63,185,80,.06);
        border:1px solid rgba(63,185,80,.18)}
   .azrec.azstop{background:rgba(248,81,73,.06);border-color:rgba(248,81,73,.2)}
@@ -772,7 +778,7 @@ PAGE = """<!doctype html>
 </style></head>
 <body>
 <header>
-  <h1>MEXC · 200-EMA cross &amp; retest</h1>
+  <h1>Apex<span class="brandsub">MEXC Futures Scanner</span></h1>
   <span class="sub" id="meta"></span>
   <button id="alertBtn" class="alertbtn" onclick="enableAlerts()">🔔 Enable breakout alerts</button>
 </header>
