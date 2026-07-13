@@ -644,6 +644,67 @@ PAGE = """<!doctype html>
   .phasepill{border-radius:6px;padding:1px 7px;font-size:11px;font-weight:700;border:1px solid var(--line)}
   .phase-broke{background:rgba(63,185,80,.16);color:var(--accent);border-color:rgba(63,185,80,.5)}
   .phase-form{background:rgba(139,152,173,.12);color:var(--dim)}
+  /* ============ UX POLISH PASS (overrides above) ============ */
+  html{-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+  body{background:radial-gradient(1200px 600px at 78% -10%,rgba(63,185,80,.05),transparent 60%),var(--bg);
+       letter-spacing:.01em}
+  ::selection{background:rgba(63,185,80,.28)}
+  /* thin, dark custom scrollbars */
+  *{scrollbar-width:thin;scrollbar-color:#2a3242 transparent}
+  *::-webkit-scrollbar{width:10px;height:10px}
+  *::-webkit-scrollbar-thumb{background:#2a3242;border-radius:8px;border:2px solid var(--bg)}
+  *::-webkit-scrollbar-thumb:hover{background:#3a4458}
+  /* smooth micro-interactions */
+  .tab,.fbtn,.tfbtn,.azbtn,.wstar,.wlbtn,.alertbtn,.ladchip,.azbar button,.chip a,td.sym a{
+       transition:background .15s ease,color .15s ease,border-color .15s ease,transform .12s ease,box-shadow .15s ease}
+  /* header: sleeker brand bar */
+  header{background:linear-gradient(180deg,rgba(20,25,36,.55),transparent)}
+  h1{letter-spacing:-.01em}
+  .alertbtn:hover{border-color:var(--accent);color:var(--accent)}
+  /* tabs: pill row, clear active state */
+  .tab{border-radius:9px;border-bottom:1px solid var(--line);background:rgba(20,25,36,.6)}
+  .tab:hover{color:var(--txt);border-color:#33405a;transform:translateY(-1px)}
+  .tab.active{background:linear-gradient(180deg,rgba(63,185,80,.16),var(--head));color:#fff;
+       border-color:rgba(63,185,80,.5);box-shadow:0 2px 10px rgba(63,185,80,.12)}
+  .fbtn:hover{border-color:var(--accent);color:var(--txt)}
+  .tfbtn:hover{border-color:var(--accent);color:var(--txt)}
+  /* tables: zebra, richer hover, refined sticky header */
+  .wrap{padding:14px 22px 60px}
+  thead th{top:0;z-index:40;background:var(--head);border-bottom:1px solid #2b3444;
+       box-shadow:0 2px 8px rgba(0,0,0,.35);padding-top:10px;padding-bottom:10px;
+       text-transform:uppercase;letter-spacing:.04em;font-size:11px}
+  thead th:hover{color:var(--txt)}
+  tbody tr{transition:background .1s ease}
+  tbody tr:nth-child(even) td{background:rgba(255,255,255,.014)}
+  tbody tr:hover td{background:rgba(63,185,80,.06)}
+  tbody tr:hover td:first-child{box-shadow:inset 3px 0 0 var(--accent)}
+  td.sym a:hover{text-decoration:underline}
+  .score{font-variant-numeric:tabular-nums}
+  /* active-sort arrow */
+  th[data-sort]::after{margin-left:5px;color:var(--accent);font-size:10px}
+  th[data-sort="asc"]::after{content:"▲"}
+  th[data-sort="desc"]::after{content:"▼"}
+  /* pills / badges: subtle depth */
+  .biaspill2,.tfpill,.patbadge,.corrbadge,.pill{transition:transform .12s ease}
+  tr:hover .biaspill2{transform:translateY(-1px)}
+  /* analyze card: lift + accent edge */
+  .azcard{box-shadow:0 8px 30px rgba(0,0,0,.35);border-color:#28324a;
+       background:linear-gradient(180deg,#161c28,#141924)}
+  .azsec{border-top:1px solid var(--line);margin-top:16px;padding-top:12px;
+       font-weight:700;color:var(--txt);letter-spacing:.02em}
+  .azsec:first-of-type{border-top:none}
+  .azcell{transition:border-color .15s ease,background .15s ease}
+  .azcell:hover{border-color:#33405a;background:#131926}
+  .ladchip:hover{border-color:var(--accent);color:var(--txt);transform:translateY(-1px)}
+  .azbar input{transition:border-color .15s ease,box-shadow .15s ease}
+  .azbar input:focus{box-shadow:0 0 0 3px rgba(63,185,80,.15)}
+  .azbar button:hover:not(:disabled){filter:brightness(1.08)}
+  /* nicer empty state */
+  .empty{font-size:13px;opacity:.9}
+  /* tooltip: softer */
+  #tip{border-color:#33405a;box-shadow:0 10px 30px rgba(0,0,0,.55);border-radius:9px}
+  @media(max-width:640px){ .wrap{padding:10px 12px 50px} header,.status,.tabs,.filterbar{padding-left:12px;padding-right:12px}
+       thead th{top:0} .tabs{top:0} .filterbar{position:static} }
 </style></head>
 <body>
 <header>
@@ -1856,21 +1917,26 @@ function render(){
 // Clicking a TP column header ranks by that target's REWARD:RISK (not its price)
 // — so you can surface the best-R:R setups. Maps tpN -> rrN for sorting.
 function remapTp(k){ return /^tp\d$/.test(k) ? 'rr'+k.slice(2) : k; }
+// Show a ▲/▼ arrow on the active-sort column header.
+function setSortArrow(th, dir){
+  const head=th.closest('thead'); if(head) head.querySelectorAll('th[data-sort]').forEach(x=>x.removeAttribute('data-sort'));
+  th.setAttribute('data-sort', dir>0?'asc':'desc');
+}
 document.querySelectorAll("th[data-k]").forEach(th=>th.addEventListener("click",()=>{
   const k=remapTp(th.dataset.k); if(k===sortKey) sortDir*=-1; else {sortKey=k; sortDir=(k==="symbol")?1:-1;}
-  render();
+  setSortArrow(th,sortDir); render();
 }));
 document.querySelectorAll("th[data-fk]").forEach(th=>th.addEventListener("click",()=>{
   const k=remapTp(th.dataset.fk); if(k===fSortKey) fSortDir*=-1; else {fSortKey=k; fSortDir=(k==="symbol")?1:-1;}
-  renderFlags();
+  setSortArrow(th,fSortDir); renderFlags();
 }));
 document.querySelectorAll("th[data-ck]").forEach(th=>th.addEventListener("click",()=>{
   const k=remapTp(th.dataset.ck); if(k===cSortKey) cSortDir*=-1; else {cSortKey=k; cSortDir=(k==="symbol"||k==="position")?1:-1;}
-  renderCPR();
+  setSortArrow(th,cSortDir); renderCPR();
 }));
 document.querySelectorAll("th[data-bk]").forEach(th=>th.addEventListener("click",()=>{
   const k=remapTp(th.dataset.bk); if(k===bSortKey) bSortDir*=-1; else {bSortKey=k; bSortDir=(k==="symbol")?1:-1;}
-  renderBounce();
+  setSortArrow(th,bSortDir); renderBounce();
 }));
 function renderBounce(){
   const rows=[...blatest].filter(h=>biasOk(h,"bounce")).sort((a,b)=>{
@@ -1931,15 +1997,15 @@ function renderCPR(){
 }
 document.querySelectorAll("th[data-sk]").forEach(th=>th.addEventListener("click",()=>{
   const k=remapTp(th.dataset.sk); if(k===sSortKey) sSortDir*=-1; else {sSortKey=k; sSortDir=(k==="symbol")?1:-1;}
-  renderShorts();
+  setSortArrow(th,sSortDir); renderShorts();
 }));
 document.querySelectorAll("th[data-xk]").forEach(th=>th.addEventListener("click",()=>{
   const k=remapTp(th.dataset.xk); if(k===xSortKey) xSortDir*=-1; else {xSortKey=k; xSortDir=(k==="symbol"||k==="tf")?1:-1;}
-  renderStb();
+  setSortArrow(th,xSortDir); renderStb();
 }));
 document.querySelectorAll("th[data-ek]").forEach(th=>th.addEventListener("click",()=>{
   const k=remapTp(th.dataset.ek); if(k===eeSortKey) eeSortDir*=-1; else {eeSortKey=k; eeSortDir=(k==="symbol")?1:-1;}
-  renderEarly();
+  setSortArrow(th,eeSortDir); renderEarly();
 }));
 function renderEarly(){
   const rows=[...eelatest].filter(h=>biasOk(h,"early")).sort((a,b)=>{
