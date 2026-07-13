@@ -719,11 +719,16 @@ PAGE = """<!doctype html>
      the columns that scroll underneath it. */
   td.sym{position:sticky;left:0;z-index:30;background:var(--bg2);
        box-shadow:8px 0 12px -8px rgba(0,0,0,.55);
-       white-space:normal;max-width:250px;vertical-align:middle;overflow:hidden}
+       white-space:normal;vertical-align:top;overflow:hidden;
+       width:232px;min-width:232px;max-width:232px}
   td.sym .wstar,td.sym>a{vertical-align:middle}
+  /* badges wrap onto their own lines under the ticker and never spill into the
+     scrolling columns */
+  td.sym>.patbadge,td.sym>.tfbias,td.sym>.supbadge,td.sym>.corrpill,
+  td.sym>.bothbadge,td.sym>.freshbadge,td.sym>.newbadge,td.sym>.brokebadge{margin-top:3px}
   tbody tr:hover td.sym{background:#121a28}
   thead th:first-child{position:sticky;left:0;z-index:46;background:rgba(21,28,41,.98);
-       white-space:normal;max-width:250px}
+       width:232px;min-width:232px;max-width:232px}
   th[data-sort]::after{margin-left:6px;color:var(--accent);font-size:9px;vertical-align:middle}
   th[data-sort="asc"]::after{content:"▲"}
   th[data-sort="desc"]::after{content:"▼"}
@@ -1977,7 +1982,13 @@ function azCard(d0){
     const sy=b==='bullish'?'▲':b==='bearish'?'▼':'–';
     return `<span style="color:${co};font-weight:700" title="${tf.toUpperCase()} market-structure bias: ${b||'n/a'}">${sy}</span>`; };
   const tfSup=(tf,v,sign)=>`${tf==='1d'?'1D':tf==='1w'?'1W':tf} ${tfMark(tf)} ${v==null?'—':fmtNum(v)+pct(v,sign)}`;
-  const rec=(rtg&&rtg.primary)?{tp:rtg.primary.lvl, rr:rtg.primary.rr, move:rtg.primary.move, p:rtg.primary.p}:{tp:null};
+  const rec=(rtg&&rtg.primary)?{tp:rtg.primary.lvl, rr:rtg.primary.rr, move:rtg.primary.move, p:rtg.primary.p, kind:rtg.primary.kind}:{tp:null};
+  // Which timeframe a level's basis text refers to (for "based on the Daily chart" labels).
+  const tfOfBasis=(b)=>{ b=(''+(b||'')).toLowerCase();
+    if(/weekly|1w/.test(b)) return 'Weekly'; if(/daily|1d/.test(b)) return 'Daily';
+    if(/\b4h\b/.test(b)) return '4h'; if(/\b1h\b/.test(b)) return '1h'; return null; };
+  const stopTf=rstop?tfOfBasis(rstop.basis):null;
+  const tgtTf=rec.tp!=null?tfOfBasis(rec.kind):null;
   const isRec=(lvl)=> rec.tp!=null && lvl!=null && Math.abs(lvl-rec.tp)/(rec.tp||1) < 0.004;
   const sgn=(d.side||'long')==='short'?'+':'−';         // stop/entry sign relative to price for this side
   // Distance of a level in ATR units (the honest "how tight/far" for THIS coin).
@@ -2035,13 +2046,13 @@ function azCard(d0){
     ${(d0.plans&&activeSide!==auto)?`<div class="sidenote">Showing the <b>${activeSide.toUpperCase()}</b> perspective — a ${activeSide==='long'?'reversal/counter-trend long':'counter-trend short'}. The coin's own lean is <b>${auto.toUpperCase()}</b>, so treat this as the plan <i>if</i> it turns; the entries, stops, targets and R:R below are all for a ${activeSide}.</div>`:''}
     <div class="azverdict ${rec.tp!=null?((d.side||'long')==='short'?'short':'long'):'none'}" data-tip="The bottom line for this coin, at a glance. Everything below is the detail behind it.">
       ${rec.tp!=null?`
-        <span class="vbadge v-${(d.side||'long')==='short'?'short':'long'}">${(d.side||'long')==='short'?'SHORT ▼':'LONG ▲'}</span>
-        <span class="vgrade">Grade ${planGrade}</span><span class="vsep"></span>
-        <span class="vitem"><i>Entry</i>${fmtNum(recE)}${crossTfTag}</span>
-        <span class="vitem"><i>Stop</i>${rstop?fmtNum(rstop.level):'—'}${rstop&&rstop.atrx?` <span style="color:var(--dim2)">${rstop.atrx.toFixed(1)}×</span>`:''}</span>
-        <span class="vitem"><i>Target</i>${fmtNum(rec.tp)}</span>
-        <span class="vitem"><i>R:R</i><b>${rec.rr.toFixed(2)}</b></span>
-        <span class="vitem"><i>Reach</i>${Math.round(rec.p*100)}%</span>`
+        <span class="vbadge v-${(d.side||'long')==='short'?'short':'long'}" data-tip="The side to trade — LONG (buy the dip, profit as it rises) or SHORT (sell strength, profit as it falls) — based on this coin's own directional lean. Use the LONG/SHORT toggle to plan the other side.">${(d.side||'long')==='short'?'SHORT ▼':'LONG ▲'}</span>
+        <span class="vgrade" data-tip="Overall quality of this setup: A+ / A / B / C. It blends the reward:risk with how reachable the target is — an A+ has both a high R:R and a high chance of getting there.">Grade ${planGrade}</span><span class="vsep"></span>
+        <span class="vitem" data-tip="The recommended place to get IN — a value-area pullback (support / EMA / Supertrend retest), not necessarily the current price. Chosen across timeframes for the best reward:risk that's still likely to fill.${beHigherTf?' Taken from the '+TFNAME[be.tf]+' chart — a stronger level price should reach first.':' Based on: '+esc(be?be.basis:'')}"><i>Entry</i>${fmtNum(recE)}${crossTfTag}</span>
+        <span class="vitem" data-tip="The recommended stop-loss — the level that invalidates the trade, just beyond real structure and clear of the wick/noise range. Shown with its distance in ×ATR (the honest measure of 'tight'). Based on: ${esc(rstop?rstop.basis:'—')}${stopTf?' ('+stopTf+' chart)':''}."><i>Stop</i>${rstop?fmtNum(rstop.level):'—'}${rstop&&rstop.atrx?` <span style="color:var(--dim2)">${rstop.atrx.toFixed(1)}×</span>`:''}${stopTf&&beHigherTf?`<span class="tfsrc">${stopTf}</span>`:''}</span>
+        <span class="vitem" data-tip="The recommended take-profit — the best target by expected value (reward:risk × reachability) that clears the 1.5:1 floor. Based on: ${esc(rec.kind||'overhead resistance')}${tgtTf?' ('+tgtTf+' chart)':''}."><i>Target</i>${fmtNum(rec.tp)}${tgtTf&&/Daily|Weekly/.test(rec.kind||'')?`<span class="tfsrc">${tgtTf}</span>`:''}</span>
+        <span class="vitem" data-tip="Reward-to-risk: how many units of profit to the target for each unit risked to the stop, from the recommended entry. We only recommend trades clearing 1.5:1."><i>R:R</i><b>${rec.rr.toFixed(2)}</b></span>
+        <span class="vitem" data-tip="Reachability — the estimated chance price actually reaches the target before the stop, from the distance (in ATR) adjusted for how strongly the trend, momentum and volume back the move."><i>Reach</i>${Math.round(rec.p*100)}%</span>`
       :`<span class="vbadge v-none">⛔ NO TRADE</span>
         <span class="vitem" style="font-family:'Inter'">Best realistic R:R is only <b>${rtg?rtg.bestRR.toFixed(2):'—'}</b> — under the 1.5 floor. Wait for a better entry or setup.</span>`}
     </div>
@@ -2084,7 +2095,7 @@ function azCard(d0){
     </div>
     ${be?`<div class="azrec" data-tip="The smartest place to get IN — not necessarily near the current price. If price is extended or correcting, a deeper pullback (a support / EMA / Supertrend retest) makes a better, more realistic trade; a short can wait to sell into a higher rally. Chosen to maximise the resulting reward:risk while staying a fill that's likely to actually print. Based on: ${esc(be.basis)}.">🎯 Recommended entry: <b>${fmtNum(recE)}</b> <span class="rr">${sgn}${be.distPct.toFixed(1)}%${be.distATR?` · ${be.distATR.toFixed(1)}×ATR`:''} ${(d.side||'long')==='short'?'above':'below'} price</span> <span style="color:var(--dim)">— ${esc(be.basis)}${crossTfNote}${(be.distATR&&be.distATR>2)?' · patient fill — wait for it, don\\'t chase':''}</span></div>`:''}
     ${rstop?`<div class="azrec azstop" data-tip="The recommended stop, judged for THIS chart — not a fixed % or a blanket 'go wide'. It sits just beyond the nearest real level that would invalidate the setup (swing low, Supertrend, EMA, HTF support), once clear of noise (≥ max(1.5%, 1.1× ATR)). Distance is shown in ×ATR because that's the honest measure of 'tight' — a big % on a volatile coin can still be only ~1.5× ATR. ${rstop.note?esc(rstop.note.charAt(0).toUpperCase()+rstop.note.slice(1))+'. ':''}It's the stop the recommended R:R is measured against. Based on: ${esc(rstop.basis)}">🛑 Recommended stop-loss: <b>${fmtNum(rstop.level)}</b> <span class="rr">${sgn}${rstop.pct.toFixed(1)}%${rstop.atrx?` · ${rstop.atrx.toFixed(1)}×ATR`:''} from entry</span> <span style="color:var(--dim)">— ${esc(rstop.basis)}${rstop.note?' · '+esc(rstop.note):''}</span></div>`:''}
-    ${rec.tp!=null?`<div class="azrec" data-tip="Recommended by EXPECTED VALUE, not raw ratio: reward:risk × how reachable the target is. Reachability decays with distance (in ATR units) but stretches out when the trend, momentum and volume back the move — so a far target isn't dismissed if the setup is strong, and a nearby one isn't over-rated if it's weak. Measured from the recommended entry (${fmtNum(recE)}) over the recommended stop (${rstop?fmtNum(rstop.level):'—'}), capped 8:1, and only shown because it clears the 1.5:1 floor. Grade blends R:R and reachability.">⭐ Recommended take-profit: <b>${fmtNum(rec.tp)}</b> <span class="rr">${(d.side||'long')==='short'?'−':'+'}${(rec.move*100).toFixed(1)}% · R:R <b>${rec.rr.toFixed(2)}</b> · ~${Math.round(rec.p*100)}% reach · grade <b>${planGrade}</b></span></div>
+    ${rec.tp!=null?`<div class="azrec" data-tip="Recommended by EXPECTED VALUE, not raw ratio: reward:risk × how reachable the target is. Reachability decays with distance (in ATR units) but stretches out when the trend, momentum and volume back the move — so a far target isn't dismissed if the setup is strong, and a nearby one isn't over-rated if it's weak. Measured from the recommended entry (${fmtNum(recE)}) over the recommended stop (${rstop?fmtNum(rstop.level):'—'}), capped 8:1, and only shown because it clears the 1.5:1 floor. Grade blends R:R and reachability.">⭐ Recommended take-profit: <b>${fmtNum(rec.tp)}</b> <span class="rr">${(d.side||'long')==='short'?'−':'+'}${(rec.move*100).toFixed(1)}% · R:R <b>${rec.rr.toFixed(2)}</b> · ~${Math.round(rec.p*100)}% reach · grade <b>${planGrade}</b></span>${rec.kind?` <span style="color:var(--dim)">— ${esc(rec.kind)}${tgtTf&&/Daily|Weekly/.test(rec.kind||'')?` <span class="tfsrc">${tgtTf} chart</span>`:''}</span>`:''}</div>
     <div class="sidenote" data-tip="A sensible way to take the trade off: bank part at the nearest solid target to de-risk, hold the core to the base target, leave a runner for the stretch if momentum carries.">Scale-out: 🔒 Secure <b>${fmtNum(rtg.secure.lvl)}</b> (R${rtg.secure.rr.toFixed(1)}) · 🎯 Base <b>${fmtNum(rtg.primary.lvl)}</b> (R${rtg.primary.rr.toFixed(1)})${rtg.stretch?` · 🚀 Stretch <b>${fmtNum(rtg.stretch.lvl)}</b> (R${rtg.stretch.rr.toFixed(1)})`:''}</div>
     <div class="sidenote" data-tip="How the same trade looks if you enter NOW at the current market price instead of waiting for the 🎯 recommended pullback — same stop and target, worse fill, so a lower R:R. Use it to decide: take it now, or wait for the better entry.">⚡ Enter now at market (CMP ${fmtNum(cmpE)}): ${rrAt(cmpE)!=null?`R:R <b>${rrAt(cmpE).toFixed(2)}</b> to the base target`:'stop is already in the way — no clean entry here'} <span style="color:var(--dim)">vs ${rec.rr.toFixed(2)} waiting for ${fmtNum(recE)}${(rrAt(cmpE)!=null&&rrAt(cmpE)<1.5)?' — under 1.5:1 now, better to wait for the pullback':(cmpE!=null&&recE!=null&&Math.abs(cmpE-recE)/recE<0.005?' — basically at the entry already':'')}</span></div>`
     :`<div class="azrec" style="color:#f0b429" data-tip="No target on the correct side clears a 1.5:1 reward:risk from a sensible stop. In crypto a sub-1.5 R:R trade isn't worth the risk — this is a 'no trade / wait' call, not a setup. Wait for a deeper entry (better R:R), a tighter valid stop level, or a different coin.">⛔ No trade here — best realistic R:R is only <b>${rtg?rtg.bestRR.toFixed(2):'—'}</b>, under the 1.5 minimum. Wait for a better entry or setup.</div>`}
