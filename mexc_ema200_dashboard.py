@@ -1594,14 +1594,22 @@ function pickEntry(d){
             if(d.ema!=null&&d.ema>price) add(d.ema*0.998,'200-EMA retest');
             if(d.supertrend!=null&&d.supertrend_role==='resistance'&&d.supertrend>price) add(d.supertrend*0.997,'Supertrend retest'); }
   if(!cands.length) return null;
+  const pot=potentialScore(d, side);
   let best=null;
   for(const c of cands){
     const ee=evalEntry(d, c.level);                           // its best stop + targets (survival-weighted)
-    if(!ee || !ee.rtg || !ee.rtg.primary) continue;           // must yield a real >=1.5 R:R trade
+    if(!ee || !ee.rtg || !ee.rtg.primary) continue;           // must yield a real >=1.5 R:R trade w/ a menu stop
     const distATR=atr? Math.abs((c.level-price)/price*100)/atr : 0;
-    if(distATR > 3.5) continue;                               // >3.5x ATR from price = not a realistic near-term fill
-    const fill=1/(1+Math.pow(distATR/3,1.8));                 // strong preference for fills that will actually print
-    const score=ee.rtg.primary.ev*surviveProb(ee.stop.atrx)*(0.4+0.6*fill);
+    if(distATR > 8) continue;                                 // absurdly far — not part of this move
+    // A DEEP pullback can be the right entry — in a strong trend, or at a major
+    // level (200 EMA / HTF support / Supertrend), waiting for it is smart, not
+    // wrong. So instead of a hard depth cap, widen the "realistic fill" horizon
+    // with potential and for major levels; shallow entries still win when the
+    // setup is weak or the level is minor.
+    const major=/200[- ]?EMA|Daily|Weekly|Supertrend/i.test(c.basis||'');
+    const horizon=2.5 + pot*3.5 + (major?1.5:0);             // ATRs of pullback that's realistic to wait for
+    const fill=1/(1+Math.pow(distATR/horizon,1.8));
+    const score=ee.rtg.primary.ev*surviveProb(ee.stop.atrx)*(0.35+0.65*fill);
     if(!best || score>best.score) best={level:c.level, basis:c.basis, score, rt:ee.rtg, rs:ee.stop,
         distPct:Math.abs((c.level-price)/price*100), distATR};
   }
