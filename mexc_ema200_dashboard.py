@@ -652,7 +652,6 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabCpr" onclick="showTab('cpr')">Narrow CPR</div>
   <div class="tab" id="tabBounce" onclick="showTab('bounce')">Support bounce</div>
   <div class="tab" id="tabStb" onclick="showTab('stb')">Supertrend support bounce</div>
-  <div class="tab" id="tabWedge" onclick="showTab('wedge')">Falling wedge</div>
   <div class="tab" id="tabShorts" onclick="showTab('shorts')">Shorts</div>
   <div class="tab" id="tabEarly" onclick="showTab('early')">⏳ Early</div>
   <div class="tab" id="tabTop" onclick="showTab('top')">⭐ Top setups</div>
@@ -825,37 +824,6 @@ PAGE = """<!doctype html>
 </div>
 </div>
 
-<div class="view" id="viewWedge">
-<div class="status">
-  <span>Falling wedge — price coiling in a converging downtrend (bullish reversal), on 4h / Daily / Weekly. Fires near the apex or on the breakout.</span>
-  <span id="wedgeCount"></span>
-</div>
-<div class="wrap">
-  <table id="wtbl">
-    <thead><tr>
-      <th data-wk="symbol">Symbol</th>
-      <th data-wk="price">Price</th>
-      <th data-wk="tf">TF</th>
-      <th data-wk="phase">Phase</th>
-      <th data-wk="conv_pct">Converge %</th>
-      <th data-wk="touches">Touches</th>
-      <th data-wk="bias">Bias</th>
-      <th data-wk="optimal_entry">Breakout entry</th>
-      <th data-wk="sl_tight">SL tight</th>
-      <th data-wk="sl_wide">SL wide</th>
-      <th data-wk="tp1">TP1</th>
-      <th data-wk="tp2">TP2</th>
-      <th data-wk="tp3">TP3</th>
-      <th data-wk="tp4">TP4</th>
-      <th data-wk="tp5">TP5</th>
-      <th data-wk="rvol">RVol</th>
-      <th data-wk="score">Score</th>
-    </tr></thead>
-    <tbody id="wrows"></tbody>
-  </table>
-  <div class="empty" id="wempty" style="display:none">No falling-wedge setups right now. The loop keeps scanning…</div>
-</div>
-</div>
 
 <div class="view" id="viewShorts">
 <div class="status">
@@ -1222,16 +1190,11 @@ function renderFilterBar(){
     for(const [k,l] of [["all","All flags"],["forming","Forming only"],["broken","Broken out only"]])
       h+=`<span class="fbtn ${f.phase===k?'active':''}" onclick="setF('flags','phase','${k}')">${l}</span>`;
   }
-  if(t==="wedge"){
-    h+='<span style="color:var(--line)">|</span>';
-    for(const [k,l] of [["all","All wedges"],["forming","Coiling only"],["broken","Broken out only"]])
-      h+=`<span class="fbtn ${f.phase===k?'active':''}" onclick="setF('wedge','phase','${k}')">${l}</span>`;
-  }
   bar.innerHTML=h;
 }
 function setF(tab,key,val){ FILT[tab][key]=val; renderFilterBar();
   ({setups:render,flags:renderFlags,cpr:renderCPR,bounce:renderBounce,
-    wedge:renderWedge,shorts:renderShorts,top:renderTop,stb:renderStb,
+    shorts:renderShorts,top:renderTop,stb:renderStb,
     early:renderEarly}[tab]||(()=>{}))();
 }
 let alertsOn=false, audioCtx=null, seenBreak=Math.floor(Date.now()/1000);
@@ -1280,8 +1243,11 @@ function ago(ts){ if(!ts) return "—"; const s=Math.max(0,Math.floor(Date.now()
   return Math.floor(m/60)+"h "+(m%60)+"m ago"; }
 function until(ts){ if(!ts) return "—"; const s=Math.floor(ts-Date.now()/1000);
   if(s<=0) return "due"; const m=Math.floor(s/60); return m>0? m+"m "+(s%60)+"s" : s+"s"; }
-function tvLink(sym){ const perp=(lastData&&lastData.cfg&&lastData.cfg.market==="futures")?".P":"";
-  return "https://www.tradingview.com/chart/?symbol=MEXC:"+sym+perp; }
+// Some contracts are listed on TradingView under a different ticker than MEXC's
+// futures symbol — map those so the chart link resolves (e.g. AIGENSYN = AI).
+const TV_ALIAS={AIGENSYNUSDT:"AIUSDT"};
+function tvLink(sym){ const s=TV_ALIAS[sym]||sym; const perp=(lastData&&lastData.cfg&&lastData.cfg.market==="futures")?".P":"";
+  return "https://www.tradingview.com/chart/?symbol=MEXC:"+s+perp; }
 function badges(h){
   let s="";
   if(h.is_new) s+='<span class="newbadge">NEW</span>';
@@ -1373,7 +1339,7 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["wedge","Wedge"],["shorts","Shorts"],["early","Early"],["top","Top"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["top","Top"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
@@ -1410,26 +1376,32 @@ function setAzSide(s){
 function stopsSection(list,side,recLevel){
   if(!list||!list.length) return '';
   const isR=(lvl)=> recLevel!=null && lvl!=null && Math.abs(lvl-recLevel)/(recLevel||1) < 0.004;
-  const chips=list.map(s=>`<span class="ladchip${isR(s.level)?' ladrecstop':''}" data-tip="${esc((''+s.basis)+' — a '+(side==='short'?'short':'long')+' stop here risks '+Math.abs(s.pct).toFixed(1)+'% from the current price.'+(isR(s.level)?' 🛑 Recommended stop — the tightest level that still sits beyond normal noise.':''))}">${isR(s.level)?'🛑 ':''}${fmtNum(s.level)} <span class="rr">${s.pct>=0?'+':''}${s.pct}% · ${s.basis}</span></span>`).join('');
+  const chips=list.map(s=>`<span class="ladchip${isR(s.level)?' ladrecstop':''}" data-tip="${esc((''+s.basis)+' — a '+(side==='short'?'short':'long')+' stop here risks '+Math.abs(s.pct).toFixed(1)+'% from the current price.'+(isR(s.level)?' 🛑 Recommended stop — safety-first: a well-defended level that gives the trade room, not the tightest.':''))}">${isR(s.level)?'🛑 ':''}${fmtNum(s.level)} <span class="rr">${s.pct>=0?'+':''}${s.pct}% · ${s.basis}</span></span>`).join('');
   return `<div class="azsec" data-tip="Candidate stop-loss levels, each anchored to a specific structure (swing high/low, the Supertrend line, the 200 EMA, or a higher-timeframe support/resistance) and buffered by a fraction of ATR. Pick the one that fits your risk and thesis — tighter = smaller risk but easier to get wicked out; wider = more room. 🛑 = recommended.">Stop-loss options <span class="azsub">— ${side==='short'?'above':'below'} price, each with what it\\'s based on · 🛑 = recommended</span></div>`
     + `<div class="azladder">${chips}</div>`;
 }
-// The recommended stop: the TIGHTEST structural option that still clears the
-// noise floor (>= max(2.5%, 1.5x ATR) from the intended entry). A real level,
-// beyond normal wicks, smallest sensible risk. Falls back to the tight stop.
+// The recommended stop: SAFETY-first. Among the structural stop levels on the
+// correct side that clear the noise floor (>= max(2.5%, 1.5x ATR) from the
+// intended entry), prefer the WIDEST — the most-defended level (a deeper swing
+// low / HTF support) that gives the trade room to breathe — but cap it at a
+// sane, volatility-scaled ceiling (max(6%, 3x ATR)) so it's never reckless. If
+// every level is beyond that ceiling, take the least-wide of them. A real
+// structural level, deliberately roomy. Falls back to the tight stop.
 function recStop(d, entry){
   const side=(d.side||'long');
   const E=(entry!=null)?entry:(d.retest_entry!=null?d.retest_entry:(d.optimal_entry!=null?d.optimal_entry:d.price));
   const list=(d.stop_levels||[]);
   const floorPct=Math.max(2.5, 1.5*(d.atr_pct||0));
+  const capPct=Math.max(6, 3*(d.atr_pct||0));
   const distE=(lvl)=> (E&&lvl)? Math.abs((lvl-E)/E)*100 : 0;
   const onSide=(lvl)=> side==='short'? lvl>E : lvl<E;
   const valid=list.filter(s=> onSide(s.level) && distE(s.level)>=floorPct);
   let pick=null;
-  if(valid.length){ pick=valid.reduce((a,b)=> distE(a.level)<=distE(b.level)?a:b); }
-  else { const on=list.filter(s=>onSide(s.level));
-    if(on.length) pick=on.reduce((a,b)=> distE(a.level)>=distE(b.level)?a:b); }
+  const withinCap=valid.filter(s=> distE(s.level)<=capPct);
+  if(withinCap.length){ pick=withinCap.reduce((a,b)=> distE(a.level)>=distE(b.level)?a:b); }   // widest within the sane ceiling = safest
+  else if(valid.length){ pick=valid.reduce((a,b)=> distE(a.level)<=distE(b.level)?a:b); }        // all beyond cap → least-wide
   if(pick) return {level:pick.level, basis:pick.basis, pct:distE(pick.level)};
+  if(d.sl_wide!=null) return {level:d.sl_wide, basis:(d.sl_wide_basis||'the deeper structural stop'), pct:distE(d.sl_wide)};
   if(d.sl_tight!=null) return {level:d.sl_tight, basis:(d.sl_tight_basis||'the floored structural tight stop'), pct:distE(d.sl_tight)};
   return null;
 }
@@ -1529,7 +1501,7 @@ function azCard(d0){
       ${aztp(d,4)}
       ${aztp(d,5)}
     </div>
-    ${rstop?`<div class="azrec azstop" data-tip="The recommended stop-loss: the tightest of the structural stop levels below that still sits beyond normal noise — at least max(2.5%, 1.5× ATR) from the retest entry. Smallest sensible risk without getting wicked out; it's the stop the recommended R:R is measured against. Based on: ${esc(rstop.basis)}">🛑 Recommended stop-loss: <b>${fmtNum(rstop.level)}</b> <span class="rr">${(d.side||'long')==='short'?'+':'−'}${rstop.pct.toFixed(1)}% from retest entry</span> <span style="color:var(--dim)">— ${esc(rstop.basis)}</span></div>`:''}
+    ${rstop?`<div class="azrec azstop" data-tip="The recommended stop-loss: SAFETY-first. The most-defended structural level (a deeper swing low / higher-timeframe support) that gives the trade room to breathe, capped at a sane volatility-scaled ceiling (max 6% / 3× ATR) so it's never reckless. Wider than the tight stop on purpose — you're less likely to get wicked out. It's the stop the recommended R:R is measured against. Based on: ${esc(rstop.basis)}">🛑 Recommended stop-loss: <b>${fmtNum(rstop.level)}</b> <span class="rr">${(d.side||'long')==='short'?'+':'−'}${rstop.pct.toFixed(1)}% from retest entry</span> <span style="color:var(--dim)">— ${esc(rstop.basis)} · gives room</span></div>`:''}
     ${rec.tp!=null?`<div class="azrec" data-tip="The most realistic worthwhile take-profit: the target with the best reward:risk that still sits a meaningful (≥2%) move away, measured from the RETEST entry (${fmtNum(recE)}) over the RECOMMENDED stop (${rstop?fmtNum(rstop.level):fmtNum(d.sl_tight)}) and capped at 8:1. R:R = |target − entry| ÷ |entry − stop|. This is the same basis the Top-setups tab uses.">⭐ Recommended take-profit: <b>${fmtNum(rec.tp)}</b> <span class="rr">${(d.side||'long')==='short'?'−':'+'}${(rec.move*100).toFixed(1)}% · R:R <b>${rec.rr.toFixed(2)}</b></span> <span style="color:var(--dim)">from retest entry ${fmtNum(recE)}</span></div>`:''}
     ${stopsSection(d.stop_levels, d.side||'long', rstop?rstop.level:null)}
     <div class="azsec" data-tip="A fuller ladder of profit targets: overhead resistance levels blended with Fibonacci extensions of the recent range, in order. Each shows % upside and R:R to the tight stop. The ⭐ chip is the recommended (best realistic R:R) target.">Target ladder <span class="azsub">resistances + Fibonacci extensions · ⭐ = recommended</span></div>
@@ -1555,7 +1527,6 @@ function renderBanner(){
   else if(activeTab==="cpr"){ newSyms=(lastData&&lastData.cpr_new_symbols)||[]; what="narrow CPR"; }
   else if(activeTab==="bounce"){ newSyms=(lastData&&lastData.bounce_new_symbols)||[]; what="support bounce"; }
   else if(activeTab==="stb"){ newSyms=(lastData&&lastData.stb_new_symbols)||[]; what="supertrend bounce"; }
-  else if(activeTab==="wedge"){ newSyms=(lastData&&lastData.wedge_new_symbols)||[]; what="falling wedge"; }
   else if(activeTab==="shorts"){ newSyms=(lastData&&lastData.short_new_symbols)||[]; what="short setup"; }
   if(!newSyms.length){ b.classList.remove("show"); b.innerHTML=""; return; }
   const chips=newSyms.map(s=>`<span class="chip"><a href="${tvLink(s)}" target="_blank" rel="noopener">${s}</a></span>`).join("");
@@ -1692,10 +1663,6 @@ function renderCPR(){
     tb.appendChild(tr);
   }
 }
-document.querySelectorAll("th[data-wk]").forEach(th=>th.addEventListener("click",()=>{
-  const k=th.dataset.wk; if(k===wSortKey) wSortDir*=-1; else {wSortKey=k; wSortDir=(k==="symbol"||k==="tf"||k==="phase")?1:-1;}
-  renderWedge();
-}));
 document.querySelectorAll("th[data-sk]").forEach(th=>th.addEventListener("click",()=>{
   const k=th.dataset.sk; if(k===sSortKey) sSortDir*=-1; else {sSortKey=k; sSortDir=(k==="symbol")?1:-1;}
   renderShorts();
@@ -1761,39 +1728,6 @@ function renderStb(){
       `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
       corrTd(h.btc_corr)+
       `<td data-tip="Optimal entry — a fill near the Supertrend line rather than chasing.">${fmtNum(h.optimal_entry)}</td>`+
-      slTightCell(h)+
-      slWideCell(h)+
-      tpsCells(h,5)+
-      rvCell(h.rvol)+
-      `<td class="score">${(+h.score).toFixed(1)}</td>`;
-    tb.appendChild(tr);
-  }
-}
-function wedgePhase(h){ return h.broken_out
-  ? '<span class="phasepill phase-broke">🚀 Broke out</span>'
-  : '<span class="phasepill phase-form">Coiling</span>'; }
-function renderWedge(){
-  const ph=FILT.wedge.phase;
-  const rows=[...wlatest].filter(h=>biasOk(h,"wedge")
-      &&(ph==="all"||(ph==="broken"?h.broken_out:!h.broken_out))).sort((a,b)=>{
-    const x=a[wSortKey],y=b[wSortKey];
-    if(typeof x==="string") return wSortDir*x.localeCompare(y);
-    return wSortDir*((x??0)-(y??0));
-  });
-  const tb=document.getElementById("wrows"); tb.innerHTML="";
-  document.getElementById("wempty").style.display = rows.length? "none":"block";
-  for(const h of rows){
-    const tr=document.createElement("tr");
-    tr.className=rowClass(h);
-    tr.innerHTML =
-      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
-      `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
-      `<td><span class="tfpill tf-${(h.tf||'').toLowerCase()}">${h.tf||'4h'}</span></td>`+
-      `<td>${wedgePhase(h)}</td>`+
-      `<td data-tip="How far the two wedge lines have converged toward the apex. Higher = tighter coil, closer to resolution.">${h.conv_pct==null?'—':(+h.conv_pct).toFixed(1)}</td>`+
-      `<td>${h.touches==null?'—':h.touches}</td>`+
-      `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
-      `<td data-tip="Breakout entry — a break/retest of the upper (descending) wedge line rather than chasing.">${fmtNum(h.optimal_entry)}</td>`+
       slTightCell(h)+
       slWideCell(h)+
       tpsCells(h,5)+
@@ -1934,7 +1868,7 @@ function renderTop(){
   if(!lastData) return;
   const srcB=[["200-EMA reclaim",lastData.hits],["Bull flag",lastData.flag_hits],
               ["Narrow CPR",lastData.cpr_hits],["Support bounce",lastData.bounce_hits],
-              ["Falling wedge",lastData.wedge_hits],["Supertrend bounce",lastData.stb_hits]];
+              ["Supertrend bounce",lastData.stb_hits]];
   const m={};
   for(const [lbl,list] of srcB) for(const h of (list||[])){
     const k=h.symbol, q=setupQuality(h);
@@ -2010,7 +1944,6 @@ async function poll(){
     blatest=d.bounce_hits||[]; renderBounce();
     xlatest=d.stb_hits||[]; renderStb();
     eelatest=d.early_hits||[]; renderEarly();
-    wlatest=d.wedge_hits||[]; renderWedge();
     slatest=d.short_hits||[]; renderShorts();
     renderTop();
     const evs=(d.breakout_events||[]).filter(e=>e.time>seenBreak);
@@ -2022,7 +1955,6 @@ async function poll(){
     document.getElementById("cprCount").textContent = `${clatest.length} narrow-CPR · ${d.universe} pairs${bothTxt}`;
     document.getElementById("bounceCount").textContent = `${blatest.length} bounce(s) · ${d.universe} pairs${bothTxt}`;
     document.getElementById("stbCount").textContent = `${xlatest.length} supertrend bounce(s) · ${d.universe} pairs${bothTxt}`;
-    document.getElementById("wedgeCount").textContent = `${wlatest.length} wedge(s) · ${d.universe} pairs${bothTxt}`;
     document.getElementById("shortCount").textContent = `${slatest.length} short setup(s) · ${d.universe} pairs`;
     document.getElementById("earlyCount").textContent = `${eelatest.length} early setup(s) · ${d.universe} pairs — unconfirmed`;
     // topCount is set inside renderTop() (it knows the deduped long count).
@@ -2081,7 +2013,7 @@ const HDR_TIPS={
   support:"The support the coin is coiling on (daily/weekly swing low or base low) — identified from swing-low pivots."
 };
 function applyHeaderTips(){
-  document.querySelectorAll("th[data-k],th[data-fk],th[data-ck],th[data-bk],th[data-wk],th[data-sk],th[data-xk],th[data-ek]").forEach(th=>{
+  document.querySelectorAll("th[data-k],th[data-fk],th[data-ck],th[data-bk],th[data-sk],th[data-xk],th[data-ek]").forEach(th=>{
     const k=th.dataset.k||th.dataset.fk||th.dataset.ck||th.dataset.bk||th.dataset.wk||th.dataset.sk||th.dataset.xk||th.dataset.ek;
     if(HDR_TIPS[k]) th.setAttribute("data-tip",HDR_TIPS[k]);
   });

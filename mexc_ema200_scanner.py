@@ -2298,6 +2298,19 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
                 _add_stop(ksup["sup_1d"] - 0.3 * a, "Below the Daily swing-low support")
             if ksup.get("sup_1w"):
                 _add_stop(ksup["sup_1w"] - 0.3 * a, "Below the Weekly swing-low support")
+        # Always-available candidates so the menu is never bare (e.g. a coin sitting
+        # below all its higher-TF supports): the recent range extreme plus two
+        # volatility (ATR) stops giving graduated risk choices.
+        _base_lo = min(lows[-30:]) if len(lows) >= 30 else min(lows)
+        _base_hi = max(highs[-30:]) if len(highs) >= 30 else max(highs)
+        if side == "short":
+            _add_stop(_base_hi + 0.5 * a, "Above the recent 30-bar range high")
+            _add_stop(price + 1.5 * a, "≈1.5× ATR above price (volatility stop)")
+            _add_stop(price + 2.5 * a, "≈2.5× ATR above price (wider volatility stop)")
+        else:
+            _add_stop(_base_lo - 0.5 * a, "Below the recent 30-bar range low")
+            _add_stop(price - 1.5 * a, "≈1.5× ATR below price (volatility stop)")
+            _add_stop(price - 2.5 * a, "≈2.5× ATR below price (wider volatility stop)")
         stop_levels.sort(key=lambda s: abs(s["level"] - price))
         _sd, _seen = [], []
         for s in stop_levels:
