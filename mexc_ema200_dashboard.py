@@ -585,6 +585,11 @@ PAGE = """<!doctype html>
   td[data-tip]{cursor:help}
   td.ematp{background:rgba(88,166,255,.13);box-shadow:inset 2px 0 0 #58a6ff}
   .emastar{color:#58a6ff;font-weight:800;margin-left:3px;cursor:help}
+  .wstar{cursor:pointer;margin-right:6px;color:var(--dim);font-size:15px;user-select:none;vertical-align:middle}
+  .wstar:hover{color:#f0b429}
+  .wstar.on{color:#f0b429}
+  .wlbtn{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:3px 9px;font-size:12px;font-weight:600;color:#e6edf3;cursor:pointer;margin-right:6px}
+  .wlbtn:hover{border-color:var(--accent)}
   .azladder{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 4px}
   .azrec{margin:10px 0 2px;font-size:14px;color:#e6edf3}
   .azrec b{color:var(--accent)}
@@ -655,6 +660,7 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabShorts" onclick="showTab('shorts')">Shorts</div>
   <div class="tab" id="tabEarly" onclick="showTab('early')">⏳ Early</div>
   <div class="tab" id="tabTop" onclick="showTab('top')">⭐ Top setups</div>
+  <div class="tab" id="tabWatch" onclick="showTab('watch')">📌 Watchlist</div>
   <div class="tab" id="tabAnalyze" onclick="showTab('analyze')">Analyze a coin</div>
   <div class="tab" id="tabInfo" onclick="showTab('info')">Info</div>
 </div>
@@ -914,6 +920,27 @@ PAGE = """<!doctype html>
     <tbody id="tbrows"></tbody>
   </table>
   <div class="empty" id="tbempty" style="display:none">No setups clear the quality bar right now — the loop keeps scanning. (Better to show nothing than a mediocre trade.)</div>
+</div>
+</div>
+
+<div class="view" id="viewWatch">
+<div class="status">
+  <span>📌 Watchlist — coins you've starred. Add or remove from any tab (☆/★ next to the symbol) or from Analyze. Saved in this browser. Live price & bias update every scan; click Analyze for the full plan.</span>
+  <span id="watchCount"></span>
+</div>
+<div class="wrap">
+  <table id="wltbl">
+    <thead><tr>
+      <th>Symbol</th>
+      <th>Price</th>
+      <th>Bias</th>
+      <th>On scans</th>
+      <th>BTC ρ</th>
+      <th>Actions</th>
+    </tr></thead>
+    <tbody id="wlrows"></tbody>
+  </table>
+  <div class="empty" id="wlempty" style="display:none">Your watchlist is empty. Click the ☆ next to any coin's symbol (on any tab or in Analyze) to add it here.</div>
 </div>
 </div>
 
@@ -1248,6 +1275,53 @@ function until(ts){ if(!ts) return "—"; const s=Math.floor(ts-Date.now()/1000)
 const TV_ALIAS={AIGENSYNUSDT:"AIUSDT"};
 function tvLink(sym){ const s=TV_ALIAS[sym]||sym; const perp=(lastData&&lastData.cfg&&lastData.cfg.market==="futures")?".P":"";
   return "https://www.tradingview.com/chart/?symbol=MEXC:"+s+perp; }
+// ---- Watchlist (saved in this browser via localStorage) --------------------
+let WATCH=new Set();
+try{ WATCH=new Set(JSON.parse(localStorage.getItem('mexcWatch')||'[]')); }catch(e){}
+function saveWatch(){ try{ localStorage.setItem('mexcWatch', JSON.stringify([...WATCH])); }catch(e){} }
+function toggleWatch(sym, ev){ if(ev){ ev.stopPropagation(); ev.preventDefault(); }
+  if(WATCH.has(sym)) WATCH.delete(sym); else WATCH.add(sym);
+  saveWatch();
+  // refresh the star everywhere + the watchlist tab + its count
+  document.querySelectorAll('.wstar[data-sym="'+sym+'"]').forEach(el=>{
+    const on=WATCH.has(sym); el.classList.toggle('on',on); el.textContent=on?'★':'☆';
+    el.title=on?'Remove from watchlist':'Add to watchlist'; });
+  renderWatch();
+  const wc=document.getElementById('tabWatch'); if(wc) wc.textContent=`📌 Watchlist${WATCH.size?' ('+WATCH.size+')':''}`;
+}
+function watchStar(sym){ const on=WATCH.has(sym);
+  return `<span class="wstar${on?' on':''}" data-sym="${sym}" title="${on?'Remove from watchlist':'Add to watchlist'}" onclick="toggleWatch('${sym}',event)">${on?'★':'☆'}</span>`; }
+function analyzeFromWatch(sym){ const inp=document.getElementById('azInput'); if(inp){ inp.value=sym; } showTab('analyze'); analyze(); }
+// Look up the freshest row we have for a symbol across all scan lists (for price/bias).
+function watchLookup(sym){
+  const lists=[latest,flatest,clatest,blatest,xlatest,slatest,eelatest];
+  let found=null; const on=[];
+  const names=[[latest,'200-EMA reclaim'],[flatest,'Bull flag'],[clatest,'Narrow CPR'],[blatest,'Support bounce'],[xlatest,'Supertrend bounce'],[slatest,'Short'],[eelatest,'Early']];
+  for(const [lst,nm] of names){ for(const h of (lst||[])){ if(h.symbol===sym){ if(!found) found=h; on.push(nm); break; } } }
+  return {row:found, on};
+}
+function renderWatch(){
+  const tb=document.getElementById('wlrows'); if(!tb) return;
+  const syms=[...WATCH].sort();
+  document.getElementById('wlempty').style.display = syms.length? 'none':'block';
+  document.getElementById('watchCount').textContent = syms.length? `${syms.length} coin(s)`:'';
+  tb.innerHTML='';
+  for(const sym of syms){
+    const {row,on}=watchLookup(sym);
+    const price=row? (row.live!=null?row.live:row.price) : null;
+    const bias=row? (row.bias||'—') : '—';
+    const corr=row? row.btc_corr : null;
+    const tr=document.createElement('tr');
+    tr.innerHTML =
+      `<td class="sym">${watchStar(sym)}<a href="${tvLink(sym)}" target="_blank" rel="noopener">${sym}</a></td>`+
+      `<td>${price!=null?fmtNum(price):'<span style=\\'color:var(--dim)\\'>—</span>'}</td>`+
+      `<td><span class="biaspill2 b-${(bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${bias}</span></td>`+
+      `<td>${on.length? on.join(', ') : '<span style=\\'color:var(--dim)\\'>not on a scan now</span>'}</td>`+
+      corrTd(corr)+
+      `<td><span class="wlbtn" onclick="analyzeFromWatch('${sym}')">Analyze</span><a class="wlbtn" href="${tvLink(sym)}" target="_blank" rel="noopener">Chart ↗</a><span class="wlbtn" onclick="toggleWatch('${sym}',event)">Remove</span></td>`;
+    tb.appendChild(tr);
+  }
+}
 function badges(h){
   let s="";
   if(h.is_new) s+='<span class="newbadge">NEW</span>';
@@ -1339,10 +1413,11 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["top","Top"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["top","Top"],["watch","Watch"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
+  if(which==="watch") renderWatch();
   renderBanner();  // banner follows the active scan tab
   renderFilterBar();  // filters are per-tab
 }
@@ -1397,19 +1472,126 @@ function recStop(d, entry){
   const side=(d.side||'long');
   const E=(entry!=null)?entry:(d.retest_entry!=null?d.retest_entry:(d.optimal_entry!=null?d.optimal_entry:d.price));
   const list=(d.stop_levels||[]);
-  const floorPct=Math.max(2.0, 1.2*(d.atr_pct||0));
-  const distE=(lvl)=> (E&&lvl)? Math.abs((lvl-E)/E)*100 : 0;
+  const atr=d.atr_pct||0;
+  const floorPct=Math.max(1.5, 1.1*atr);                     // clear of noise: >=1.1x ATR (and >=1.5%)
+  const distE=(lvl)=> (E&&lvl)? Math.abs((lvl-E)/E)*100 : 0; // ALWAYS from the intended (retest) entry
+  const atrx=(lvl)=> atr? distE(lvl)/atr : null;             // distance in ATR units — the honest "how tight"
   const onSide=(lvl)=> side==='short'? lvl>E : lvl<E;
-  const isVol=(b)=> /ATR/i.test(b||'');                       // ATR-multiple = fallback only
+  const isVol=(b)=> /ATR/i.test(b||'');                      // ATR-multiple = fallback only
   const valid=list.filter(s=> onSide(s.level) && distE(s.level)>=floorPct);
   const structural=valid.filter(s=> !isVol(s.basis));
-  const pool=structural.length? structural : valid;          // real structure first; ATR stop only if nothing else
-  let pick=null;
-  if(pool.length){ pick=pool.reduce((a,b)=> distE(a.level)<=distE(b.level)?a:b); }   // nearest defended level beyond the noise
-  if(pick) return {level:pick.level, basis:pick.basis, pct:distE(pick.level)};
-  if(d.sl_wide!=null) return {level:d.sl_wide, basis:(d.sl_wide_basis||'the deeper structural stop'), pct:distE(d.sl_wide)};
-  if(d.sl_tight!=null) return {level:d.sl_tight, basis:(d.sl_tight_basis||'the floored structural tight stop'), pct:distE(d.sl_tight)};
+  let pick=null, note='';
+  if(structural.length){
+    // Nearest real invalidation level beyond the noise. On a high-ATR coin this
+    // can be a big % yet only ~1–2x ATR — perfectly normal for that chart.
+    pick=structural.reduce((a,b)=> distE(a.level)<=distE(b.level)?a:b);
+    const ax=atrx(pick.level);
+    note = (ax!=null && ax>4) ? 'structure sits fairly far (>4x ATR) — size the position smaller so the $ risk stays controlled'
+         : 'the nearest real level that would invalidate the setup, just clear of the noise';
+  } else if(valid.length){
+    pick=valid.reduce((a,b)=> distE(a.level)<=distE(b.level)?a:b);  // no clean structure → volatility stop
+    note='no clean structure nearby — a volatility (ATR) stop';
+  }
+  if(pick) return {level:pick.level, basis:pick.basis, pct:distE(pick.level), atrx:atrx(pick.level), note};
+  if(d.sl_wide!=null) return {level:d.sl_wide, basis:(d.sl_wide_basis||'the deeper structural stop'), pct:distE(d.sl_wide), atrx:atrx(d.sl_wide), note:''};
+  if(d.sl_tight!=null) return {level:d.sl_tight, basis:(d.sl_tight_basis||'the structural stop'), pct:distE(d.sl_tight), atrx:atrx(d.sl_tight), note:''};
   return null;
+}
+// How much momentum / trend / volume backs a SUSTAINED move in `side` — a 0..1
+// "potential" score. High potential legitimately stretches how far a target can
+// realistically run (a far level isn't unrealistic if the trend is strong).
+function potentialScore(d, side){
+  let s=0.5; const long=side!=='short';
+  const trend=d.trend, rsi=d.rsi, vt=(d.vol_trend||''), pr=(d.pressure||'').toLowerCase(),
+        struct=(d.structure||'').toLowerCase();
+  if(long){ if(trend==='up') s+=0.15; if(trend==='down') s-=0.12;
+            if(struct.indexOf('up')>=0) s+=0.08; if(struct.indexOf('down')>=0) s-=0.06; }
+  else    { if(trend==='down') s+=0.15; if(trend==='up') s-=0.12;
+            if(struct.indexOf('down')>=0) s+=0.08; if(struct.indexOf('up')>=0) s-=0.06; }
+  if(rsi!=null){ if(long){ if(rsi>55&&rsi<72) s+=0.10; else if(rsi>=72) s+=0.02; else if(rsi<40) s-=0.03; }
+                 else    { if(rsi<45&&rsi>28) s+=0.10; else if(rsi<=28) s+=0.02; else if(rsi>60) s-=0.03; } }
+  if(vt==='rising'){ if(long&&pr.indexOf('buyer')>=0) s+=0.10; if(!long&&pr.indexOf('seller')>=0) s+=0.10; }
+  if(long&&pr.indexOf('buyer')>=0) s+=0.04; if(!long&&pr.indexOf('seller')>=0) s+=0.04;
+  if(d.choch==='bullish'&&long) s+=0.05; if(d.choch==='bearish'&&!long) s+=0.05;
+  if(d.btc_corr!=null && d.btc_corr>=0.85) s-=0.03;   // "breakout" may just be BTC beta
+  return Math.max(0.05, Math.min(1, s));
+}
+// Reachability of a target: decays with distance measured in ATR units, but the
+// "reachable horizon" widens with potential — so strong setups keep far targets
+// viable, weak ones don't. Not a true probability, a sensible 0.05..0.98 proxy.
+function reachProb(distATR, pot){
+  if(distATR==null) distATR=4;
+  const horizon = 3 + (pot||0.5)*9;    // ATRs comfortably reachable: ~3 (weak) .. ~12 (strong)
+  return Math.max(0.05, Math.min(0.98, 1/(1+Math.pow(distATR/horizon, 1.8))));
+}
+// Rank the profit targets by EXPECTED VALUE (reward:risk x reach probability),
+// not raw R:R — so we don't recommend a far pie-in-the-sky target just because
+// its ratio is big. Returns a primary (best EV, R:R>=1.2) plus a scale-out plan:
+// Secure (nearest bankable), Base (=primary), Stretch (ambitious, for strong runs).
+function recTargets(d, entry, stopLevel){
+  const side=(d.side||'long'), long=side!=='short', price=d.price, atr=d.atr_pct||0;
+  const risk=(entry!=null&&stopLevel!=null)?Math.abs(entry-stopLevel):null;
+  if(risk==null||risk===0) return null;
+  const pot=potentialScore(d, side);
+  const cand=[]; const seen=[];
+  const push=(lvl,kind)=>{
+    if(lvl==null) return; if(long? lvl<=entry : lvl>=entry) return;
+    const move=Math.abs((lvl-entry)/entry); if(move<0.015) return;
+    if(seen.some(x=>Math.abs(x-lvl)/lvl<0.004)) return; seen.push(lvl);
+    const rr=Math.min(Math.abs(lvl-entry)/risk,8);
+    const dATR=atr? (move*100)/atr : null;
+    const p=reachProb(dATR, pot);
+    cand.push({lvl,kind,move,rr,p,dATR,ev:rr*p});
+  };
+  if(d.target_ladder&&d.target_ladder.length){ for(const t of d.target_ladder) push(t.level,t.kind); }
+  else { for(let i=1;i<=5;i++) push(d['tp'+i], d['tp'+i+'_basis']); }
+  if(!cand.length) return null;
+  cand.sort((a,b)=>a.move-b.move);
+  const MINRR=1.5;                       // in crypto, a sub-1.5 R:R "trade" is not worth taking
+  const bestRR=cand.reduce((m,c)=>Math.max(m,c.rr),0);
+  const eligible=cand.filter(c=>c.rr>=MINRR);
+  // Recommended = best expected value AMONG targets that clear the 1.5 R:R floor.
+  // If nothing clears it, there is NO recommended trade (don't manufacture one).
+  const primary=eligible.length? eligible.reduce((a,b)=> a.ev>=b.ev?a:b) : null;
+  const secure=primary? (cand.filter(c=>c.rr>=MINRR&&c.move<=primary.move).sort((a,b)=>a.move-b.move)[0]||primary) : null;
+  const farPool=primary? cand.filter(c=>c.rr>=2.5 && c.move>primary.move && c.p>=0.18) : [];
+  const stretch=farPool.length?farPool[farPool.length-1]:null;
+  return {primary, secure, stretch, pot, bestRR, minRR:MINRR, all:cand};
+}
+// Pick the best value-area ENTRY. A long doesn't have to buy near current price —
+// if price is extended or correcting, a deeper pullback (a support / EMA /
+// Supertrend retest) can be the smarter fill; a short can sell into a higher
+// rally. We score each candidate entry by the trade it produces (expected value
+// of the best >=1.5 R:R target from there) with a mild preference for fills that
+// are more likely to actually print (closer, in ATR terms).
+function pickEntry(d){
+  const side=(d.side||'long'), long=side!=='short', price=d.price, atr=d.atr_pct||0;
+  if(price==null) return null;
+  const cands=[];
+  const add=(lvl,basis)=>{ if(lvl==null||lvl<=0) return; if(long? lvl>=price : lvl<=price) return;
+    if(cands.some(c=>Math.abs(c.level-lvl)/lvl<0.003)) return; cands.push({level:lvl,basis}); };
+  add(d.retest_entry,'retest level'); add(d.optimal_entry,'optimal fill');
+  if(long){ (d.supports||[]).slice(0,3).forEach(s=>add(s,'swing-low support'));
+            add(d.sup_1d,'Daily swing-low support'); add(d.sup_1w,'Weekly swing-low support');
+            if(d.ema!=null&&d.ema<price) add(d.ema*1.002,'200-EMA retest');
+            if(d.supertrend!=null&&d.supertrend_role==='support'&&d.supertrend<price) add(d.supertrend*1.003,'Supertrend retest'); }
+  else    { (d.resistances||[]).slice(0,3).forEach(s=>add(s,'swing-high resistance'));
+            add(d.res_1d,'Daily swing-high resistance'); add(d.res_1w,'Weekly swing-high resistance');
+            if(d.ema!=null&&d.ema>price) add(d.ema*0.998,'200-EMA retest');
+            if(d.supertrend!=null&&d.supertrend_role==='resistance'&&d.supertrend>price) add(d.supertrend*0.997,'Supertrend retest'); }
+  if(!cands.length) return null;
+  let best=null;
+  for(const c of cands){
+    const rs=recStop(d, c.level); const st=rs?rs.level:d.sl_tight;
+    const rt=recTargets(d, c.level, st);
+    const tradeEV=(rt&&rt.primary)? rt.primary.ev : 0;         // 0 if no >=1.5 R:R trade from here
+    const distATR=atr? Math.abs((c.level-price)/price*100)/atr : 0;
+    const fill=1/(1+Math.pow(distATR/6,1.5));                  // closer fills are likelier to print
+    const score=tradeEV*(0.5+0.5*fill);
+    if(!best || score>best.score) best={level:c.level, basis:c.basis, score, rt, rs,
+        distPct:Math.abs((c.level-price)/price*100), distATR};
+  }
+  return (best&&best.score>0)?best:null;
 }
 function patternsSection(p){
   if(!p) return '';
@@ -1440,11 +1622,22 @@ function azCard(d0){
   const pct=(v,sign)=> d.price&&v!=null? ` <span class="rr">${sign}${(Math.abs((v-d.price)/d.price)*100).toFixed(1)}%</span>`:'';
   const tp=(v,rr)=> v==null?'—':`${fmtNum(v)}${rr!=null?` <span class="rr">R:R ${(+rr).toFixed(2)}</span>`:''}`;
   const notes=(d.notes||[]).map(n=>`<li>${n}</li>`).join("");
-  const recE=d.retest_entry!=null?d.retest_entry:(d.optimal_entry!=null?d.optimal_entry:d.entry);
-  const rstop=recStop(d, recE);     // context-aware recommended stop (nearest real structure beyond noise)
-  const recSrc=rstop?Object.assign({},d,{sl_tight:rstop.level}):d;
-  const rec=realisticRR(recSrc, recE);   // best realistic target from the retest entry, over the recommended stop
+  // --- Recommended trade. Pick the best value-area ENTRY (may be a deeper
+  // pullback for a long / higher rally for a short, not just the nearest level),
+  // then the context-aware stop and the expected-value take-profit.
+  const be=pickEntry(d);
+  const recE=be?be.level:(d.retest_entry!=null?d.retest_entry:(d.optimal_entry!=null?d.optimal_entry:d.entry));
+  const rstop=(be&&be.rs)?be.rs:recStop(d, recE);
+  const rtg=(be&&be.rt)?be.rt:recTargets(d, recE, rstop?rstop.level:d.sl_tight);
+  const rec=(rtg&&rtg.primary)?{tp:rtg.primary.lvl, rr:rtg.primary.rr, move:rtg.primary.move, p:rtg.primary.p}:{tp:null};
   const isRec=(lvl)=> rec.tp!=null && lvl!=null && Math.abs(lvl-rec.tp)/(rec.tp||1) < 0.004;
+  const sgn=(d.side||'long')==='short'?'+':'−';         // stop/entry sign relative to price for this side
+  // Distance of a level in ATR units (the honest "how tight/far" for THIS coin).
+  const atrxOf=(lvl,ref)=>{ const r=(ref!=null)?ref:d.price; if(lvl==null||r==null||!d.atr_pct) return null;
+    return Math.abs((lvl-r)/r*100)/d.atr_pct; };
+  const slInfo=(lvl)=>{ const p=(d.price&&lvl!=null)?Math.abs((lvl-d.price)/d.price*100):null; const a=atrxOf(lvl,d.price);
+    return (p!=null?`${p.toFixed(1)}%`:'')+(a!=null?` · ${a.toFixed(1)}×ATR`:''); };
+  const planGrade=(rec.tp==null)?'—':(rec.rr>=3&&rec.p>=0.45?'A+':rec.rr>=2.5&&rec.p>=0.35?'A':rec.rr>=2&&rec.p>=0.3?'B':'C');
   // Reward:risk of a target measured from the retest entry over a given stop
   // (side-aware, only counts targets on the right side, capped at 8:1).
   const rrOn=(tpv,stop)=>{ if(tpv==null||recE==null||stop==null||recE===stop) return null;
@@ -1466,7 +1659,7 @@ function azCard(d0){
   };
   return `<div class="azcard">
     <div class="azhead">
-      <span class="sym">${d.symbol}</span>
+      <span class="sym">${watchStar(d.symbol)}${d.symbol}</span>
       <span style="color:var(--dim);font-size:12px;border:1px solid var(--line);border-radius:6px;padding:1px 7px">${(d.interval||'4h')} chart</span>
       <span class="dirpill dir-${(d.direction||'neutral').toLowerCase()}" data-tip="${d.dir_reason||''}">${(d.direction||'—').toUpperCase()}${d.direction==='Long'?' ▲':d.direction==='Short'?' ▼':''}</span>
       <span class="biaspill bias-${d.bias}" data-tip="${d.bias_reason||''}">${d.bias.toUpperCase()}</span>
@@ -1503,21 +1696,24 @@ function azCard(d0){
     </div>
     ${tfBiasSection(d.tf_bias)}
     ${patternsSection(d.patterns)}
-    <div class="azsec">Trade plan <span class="azsub">${(d.side||'long')==='short'?'SHORT — sell resistance, stops ABOVE, targets BELOW':'LONG — buy support, stops BELOW, targets ABOVE'} → 5 targets · R:R to the 🛑 recommended stop (tight-stop R:R in hover)</span></div>
+    <div class="azsec">Trade plan <span class="azsub">${(d.side||'long')==='short'?'SHORT — sell into strength, stops ABOVE, targets BELOW':'LONG — buy the dip, stops BELOW, targets ABOVE'} · entry may be a patient pullback · only setups clearing 1.5:1 R:R are recommended</span></div>
     <div class="azgrid">
       ${cell("Entry (now)", fmtNum(d.entry), "Based on: the current live price — your immediate entry if you take it here.")}
       ${cell("Retest entry", fmtNum(d.retest_entry!=null?d.retest_entry:d.optimal_entry), (d.side||'long')==='short'?"A proper pullback fill — wait for a rally back UP to the nearest swing-high / EMA / Supertrend ABOVE price and short the retest, rather than chasing the drop.":"A proper pullback fill — wait for a dip DOWN to the nearest swing-low support / reclaimed EMA / Supertrend BELOW price and buy the retest, rather than chasing the candle. This is the entry the recommended R:R uses.")}
       ${cell("Optimal entry", fmtNum(d.optimal_entry), (d.side||'long')==='short'?"Based on: the nearest swing-high resistance — a better short fill is to sell into it rather than shorting here.":"Based on: the nearest swing-low support / reclaimed 200 EMA — a lower-risk long fill is to buy a pullback to it rather than chasing.")}
-      ${cell("SL tight", fmtNum(d.sl_tight), esc(d.sl_tight_basis||((d.side||'long')==='short'?"The nearest swing-high / retest high, buffered by 0.5× ATR ABOVE it.":"The immediate structure (retest low / nearest swing low), buffered by 0.5× ATR BELOW it.")))}
-      ${cell("SL wide", fmtNum(d.sl_wide), esc(d.sl_wide_basis||((d.side||'long')==='short'?"A deeper swing high + 1.0× ATR — more room, larger risk per unit.":"A deeper swing low − 1.0× ATR — more room, larger risk per unit.")))}
+      ${cell("SL near"+(atrxOf(d.sl_tight)!=null?` <span class="rr">${slInfo(d.sl_tight)}</span>`:''), fmtNum(d.sl_tight), esc("The nearer of the two structural stops. On a high-timeframe / high-volatility chart even the 'near' stop can be a big % — what matters is the ×ATR distance shown (≈1× ATR is genuinely tight, 3×+ is wide). "+(d.sl_tight_basis||"")))}
+      ${cell("SL deep"+(atrxOf(d.sl_wide)!=null?` <span class="rr">${slInfo(d.sl_wide)}</span>`:''), fmtNum(d.sl_wide), esc("The deeper structural stop — more room, larger risk per unit. "+(d.sl_wide_basis||"")))}
       ${aztp(d,1)}
       ${aztp(d,2)}
       ${aztp(d,3)}
       ${aztp(d,4)}
       ${aztp(d,5)}
     </div>
-    ${rstop?`<div class="azrec azstop" data-tip="The recommended stop-loss, chosen with judgement for THIS chart — not a fixed % or a blanket 'go wide'. It sits just beyond the nearest real structural level that would invalidate the setup (a swing low, Supertrend, EMA or higher-timeframe support), once that level is clear of normal noise (≥ max(2%, 1.2× ATR) — so a high-volatility coin gets more room, a calm one less). Structure is preferred over a blunt ATR-multiple. Close enough for a workable reward:risk, far enough not to get wicked out. It's the stop the recommended R:R is measured against. Based on: ${esc(rstop.basis)}">🛑 Recommended stop-loss: <b>${fmtNum(rstop.level)}</b> <span class="rr">${(d.side||'long')==='short'?'+':'−'}${rstop.pct.toFixed(1)}% from retest entry</span> <span style="color:var(--dim)">— ${esc(rstop.basis)}</span></div>`:''}
-    ${rec.tp!=null?`<div class="azrec" data-tip="The most realistic worthwhile take-profit: the target with the best reward:risk that still sits a meaningful (≥2%) move away, measured from the RETEST entry (${fmtNum(recE)}) over the RECOMMENDED stop (${rstop?fmtNum(rstop.level):fmtNum(d.sl_tight)}) and capped at 8:1. R:R = |target − entry| ÷ |entry − stop|. This is the same basis the Top-setups tab uses.">⭐ Recommended take-profit: <b>${fmtNum(rec.tp)}</b> <span class="rr">${(d.side||'long')==='short'?'−':'+'}${(rec.move*100).toFixed(1)}% · R:R <b>${rec.rr.toFixed(2)}</b></span> <span style="color:var(--dim)">from retest entry ${fmtNum(recE)}</span></div>`:''}
+    ${be?`<div class="azrec" data-tip="The smartest place to get IN — not necessarily near the current price. If price is extended or correcting, a deeper pullback (a support / EMA / Supertrend retest) makes a better, more realistic trade; a short can wait to sell into a higher rally. Chosen to maximise the resulting reward:risk while staying a fill that's likely to actually print. Based on: ${esc(be.basis)}.">🎯 Recommended entry: <b>${fmtNum(recE)}</b> <span class="rr">${sgn}${be.distPct.toFixed(1)}%${be.distATR?` · ${be.distATR.toFixed(1)}×ATR`:''} ${(d.side||'long')==='short'?'above':'below'} price</span> <span style="color:var(--dim)">— ${esc(be.basis)}${(be.distATR&&be.distATR>2)?' · patient fill — wait for it, don\\'t chase':''}</span></div>`:''}
+    ${rstop?`<div class="azrec azstop" data-tip="The recommended stop, judged for THIS chart — not a fixed % or a blanket 'go wide'. It sits just beyond the nearest real level that would invalidate the setup (swing low, Supertrend, EMA, HTF support), once clear of noise (≥ max(1.5%, 1.1× ATR)). Distance is shown in ×ATR because that's the honest measure of 'tight' — a big % on a volatile coin can still be only ~1.5× ATR. ${rstop.note?esc(rstop.note.charAt(0).toUpperCase()+rstop.note.slice(1))+'. ':''}It's the stop the recommended R:R is measured against. Based on: ${esc(rstop.basis)}">🛑 Recommended stop-loss: <b>${fmtNum(rstop.level)}</b> <span class="rr">${sgn}${rstop.pct.toFixed(1)}%${rstop.atrx?` · ${rstop.atrx.toFixed(1)}×ATR`:''} from entry</span> <span style="color:var(--dim)">— ${esc(rstop.basis)}${rstop.note?' · '+esc(rstop.note):''}</span></div>`:''}
+    ${rec.tp!=null?`<div class="azrec" data-tip="Recommended by EXPECTED VALUE, not raw ratio: reward:risk × how reachable the target is. Reachability decays with distance (in ATR units) but stretches out when the trend, momentum and volume back the move — so a far target isn't dismissed if the setup is strong, and a nearby one isn't over-rated if it's weak. Measured from the recommended entry (${fmtNum(recE)}) over the recommended stop (${rstop?fmtNum(rstop.level):'—'}), capped 8:1, and only shown because it clears the 1.5:1 floor. Grade blends R:R and reachability.">⭐ Recommended take-profit: <b>${fmtNum(rec.tp)}</b> <span class="rr">${(d.side||'long')==='short'?'−':'+'}${(rec.move*100).toFixed(1)}% · R:R <b>${rec.rr.toFixed(2)}</b> · ~${Math.round(rec.p*100)}% reach · grade <b>${planGrade}</b></span></div>
+    <div class="sidenote" data-tip="A sensible way to take the trade off: bank part at the nearest solid target to de-risk, hold the core to the base target, leave a runner for the stretch if momentum carries.">Scale-out: 🔒 Secure <b>${fmtNum(rtg.secure.lvl)}</b> (R${rtg.secure.rr.toFixed(1)}) · 🎯 Base <b>${fmtNum(rtg.primary.lvl)}</b> (R${rtg.primary.rr.toFixed(1)})${rtg.stretch?` · 🚀 Stretch <b>${fmtNum(rtg.stretch.lvl)}</b> (R${rtg.stretch.rr.toFixed(1)})`:''}</div>`
+    :`<div class="azrec" style="color:#f0b429" data-tip="No target on the correct side clears a 1.5:1 reward:risk from a sensible stop. In crypto a sub-1.5 R:R trade isn't worth the risk — this is a 'no trade / wait' call, not a setup. Wait for a deeper entry (better R:R), a tighter valid stop level, or a different coin.">⛔ No trade here — best realistic R:R is only <b>${rtg?rtg.bestRR.toFixed(2):'—'}</b>, under the 1.5 minimum. Wait for a better entry or setup.</div>`}
     ${stopsSection(d.stop_levels, d.side||'long', rstop?rstop.level:null)}
     <div class="azsec" data-tip="A fuller ladder of profit targets: overhead resistance levels blended with Fibonacci extensions of the recent range, in order. Each shows % move and R:R — R = to the 🛑 recommended stop, Rt = to the tight stop. The ⭐ chip is the recommended (best realistic R:R) target.">Target ladder <span class="azsub">resistances + Fibonacci extensions · R = to recommended stop · Rt = to tight stop · ⭐ = recommended</span></div>
     <div class="azladder">
@@ -1563,7 +1759,7 @@ function renderFlags(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.pole_gain_pct).toFixed(1)}</td>`+
       `<td>${h.flag_bars}</td>`+
@@ -1591,7 +1787,7 @@ function render(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.pct_above_ema).toFixed(2)}</td>`+
       `<td>${h.bars_since_cross}</td>`+
@@ -1633,7 +1829,7 @@ function renderBounce(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${fmtNum(h.support)}</td>`+
       `<td><span class="tfpill tf-${(h.tf||'').toLowerCase()}">${h.tf||'—'}</span></td>`+
@@ -1662,7 +1858,7 @@ function renderCPR(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.cpr_width_pct).toFixed(3)}</td>`+
       `<td>${h.position}</td>`+
@@ -1702,7 +1898,7 @@ function renderEarly(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td data-tip="The strong support the coin is coiling on (daily/weekly swing low or base low).">${fmtNum(h.support)}</td>`+
       `<td data-tip="How far below its recent 120-bar high the coin is trading — how beaten down it is.">${h.drawdown_pct==null?'—':(+h.drawdown_pct).toFixed(0)}%</td>`+
@@ -1733,7 +1929,7 @@ function renderStb(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td data-tip="The Supertrend line value on the strongest confirming timeframe — acting as support below price.">${fmtNum(h.supertrend)}</td>`+
       `<td><span class="tfpill tf-${(h.tf||'').toLowerCase()}">${h.tf||'4h'}</span></td>`+
@@ -1862,7 +2058,7 @@ function renderShorts(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
       ratingCell(h._rating,h._why)+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.pct_below_ema).toFixed(2)}</td>`+
@@ -1935,7 +2131,7 @@ function renderTop(){
     const tgtTip = o.rr.move? esc(`Target ${fmtNum(o.rr.tp)} — a +${(o.rr.move*100).toFixed(1)}% move, the basis for the R:R.`):'';
     const tr=document.createElement('tr'); tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym"><a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
+      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${h.symbol}</a>${badges(h)}</td>`+
       ratingCell(o.rating,o.why)+
       `<td data-tip="${esc(o.f.setups)}">${o.f.nScans>1?'★ ':''}${o.f.nScans}</td>`+
       `<td>${fmtNum(P)}</td>`+
@@ -1961,6 +2157,8 @@ async function poll(){
     eelatest=d.early_hits||[]; renderEarly();
     slatest=d.short_hits||[]; renderShorts();
     renderTop();
+    renderWatch();
+    { const wc=document.getElementById("tabWatch"); if(wc) wc.textContent=`📌 Watchlist${WATCH.size?' ('+WATCH.size+')':''}`; }
     const evs=(d.breakout_events||[]).filter(e=>e.time>seenBreak);
     if(evs.length){ seenBreak=Math.max(seenBreak, ...evs.map(e=>e.time)); if(alertsOn) fireBreakout(evs); }
     renderBanner();
