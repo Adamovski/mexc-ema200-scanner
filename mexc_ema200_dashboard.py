@@ -1455,47 +1455,61 @@ function stopsSection(list,side,recLevel){
   return `<div class="azsec" data-tip="Candidate stop-loss levels, each anchored to a specific structure (swing high/low, the Supertrend line, the 200 EMA, or a higher-timeframe support/resistance) and buffered by a fraction of ATR. Pick the one that fits your risk and thesis — tighter = smaller risk but easier to get wicked out; wider = more room. 🛑 = recommended.">Stop-loss options <span class="azsub">— ${side==='short'?'above':'below'} price, each with what it\\'s based on · 🛑 = recommended</span></div>`
     + `<div class="azladder">${chips}</div>`;
 }
-// The recommended stop — chosen with judgement, not a fixed rule. The idea: put
-// the stop just beyond the nearest REAL structural level that would actually
-// invalidate the thesis, once it's clear of normal noise. Steps:
-//   1) Noise floor = max(2%, 1.2× ATR) from the entry — volatility-aware, so a
-//      choppy/high-ATR coin demands more room and a calm one less. Anything
-//      tighter than this is inside the wick range and rejected (not too tight).
-//   2) Prefer STRUCTURAL levels (swing low/high, Supertrend, 200 EMA, HTF
-//      support/resistance, range extreme) over blunt ATR-multiple stops.
-//   3) Among those, take the NEAREST that clears the floor — the closest
-//      defended level beyond the noise. That's the best reward:risk while still
-//      sitting on real structure (not lazily the widest).
-//   4) Only if no structural level qualifies do we fall back to a volatility
-//      (ATR) stop, then to the wide/tight stop.
-function recStop(d, entry){
-  const side=(d.side||'long');
-  const E=(entry!=null)?entry:(d.retest_entry!=null?d.retest_entry:(d.optimal_entry!=null?d.optimal_entry:d.price));
-  const list=(d.stop_levels||[]);
-  const atr=d.atr_pct||0;
-  const floorPct=Math.max(1.5, 1.1*atr);                     // clear of noise: >=1.1x ATR (and >=1.5%)
-  const distE=(lvl)=> (E&&lvl)? Math.abs((lvl-E)/E)*100 : 0; // ALWAYS from the intended (retest) entry
-  const atrx=(lvl)=> atr? distE(lvl)/atr : null;             // distance in ATR units — the honest "how tight"
+// P(a stop at `riskATR` ATRs away survives normal noise without being wicked
+// out before the target). Near the wick range (~<1x ATR) it's very likely to be
+// tripped; by ~2.5-3x ATR it's comfortably clear. A smooth S-curve.
+function surviveProb(riskATR){
+  if(riskATR==null) riskATR=1.5;
+  return Math.max(0.05, Math.min(0.96, 1/(1+Math.exp(-(riskATR-1.5)*1.7))));
+}
+// Evaluate an ENTRY: from the actual stop-loss OPTIONS on the menu, choose the
+// stop that maximises TRADE QUALITY = EV(best target from this entry over this
+// stop) × P(the stop survives normal noise). This is the whole game: a tight
+// stop gives a fat R:R but gets wicked out (low survival); a wide stop survives
+// but shrinks R:R — the winner is the sweet spot in between, decided per chart
+// by its own volatility. Real structure gets a small nudge over a blunt ATR
+// stop, and in a clean trend the trend line (Supertrend/EMA) gets a small nudge
+// too — nudges, not mandates. Returns {stop, rtg, sc} or null. The chosen stop
+// is always one of the menu chips, so it can be highlighted there.
+function evalEntry(d, E){
+  const side=(d.side||'long'), atr=d.atr_pct||0, list=(d.stop_levels||[]);
+  if(E==null) return null;
   const onSide=(lvl)=> side==='short'? lvl>E : lvl<E;
-  const isVol=(b)=> /ATR/i.test(b||'');                      // ATR-multiple = fallback only
-  const valid=list.filter(s=> onSide(s.level) && distE(s.level)>=floorPct);
-  const structural=valid.filter(s=> !isVol(s.basis));
-  let pick=null, note='';
-  if(structural.length){
-    // Nearest real invalidation level beyond the noise. On a high-ATR coin this
-    // can be a big % yet only ~1–2x ATR — perfectly normal for that chart.
-    pick=structural.reduce((a,b)=> distE(a.level)<=distE(b.level)?a:b);
-    const ax=atrx(pick.level);
-    note = (ax!=null && ax>4) ? 'structure sits fairly far (>4x ATR) — size the position smaller so the $ risk stays controlled'
-         : 'the nearest real level that would invalidate the setup, just clear of the noise';
-  } else if(valid.length){
-    pick=valid.reduce((a,b)=> distE(a.level)<=distE(b.level)?a:b);  // no clean structure → volatility stop
-    note='no clean structure nearby — a volatility (ATR) stop';
+  const distE=(lvl)=> Math.abs((lvl-E)/E)*100;
+  const atrx=(lvl)=> atr? distE(lvl)/atr : distE(lvl)/2.5;
+  const isVol=(b)=> /ATR/i.test(b||'');
+  const isTrend=(b)=> /supertrend/i.test(b||'') || /200 EMA/i.test(b||'');
+  const trending = side==='short'? d.trend==='down' : d.trend==='up';
+  const onSideAll=list.filter(s=> onSide(s.level));
+  if(!onSideAll.length) return null;
+  const band=onSideAll.filter(s=> atrx(s.level)>=0.9 && atrx(s.level)<=6);
+  const pool=band.length?band:onSideAll;
+  const mk=(s)=>{ const ax=atrx(s.level);
+    const note = (isTrend(s.basis)&&trending) ? 'the trend line that has carried this move — a close through it flips the trend, the true invalidation here'
+      : (ax>3.5 ? 'a wider structural level that comfortably clears the wick/noise range' : 'just below real structure, beyond the recent wick range');
+    return {level:s.level, basis:s.basis, pct:distE(s.level), atrx:ax, note}; };
+  let best=null;
+  for(const s of pool){
+    const rt=recTargets(d, E, s.level);
+    const ev=(rt&&rt.primary)? rt.primary.ev : 0;
+    if(ev<=0) continue;                                  // must yield a >=1.5 R:R trade
+    let sc=ev*surviveProb(atrx(s.level));
+    if(!isVol(s.basis)) sc*=1.08;                        // real structure over a blunt ATR stop
+    if(trending && isTrend(s.basis)) sc*=1.08;           // trend line nudge in a trend
+    if(!best || sc>best.sc) best={sc, rtg:rt, stop:mk(s)};
   }
-  if(pick) return {level:pick.level, basis:pick.basis, pct:distE(pick.level), atrx:atrx(pick.level), note};
-  if(d.sl_wide!=null) return {level:d.sl_wide, basis:(d.sl_wide_basis||'the deeper structural stop'), pct:distE(d.sl_wide), atrx:atrx(d.sl_wide), note:''};
-  if(d.sl_tight!=null) return {level:d.sl_tight, basis:(d.sl_tight_basis||'the structural stop'), pct:distE(d.sl_tight), atrx:atrx(d.sl_tight), note:''};
-  return null;
+  if(best) return best;
+  // No stop produced a >=1.5 R:R trade — return the nearest sensible structural
+  // level (beyond ~1.2x ATR) for reference; the TP logic will flag "no trade".
+  const struct=pool.filter(s=> !isVol(s.basis) && atrx(s.level)>=1.2);
+  const refPool=struct.length?struct:pool;
+  const s=refPool.reduce((a,b)=> atrx(a.level)<=atrx(b.level)?a:b);
+  return {sc:0, rtg:recTargets(d, E, s.level), stop:mk(s)};
+}
+// Thin wrapper kept for callers that just want the stop for a given entry.
+function recStop(d, entry){
+  const E=(entry!=null)?entry:(d.retest_entry!=null?d.retest_entry:(d.optimal_entry!=null?d.optimal_entry:d.price));
+  const e=evalEntry(d, E); return e? e.stop : null;
 }
 // How much momentum / trend / volume backs a SUSTAINED move in `side` — a 0..1
 // "potential" score. High potential legitimately stretches how far a target can
@@ -1582,13 +1596,13 @@ function pickEntry(d){
   if(!cands.length) return null;
   let best=null;
   for(const c of cands){
-    const rs=recStop(d, c.level); const st=rs?rs.level:d.sl_tight;
-    const rt=recTargets(d, c.level, st);
-    const tradeEV=(rt&&rt.primary)? rt.primary.ev : 0;         // 0 if no >=1.5 R:R trade from here
+    const ee=evalEntry(d, c.level);                           // its best stop + targets (survival-weighted)
+    if(!ee || !ee.rtg || !ee.rtg.primary) continue;           // must yield a real >=1.5 R:R trade
     const distATR=atr? Math.abs((c.level-price)/price*100)/atr : 0;
-    const fill=1/(1+Math.pow(distATR/6,1.5));                  // closer fills are likelier to print
-    const score=tradeEV*(0.5+0.5*fill);
-    if(!best || score>best.score) best={level:c.level, basis:c.basis, score, rt, rs,
+    if(distATR > 3.5) continue;                               // >3.5x ATR from price = not a realistic near-term fill
+    const fill=1/(1+Math.pow(distATR/3,1.8));                 // strong preference for fills that will actually print
+    const score=ee.rtg.primary.ev*surviveProb(ee.stop.atrx)*(0.4+0.6*fill);
+    if(!best || score>best.score) best={level:c.level, basis:c.basis, score, rt:ee.rtg, rs:ee.stop,
         distPct:Math.abs((c.level-price)/price*100), distATR};
   }
   return (best&&best.score>0)?best:null;
@@ -1626,9 +1640,11 @@ function azCard(d0){
   // pullback for a long / higher rally for a short, not just the nearest level),
   // then the context-aware stop and the expected-value take-profit.
   const be=pickEntry(d);
-  const recE=be?be.level:(d.retest_entry!=null?d.retest_entry:(d.optimal_entry!=null?d.optimal_entry:d.entry));
-  const rstop=(be&&be.rs)?be.rs:recStop(d, recE);
-  const rtg=(be&&be.rt)?be.rt:recTargets(d, recE, rstop?rstop.level:d.sl_tight);
+  let recE, rstop, rtg;
+  if(be){ recE=be.level; rstop=be.rs; rtg=be.rt; }
+  else { recE=(d.retest_entry!=null?d.retest_entry:(d.optimal_entry!=null?d.optimal_entry:d.entry));
+         const ee=evalEntry(d, recE);
+         rstop=ee?ee.stop:null; rtg=ee?ee.rtg:recTargets(d, recE, rstop?rstop.level:d.sl_tight); }
   const rec=(rtg&&rtg.primary)?{tp:rtg.primary.lvl, rr:rtg.primary.rr, move:rtg.primary.move, p:rtg.primary.p}:{tp:null};
   const isRec=(lvl)=> rec.tp!=null && lvl!=null && Math.abs(lvl-rec.tp)/(rec.tp||1) < 0.004;
   const sgn=(d.side||'long')==='short'?'+':'−';         // stop/entry sign relative to price for this side
