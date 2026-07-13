@@ -588,7 +588,15 @@ PAGE = """<!doctype html>
   .azladder{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 4px}
   .azrec{margin:10px 0 2px;font-size:14px;color:#e6edf3}
   .azrec b{color:var(--accent)}
+  .azstop b{color:#f85149}
   .ladrec{border-color:var(--accent)!important;background:rgba(63,185,80,.12)!important;box-shadow:0 0 0 1px rgba(63,185,80,.35)}
+  .ladrecstop{border-color:#f85149!important;background:rgba(248,81,73,.12)!important;box-shadow:0 0 0 1px rgba(248,81,73,.35)}
+  .sidetog{display:inline-flex;gap:0;border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-left:8px}
+  .sidetog button{background:var(--bg);color:var(--dim);border:0;padding:4px 12px;font-size:12px;font-weight:700;cursor:pointer}
+  .sidetog button.on{color:#fff}
+  .sidetog button.on.long{background:rgba(63,185,80,.35)}
+  .sidetog button.on.short{background:rgba(248,81,73,.35)}
+  .sidenote{color:var(--dim);font-size:12px;margin:2px 0 8px}
   .ladchip{background:var(--bg);border:1px solid var(--line);border-radius:8px;
        padding:7px 11px;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;cursor:help}
   .azsec{font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;
@@ -1388,15 +1396,42 @@ async function analyze(){
   try{
     const r=await fetch("/analyze?symbol="+encodeURIComponent(sym)+"&interval="+azTf,{cache:"no-store"});
     const d=await r.json();
+    azLast = d.error ? null : d; azSide = null;   // reset perspective to the coin's own lean
     box.innerHTML = d.error ? '<div class="azerr">'+d.error+'</div>' : azCard(d);
   }catch(e){ box.innerHTML='<div class="azerr">Analysis failed — try again.</div>'; }
   btn.disabled=false; btn.textContent=t;
 }
-function stopsSection(list,side){
+// Long/Short perspective toggle for the Analyze card. null = the coin's own lean.
+let azLast=null, azSide=null;
+function setAzSide(s){
+  azSide = (azSide===s) ? null : s;   // click the active side again to snap back to auto
+  if(azLast) document.getElementById("azResult").innerHTML=azCard(azLast);
+}
+function stopsSection(list,side,recLevel){
   if(!list||!list.length) return '';
-  const chips=list.map(s=>`<span class="ladchip" data-tip="${(''+s.basis).replace(/"/g,'&quot;')} — a ${side==='short'?'short':'long'} stop here risks ${Math.abs(s.pct).toFixed(1)}% from the current price.">${fmtNum(s.level)} <span class="rr">${s.pct>=0?'+':''}${s.pct}% · ${s.basis}</span></span>`).join('');
-  return `<div class="azsec" data-tip="Candidate stop-loss levels, each anchored to a specific structure (swing high/low, the Supertrend line, the 200 EMA, or a higher-timeframe support/resistance) and buffered by a fraction of ATR. Pick the one that fits your risk and thesis — tighter = smaller risk but easier to get wicked out; wider = more room.">Stop-loss options <span class="azsub">— ${side==='short'?'above':'below'} price, each with what it\\'s based on</span></div>`
+  const isR=(lvl)=> recLevel!=null && lvl!=null && Math.abs(lvl-recLevel)/(recLevel||1) < 0.004;
+  const chips=list.map(s=>`<span class="ladchip${isR(s.level)?' ladrecstop':''}" data-tip="${esc((''+s.basis)+' — a '+(side==='short'?'short':'long')+' stop here risks '+Math.abs(s.pct).toFixed(1)+'% from the current price.'+(isR(s.level)?' 🛑 Recommended stop — the tightest level that still sits beyond normal noise.':''))}">${isR(s.level)?'🛑 ':''}${fmtNum(s.level)} <span class="rr">${s.pct>=0?'+':''}${s.pct}% · ${s.basis}</span></span>`).join('');
+  return `<div class="azsec" data-tip="Candidate stop-loss levels, each anchored to a specific structure (swing high/low, the Supertrend line, the 200 EMA, or a higher-timeframe support/resistance) and buffered by a fraction of ATR. Pick the one that fits your risk and thesis — tighter = smaller risk but easier to get wicked out; wider = more room. 🛑 = recommended.">Stop-loss options <span class="azsub">— ${side==='short'?'above':'below'} price, each with what it\\'s based on · 🛑 = recommended</span></div>`
     + `<div class="azladder">${chips}</div>`;
+}
+// The recommended stop: the TIGHTEST structural option that still clears the
+// noise floor (>= max(2.5%, 1.5x ATR) from the intended entry). A real level,
+// beyond normal wicks, smallest sensible risk. Falls back to the tight stop.
+function recStop(d, entry){
+  const side=(d.side||'long');
+  const E=(entry!=null)?entry:(d.retest_entry!=null?d.retest_entry:(d.optimal_entry!=null?d.optimal_entry:d.price));
+  const list=(d.stop_levels||[]);
+  const floorPct=Math.max(2.5, 1.5*(d.atr_pct||0));
+  const distE=(lvl)=> (E&&lvl)? Math.abs((lvl-E)/E)*100 : 0;
+  const onSide=(lvl)=> side==='short'? lvl>E : lvl<E;
+  const valid=list.filter(s=> onSide(s.level) && distE(s.level)>=floorPct);
+  let pick=null;
+  if(valid.length){ pick=valid.reduce((a,b)=> distE(a.level)<=distE(b.level)?a:b); }
+  else { const on=list.filter(s=>onSide(s.level));
+    if(on.length) pick=on.reduce((a,b)=> distE(a.level)>=distE(b.level)?a:b); }
+  if(pick) return {level:pick.level, basis:pick.basis, pct:distE(pick.level)};
+  if(d.sl_tight!=null) return {level:d.sl_tight, basis:(d.sl_tight_basis||'the floored structural tight stop'), pct:distE(d.sl_tight)};
+  return null;
 }
 function patternsSection(p){
   if(!p) return '';
@@ -1416,7 +1451,13 @@ function tfBiasSection(tb){
   return `<div class="azsec" data-tip="The trend bias on each timeframe from market structure. Alignment across timeframes (all green or all red) is a stronger signal than a single timeframe.">Bias by timeframe <span class="azsub">— 1h / 4h / Daily / Weekly</span></div>`
     + `<div class="patrow" style="margin:8px 0 2px">${one('1h','1h')}${one('4h','4h')}${one('1d','Daily')}${one('1w','Weekly')}</div>`;
 }
-function azCard(d){
+function azCard(d0){
+  // Perspective: default to the coin's own lean (auto_side), or the user's
+  // Long/Short toggle. Merge the chosen plan's entries/stops/targets over the
+  // side-independent read so the whole trade plan reflects that perspective.
+  const auto=d0.auto_side||d0.side||'long';
+  const activeSide=(azSide==='long'||azSide==='short')?azSide:auto;
+  const d=(d0.plans&&d0.plans[activeSide])?Object.assign({},d0,d0.plans[activeSide]):d0;
   const cell=(k,v,tip)=>`<div class="azcell"${tip?` data-tip="${tip}"`:''}><div class="k">${k}</div><div class="v">${v}</div></div>`;
   const pct=(v,sign)=> d.price&&v!=null? ` <span class="rr">${sign}${(Math.abs((v-d.price)/d.price)*100).toFixed(1)}%</span>`:'';
   const tp=(v,rr)=> v==null?'—':`${fmtNum(v)}${rr!=null?` <span class="rr">R:R ${(+rr).toFixed(2)}</span>`:''}`;
@@ -1432,7 +1473,9 @@ function azCard(d){
   };
   const notes=(d.notes||[]).map(n=>`<li>${n}</li>`).join("");
   const recE=d.retest_entry!=null?d.retest_entry:(d.optimal_entry!=null?d.optimal_entry:d.entry);
-  const rec=realisticRR(d, recE);   // best realistic target from the retest entry
+  const rstop=recStop(d, recE);     // recommended stop = tightest sensible structural level
+  const recSrc=rstop?Object.assign({},d,{sl_tight:rstop.level}):d;
+  const rec=realisticRR(recSrc, recE);   // best realistic target from the retest entry, over the recommended stop
   const isRec=(lvl)=> rec.tp!=null && lvl!=null && Math.abs(lvl-rec.tp)/(rec.tp||1) < 0.004;
   return `<div class="azcard">
     <div class="azhead">
@@ -1443,7 +1486,12 @@ function azCard(d){
       <span>${fmtNum(d.price)}</span>
       <span style="color:var(--dim)">EMA200 ${fmtNum(d.ema)} · ${d.pct_vs_ema>=0?'+':''}${d.pct_vs_ema}% · trend ${d.trend}</span>
       <a href="${tvLink(d.symbol)}" target="_blank" rel="noopener">open chart ↗</a>
+      ${d0.plans?`<span class="sidetog" data-tip="Switch the trade plan below between a LONG and a SHORT perspective. You can plan a reversal/counter-trend entry even when the coin's own lean is the other way. Click the active side again to snap back to the auto lean.">
+        <button class="${activeSide==='long'?'on long':''}" onclick="setAzSide('long')">LONG</button>
+        <button class="${activeSide==='short'?'on short':''}" onclick="setAzSide('short')">SHORT</button>
+      </span>`:''}
     </div>
+    ${(d0.plans&&activeSide!==auto)?`<div class="sidenote">Showing the <b>${activeSide.toUpperCase()}</b> perspective — a ${activeSide==='long'?'reversal/counter-trend long':'counter-trend short'}. The coin's own lean is <b>${auto.toUpperCase()}</b>, so treat this as the plan <i>if</i> it turns; the entries, stops, targets and R:R below are all for a ${activeSide}.</div>`:''}
     <div class="aztags">
       <span class="aztag ${d.ema_reclaim?'on':''}">200-EMA reclaim${d.ema_reclaim?' · '+d.ema_reclaim_score:''}</span>
       <span class="aztag ${d.bull_flag?'on':''}">Bull flag${d.bull_flag?' · '+d.bull_flag_score:''}</span>
@@ -1481,8 +1529,9 @@ function azCard(d){
       ${aztp(d,4)}
       ${aztp(d,5)}
     </div>
-    ${rec.tp!=null?`<div class="azrec" data-tip="The most realistic worthwhile take-profit: the target with the best reward:risk that still sits a meaningful (≥2%) move away, measured from the RETEST entry (${fmtNum(recE)}) over the tight stop (${fmtNum(d.sl_tight)}) and capped at 8:1. R:R = |target − entry| ÷ |entry − stop|. This is the same basis the Top-setups tab uses.">⭐ Recommended take-profit: <b>${fmtNum(rec.tp)}</b> <span class="rr">${(d.side||'long')==='short'?'−':'+'}${(rec.move*100).toFixed(1)}% · R:R <b>${rec.rr.toFixed(2)}</b></span> <span style="color:var(--dim)">from retest entry ${fmtNum(recE)}</span></div>`:''}
-    ${stopsSection(d.stop_levels, d.side||'long')}
+    ${rstop?`<div class="azrec azstop" data-tip="The recommended stop-loss: the tightest of the structural stop levels below that still sits beyond normal noise — at least max(2.5%, 1.5× ATR) from the retest entry. Smallest sensible risk without getting wicked out; it's the stop the recommended R:R is measured against. Based on: ${esc(rstop.basis)}">🛑 Recommended stop-loss: <b>${fmtNum(rstop.level)}</b> <span class="rr">${(d.side||'long')==='short'?'+':'−'}${rstop.pct.toFixed(1)}% from retest entry</span> <span style="color:var(--dim)">— ${esc(rstop.basis)}</span></div>`:''}
+    ${rec.tp!=null?`<div class="azrec" data-tip="The most realistic worthwhile take-profit: the target with the best reward:risk that still sits a meaningful (≥2%) move away, measured from the RETEST entry (${fmtNum(recE)}) over the RECOMMENDED stop (${rstop?fmtNum(rstop.level):fmtNum(d.sl_tight)}) and capped at 8:1. R:R = |target − entry| ÷ |entry − stop|. This is the same basis the Top-setups tab uses.">⭐ Recommended take-profit: <b>${fmtNum(rec.tp)}</b> <span class="rr">${(d.side||'long')==='short'?'−':'+'}${(rec.move*100).toFixed(1)}% · R:R <b>${rec.rr.toFixed(2)}</b></span> <span style="color:var(--dim)">from retest entry ${fmtNum(recE)}</span></div>`:''}
+    ${stopsSection(d.stop_levels, d.side||'long', rstop?rstop.level:null)}
     <div class="azsec" data-tip="A fuller ladder of profit targets: overhead resistance levels blended with Fibonacci extensions of the recent range, in order. Each shows % upside and R:R to the tight stop. The ⭐ chip is the recommended (best realistic R:R) target.">Target ladder <span class="azsub">resistances + Fibonacci extensions · ⭐ = recommended</span></div>
     <div class="azladder">
       ${(d.target_ladder||[]).map((t,i)=>`<span class="ladchip${isRec(t.level)?' ladrec':''}" data-tip="Target ${i+1}: ${t.kind} at ${fmtNum(t.level)} — ${t.pct>=0?'+':''}${t.pct}% move, R:R ${t.rr!=null?t.rr:'—'} to the tight stop.${isRec(t.level)?' ⭐ Recommended — best realistic reward:risk.':''}">${isRec(t.level)?'⭐ ':''}T${i+1} ${fmtNum(t.level)} <span class="rr">${t.pct>=0?'+':''}${t.pct}%${t.rr!=null?` · R${t.rr}`:''}</span></span>`).join('') || '<span style="color:var(--dim)">No further targets that side.</span>'}

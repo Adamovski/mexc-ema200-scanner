@@ -2231,139 +2231,153 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
                   f"signals across the 200-EMA side, market structure & CHoCH, RSI, "
                   f"and active setups — the stronger side wins.")
 
-    # --- DIRECTIONAL trade plan (short = stops above, targets below) ---
-    side = "short" if direction == "Short" else "long"
-    if side == "short":
-        r0 = res[0] if res else (ema_now if not above else price * 1.03)
-        optimal_entry = r0                       # sell into the nearest resistance
-        sl_tight = r0 + 0.5 * a                   # stop ABOVE resistance
-        r1 = res[1] if len(res) > 1 else r0
-        sl_wide = max(r1 + 1.0 * a, sl_tight)
-    else:
-        if sup:
-            optimal_entry = sup[0]
-        elif above:
-            optimal_entry = round(ema_now * 1.002, 10)
+    # --- DIRECTIONAL trade plans. Build BOTH a long and a short plan so the UI
+    # can toggle perspective: a coin that's currently bearish still gets a valid
+    # reversal-LONG plan (buy support, targets up), and a bullish coin gets a
+    # SHORT plan (sell resistance, targets down). Each plan carries its own
+    # entries, stops, target ladder and R:R. (short = stops above, targets below)
+    def _build_plan(side):
+        if side == "short":
+            r0 = res[0] if res else (ema_now if not above else price * 1.03)
+            optimal_entry = r0                       # sell into the nearest resistance
+            sl_tight = r0 + 0.5 * a                   # stop ABOVE resistance
+            r1 = res[1] if len(res) > 1 else r0
+            sl_wide = max(r1 + 1.0 * a, sl_tight)
         else:
-            optimal_entry = price
-        near_support = sup[0] if sup else (ema_now if above else price * 0.97)
-        sl_tight = near_support - 0.5 * a
-        deep_support = sup[1] if len(sup) > 1 else (sup[0] if sup else near_support)
-        sl_wide = min(deep_support - 1.0 * a, sl_tight)
+            if sup:
+                optimal_entry = sup[0]
+            elif above:
+                optimal_entry = round(ema_now * 1.002, 10)
+            else:
+                optimal_entry = price
+            near_support = sup[0] if sup else (ema_now if above else price * 0.97)
+            sl_tight = near_support - 0.5 * a
+            deep_support = sup[1] if len(sup) > 1 else (sup[0] if sup else near_support)
+            sl_wide = min(deep_support - 1.0 * a, sl_tight)
 
-    # Volatility floor on the tight stop: for a high-conviction swing a stop
-    # must clear normal noise (else it gets wicked out AND inflates R:R). Push
-    # it out to at least max(1.5x ATR, 2.5%) if the structure stop is tighter.
-    sl_tight, sl_wide = _apply_stop_floor(entry, sl_tight, sl_wide, a,
-                                          plan_entry=optimal_entry)
+        # Volatility floor on the tight stop, measured from the intended fill so
+        # the stop stays sensibly beyond the entry and out of the noise.
+        sl_tight, sl_wide = _apply_stop_floor(entry, sl_tight, sl_wide, a,
+                                              plan_entry=optimal_entry)
 
-    # --- Candidate stop-loss levels, each labelled by what defines it ----------
-    # For a long these sit BELOW price (under swings / Supertrend / EMA); for a
-    # short they sit ABOVE. Buffered by a fraction of ATR so a normal wick doesn't
-    # trip them. The trader picks the one that matches their risk & thesis.
-    stop_levels = []
+        # Candidate stop-loss levels, each labelled by what defines it. For a long
+        # these sit BELOW price; for a short ABOVE. ATR-buffered.
+        stop_levels = []
 
-    def _add_stop(level, basis):
-        if level is None or level <= 0:
-            return
-        if side == "short" and level <= price:
-            return
-        if side != "short" and level >= price:
-            return
-        stop_levels.append({"level": round(level, 10), "basis": basis,
-                            "pct": round((level - price) / price * 100, 2)})
+        def _add_stop(level, basis):
+            if level is None or level <= 0:
+                return
+            if side == "short" and level <= price:
+                return
+            if side != "short" and level >= price:
+                return
+            stop_levels.append({"level": round(level, 10), "basis": basis,
+                                "pct": round((level - price) / price * 100, 2)})
 
-    if side == "short":
-        if res:
-            _add_stop(res[0] + 0.3 * a, "Above the nearest swing high")
-            if len(res) > 1:
-                _add_stop(res[1] + 0.5 * a, "Above a deeper swing high")
-        if st_val and st_role == "resistance":
-            _add_stop(st_val + 0.2 * a, f"Above the {interval} Supertrend line")
-        if not above:
-            _add_stop(ema_now + 0.2 * a, f"Above the 200 EMA ({interval})")
-        if kres.get("res_1d"):
-            _add_stop(kres["res_1d"] + 0.3 * a, "Above the Daily swing-high resistance")
-    else:
-        if sup:
-            _add_stop(sup[0] - 0.3 * a, "Below the nearest swing low")
-            if len(sup) > 1:
-                _add_stop(sup[1] - 0.5 * a, "Below a deeper swing low")
-        if st_val and st_role == "support":
-            _add_stop(st_val - 0.2 * a, f"Below the {interval} Supertrend line")
-        if above:
-            _add_stop(ema_now - 0.2 * a, f"Below the 200 EMA ({interval})")
-        if ksup.get("sup_1d"):
-            _add_stop(ksup["sup_1d"] - 0.3 * a, "Below the Daily swing-low support")
-        if ksup.get("sup_1w"):
-            _add_stop(ksup["sup_1w"] - 0.3 * a, "Below the Weekly swing-low support")
-    # nearest to price first, dedupe near-equal levels
-    stop_levels.sort(key=lambda s: abs(s["level"] - price))
-    _sd, _seen = [], []
-    for s in stop_levels:
-        if all(abs(s["level"] - x) / price > 0.004 for x in _seen):
-            _sd.append(s)
-            _seen.append(s["level"])
-    stop_levels = _sd[:6]
+        if side == "short":
+            if res:
+                _add_stop(res[0] + 0.3 * a, "Above the nearest swing high")
+                if len(res) > 1:
+                    _add_stop(res[1] + 0.5 * a, "Above a deeper swing high")
+            if st_val and st_role == "resistance":
+                _add_stop(st_val + 0.2 * a, f"Above the {interval} Supertrend line")
+            if not above:
+                _add_stop(ema_now + 0.2 * a, f"Above the 200 EMA ({interval})")
+            if kres.get("res_1d"):
+                _add_stop(kres["res_1d"] + 0.3 * a, "Above the Daily swing-high resistance")
+        else:
+            if sup:
+                _add_stop(sup[0] - 0.3 * a, "Below the nearest swing low")
+                if len(sup) > 1:
+                    _add_stop(sup[1] - 0.5 * a, "Below a deeper swing low")
+            if st_val and st_role == "support":
+                _add_stop(st_val - 0.2 * a, f"Below the {interval} Supertrend line")
+            if above:
+                _add_stop(ema_now - 0.2 * a, f"Below the 200 EMA ({interval})")
+            if ksup.get("sup_1d"):
+                _add_stop(ksup["sup_1d"] - 0.3 * a, "Below the Daily swing-low support")
+            if ksup.get("sup_1w"):
+                _add_stop(ksup["sup_1w"] - 0.3 * a, "Below the Weekly swing-low support")
+        stop_levels.sort(key=lambda s: abs(s["level"] - price))
+        _sd, _seen = [], []
+        for s in stop_levels:
+            if all(abs(s["level"] - x) / price > 0.004 for x in _seen):
+                _sd.append(s)
+                _seen.append(s["level"])
+        stop_levels = _sd[:6]
 
-    # Target ladder — structural levels (supports for shorts / resistances for
-    # longs) blended with Fibonacci extensions, deduped, up to 8. ALWAYS yields
-    # targets: if structure runs out (coin at its highs/lows) it falls back to
-    # measured % steps so the plan is never empty.
-    rng = hh - ll if hh > ll else 0.0
-    if side == "short":                          # targets go DOWN
-        cand = [(lvl, "support (prior swing low)") for lvl in sup]
-        for ratio in (0.272, 0.414, 0.618, 1.0, 1.618, 2.0):
-            lvl = ll - rng * ratio
-            if 0 < lvl < price:
-                cand.append((lvl, f"{ratio:g}× Fibonacci downside extension"))
-        cand.sort(key=lambda x: -x[0])
-        picked = []
-        for lvl, kind in cand:
-            if lvl >= price:
-                continue
-            if not picked or lvl < picked[-1][0] * 0.995:
-                picked.append((lvl, kind))
-        if not picked:
-            picked = [(round(entry * (1 - p), 10), f"{int(p*100)}% measured drop")
-                      for p in (0.1, 0.2, 0.3, 0.4, 0.5)]
-    else:                                        # targets go UP
-        cand = [(lvl, "overhead resistance (prior swing high)") for lvl in res]
-        for ratio in (0.272, 0.414, 0.618, 1.0, 1.618, 2.0):
-            lvl = hh + rng * ratio
-            if lvl > price:
-                cand.append((lvl, f"{ratio:g}× Fibonacci extension of the recent range"))
-        cand.sort(key=lambda x: x[0])
-        picked = []
-        for lvl, kind in cand:
-            if lvl <= price:
-                continue
-            if not picked or lvl > picked[-1][0] * 1.005:
-                picked.append((lvl, kind))
-        if not picked:
-            picked = [(round(entry * (1 + p), 10), f"{int(p*100)}% measured move")
-                      for p in (0.1, 0.2, 0.3, 0.4, 0.5)]
-    picked = picked[:8]
-    target_ladder = [{"level": lvl, "kind": kind,
-                      "pct": round((lvl - entry) / entry * 100, 1),
-                      "rr": round((lvl - entry) / (entry - sl_tight), 2)
-                             if entry != sl_tight else None}
-                     for lvl, kind in picked]
-    # Trade-plan TP1..TP5 = the first five ladder targets — always populated and
-    # consistent with the ladder shown below. Carry each target's own basis, and
-    # flag the one that IS the 200-EMA reclaim so the UI highlights it.
-    plan_tps = [(t["level"],
-                 f"{t['kind']} at {t['level']:.6g}.",
-                 abs(t["level"] - ema_now) / ema_now < 0.002 if ema_now else False)
-                for t in target_ladder[:5]]
-    _st_basis = (f"Above the nearest resistance / rejected level at {sl_tight:.6g}"
-                 if side == "short" else
-                 f"Below the nearest support / structure at {sl_tight:.6g}")
-    bundle = level_bundle(
-        entry, sl_tight, sl_wide, plan_tps,
-        sl_tight_basis=_st_basis + ", ATR-buffered.",
-        sl_wide_basis=(f"A deeper structural level at {sl_wide:.6g} for more room, "
-                       f"ATR-buffered."))
+        # Target ladder — structural levels blended with Fibonacci extensions,
+        # deduped, up to 8. ALWAYS yields targets (falls back to measured % steps).
+        rng = hh - ll if hh > ll else 0.0
+        if side == "short":                          # targets go DOWN
+            cand = [(lvl, "support (prior swing low)") for lvl in sup]
+            for ratio in (0.272, 0.414, 0.618, 1.0, 1.618, 2.0):
+                lvl = ll - rng * ratio
+                if 0 < lvl < price:
+                    cand.append((lvl, f"{ratio:g}× Fibonacci downside extension"))
+            cand.sort(key=lambda x: -x[0])
+            picked = []
+            for lvl, kind in cand:
+                if lvl >= price:
+                    continue
+                if not picked or lvl < picked[-1][0] * 0.995:
+                    picked.append((lvl, kind))
+            if not picked:
+                picked = [(round(entry * (1 - p), 10), f"{int(p*100)}% measured drop")
+                          for p in (0.1, 0.2, 0.3, 0.4, 0.5)]
+        else:                                        # targets go UP
+            cand = [(lvl, "overhead resistance (prior swing high)") for lvl in res]
+            for ratio in (0.272, 0.414, 0.618, 1.0, 1.618, 2.0):
+                lvl = hh + rng * ratio
+                if lvl > price:
+                    cand.append((lvl, f"{ratio:g}× Fibonacci extension of the recent range"))
+            cand.sort(key=lambda x: x[0])
+            picked = []
+            for lvl, kind in cand:
+                if lvl <= price:
+                    continue
+                if not picked or lvl > picked[-1][0] * 1.005:
+                    picked.append((lvl, kind))
+            if not picked:
+                picked = [(round(entry * (1 + p), 10), f"{int(p*100)}% measured move")
+                          for p in (0.1, 0.2, 0.3, 0.4, 0.5)]
+        picked = picked[:8]
+        target_ladder = [{"level": lvl, "kind": kind,
+                          "pct": round((lvl - entry) / entry * 100, 1),
+                          "rr": round((lvl - entry) / (entry - sl_tight), 2)
+                                 if entry != sl_tight else None}
+                         for lvl, kind in picked]
+        plan_tps = [(t["level"],
+                     f"{t['kind']} at {t['level']:.6g}.",
+                     abs(t["level"] - ema_now) / ema_now < 0.002 if ema_now else False)
+                    for t in target_ladder[:5]]
+        _st_basis = (f"Above the nearest resistance / rejected level at {sl_tight:.6g}"
+                     if side == "short" else
+                     f"Below the nearest support / structure at {sl_tight:.6g}")
+        bundle = level_bundle(
+            entry, sl_tight, sl_wide, plan_tps,
+            sl_tight_basis=_st_basis + ", ATR-buffered.",
+            sl_wide_basis=(f"A deeper structural level at {sl_wide:.6g} for more room, "
+                           f"ATR-buffered."))
+        retest = retest_level(highs, lows, price, side, ema_now,
+                              st_val if st_role else None)
+        return {"side": side, "optimal_entry": optimal_entry, "retest_entry": retest,
+                "stop_levels": stop_levels, "target_ladder": target_ladder, **bundle}
+
+    plan_long = _build_plan("long")
+    plan_short = _build_plan("short")
+    default_side = "short" if direction == "Short" else "long"
+    active = plan_short if default_side == "short" else plan_long
+    # Expose the default-side plan at the top level (backward compatible), and
+    # ship BOTH plans so the UI can switch perspective without a re-fetch.
+    side = default_side
+    optimal_entry = active["optimal_entry"]
+    stop_levels = active["stop_levels"]
+    target_ladder = active["target_ladder"]
+    _active_retest = active["retest_entry"]
+    bundle = {k: v for k, v in active.items()
+              if k not in ("side", "optimal_entry", "retest_entry",
+                           "stop_levels", "target_ladder")}
 
     notes = []
     if data_stale:
@@ -2476,8 +2490,9 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "sup_4h": ksup["sup_4h"], "sup_1d": ksup["sup_1d"], "sup_1w": ksup["sup_1w"],
         "entry": entry,
         "optimal_entry": optimal_entry,
-        "retest_entry": retest_level(highs, lows, price, side, ema_now,
-                                     st_val if st_role else None),
+        "retest_entry": _active_retest,
+        "auto_side": default_side,
+        "plans": {"long": plan_long, "short": plan_short},
         "supports": sup,
         "ema_reclaim": bool(okE),
         "ema_reclaim_score": dE.get("score") if okE else None,
