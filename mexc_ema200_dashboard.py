@@ -756,6 +756,22 @@ PAGE = """<!doctype html>
        background:linear-gradient(90deg,var(--accent),transparent 60%);opacity:.7}
   .azhead .sym{font-size:20px;font-weight:800;letter-spacing:-.01em}
   /* verdict bar — the bottom line, up top */
+  /* cross-timeframe summary block (sits above the per-timeframe Analyze card) */
+  .azxtf{margin:0 0 14px;padding:12px 16px;border-radius:13px;border:1px solid var(--line2);
+       background:linear-gradient(90deg,rgba(63,185,80,.10),rgba(20,25,36,.30))}
+  .azxtf-short{background:linear-gradient(90deg,rgba(248,81,73,.10),rgba(20,25,36,.30))}
+  .azxtf-load{color:var(--dim);font-size:13px;background:rgba(20,25,36,.4)}
+  .xtfhead{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin-bottom:8px}
+  .xtftitle{font-weight:800;font-size:14px;color:#fff;letter-spacing:.01em}
+  .xtftf{font-weight:800;font-size:12px;color:var(--accent);background:rgba(63,185,80,.14);
+       border:1px solid rgba(63,185,80,.4);border-radius:7px;padding:2px 9px}
+  .xtfside{font-weight:800;font-size:12px;border-radius:7px;padding:2px 9px}
+  .xtfcur{color:var(--dim);font-size:12px}
+  .xtfrow{display:flex;flex-wrap:wrap;gap:6px 20px}
+  .xtfi{font-family:var(--mono);font-size:13.5px;font-weight:600;color:var(--txt)}
+  .xtfi i{font-style:normal;color:var(--dim2);font-size:9.5px;text-transform:uppercase;
+       letter-spacing:.06em;margin-right:6px;font-family:"Inter",sans-serif;font-weight:600}
+  .xtfi b{color:var(--accent)}
   .azverdict{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;margin:12px 0 4px;
        padding:13px 16px;border-radius:13px;border:1px solid var(--line2);
        background:linear-gradient(90deg,rgba(63,185,80,.12),rgba(20,25,36,.35))}
@@ -1126,6 +1142,7 @@ PAGE = """<!doctype html>
     <button id="azBtn" onclick="analyze()">Analyze</button>
   </div>
   <div class="aztfs">Timeframe:
+    <span class="tfbtn" data-tf="15m" onclick="setAzTf('15m')" title="15-minute — for scalps / fast intraday setups">15m</span>
     <span class="tfbtn" data-tf="1h" onclick="setAzTf('1h')">1h</span>
     <span class="tfbtn active" data-tf="4h" onclick="setAzTf('4h')">4h</span>
     <span class="tfbtn" data-tf="1d" onclick="setAzTf('1d')">1D</span>
@@ -1711,6 +1728,14 @@ function setAzTf(tf){ azTf=tf;
   document.querySelectorAll(".tfbtn").forEach(x=>x.classList.toggle("active",x.dataset.tf===tf));
   if(document.getElementById("azInput").value.trim()) analyze();
 }
+// Long/Short perspective toggle for the Analyze card. null = the coin's own lean.
+let azLast=null, azSide=null, azXtfHtml='';
+// Cache of /analyze results per symbol per timeframe (for the cross-TF summary).
+const AZ_TFS=['15m','1h','4h','1d','1w'];
+let azTfCache={};
+function azCachePut(sym,tf,d){ sym=(sym||'').toUpperCase(); (azTfCache[sym]=azTfCache[sym]||{})[tf]={d,ts:Date.now()}; }
+function renderAz(){ const box=document.getElementById("azResult"); if(!box||!azLast) return;
+  box.innerHTML=(azXtfHtml||'')+azCard(azLast); }
 async function analyze(){
   const inp=document.getElementById("azInput");
   const btn=document.getElementById("azBtn");
@@ -1722,16 +1747,61 @@ async function analyze(){
   try{
     const r=await fetch("/analyze?symbol="+encodeURIComponent(sym)+"&interval="+azTf,{cache:"no-store"});
     const d=await r.json();
-    azLast = d.error ? null : d; azSide = null;   // reset perspective to the coin's own lean
-    box.innerHTML = d.error ? '<div class="azerr">'+d.error+'</div>' : azCard(d);
+    if(d.error){ azLast=null; azXtfHtml=''; box.innerHTML='<div class="azerr">'+d.error+'</div>'; }
+    else { azLast=d; azSide=null;             // reset perspective to the coin's own lean
+      azXtfHtml='<div class="azxtf azxtf-load">⏳ Comparing 15m · 1h · 4h · Daily · Weekly for the single best plan…</div>';
+      renderAz(); azCachePut(d.symbol||sym, azTf, d); crossTfSummary(d.symbol||sym); }
   }catch(e){ box.innerHTML='<div class="azerr">Analysis failed — try again.</div>'; }
   btn.disabled=false; btn.textContent=t;
 }
-// Long/Short perspective toggle for the Analyze card. null = the coin's own lean.
-let azLast=null, azSide=null;
 function setAzSide(s){
   azSide = (azSide===s) ? null : s;   // click the active side again to snap back to auto
-  if(azLast) document.getElementById("azResult").innerHTML=azCard(azLast);
+  renderAz();
+}
+// Analyze this coin on EVERY timeframe and surface the single best-graded plan,
+// independent of the timeframe being viewed — each level still labelled with its
+// own source chart. Reuses the same recommendation engine per timeframe.
+async function crossTfSummary(sym){
+  const S=(sym||'').toUpperCase();
+  await Promise.all(AZ_TFS.map(async tf=>{
+    const c=azTfCache[S]&&azTfCache[S][tf];
+    if(c && (Date.now()-c.ts)<120000) return;                 // fresh enough
+    try{ const r=await fetch("/analyze?symbol="+encodeURIComponent(sym)+"&interval="+tf,{cache:"no-store"});
+      const dd=await r.json(); if(!dd.error) azCachePut(S,tf,dd); }catch(e){}
+  }));
+  if(!azLast || (azLast.symbol||'').toUpperCase()!==S) return;  // user moved on
+  let best=null;
+  for(const tf of AZ_TFS){ const c=azTfCache[S]&&azTfCache[S][tf]; if(!c) continue; const dd=c.d;
+    const side=dd.auto_side||dd.side||'long';
+    const dm=(dd.plans&&dd.plans[side])?Object.assign({},dd,dd.plans[side]):dd;
+    const be=pickEntry(dm); if(!be||!be.rt||!be.rt.primary) continue;
+    const rec=be.rt.primary;
+    const gr=(rec.rr>=3&&rec.p>=.45?'A+':rec.rr>=2.5&&rec.p>=.35?'A':rec.rr>=2&&rec.p>=.3?'B':'C');
+    const grank={'A+':4,'A':3,'B':2,'C':1}[gr];
+    const cand={tf,side,gr,grank,be,rec,ev:rec.ev};
+    if(!best || (cand.grank!==best.grank? cand.grank>best.grank : cand.ev>best.ev)) best=cand;
+  }
+  azXtfHtml = best? xtfBlock(best)
+    : '<div class="azxtf">No clean ≥1.5 R:R plan on any timeframe (15m→Weekly) right now — better to wait.</div>';
+  renderAz();
+}
+function xtfBlock(b){
+  const long=b.side!=='short', be=b.be, rec=b.rec, stop=be.rs, tfN=TFNAME[b.tf]||b.tf;
+  const eTf=(be.tf&&be.tf!==b.tf)?TFNAME[be.tf]:null;          // entry from a different chart
+  const sTf=tfLabelOf(stop&&stop.basis), tTf=tfLabelOf(rec.kind);
+  const chip=(tf)=> tf?` <span class="tfsrc">${tf}</span>`:'';
+  return `<div class="azxtf azxtf-${long?'long':'short'}" data-tip="Across 15m · 1h · 4h · Daily · Weekly, this is the single best-graded plan for this coin right now — independent of the timeframe you're viewing below. Each level still shows which chart it comes from.">
+    <div class="xtfhead"><span class="xtftitle">⭐ Best across timeframes</span>
+      <span class="xtftf">${tfN} chart</span><span class="vgrade">Grade ${b.gr}</span>
+      <span class="xtfside ${long?'v-long':'v-short'}">${long?'LONG ▲':'SHORT ▼'}</span>
+      ${b.tf!==azTf?`<button class="wlbtn" onclick="setAzTf('${b.tf}')">View on ${tfN} ↗</button>`:`<span class="xtfcur">— you're viewing this timeframe</span>`}</div>
+    <div class="xtfrow">
+      <span class="xtfi"><i>Entry</i>${fmtNum(be.level)}${chip(eTf)}</span>
+      <span class="xtfi"><i>Stop</i>${stop?fmtNum(stop.level):'—'}${chip(sTf&&/daily|weekly|1w|1d/i.test(stop&&stop.basis||'')?sTf:null)}</span>
+      <span class="xtfi"><i>Target</i>${fmtNum(rec.lvl)}${chip(/Daily|Weekly/.test(rec.kind||'')?tTf:null)}</span>
+      <span class="xtfi"><i>R:R</i><b>${rec.rr.toFixed(2)}</b></span>
+      <span class="xtfi"><i>Reach</i>${Math.round(rec.p*100)}%</span>
+    </div></div>`;
 }
 function stopsSection(list,side,recLevel){
   if(!list||!list.length) return '';
@@ -1867,8 +1937,13 @@ function recTargets(d, entry, stopLevel){
 // gets hit first on a pullback. Used to (a) nudge the entry score toward stronger
 // TFs and (b) build the "shield": price should turn at the nearest strong HTF
 // level before reaching anything deeper.
-const TFRANK={'1h':1,'4h':2,'1d':3,'1w':4};
-const TFNAME={'1h':'1h','4h':'4h','1d':'Daily','1w':'Weekly'};
+const TFRANK={'15m':0,'1h':1,'4h':2,'1d':3,'1w':4};
+const TFNAME={'15m':'15m','1h':'1h','4h':'4h','1d':'Daily','1w':'Weekly'};
+// Global basis→timeframe label (used by the cross-timeframe summary).
+function tfLabelOf(b){ b=(''+(b||'')).toLowerCase();
+  if(/weekly|1w/.test(b)) return 'Weekly'; if(/daily|1d/.test(b)) return 'Daily';
+  if(/\b4h\b/.test(b)) return '4h'; if(/15\s*m/.test(b)) return '15m';
+  if(/\b1h\b/.test(b)) return '1h'; return null; }
 function pickEntry(d){
   const side=(d.side||'long'), long=side!=='short', price=d.price, atr=d.atr_pct||0;
   if(price==null) return null;
@@ -2897,7 +2972,7 @@ def make_handler(state: State):
             q = parse_qs(urlparse(self.path).query)
             raw = (q.get("symbol") or [""])[0]
             iv = (q.get("interval") or [state.cfg["interval"]])[0]
-            if iv not in ("1h", "4h", "1d", "1w"):
+            if iv not in ("15m", "1h", "4h", "1d", "1w"):
                 iv = "4h"
             sym = normalize_symbol(raw, state.cfg.get("quote", "USDT"))
             if not sym:
