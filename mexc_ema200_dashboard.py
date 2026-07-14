@@ -573,7 +573,7 @@ PAGE = """<!doctype html>
   .aztfs{display:flex;gap:6px;align-items:center;color:var(--dim);font-size:12.5px;margin:2px 0 10px}
   .tfbtn{padding:3px 12px;border:1px solid var(--line);border-radius:14px;cursor:pointer;color:var(--dim)}
   .tfbtn.active{background:var(--accent);color:#04140a;border-color:var(--accent);font-weight:700}
-  .azresult{max-width:820px}
+  .azresult{max-width:1600px}
   .azcard{background:var(--panel);border:1px solid var(--line);border-radius:12px;
        padding:16px 18px;margin:6px 0 14px}
   .azhead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:4px}
@@ -784,7 +784,10 @@ PAGE = """<!doctype html>
   .azside{flex:0 0 400px;width:400px;position:sticky;top:12px;max-height:calc(100vh - 24px);overflow-y:auto}
   .azside .azxtf{margin:0}
   .xtfexp{font-size:11px}
-  @media(max-width:1150px){ .azcols{flex-direction:column} .azside{order:-1;width:100%;flex:1 1 auto;position:static;max-height:none;overflow:visible} }
+  .azside{flex:0 0 360px;width:360px}
+  .azpe{border:1px solid var(--line2);border-radius:13px;padding:12px 16px;background:rgba(20,25,36,.35)}
+  .azpe .azsec{margin-top:0}
+  @media(max-width:1150px){ .azcols{flex-direction:column} .azside{order:2;width:100%;flex:1 1 auto;position:static;max-height:none;overflow:visible} }
   .azxtf{margin:0 0 14px;padding:12px 16px;border-radius:13px;border:1px solid var(--line2);
        background:linear-gradient(90deg,rgba(63,185,80,.10),rgba(20,25,36,.30))}
   .azxtf-short{background:linear-gradient(90deg,rgba(248,81,73,.10),rgba(20,25,36,.30))}
@@ -1777,7 +1780,13 @@ const AZ_TFS=['15m','1h','4h','1d','1w'];
 let azTfCache={};
 function azCachePut(sym,tf,d){ sym=(sym||'').toUpperCase(); (azTfCache[sym]=azTfCache[sym]||{})[tf]={d,ts:Date.now()}; }
 function renderAz(){ const box=document.getElementById("azResult"); if(!box||!azLast) return;
-  box.innerHTML=(azXtfHtml||'')+azCard(azLast); }
+  // Cross-timeframe summary on top (full width); below it the coin analysis on the
+  // left with the plain-English read as a sticky rail on the right, using the page's
+  // full width so nothing is compressed.
+  const pe=plainEnglishHtml(azLast);
+  box.innerHTML=(azXtfHtml||'') + (pe
+    ? `<div class="azcols"><div class="azmain">${azCard(azLast)}</div><aside class="azside">${pe}</aside></div>`
+    : azCard(azLast)); }
 async function analyze(){
   const inp=document.getElementById("azInput");
   const btn=document.getElementById("azBtn");
@@ -2312,9 +2321,13 @@ function azCard(d0){
         return `<span class="${cls}" data-tip="Target ${i+1}: ${t.kind} at ${fmtNum(t.level)} — ${t.pct>=0?'+':''}${t.pct}% move. R:R ${rR!=null?rR.toFixed(2):'—'} from the recommended entry, ${rC!=null?rC.toFixed(2):'—'} if you enter now at market, ${rT!=null?rT.toFixed(2):'—'} to the tight stop.${roleTxt}">${role?role+' ':''}T${i+1} ${fmtNum(t.level)} <span class="rr">${t.pct>=0?'+':''}${t.pct}%${rR!=null?` · R${rR.toFixed(1)}`:''}${rC!=null?` · Rc${rC.toFixed(1)}`:''}${rT!=null?` · Rt${rT.toFixed(1)}`:''}</span></span>`;
       }).join('') || '<span style="color:var(--dim)">No further targets that side.</span>'}
     </div>
-    <div class="azsec">In plain English</div>
-    <ul class="aznotes">${notes}</ul>
   </div>`;
+}
+// The "In plain English" bullet summary — rendered in the right-hand rail.
+function plainEnglishHtml(d){
+  const notes=((d&&d.notes)||[]).map(n=>`<li>${n}</li>`).join('');
+  if(!notes) return '';
+  return `<div class="azpe"><div class="azsec">In plain English <span class="azsub">— the read behind this coin</span></div><ul class="aznotes">${notes}</ul></div>`;
 }
 function renderBanner(){
   const b=document.getElementById("banner");
