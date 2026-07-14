@@ -700,6 +700,10 @@ PAGE = """<!doctype html>
   .scorepill.sc-c{background:rgba(139,152,173,.14);color:#c3ccd8}
   .scorepill.sc-d{background:rgba(139,152,173,.08);color:var(--dim)}
   td.rrg b{color:var(--accent)} td.rry b{color:#f0b429} td.rrd{color:var(--dim)}
+  .derivbox{margin:9px 0 2px;padding:9px 13px;border-radius:10px;font-size:13px;border:1px solid var(--line2);background:var(--bg2)}
+  .derivbox.derivgood{border-color:rgba(63,185,80,.5);background:rgba(63,185,80,.08)}
+  .derivbox.derivwarn{border-color:rgba(240,180,41,.55);background:rgba(240,180,41,.09)}
+  .derivbox.derivneu{border-color:var(--line2)}
   .corrbadge{border-radius:6px;padding:0 6px;font-size:10.5px;font-weight:700;border:1px solid var(--line);margin-left:5px;font-variant-numeric:tabular-nums;cursor:help}
   .corr-hi{background:rgba(210,153,34,.16);color:#d29922;border-color:rgba(210,153,34,.45)}
   .corr-mid{background:rgba(139,152,173,.12);color:var(--dim)}
@@ -2284,6 +2288,25 @@ function dcaPlanHtml(d, recE, stop, tp, side, distATR, compact){
     <ul class="solist">${items}</ul>
     <div class="dcaavg">Average entry ≈ <b>${fmtNum(avg)}</b> · R:R from avg <b>${rrAvg.toFixed(2)}</b> <span style="color:var(--dim)">(vs ${rrSingle.toFixed(2)} single-fill) · one stop for the whole position at ${fmtNum(stop)}</span></div></div>`;
 }
+// Derivatives confluence line (Coinalyze) — does real positioning back the
+// price-based setup, or warn against it? Empty unless a COINALYZE_API_KEY is set.
+function derivConfluenceHtml(d){
+  const v=d&&d.derivatives; if(!v) return '';
+  const parts=[];
+  if(v.divergence_note){
+    const good=v.divergence==='real_up'||v.divergence==='real_down';
+    const warn=v.divergence==='fake_up'||v.divergence==='exhaust_down';
+    parts.push(`${good?'✅':warn?'⚠':'•'} <b>OI:</b> ${esc(v.divergence_note)}`);
+  }
+  if(v.funding!=null){ const f=v.funding*100;
+    if(Math.abs(f)>=0.03) parts.push(`<b>Funding ${f>=0?'+':''}${f.toFixed(3)}%</b> — ${f>=0?'crowded longs (squeeze-down risk)':'crowded shorts (squeeze-up fuel)'}`);
+  }
+  if(v.long_short!=null && (v.long_short>1.3||v.long_short<0.77))
+    parts.push(`L/S ${v.long_short.toFixed(2)} (${v.long_short>1?'crowd long':'crowd short'})`);
+  if(!parts.length) return '';
+  const cls=(v.divergence==='fake_up'||v.divergence==='exhaust_down')?'derivwarn':(v.divergence==='real_up'||v.divergence==='real_down')?'derivgood':'derivneu';
+  return `<div class="derivbox ${cls}" data-tip="Derivatives confluence from Coinalyze — open-interest divergence, funding and long/short positioning. Real moves have open interest backing them; short-covering 'fake pumps' don't. Use it to confirm or fade the price-based setup.">🔬 Derivatives confluence: ${parts.join(' · ')}</div>`;
+}
 function pickEntry(d){
   const side=(d.side||'long'), long=side!=='short', price=d.price, atr=d.atr_pct||0;
   if(price==null) return null;
@@ -2480,6 +2503,7 @@ function azCard(d0){
       <span class="aztag ${d.bull_flag?'on':''}">Bull flag${d.bull_flag?' · '+d.bull_flag_score:''}</span>
       <span class="aztag ${d.support_bounce?'on':''}" ${d.support_bounce?`data-tip="Flagged by clustering ${d.support_bounce_tf} ${d.support_bounce_method||'swing-low pivot'} levels (tested ${d.support_bounce_touches||'?'}× ). The support is the ${d.support_bounce_method||'swing-low pivot zone'} at ${fmtNum(d.support_bounce_support)}."`:''}>Support bounce${d.support_bounce?` · off ${d.support_bounce_tf} ${d.support_bounce_method||'swing-low'} ${fmtNum(d.support_bounce_support)} (${d.support_bounce_touches||'?'}×) · score `+d.support_bounce_score:''}</span>
     </div>
+    ${derivConfluenceHtml(d)}
     <div class="azsec">Market read</div>
     <div class="azgrid">
       ${cell("Structure", (d.structure||'—')+(d.choch?` · ${d.choch} CHoCH`:''), d.struct_reason||"Market structure from swing highs/lows. CHoCH = the first break the other way — an early reversal cue that can appear inside a trend.")}
@@ -2491,6 +2515,9 @@ function azCard(d0){
       ${cell("ATR", d.atr_pct==null?'—':d.atr_pct+'%', "Average True Range as a % of price — the coin's volatility. Stops are buffered by a fraction of this.")}
       ${cell("Open interest", (()=>{const o=d.open_interest; if(!o||o.oi_usd==null) return '—'; const m=o.oi_usd; const s=m>=1e9?'$'+(m/1e9).toFixed(2)+'B':m>=1e6?'$'+(m/1e6).toFixed(1)+'M':'$'+(m/1e3).toFixed(0)+'K'; return s+(o.chg24!=null?` <span class="rr">${o.chg24>=0?'+':''}${o.chg24.toFixed(1)}% 24h</span>`:''); })(), "Open interest — the total notional in open perpetual positions right now (holdVol × price). Rising OI as price rises = new money backing the move (conviction). Price rising while OI is flat or falling = short-covering or a thin move that can be a fake pump — confirm before chasing. Perps only.")}
       ${cell("Liquidity tier", (()=>{const t=liqTier(d); return ({mega:'Mega-cap',large:'Large-cap',mid:'Mid',thin:'Thin / illiquid'})[t]; })(), "Size/liquidity tier from open interest + volatility. Mega/large-cap coins (big OI, low ATR — BTC/ETH/SOL-like) respect levels and wick far less, so the recommended STOP is allowed to sit tighter (better R:R, suits higher leverage). Thin/high-volatility coins get more wick clearance so a random spike doesn't stop you out.")}
+      ${(d.derivatives&&d.derivatives.oi_chg_pct!=null)?cell("OI trend (24h)", (()=>{const v=d.derivatives; const oc=v.oi_chg_pct; const dv=v.divergence; const dl=dv==='fake_up'?'⚠ fake-pump risk':dv==='real_up'?'✅ real up':dv==='real_down'?'✅ real down':dv==='exhaust_down'?'⚠ selloff exhausting':'flat'; return `${oc>=0?'+':''}${oc}% <span class="rr">${dl}</span>`; })(), "Open-interest change over 24h vs price, from Coinalyze. Price up + OI up = new money (real). Price up + OI down = short-covering / fake pump. Price down + OI up = fresh shorts (real). Price down + OI down = longs unwinding (selloff may be exhausting)."):''}
+      ${(d.derivatives&&d.derivatives.funding!=null)?cell("Funding rate", (()=>{const f=d.derivatives.funding*100; const lbl=f>=0.03?'crowded long':f<=-0.03?'crowded short':'balanced'; return `${f>=0?'+':''}${f.toFixed(4)}% <span class="rr">${lbl}</span>`; })(), "Latest perpetual funding rate (Coinalyze). Positive = longs pay shorts (crowded longs, squeeze-down risk); negative = shorts pay longs (crowded shorts, squeeze-up fuel). Near zero = balanced positioning."):''}
+      ${(d.derivatives&&d.derivatives.long_short!=null)?cell("Long/short ratio", (()=>{const r=d.derivatives.long_short; const lbl=r>1.05?'more longs':r<0.95?'more shorts':'balanced'; return `${r.toFixed(2)} <span class="rr">${lbl}</span>`; })(), "Ratio of long to short accounts (Coinalyze). Above 1 = crowd leans long, below 1 = leans short. Extreme readings often precede a squeeze the other way."):''}
       ${cell("BTC correlation", d.btc_corr==null?'—':('ρ '+(+d.btc_corr).toFixed(2)+(d.btc_corr>=0.85?' · just follows BTC':d.btc_corr<0.5?' · independent':' · partly linked')), "How closely this coin's 4h returns tracked BTC over the last ~10 days (Pearson ρ, −1 to +1). ρ≥0.85 means the move is largely just BTC beta — a 'breakout' here may only be BTC pulling it up. Low or negative ρ means the coin is trading on its own story, which is usually what you want for an independent setup.")}
       ${cell("Supertrend ("+(d.interval||'4h')+")", d.supertrend==null?'—':(fmtNum(d.supertrend)+' · '+(d.supertrend_role==='support'?'SUPPORT':'RESISTANCE')+pct(d.supertrend, d.supertrend_role==='support'?'-':'+')), `Supertrend (ATR 10×3) on the ${d.interval||'4h'} chart. When price is ABOVE the line the trend is up and the line acts as a trailing SUPPORT; when price is BELOW it the trend is down and it acts as RESISTANCE. Here it's ${d.supertrend_role||'—'} at ${d.supertrend==null?'—':fmtNum(d.supertrend)} — a level to watch for the trend flipping.`)}
       ${cell("Supports (distance)", (d.supports||[]).slice(0,3).map(v=>fmtNum(v)+pct(v,'-')).join(' · ')||'—', "Based on: swing-low pivots — prior candle lows the market previously bounced from — on this timeframe, nearest first, with the % below current price.")}

@@ -1882,6 +1882,161 @@ def _spot_live_price(sess: requests.Session, symbol: str) -> float | None:
     return float(p) if p else None
 
 
+# ---------------------------------------------------------------------------
+# Coinalyze — free derivatives-history API (open interest, funding rate,
+# long/short ratio, liquidations). MEXC's own API only returns a LIVE open-
+# interest snapshot, so we use Coinalyze to get the HISTORY needed for a real
+# price-vs-OI divergence read plus funding/positioning context.
+#
+# Entirely optional and self-contained: set COINALYZE_API_KEY in the environment
+# to enable it. Without a key (or on any error) every function returns None and
+# the app behaves exactly as before. Free tier = 40 calls/min, and each symbol in
+# a request counts as one call, so this is used ON DEMAND (Analyze a coin), not
+# across the whole universe.
+# ---------------------------------------------------------------------------
+COINALYZE_KEY = os.environ.get("COINALYZE_API_KEY", "").strip()
+COINALYZE_BASE = "https://api.coinalyze.net/v1"
+_CX_SESS = requests.Session()
+_cx_symbol_map: dict | None = None      # BASE asset (e.g. 'BTC') -> coinalyze perp symbol
+_cx_map_ts = 0.0
+
+
+def _cx_get(path: str, params: dict, timeout: int = 15):
+    if not COINALYZE_KEY:
+        return None
+    p = dict(params)
+    p["api_key"] = COINALYZE_KEY
+    try:
+        r = _CX_SESS.get(f"{COINALYZE_BASE}{path}", params=p, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def _cx_build_symbol_map() -> dict:
+    """Map BASE asset -> Coinalyze perpetual symbol, preferring MEXC's own USDT
+    perp so the OI/funding we read matches the exchange the user trades; any other
+    exchange fills gaps. Cached ~6h; {} if the API is unavailable."""
+    global _cx_symbol_map, _cx_map_ts
+    now = time.time()
+    if _cx_symbol_map is not None and (now - _cx_map_ts) < 6 * 3600:
+        return _cx_symbol_map
+    markets = _cx_get("/future-markets", {})
+    if not isinstance(markets, list):
+        _cx_symbol_map = {}
+        _cx_map_ts = now
+        return _cx_symbol_map
+    exch = _cx_get("/exchanges", {})
+    mexc_code = None
+    if isinstance(exch, list):
+        for e in exch:
+            if "mexc" in (e.get("name", "") or "").lower():
+                mexc_code = e.get("code")
+                break
+    mexc_map, any_map = {}, {}
+    for mk in markets:
+        if not mk.get("is_perpetual"):
+            continue
+        if (mk.get("quote_asset") or "").upper() not in ("USDT", "USD"):
+            continue
+        base = (mk.get("base_asset") or "").upper()
+        sym = mk.get("symbol")
+        if not base or not sym:
+            continue
+        if mexc_code and mk.get("exchange") == mexc_code:
+            mexc_map.setdefault(base, sym)
+        else:
+            any_map.setdefault(base, sym)
+    m = dict(any_map)
+    m.update(mexc_map)                       # MEXC wins where present
+    _cx_symbol_map = m
+    _cx_map_ts = now
+    return m
+
+
+def cx_symbol_for(display_symbol: str):
+    """MEXC display symbol 'BTCUSDT' -> Coinalyze perp symbol, or None."""
+    s = (display_symbol or "").upper()
+    base = s
+    for q in ("USDT", "USD"):
+        if s.endswith(q):
+            base = s[:-len(q)]
+            break
+    return _cx_build_symbol_map().get(base)
+
+
+def fetch_derivatives(display_symbol: str, bars: int = 24) -> dict | None:
+    """Derivatives history + a price-vs-OI divergence read for ONE coin, from
+    Coinalyze. Pulls hourly open-interest, funding-rate, long/short-ratio and
+    OHLCV over the last `bars` hours. Returns a dict (or None when there's no key
+    / no match). ~4 API calls — on-demand use only."""
+    if not COINALYZE_KEY:
+        return None
+    sym = cx_symbol_for(display_symbol)
+    if not sym:
+        return None
+    now = int(time.time())
+    frm = now - (bars + 2) * 3600
+
+    def hist(path):
+        d = _cx_get(path, {"symbols": sym, "interval": "1hour", "from": frm, "to": now})
+        if isinstance(d, list) and d and isinstance(d[0].get("history"), list):
+            return d[0]["history"]
+        return None
+
+    oi = hist("/open-interest-history")           # {t,o,h,l,c} — c = OI at close
+    fr = hist("/funding-rate-history")            # c = funding rate
+    lsr = hist("/long-short-ratio-history")       # r = long/short ratio
+    ohlcv = hist("/ohlcv-history")                # {t,o,h,l,c,v,...}
+    out: dict = {"source": "coinalyze"}
+
+    if oi and len(oi) >= 4:
+        oi_now = oi[-1].get("c")
+        oi_then = oi[max(0, len(oi) - bars)].get("c")
+        out["oi_now"] = oi_now
+        if oi_now and oi_then:
+            out["oi_chg_pct"] = round((oi_now / oi_then - 1) * 100, 1)
+    if fr:
+        out["funding"] = fr[-1].get("c")          # latest funding rate (fraction)
+        vals = [x.get("c") for x in fr if x.get("c") is not None]
+        if vals:
+            out["funding_avg"] = sum(vals) / len(vals)
+    if lsr:
+        out["long_short"] = lsr[-1].get("r")
+    if ohlcv and len(ohlcv) >= 4 and out.get("oi_chg_pct") is not None:
+        p_now = ohlcv[-1].get("c")
+        p_then = ohlcv[max(0, len(ohlcv) - bars)].get("c")
+        if p_now and p_then:
+            out["price_chg_pct"] = round((p_now / p_then - 1) * 100, 1)
+
+    pc, oc = out.get("price_chg_pct"), out.get("oi_chg_pct")
+    if pc is not None and oc is not None:
+        pu, pd = pc > 0.7, pc < -0.7
+        ou, od = oc > 2, oc < -2
+        if pu and ou:
+            out["divergence"] = "real_up"
+            out["divergence_note"] = ("price and open interest both rising — new money "
+                                      "behind the move (real, conviction up-move)")
+        elif pu and od:
+            out["divergence"] = "fake_up"
+            out["divergence_note"] = ("price up but open interest FALLING — short-covering / "
+                                      "a thin rally that can fade (fake-pump risk, confirm before chasing)")
+        elif pd and ou:
+            out["divergence"] = "real_down"
+            out["divergence_note"] = ("price down with open interest rising — fresh shorts, "
+                                      "conviction selling (real down-move)")
+        elif pd and od:
+            out["divergence"] = "exhaust_down"
+            out["divergence_note"] = ("price and open interest both falling — longs unwinding, "
+                                      "the selloff may be exhausting (watch for a bounce)")
+        else:
+            out["divergence"] = "neutral"
+            out["divergence_note"] = "open interest roughly flat vs price — no clear divergence"
+    return out if len(out) > 1 else None
+
+
 def fetch_open_interest(sess: requests.Session, symbol: str) -> dict | None:
     """Current open interest for a MEXC perp from the contract ticker.
     Returns {oi, price, oi_usd, chg24} — oi is holdVol (contracts), oi_usd an
@@ -2425,6 +2580,9 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     price = live if live else closes[last]
     # Open interest context (perps only) — is the move backed by real positioning?
     oi_data = fetch_open_interest(sess, symbol) if mkt == "futures" else None
+    # Deeper derivatives HISTORY (OI divergence, funding, long/short) from Coinalyze
+    # — only when a COINALYZE_API_KEY is configured; otherwise stays None.
+    deriv = fetch_derivatives(symbol) if mkt == "futures" else None
     ema_now = e[last]
     if ema_now is None:
         return {"error": "Not enough data to compute the 200 EMA."}
@@ -2886,6 +3044,31 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
                      + ". Price rising WITH open interest = new money backing the move; "
                        "price up while OI is flat or falling = a weaker, short-covering move "
                        "(possible fake pump — confirm before chasing).")
+    if deriv:
+        if deriv.get("divergence_note"):
+            _oc = deriv.get("oi_chg_pct")
+            _icon = "✅" if deriv.get("divergence") in ("real_up", "real_down") else \
+                    "⚠" if deriv.get("divergence") in ("fake_up", "exhaust_down") else "•"
+            notes.append(f"{_icon} OI divergence (24h): {deriv['divergence_note']}"
+                         + (f" — open interest {'+' if _oc >= 0 else ''}{_oc:.1f}% vs price "
+                            f"{'+' if deriv.get('price_chg_pct',0) >= 0 else ''}{deriv.get('price_chg_pct'):.1f}%."
+                            if _oc is not None and deriv.get('price_chg_pct') is not None else "."))
+        _f = deriv.get("funding")
+        if _f is not None:
+            _fp = _f * 100
+            if _fp >= 0.03:
+                notes.append(f"Funding is high positive ({_fp:+.3f}%) — longs are paying shorts, "
+                             "positioning is crowded long (raises squeeze-DOWN risk / long-side cost).")
+            elif _fp <= -0.03:
+                notes.append(f"Funding is negative ({_fp:+.3f}%) — shorts are paying longs, "
+                             "positioning is crowded short (squeeze-UP fuel).")
+            else:
+                notes.append(f"Funding is roughly neutral ({_fp:+.3f}%) — balanced positioning.")
+        _ls = deriv.get("long_short")
+        if _ls is not None:
+            _bias = ("more longs than shorts" if _ls > 1.05 else
+                     "more shorts than longs" if _ls < 0.95 else "balanced")
+            notes.append(f"Long/short accounts ratio: {_ls:.2f} ({_bias}).")
     if direction == "Long":
         notes.append(f"Directional lean: <b>LONG</b> — bullish signals outweigh "
                      f"bearish ({long_pts} vs {short_pts}).")
@@ -2920,6 +3103,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "rsi": r14,
         "atr_pct": atr_pct,
         "open_interest": oi_data,
+        "derivatives": deriv,
         "btc_corr": (round(btc_corr, 2) if btc_corr is not None else None),
         "supertrend": st_val,
         "supertrend_dir": st_dir,
