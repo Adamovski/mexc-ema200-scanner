@@ -1852,7 +1852,10 @@ async function crossTfSummary(sym){
   cands.sort((a,b)=> (b.grank-a.grank) || (b.score-a.score));
   const top=[];
   for(const c of cands){ if(top.length>=3) break;
-    if(top.some(t=> t.side===c.side && Math.abs(t.be.level-c.be.level)/(c.be.level||1)<0.006)) continue;
+    // In forced Long/Short mode always show 3 distinct-timeframe options (no dedup),
+    // so you can compare e.g. the Daily vs 4h plan yourself. In Auto, collapse
+    // near-identical entries so the same trade doesn't appear twice.
+    if(!azXtfSide && top.some(t=> t.side===c.side && Math.abs(t.be.level-c.be.level)/(c.be.level||1)<0.006)) continue;
     top.push(c); }
   azXtfTop=top; azXtfOpen={};
   azXtfHtml = top.length? xtfRender(top)
