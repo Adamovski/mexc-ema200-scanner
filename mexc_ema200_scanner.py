@@ -2467,10 +2467,30 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
                 picked = [(round(entry * (1 + p), 10), f"{int(p*100)}% measured move")
                           for p in (0.1, 0.2, 0.3, 0.4, 0.5)]
         picked = picked[:8]
+        # Breakout "runner" targets — a coin basing far below its prior major highs
+        # can run a long way (2x/3x) if it breaks out of the base. Append the prior
+        # major high (and a halfway rung) as ambitious runner targets so the ladder
+        # shows that upside; they're the furthest, so add them AFTER the 8-cap, which
+        # would otherwise drop them. Low reach / high R:R — a bag to hold into strength.
+        if side != "short":
+            _hi_lb = highs[-500:] if len(highs) >= 500 else highs
+            _major_hi = max(_hi_lb) if _hi_lb else 0.0
+            _runners = []
+            if _major_hi > price * 1.6:
+                _runners.append(((price + _major_hi) / 2.0, "halfway to the prior major high — breakout runner"))
+                _runners.append((_major_hi, "prior major high — breakout runner (if it breaks out)"))
+            elif _major_hi > price * 1.3:
+                _runners.append((_major_hi, "prior major high — breakout runner (if it breaks out)"))
+            for lvl, kind in _runners:
+                if all(abs(lvl - p0) / lvl > 0.01 for p0, _ in picked):
+                    picked.append((lvl, kind))
+            picked.sort(key=lambda x: x[0])
+            picked = picked[:10]
         target_ladder = [{"level": lvl, "kind": kind,
                           "pct": round((lvl - entry) / entry * 100, 1),
                           "rr": round((lvl - entry) / (entry - sl_tight), 2)
-                                 if entry != sl_tight else None}
+                                 if entry != sl_tight else None,
+                          "runner": ("runner" in kind)}
                          for lvl, kind in picked]
         plan_tps = [(t["level"],
                      f"{t['kind']} at {t['level']:.6g}.",

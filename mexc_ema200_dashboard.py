@@ -606,6 +606,9 @@ PAGE = """<!doctype html>
   .azstop b{color:#f85149}
   .ladrec{border-color:var(--accent)!important;background:rgba(63,185,80,.12)!important;box-shadow:0 0 0 1px rgba(63,185,80,.35)}
   .ladrecstop{border-color:#f85149!important;background:rgba(248,81,73,.12)!important;box-shadow:0 0 0 1px rgba(248,81,73,.35)}
+  .ladrunner{border-color:#a371f7!important;background:rgba(163,113,247,.12)!important;box-shadow:0 0 0 1px rgba(163,113,247,.3)}
+  .ladsecure{border-color:rgba(63,185,80,.4)!important}
+  .ladstretch{border-color:rgba(227,179,65,.45)!important;background:rgba(227,179,65,.07)!important}
   .sidetog{display:inline-flex;gap:0;border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-left:8px}
   .sidetog button{background:var(--bg);color:var(--dim);border:0;padding:4px 12px;font-size:12px;font-weight:700;cursor:pointer}
   .sidetog button.on{color:#fff}
@@ -767,6 +770,12 @@ PAGE = """<!doctype html>
        border:1px solid rgba(63,185,80,.4);border-radius:7px;padding:2px 9px}
   .xtfside{font-weight:800;font-size:12px;border-radius:7px;padding:2px 9px}
   .xtfcur{color:var(--dim);font-size:12px}
+  .xtftog{display:inline-flex;border:1px solid var(--line2);border-radius:8px;overflow:hidden}
+  .xtftog button{background:transparent;border:0;color:var(--dim);font-size:11px;font-weight:700;
+       padding:3px 11px;cursor:pointer;font-family:"Inter",sans-serif;letter-spacing:.02em}
+  .xtftog button:hover{color:var(--txt)}
+  .xtftog button.on{background:var(--accent);color:#04140a}
+  .xtftog button.on.short{background:#f85149;color:#fff}
   .xtfrow{display:flex;flex-wrap:wrap;gap:6px 20px}
   .xtfi{font-family:var(--mono);font-size:13.5px;font-weight:600;color:var(--txt)}
   .xtfi i{font-style:normal;color:var(--dim2);font-size:9.5px;text-transform:uppercase;
@@ -1520,7 +1529,7 @@ function watchRec(d){
   const rstop=be?be.rs:recStop(dd,recE);
   const rtg=be?be.rt:recTargets(dd,recE,rstop?rstop.level:dd.sl_tight);
   const rec=(rtg&&rtg.primary)?rtg.primary:null;
-  const grade=rec?(rec.rr>=3&&rec.p>=.45?'A+':rec.rr>=2.5&&rec.p>=.35?'A':rec.rr>=2&&rec.p>=.3?'B':'C'):'—';
+  const grade=rec?planGradeOf(rec.rr,rec.p):'—';
   return {recE, rstop, rec, grade};
 }
 function setupsCell(d, on){
@@ -1729,7 +1738,13 @@ function setAzTf(tf){ azTf=tf;
   if(document.getElementById("azInput").value.trim()) analyze();
 }
 // Long/Short perspective toggle for the Analyze card. null = the coin's own lean.
-let azLast=null, azSide=null, azXtfHtml='';
+let azLast=null, azSide=null, azXtfHtml='', azXtfSide=null;   // azXtfSide: null=auto, 'long', 'short'
+function setXtfSide(s){ azXtfSide=(azXtfSide===s)?null:s;
+  if(azLast){ azXtfHtml='<div class="azxtf azxtf-load">⏳ Re-scanning timeframes for the best '+(azXtfSide||'auto')+' plan…</div>'; renderAz(); crossTfSummary(azLast.symbol); } }
+function xtfToggle(){ return `<span class="xtftog" data-tip="Pick which side to find the single best plan for across every timeframe: Auto = the coin's own lean per chart, or force the best LONG or best SHORT.">`
+  +`<button class="${!azXtfSide?'on':''}" onclick="setXtfSide(null)">Auto</button>`
+  +`<button class="${azXtfSide==='long'?'on':''}" onclick="setXtfSide('long')">Long</button>`
+  +`<button class="${azXtfSide==='short'?'on short':''}" onclick="setXtfSide('short')">Short</button></span>`; }
 // Cache of /analyze results per symbol per timeframe (for the cross-TF summary).
 const AZ_TFS=['15m','1h','4h','1d','1w'];
 let azTfCache={};
@@ -1772,26 +1787,30 @@ async function crossTfSummary(sym){
   if(!azLast || (azLast.symbol||'').toUpperCase()!==S) return;  // user moved on
   let best=null;
   for(const tf of AZ_TFS){ const c=azTfCache[S]&&azTfCache[S][tf]; if(!c) continue; const dd=c.d;
-    const side=dd.auto_side||dd.side||'long';
-    const dm=(dd.plans&&dd.plans[side])?Object.assign({},dd,dd.plans[side]):dd;
+    const side=azXtfSide||dd.auto_side||dd.side||'long';       // forced side, or the coin's lean
+    const dm=Object.assign({}, dd, (dd.plans&&dd.plans[side])||{}); dm.side=side;
     const be=pickEntry(dm); if(!be||!be.rt||!be.rt.primary) continue;
     const rec=be.rt.primary;
-    const gr=(rec.rr>=3&&rec.p>=.45?'A+':rec.rr>=2.5&&rec.p>=.35?'A':rec.rr>=2&&rec.p>=.3?'B':'C');
+    const gr=planGradeOf(rec.rr,rec.p);
     const grank={'A+':4,'A':3,'B':2,'C':1}[gr];
     const cand={tf,side,gr,grank,be,rec,ev:rec.ev};
     if(!best || (cand.grank!==best.grank? cand.grank>best.grank : cand.ev>best.ev)) best=cand;
   }
   azXtfHtml = best? xtfBlock(best)
-    : '<div class="azxtf">No clean ≥1.5 R:R plan on any timeframe (15m→Weekly) right now — better to wait.</div>';
+    : `<div class="azxtf"><div class="xtfhead"><span class="xtftitle">⭐ Best across timeframes</span>${xtfToggle()}</div>`
+      +`<div style="color:var(--dim);font-size:13px;margin-top:2px">No clean ≥1.5 R:R ${azXtfSide?azXtfSide.toUpperCase()+' ':''}plan on any timeframe (15m→Weekly) right now — better to wait${azXtfSide?', or try Auto / the other side':''}.</div></div>`;
   renderAz();
 }
 function xtfBlock(b){
   const long=b.side!=='short', be=b.be, rec=b.rec, stop=be.rs, tfN=TFNAME[b.tf]||b.tf;
-  const eTf=(be.tf&&be.tf!==b.tf)?TFNAME[be.tf]:null;          // entry from a different chart
-  const sTf=tfLabelOf(stop&&stop.basis), tTf=tfLabelOf(rec.kind);
+  // Always label each level's source timeframe: the explicit chart in its basis if
+  // it has one (e.g. a Daily/Weekly swing level), otherwise the plan's own timeframe.
+  const eTf=be.tf?(TFNAME[be.tf]||be.tf):tfN;
+  const sTf=tfLabelOf(stop&&stop.basis)||tfN;
+  const tTf=tfLabelOf(rec.kind)||tfN;
   const chip=(tf)=> tf?` <span class="tfsrc">${tf}</span>`:'';
   return `<div class="azxtf azxtf-${long?'long':'short'}" data-tip="Across 15m · 1h · 4h · Daily · Weekly, this is the single best-graded plan for this coin right now — independent of the timeframe you're viewing below. Each level still shows which chart it comes from.">
-    <div class="xtfhead"><span class="xtftitle">⭐ Best across timeframes</span>
+    <div class="xtfhead"><span class="xtftitle">⭐ Best across timeframes</span>${xtfToggle()}
       <span class="xtftf">${tfN} chart</span><span class="vgrade">Grade ${b.gr}</span>
       <span class="xtfside ${long?'v-long':'v-short'}">${long?'LONG ▲':'SHORT ▼'}</span>
       ${b.tf!==azTf?`<button class="wlbtn" onclick="setAzTf('${b.tf}')">View on ${tfN} ↗</button>`:`<span class="xtfcur">— you're viewing this timeframe</span>`}</div>
@@ -1944,6 +1963,15 @@ function tfLabelOf(b){ b=(''+(b||'')).toLowerCase();
   if(/weekly|1w/.test(b)) return 'Weekly'; if(/daily|1d/.test(b)) return 'Daily';
   if(/\b4h\b/.test(b)) return '4h'; if(/15\s*m/.test(b)) return '15m';
   if(/\b1h\b/.test(b)) return '1h'; return null; }
+// Plan grade — blends reward:risk with REACH (the estimated chance of actually
+// hitting the target). A high R:R alone isn't enough: a trade you only reach
+// <45% of the time is a solid B, not an A, no matter how big the payoff. A needs
+// reach ≥45%, A+ needs ≥55% AND a strong R:R.
+function planGradeOf(rr,p){ if(rr==null||p==null) return '—';
+  if(rr>=3   && p>=0.55) return 'A+';
+  if(rr>=2.5 && p>=0.45) return 'A';
+  if(rr>=2   && p>=0.35) return 'B';
+  return 'C'; }
 function pickEntry(d){
   const side=(d.side||'long'), long=side!=='short', price=d.price, atr=d.atr_pct||0;
   if(price==null) return null;
@@ -2065,13 +2093,16 @@ function azCard(d0){
   const stopTf=rstop?tfOfBasis(rstop.basis):null;
   const tgtTf=rec.tp!=null?tfOfBasis(rec.kind):null;
   const isRec=(lvl)=> rec.tp!=null && lvl!=null && Math.abs(lvl-rec.tp)/(rec.tp||1) < 0.004;
+  const near=(lvl,ref)=> ref!=null && lvl!=null && Math.abs(lvl-ref)/(ref||1) < 0.004;
+  const isSecure=(lvl)=> rtg&&rtg.secure&&near(lvl,rtg.secure.lvl);
+  const isStretch=(lvl)=> rtg&&rtg.stretch&&near(lvl,rtg.stretch.lvl);
   const sgn=(d.side||'long')==='short'?'+':'−';         // stop/entry sign relative to price for this side
   // Distance of a level in ATR units (the honest "how tight/far" for THIS coin).
   const atrxOf=(lvl,ref)=>{ const r=(ref!=null)?ref:d.price; if(lvl==null||r==null||!d.atr_pct) return null;
     return Math.abs((lvl-r)/r*100)/d.atr_pct; };
   const slInfo=(lvl)=>{ const p=(d.price&&lvl!=null)?Math.abs((lvl-d.price)/d.price*100):null; const a=atrxOf(lvl,d.price);
     return (p!=null?`${p.toFixed(1)}%`:'')+(a!=null?` · ${a.toFixed(1)}×ATR`:''); };
-  const planGrade=(rec.tp==null)?'—':(rec.rr>=3&&rec.p>=0.45?'A+':rec.rr>=2.5&&rec.p>=0.35?'A':rec.rr>=2&&rec.p>=0.3?'B':'C');
+  const planGrade=(rec.tp==null)?'—':planGradeOf(rec.rr,rec.p);
   // R:R to the recommended (base) target over the recommended stop, from ANY
   // chosen entry — lets each entry cell show its own R:R and lets us compare
   // entering now at market vs waiting for the recommended pullback.
@@ -2175,9 +2206,19 @@ function azCard(d0){
     <div class="sidenote" data-tip="How the same trade looks if you enter NOW at the current market price instead of waiting for the 🎯 recommended pullback — same stop and target, worse fill, so a lower R:R. Use it to decide: take it now, or wait for the better entry.">⚡ Enter now at market (CMP ${fmtNum(cmpE)}): ${rrAt(cmpE)!=null?`R:R <b>${rrAt(cmpE).toFixed(2)}</b> to the base target`:'stop is already in the way — no clean entry here'} <span style="color:var(--dim)">vs ${rec.rr.toFixed(2)} waiting for ${fmtNum(recE)}${(rrAt(cmpE)!=null&&rrAt(cmpE)<1.5)?' — under 1.5:1 now, better to wait for the pullback':(cmpE!=null&&recE!=null&&Math.abs(cmpE-recE)/recE<0.005?' — basically at the entry already':'')}</span></div>`
     :`<div class="azrec" style="color:#f0b429" data-tip="No target on the correct side clears a 1.5:1 reward:risk from a sensible stop. In crypto a sub-1.5 R:R trade isn't worth the risk — this is a 'no trade / wait' call, not a setup. Wait for a deeper entry (better R:R), a tighter valid stop level, or a different coin.">⛔ No trade here — best realistic R:R is only <b>${rtg?rtg.bestRR.toFixed(2):'—'}</b>, under the 1.5 minimum. Wait for a better entry or setup.</div>`}
     ${stopsSection(d.stop_levels, d.side||'long', rstop?rstop.level:null)}
-    <div class="azsec" data-tip="A fuller ladder of profit targets: overhead resistance levels blended with Fibonacci extensions of the recent range, in order. Each shows % move and three reward:risk numbers — R = from the recommended (pullback) entry, Rc = if you enter NOW at market, both over the recommended stop; Rt = to the tighter stop. The ⭐ chip is the recommended target.">Target ladder <span class="azsub">R = recommended entry · Rc = enter now (CMP) · Rt = tight stop · ⭐ = recommended</span></div>
+    <div class="azsec" data-tip="A fuller ladder of profit targets in order: overhead resistances, Fibonacci extensions, and — for a coin basing far below its prior highs — breakout 'runner' targets toward those highs. The scale-out plan is marked right on the ladder: 🔒 Secure (bank part first) · ⭐ Base (recommended target) · 🚀 Stretch/Runner (leave a small bag). Each shows % move and R = from the recommended entry, Rc = enter now (CMP), Rt = to the tight stop.">Target ladder <span class="azsub">🔒 secure · ⭐ base (recommended) · 🚀 stretch/runner · R = rec entry · Rc = CMP · Rt = tight stop</span></div>
     <div class="azladder">
-      ${(d.target_ladder||[]).map((t,i)=>{const rR=recRR(t.level),rC=cmpRR(t.level),rT=tightRR(t.level);return `<span class="ladchip${isRec(t.level)?' ladrec':''}" data-tip="Target ${i+1}: ${t.kind} at ${fmtNum(t.level)} — ${t.pct>=0?'+':''}${t.pct}% move. R:R ${rR!=null?rR.toFixed(2):'—'} from the recommended entry, ${rC!=null?rC.toFixed(2):'—'} if you enter now at market, ${rT!=null?rT.toFixed(2):'—'} to the tight stop.${isRec(t.level)?' ⭐ Recommended — best realistic reward:risk.':''}">${isRec(t.level)?'⭐ ':''}T${i+1} ${fmtNum(t.level)} <span class="rr">${t.pct>=0?'+':''}${t.pct}%${rR!=null?` · R${rR.toFixed(1)}`:''}${rC!=null?` · Rc${rC.toFixed(1)}`:''}${rT!=null?` · Rt${rT.toFixed(1)}`:''}</span></span>`;}).join('') || '<span style="color:var(--dim)">No further targets that side.</span>'}
+      ${(d.target_ladder||[]).map((t,i)=>{
+        const rR=recRR(t.level),rC=cmpRR(t.level),rT=tightRR(t.level);
+        const base=isRec(t.level), sec=isSecure(t.level), str=isStretch(t.level), run=!!t.runner;
+        const role= run?'🚀': base?'⭐': sec?'🔒': str?'🚀':'';
+        const roleTxt= run?' 🚀 Breakout runner — if it breaks the base it can run here; hold a small bag into strength.'
+                     : base?' ⭐ Base — the recommended target (best realistic reward:risk).'
+                     : sec?' 🔒 Secure — bank part of the position here first to de-risk.'
+                     : str?' 🚀 Stretch — leave a runner for this if momentum carries.':'';
+        const cls='ladchip'+(base?' ladrec':'')+(run?' ladrunner':'')+(sec&&!base?' ladsecure':'')+(str&&!run&&!base?' ladstretch':'');
+        return `<span class="${cls}" data-tip="Target ${i+1}: ${t.kind} at ${fmtNum(t.level)} — ${t.pct>=0?'+':''}${t.pct}% move. R:R ${rR!=null?rR.toFixed(2):'—'} from the recommended entry, ${rC!=null?rC.toFixed(2):'—'} if you enter now at market, ${rT!=null?rT.toFixed(2):'—'} to the tight stop.${roleTxt}">${role?role+' ':''}T${i+1} ${fmtNum(t.level)} <span class="rr">${t.pct>=0?'+':''}${t.pct}%${rR!=null?` · R${rR.toFixed(1)}`:''}${rC!=null?` · Rc${rC.toFixed(1)}`:''}${rT!=null?` · Rt${rT.toFixed(1)}`:''}</span></span>`;
+      }).join('') || '<span style="color:var(--dim)">No further targets that side.</span>'}
     </div>
     <div class="azsec">In plain English</div>
     <ul class="aznotes">${notes}</ul>
