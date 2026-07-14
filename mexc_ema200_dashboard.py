@@ -609,6 +609,15 @@ PAGE = """<!doctype html>
   .ladrunner{border-color:#a371f7!important;background:rgba(163,113,247,.12)!important;box-shadow:0 0 0 1px rgba(163,113,247,.3)}
   .ladsecure{border-color:rgba(63,185,80,.4)!important}
   .ladstretch{border-color:rgba(227,179,65,.45)!important;background:rgba(227,179,65,.07)!important}
+  .soplan{margin:8px 0 4px;padding:11px 15px;border:1px solid var(--line2);border-radius:12px;background:var(--bg2)}
+  .sohead{font-size:10.5px;font-weight:800;letter-spacing:.05em;color:var(--dim2);text-transform:uppercase;margin-bottom:6px}
+  .solist{margin:0;padding-left:0;list-style:none}
+  .solist li{font-size:13px;margin:4px 0;color:var(--txt);padding-left:16px;position:relative}
+  .solist li:before{content:"›";position:absolute;left:2px;color:var(--accent);font-weight:700}
+  .solist li b{color:var(--txt)}
+  .soBE{color:var(--accent);font-weight:600}
+  .socompact{background:transparent;border:0;padding:8px 0 0;margin:6px 0 0}
+  .socompact .sohead{margin-bottom:4px}
   .sidetog{display:inline-flex;gap:0;border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-left:8px}
   .sidetog button{background:var(--bg);color:var(--dim);border:0;padding:4px 12px;font-size:12px;font-weight:700;cursor:pointer}
   .sidetog button.on{color:#fff}
@@ -1827,7 +1836,7 @@ function xtfBlock(b){
       <span class="xtfi" data-tip="Target ${fmtNum(rec.lvl)} — the best take-profit by expected value (reward:risk × how reachable it is) that clears the 1.5:1 floor. Taken from the ${tTf} chart. Why: ${esc(rec.kind||'overhead resistance')}."><i>Target</i>${fmtNum(rec.lvl)}${chip(tTf)}</span>
       <span class="xtfi" data-tip="Reward:risk — units of profit to the target for each unit risked to the stop, measured from the recommended entry. Only trades clearing 1.5:1 are shown."><i>R:R</i><b>${rec.rr.toFixed(2)}</b></span>
       <span class="xtfi" data-tip="Reach — the estimated chance price reaches the target before the stop, from the distance (in ATR) adjusted for how strongly the trend, momentum and volume back the move."><i>Reach</i>${Math.round(rec.p*100)}%</span>
-    </div></div>`;
+    </div>${scaleOutHtml(be.rt, be.level, true)}</div>`;
 }
 function stopsSection(list,side,recLevel){
   if(!list||!list.length) return '';
@@ -1979,6 +1988,31 @@ function planGradeOf(rr,p){ if(rr==null||p==null) return '—';
   if(rr>=2.5 && p>=0.45) return 'A';
   if(rr>=2   && p>=0.35) return 'B';
   return 'C'; }
+// A concrete scale-out plan: how much to sell at each target, and when to move the
+// stop to break-even. Default management: bank a first tranche at the nearest solid
+// target and de-risk to break-even (trade can no longer lose), hold the core to the
+// base target, leave a runner for the stretch / breakout target.
+function scaleOutRows(rtg){
+  if(!rtg||!rtg.primary) return [];
+  const base=rtg.primary, sec=rtg.secure, str=rtg.stretch;
+  const distinct=(a,b)=> a&&b&&Math.abs(a.lvl-b.lvl)/(b.lvl||1)>0.004;
+  const hasSec=distinct(sec,base), hasStr=distinct(str,base)&&(!sec||distinct(str,sec));
+  if(hasSec&&hasStr) return [{pct:'40%',t:sec,icon:'🔒',be:true},{pct:'35%',t:base,icon:'⭐'},{pct:'25%',t:str,icon:'🚀',runner:true}];
+  if(hasSec)         return [{pct:'50%',t:sec,icon:'🔒',be:true},{pct:'50%',t:base,icon:'⭐'}];
+  if(hasStr)         return [{pct:'60%',t:base,icon:'⭐',be:true},{pct:'40%',t:str,icon:'🚀',runner:true}];
+  return [{pct:'100%',t:base,icon:'⭐'}];
+}
+function scaleOutHtml(rtg, entry, compact){
+  const rows=scaleOutRows(rtg); if(!rows.length) return '';
+  const items=rows.map(r=>{
+    const rr=(r.t.rr!=null)?` <span class="rr">R${r.t.rr.toFixed(1)}</span>`:'';
+    const be=r.be?` <span class="soBE">→ move stop to break-even (${fmtNum(entry)}) — now risk-free</span>`:'';
+    const run=r.runner?` <span style="color:var(--dim)">— runner: trail your stop up under each new higher low</span>`:'';
+    return `<li><b>Sell ${r.pct}</b> at ${r.icon} <b>${fmtNum(r.t.lvl)}</b>${rr}${be}${run}</li>`;
+  }).join('');
+  return `<div class="soplan${compact?' socompact':''}" data-tip="A concrete way to take the trade off and manage risk: bank a first tranche at the nearest solid target and move your stop to break-even (so the trade can't turn into a loss), hold the core to the base target, and leave a runner for the stretch / breakout target with a trailing stop.">
+    <div class="sohead">📤 Scale-out &amp; risk management</div><ul class="solist">${items}</ul></div>`;
+}
 function pickEntry(d){
   const side=(d.side||'long'), long=side!=='short', price=d.price, atr=d.atr_pct||0;
   if(price==null) return null;
@@ -2209,7 +2243,7 @@ function azCard(d0){
     ${be?`<div class="azrec" data-tip="The smartest place to get IN — not necessarily near the current price. If price is extended or correcting, a deeper pullback (a support / EMA / Supertrend retest) makes a better, more realistic trade; a short can wait to sell into a higher rally. Chosen to maximise the resulting reward:risk while staying a fill that's likely to actually print. Based on: ${esc(be.basis)}.">🎯 Recommended entry: <b>${fmtNum(recE)}</b> <span class="rr">${sgn}${be.distPct.toFixed(1)}%${be.distATR?` · ${be.distATR.toFixed(1)}×ATR`:''} ${(d.side||'long')==='short'?'above':'below'} price</span> <span style="color:var(--dim)">— ${esc(be.basis)}${crossTfNote}${(be.distATR&&be.distATR>2)?' · patient fill — wait for it, don\\'t chase':''}</span></div>`:''}
     ${rstop?`<div class="azrec azstop" data-tip="The recommended stop, judged for THIS chart — not a fixed % or a blanket 'go wide'. It sits just beyond the nearest real level that would invalidate the setup (swing low, Supertrend, EMA, HTF support), once clear of noise (≥ max(1.5%, 1.1× ATR)). Distance is shown in ×ATR because that's the honest measure of 'tight' — a big % on a volatile coin can still be only ~1.5× ATR. ${rstop.note?esc(rstop.note.charAt(0).toUpperCase()+rstop.note.slice(1))+'. ':''}It's the stop the recommended R:R is measured against. Based on: ${esc(rstop.basis)}">🛑 Recommended stop-loss: <b>${fmtNum(rstop.level)}</b> <span class="rr">${sgn}${rstop.pct.toFixed(1)}%${rstop.atrx?` · ${rstop.atrx.toFixed(1)}×ATR`:''} from entry</span> <span style="color:var(--dim)">— ${esc(rstop.basis)}${rstop.note?' · '+esc(rstop.note):''}</span></div>`:''}
     ${rec.tp!=null?`<div class="azrec" data-tip="Recommended by EXPECTED VALUE, not raw ratio: reward:risk × how reachable the target is. Reachability decays with distance (in ATR units) but stretches out when the trend, momentum and volume back the move — so a far target isn't dismissed if the setup is strong, and a nearby one isn't over-rated if it's weak. Measured from the recommended entry (${fmtNum(recE)}) over the recommended stop (${rstop?fmtNum(rstop.level):'—'}), capped 8:1, and only shown because it clears the 1.5:1 floor. Grade blends R:R and reachability.">⭐ Recommended take-profit: <b>${fmtNum(rec.tp)}</b> <span class="rr">${(d.side||'long')==='short'?'−':'+'}${(rec.move*100).toFixed(1)}% · R:R <b>${rec.rr.toFixed(2)}</b> · ~${Math.round(rec.p*100)}% reach · grade <b>${planGrade}</b></span>${rec.kind?` <span style="color:var(--dim)">— ${esc(rec.kind)}${tgtTf&&/Daily|Weekly/.test(rec.kind||'')?` <span class="tfsrc">${tgtTf} chart</span>`:''}</span>`:''}</div>
-    <div class="sidenote" data-tip="A sensible way to take the trade off: bank part at the nearest solid target to de-risk, hold the core to the base target, leave a runner for the stretch if momentum carries.">Scale-out: 🔒 Secure <b>${fmtNum(rtg.secure.lvl)}</b> (R${rtg.secure.rr.toFixed(1)}) · 🎯 Base <b>${fmtNum(rtg.primary.lvl)}</b> (R${rtg.primary.rr.toFixed(1)})${rtg.stretch?` · 🚀 Stretch <b>${fmtNum(rtg.stretch.lvl)}</b> (R${rtg.stretch.rr.toFixed(1)})`:''}</div>
+    ${scaleOutHtml(rtg, recE)}
     <div class="sidenote" data-tip="How the same trade looks if you enter NOW at the current market price instead of waiting for the 🎯 recommended pullback — same stop and target, worse fill, so a lower R:R. Use it to decide: take it now, or wait for the better entry.">⚡ Enter now at market (CMP ${fmtNum(cmpE)}): ${rrAt(cmpE)!=null?`R:R <b>${rrAt(cmpE).toFixed(2)}</b> to the base target`:'stop is already in the way — no clean entry here'} <span style="color:var(--dim)">vs ${rec.rr.toFixed(2)} waiting for ${fmtNum(recE)}${(rrAt(cmpE)!=null&&rrAt(cmpE)<1.5)?' — under 1.5:1 now, better to wait for the pullback':(cmpE!=null&&recE!=null&&Math.abs(cmpE-recE)/recE<0.005?' — basically at the entry already':'')}</span></div>`
     :`<div class="azrec" style="color:#f0b429" data-tip="No target on the correct side clears a 1.5:1 reward:risk from a sensible stop. In crypto a sub-1.5 R:R trade isn't worth the risk — this is a 'no trade / wait' call, not a setup. Wait for a deeper entry (better R:R), a tighter valid stop level, or a different coin.">⛔ No trade here — best realistic R:R is only <b>${rtg?rtg.bestRR.toFixed(2):'—'}</b>, under the 1.5 minimum. Wait for a better entry or setup.</div>`}
     ${stopsSection(d.stop_levels, d.side||'long', rstop?rstop.level:null)}
