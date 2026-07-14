@@ -2133,8 +2133,15 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     mkt = cfg.get("market", "futures")
     raw = fetch_candles(sess, symbol, interval, cfg.get("kline_limit", 1000), mkt)
     if not raw or len(raw) < EMA_PERIOD + 2:
-        return {"error": f"Not enough 4h data for '{symbol}'. Check it's a coin "
-                         f"listed on MEXC {mkt} (e.g. BTC, SOL, ETHUSDT)."}
+        n = len(raw) if raw else 0
+        need = EMA_PERIOD + 2
+        lower = {"1w": "Daily / 4h", "1d": "4h / 1h", "4h": "1h / 15m",
+                 "1h": "15m", "15m": ""}.get(interval, "a lower timeframe")
+        tip = f" Try {lower}." if lower else ""
+        return {"error": f"Not enough {interval} history for '{symbol}' — it has only "
+                         f"{n} {interval} candle(s), but the 200 EMA needs {need}. "
+                         f"This coin is likely too new to analyse on the {interval} "
+                         f"chart.{tip} (Or check it's listed on MEXC {mkt}.)"}
     data_stale = not _klines_fresh(raw, interval)   # both futures & spot came back old
     rows = raw[:-1]
     try:

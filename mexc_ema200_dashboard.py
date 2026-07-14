@@ -618,6 +618,15 @@ PAGE = """<!doctype html>
   .soBE{color:var(--accent);font-weight:600}
   .socompact{background:transparent;border:0;padding:8px 0 0;margin:6px 0 0}
   .socompact .sohead{margin-bottom:4px}
+  .xtfcmp{font-size:12.5px;color:var(--txt);margin-top:8px;padding-top:7px;border-top:1px solid var(--line)}
+  .xtfcmp b{color:var(--accent)}
+  .xtfsub{font-size:11px;color:var(--dim2);font-weight:600;margin-left:auto}
+  .xtftrade{padding:9px 0 7px}
+  .xtftrade+.xtftrade{border-top:1px dashed var(--line)}
+  .xtftrade:not(.xtftrade-top){opacity:.9}
+  .xtftrade:not(.xtftrade-top) .xtfrow{font-size:12.5px}
+  .xtfhead2{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;margin-bottom:6px}
+  .xtfrank{font-weight:800;font-size:14px;color:var(--dim)}
   .sidetog{display:inline-flex;gap:0;border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-left:8px}
   .sidetog button{background:var(--bg);color:var(--dim);border:0;padding:4px 12px;font-size:12px;font-weight:700;cursor:pointer}
   .sidetog button.on{color:#fff}
@@ -1801,42 +1810,73 @@ async function crossTfSummary(sym){
   for(const tf of AZ_TFS){ const c=azTfCache[S]&&azTfCache[S][tf]; if(!c) continue;
     const s=c.d.auto_side||c.d.side; if(s==='long') leanScore+=(wTF[tf]||1); else if(s==='short') leanScore-=(wTF[tf]||1); }
   const lean = leanScore>0?'long':leanScore<0?'short':null;
-  let best=null;
+  // Collect the best plan on EVERY timeframe and (in Auto) BOTH directions, then rank
+  // by grade then expected value — and show the TOP 3 so you see the strongest setup
+  // AND its alternatives, not one debatable pick. In Auto the coin's dominant lean gets
+  // a small tie-break nudge (so a bullish coin doesn't flip to a barely-better counter-
+  // trend short), but a clearly higher-graded opposite-side trade still wins. Forced
+  // Long/Short restricts to that side.
+  const sides = azXtfSide? [azXtfSide] : ['long','short'];
+  let cands=[];
   for(const tf of AZ_TFS){ const c=azTfCache[S]&&azTfCache[S][tf]; if(!c) continue; const dd=c.d;
-    const side=azXtfSide||lean||dd.auto_side||dd.side||'long';  // forced side, else the coin's dominant lean
-    const dm=Object.assign({}, dd, (dd.plans&&dd.plans[side])||{}); dm.side=side;
-    const be=pickEntry(dm); if(!be||!be.rt||!be.rt.primary) continue;
-    const rec=be.rt.primary;
-    const gr=planGradeOf(rec.rr,rec.p);
-    const grank={'A+':4,'A':3,'B':2,'C':1}[gr];
-    const cand={tf,side,gr,grank,be,rec,ev:rec.ev};
-    if(!best || (cand.grank!==best.grank? cand.grank>best.grank : cand.ev>best.ev)) best=cand;
+    for(const side of sides){
+      const dm=Object.assign({}, dd, (dd.plans&&dd.plans[side])||{}); dm.side=side;
+      const be=pickEntry(dm); if(!be||!be.rt||!be.rt.primary) continue;
+      const rec=be.rt.primary, gr=planGradeOf(rec.rr,rec.p), grank={'A+':4,'A':3,'B':2,'C':1}[gr];
+      const leanBonus=(!azXtfSide && lean && side===lean)? 0.4 : 0;
+      cands.push({tf,side,gr,grank,be,rec,ev:rec.ev,score:rec.ev+leanBonus});
+    }
   }
-  azXtfHtml = best? xtfBlock(best)
+  cands.sort((a,b)=> (b.grank-a.grank) || (b.score-a.score));
+  const top=[];
+  for(const c of cands){ if(top.length>=3) break;
+    if(top.some(t=> t.side===c.side && Math.abs(t.be.level-c.be.level)/(c.be.level||1)<0.006)) continue;
+    top.push(c); }
+  azXtfHtml = top.length? xtfRender(top)
     : `<div class="azxtf"><div class="xtfhead"><span class="xtftitle">⭐ Best across timeframes</span>${xtfToggle()}</div>`
       +`<div style="color:var(--dim);font-size:13px;margin-top:2px">No clean ≥1.5 R:R ${azXtfSide?azXtfSide.toUpperCase()+' ':''}plan on any timeframe (15m→Weekly) right now — better to wait${azXtfSide?', or try Auto / the other side':''}.</div></div>`;
   renderAz();
 }
-function xtfBlock(b){
-  const long=b.side!=='short', be=b.be, rec=b.rec, stop=be.rs, tfN=TFNAME[b.tf]||b.tf;
-  // Always label each level's source timeframe: the explicit chart in its basis if
-  // it has one (e.g. a Daily/Weekly swing level), otherwise the plan's own timeframe.
-  const eTf=be.tf?(TFNAME[be.tf]||be.tf):tfN;
-  const sTf=tfLabelOf(stop&&stop.basis)||tfN;
-  const tTf=tfLabelOf(rec.kind)||tfN;
+function xtfRender(top){
+  const side0=top[0].side!=='short'?'long':'short';
+  return `<div class="azxtf azxtf-${side0}" data-tip="The strongest trades for this coin right now across every timeframe (15m → Weekly) and, in Auto, both directions — ranked by plan grade then expected value. #1 is the top pick with its full 'enter now' and scale-out plan; the rest are alternatives. Each level shows which chart it comes from; hover any for what it is and why.">
+    <div class="xtfhead"><span class="xtftitle">⭐ Best across timeframes</span>${xtfToggle()}<span class="xtfsub">top ${top.length} · ranked by grade × reach</span></div>
+    ${top.map((b,i)=> xtfTradeBody(b,i)).join('')}</div>`;
+}
+function xtfTradeBody(b,i){
+  const long=b.side!=='short', be=b.be, rec=b.rec, stop=be.rs, tfN=TFNAME[b.tf]||b.tf, detailed=(i===0);
+  const eTf=be.tf?(TFNAME[be.tf]||be.tf):tfN, sTf=tfLabelOf(stop&&stop.basis)||tfN, tTf=tfLabelOf(rec.kind)||tfN;
   const chip=(tf)=> tf?` <span class="tfsrc">${tf}</span>`:'';
-  return `<div class="azxtf azxtf-${long?'long':'short'}" data-tip="The single most-recommended trade for this coin right now — assembled from the best structural levels ACROSS every timeframe (15m · 1h · 4h · Daily · Weekly). The entry, stop and target can each come from a different chart; each shows its source timeframe, and hovering any tells you what it is and why it was chosen. Independent of the timeframe you're viewing below.">
-    <div class="xtfhead"><span class="xtftitle">⭐ Best across timeframes</span>${xtfToggle()}
-      <span class="xtftf" data-tip="The timeframe whose overall plan graded highest — but the individual levels below can each come from a different chart.">${tfN} chart</span><span class="vgrade" data-tip="Plan quality (A+→C), blending reward:risk with how reachable the target is. A+ needs both a strong R:R and a ≥55% chance of reaching target.">Grade ${b.gr}</span>
-      <span class="xtfside ${long?'v-long':'v-short'}" data-tip="The recommended side. In Auto it follows the coin's dominant lean across timeframes; use the toggle to force Long or Short.">${long?'LONG ▲':'SHORT ▼'}</span>
-      ${b.tf!==azTf?`<button class="wlbtn" onclick="setAzTf('${b.tf}')">View on ${tfN} ↗</button>`:`<span class="xtfcur">— you're viewing this timeframe</span>`}</div>
+  const rank=['①','②','③','④','⑤'][i]||('#'+(i+1));
+  const cmp=azLast?(azLast.live!=null?azLast.live:azLast.price):null;
+  let cmpRR=null;
+  if(cmp!=null && stop && rec){ const t=rec.lvl, s=stop.level;
+    if(long?(t>cmp&&s<cmp):(t<cmp&&s>cmp)) cmpRR=Math.min(Math.abs(t-cmp)/Math.abs(cmp-s),8); }
+  const cmpLine = (!detailed||cmp==null)?'' : `<div class="xtfcmp" data-tip="What this trade looks like if you enter NOW at the current market price (${fmtNum(cmp)}) instead of waiting for the recommended ${fmtNum(be.level)} pullback — same stop and target, so usually a lower reward:risk.">⚡ Enter now (CMP ${fmtNum(cmp)}): ${cmpRR!=null?`R:R <b>${cmpRR.toFixed(2)}</b> to target`:'the stop is already in the way — no clean entry here yet'} <span style="color:var(--dim2)">· vs ${rec.rr.toFixed(2)} waiting for ${fmtNum(be.level)}</span></div>`;
+  return `<div class="xtftrade${detailed?' xtftrade-top':''}">
+    <div class="xtfhead2"><span class="xtfrank">${rank}</span>
+      <span class="xtfside ${long?'v-long':'v-short'}">${long?'LONG ▲':'SHORT ▼'}</span>
+      <span class="vgrade" data-tip="Plan quality (A+→C), blending reward:risk with how reachable the target is. A+ needs a strong R:R and a ≥55% chance of reaching target.">Grade ${b.gr}</span>
+      <span class="xtftf" data-tip="The timeframe whose plan graded highest for this trade — the individual levels below can each come from a different chart.">${tfN} chart</span>
+      ${b.tf!==azTf?`<button class="wlbtn" onclick="setAzTf('${b.tf}')">View on ${tfN} ↗</button>`:`<span class="xtfcur">— viewing this timeframe</span>`}</div>
     <div class="xtfrow">
-      <span class="xtfi" data-tip="Entry ${fmtNum(be.level)} — the recommended fill: the best value-area pullback (a support / EMA / Supertrend retest) that maximises reward:risk while still being a level price is likely to actually reach. Taken from the ${eTf} chart. Why: ${esc(be.basis||'best value-area level')}."><i>Entry</i>${fmtNum(be.level)}${chip(eTf)}</span>
-      <span class="xtfi" data-tip="Stop ${stop?fmtNum(stop.level):'—'} — the level that invalidates the trade, placed just beyond real structure and clear of the wick/noise range (distance shown in ×ATR, the honest measure of 'tight'). Taken from the ${sTf} chart. Why: ${esc(stop?stop.basis:'—')}."><i>Stop</i>${stop?fmtNum(stop.level):'—'}${chip(sTf)}</span>
-      <span class="xtfi" data-tip="Target ${fmtNum(rec.lvl)} — the best take-profit by expected value (reward:risk × how reachable it is) that clears the 1.5:1 floor. Taken from the ${tTf} chart. Why: ${esc(rec.kind||'overhead resistance')}."><i>Target</i>${fmtNum(rec.lvl)}${chip(tTf)}</span>
-      <span class="xtfi" data-tip="Reward:risk — units of profit to the target for each unit risked to the stop, measured from the recommended entry. Only trades clearing 1.5:1 are shown."><i>R:R</i><b>${rec.rr.toFixed(2)}</b></span>
-      <span class="xtfi" data-tip="Reach — the estimated chance price reaches the target before the stop, from the distance (in ATR) adjusted for how strongly the trend, momentum and volume back the move."><i>Reach</i>${Math.round(rec.p*100)}%</span>
-    </div>${scaleOutHtml(be.rt, be.level, true)}</div>`;
+      <span class="xtfi" data-tip="Entry ${fmtNum(be.level)} — the recommended fill: the best value-area pullback that maximises reward:risk while still being a level price is likely to reach. From the ${eTf} chart. Why: ${esc(be.basis||'best value-area level')}."><i>Entry</i>${fmtNum(be.level)}${chip(eTf)}</span>
+      <span class="xtfi" data-tip="Stop ${fmtNum(stop.level)} — the level that invalidates the trade, just beyond real structure and clear of the wick/noise range. From the ${sTf} chart. Why: ${esc(stop.basis||'—')}."><i>Stop</i>${fmtNum(stop.level)}${chip(sTf)}</span>
+      <span class="xtfi" data-tip="Target ${fmtNum(rec.lvl)} — the best take-profit by expected value that clears the 1.5:1 floor. From the ${tTf} chart. Why: ${esc(rec.kind||'overhead resistance')}."><i>Target</i>${fmtNum(rec.lvl)}${chip(tTf)}</span>
+      <span class="xtfi" data-tip="Reward:risk from the recommended entry to the target over the stop. Only ≥1.5:1 shown."><i>R:R</i><b>${rec.rr.toFixed(2)}</b></span>
+      <span class="xtfi" data-tip="Reach — estimated chance of hitting the target before the stop, from ATR distance adjusted for trend / momentum / volume."><i>Reach</i>${Math.round(rec.p*100)}%</span>
+    </div>${detailed?xtfWhy(b):''}${cmpLine}${detailed?scaleOutHtml(be.rt, be.level, true):''}</div>`;
+}
+// Plain-English rationale for why the top trade is the recommended one.
+function xtfWhy(b){
+  const long=b.side!=='short', rec=b.rec, d=azLast||{}, bias=(d.bias||'').toLowerCase(), r=[];
+  r.push(`the highest-graded plan across all timeframes (Grade ${b.gr})`);
+  r.push(`R:R ${rec.rr.toFixed(2)} at ~${Math.round(rec.p*100)}% reach — ${rec.p>=0.55?'more likely than not to hit target':rec.p>=0.4?'a solid expected-value edge':'a high payoff on a lower hit-rate'}`);
+  if(long && (d.trend==='up'||bias==='bullish')) r.push(`in line with the coin's bullish structure`);
+  else if(!long && (d.trend==='down'||bias==='bearish')) r.push(`in line with the coin's bearish structure`);
+  else r.push(`a counter-trend / reversal setup — treat as unconfirmed until price turns`);
+  if(b.be&&b.be.basis) r.push(`entering at ${esc(b.be.basis)}`);
+  return `<div class="xtfwhy" data-tip="Why the engine ranks this the top trade right now — grade (R:R × reach), how it aligns with the coin's structure, and where the entry sits.">💡 <b>Why this one:</b> ${r.join(' · ')}.</div>`;
 }
 function stopsSection(list,side,recLevel){
   if(!list||!list.length) return '';
