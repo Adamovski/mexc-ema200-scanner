@@ -791,6 +791,8 @@ PAGE = """<!doctype html>
   .azside{flex:0 0 360px;width:360px}
   .azpe{border:1px solid var(--line2);border-radius:13px;padding:12px 16px;background:rgba(20,25,36,.35)}
   .azpe .azsec{margin-top:0}
+  .azsubh{font-size:10.5px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;color:var(--accent);margin:11px 0 1px}
+  .azpe .aznotes{margin:2px 0 0}
   @media(max-width:1150px){ .azcols{flex-direction:column} .azside{order:2;width:100%;flex:1 1 auto;position:static;max-height:none;overflow:visible} }
   .azxtf{margin:0 0 14px;padding:12px 16px;border-radius:13px;border:1px solid var(--line2);
        background:linear-gradient(90deg,rgba(63,185,80,.10),rgba(20,25,36,.30))}
@@ -1915,10 +1917,21 @@ function stopsSection(list,side,recLevel){
 // P(a stop at `riskATR` ATRs away survives normal noise without being wicked
 // out before the target). Near the wick range (~<1x ATR) it's very likely to be
 // tripped; by ~2.5-3x ATR it's comfortably clear. A smooth S-curve.
-function surviveProb(riskATR){
+function surviveProb(riskATR, mid){
   if(riskATR==null) riskATR=1.5;
-  return Math.max(0.05, Math.min(0.96, 1/(1+Math.exp(-(riskATR-1.5)*1.7))));
+  if(mid==null) mid=1.5;
+  return Math.max(0.05, Math.min(0.96, 1/(1+Math.exp(-(riskATR-mid)*1.7))));
 }
+// Liquidity / size tier from open interest + volatility. A big-OI, low-volatility
+// coin (BTC/ETH/SOL-like) respects levels and wicks far less, so a TIGHTER stop is
+// safe and suits higher leverage; a thin, high-ATR coin needs more wick clearance.
+// The survival curve's midpoint shifts LEFT for big coins (tight stops survive) and
+// RIGHT for thin ones (they need room).
+function liqTier(d){ const oi=d&&d.open_interest&&d.open_interest.oi_usd, atr=d&&d.atr_pct; let s=0;
+  if(oi!=null){ if(oi>=5e8) s+=2; else if(oi>=1e8) s+=1; else if(oi<1e7) s-=1; }
+  if(atr!=null){ if(atr<=2) s+=1; else if(atr>=6) s-=1; }
+  return s>=2?'mega':s===1?'large':s<=-1?'thin':'mid'; }
+function survMid(tier){ return tier==='mega'?1.05:tier==='large'?1.3:tier==='thin'?1.85:1.5; }
 // Evaluate an ENTRY: from the actual stop-loss OPTIONS on the menu, choose the
 // stop that maximises TRADE QUALITY = EV(best target from this entry over this
 // stop) × P(the stop survives normal noise). This is the whole game: a tight
@@ -1945,12 +1958,13 @@ function evalEntry(d, E){
     const note = (isTrend(s.basis)&&trending) ? 'the trend line that has carried this move — a close through it flips the trend, the true invalidation here'
       : (ax>3.5 ? 'a wider structural level that comfortably clears the wick/noise range' : 'just below real structure, beyond the recent wick range');
     return {level:s.level, basis:s.basis, pct:distE(s.level), atrx:ax, note}; };
+  const mid=survMid(liqTier(d));                         // liquidity-aware survival midpoint
   let best=null;
   for(const s of pool){
     const rt=recTargets(d, E, s.level);
     const ev=(rt&&rt.primary)? rt.primary.ev : 0;
     if(ev<=0) continue;                                  // must yield a >=1.5 R:R trade
-    let sc=ev*surviveProb(atrx(s.level));
+    let sc=ev*surviveProb(atrx(s.level), mid);
     if(!isVol(s.basis)) sc*=1.08;                        // real structure over a blunt ATR stop
     if(trending && isTrend(s.basis)) sc*=1.08;           // trend line nudge in a trend
     if(!best || sc>best.sc) best={sc, rtg:rt, stop:mk(s)};
@@ -2136,7 +2150,7 @@ function pickEntry(d){
     if(shield!=null){ const past = long ? (c.level < shield*0.999) : (c.level > shield*1.001);
       if(past){ const beyond=atr? Math.abs((c.level-shield)/price*100)/atr : 0;
         shieldPen=Math.max(0.12, 1/(1+Math.pow(beyond/0.75,1.6))); } }
-    const score=ee.rtg.primary.ev*surviveProb(ee.stop.atrx)*(0.35+0.65*fill)*tfBoost*shieldPen;
+    const score=ee.rtg.primary.ev*surviveProb(ee.stop.atrx, survMid(liqTier(d)))*(0.35+0.65*fill)*tfBoost*shieldPen;
     if(!best || score>best.score) best={level:c.level, basis:c.basis, tf:c.tf, score, rt:ee.rtg, rs:ee.stop,
         distPct:Math.abs((c.level-price)/price*100), distATR,
         shieldTf:(shield!=null&&Math.abs(c.level-shield)/shield<0.003)?shieldTf:null};
@@ -2286,6 +2300,7 @@ function azCard(d0){
       ${cell("Range position", d.range_pos==null?'—':d.range_pos+'%', `Where price sits in its recent 120-candle range on the ${d.interval||'4h'} timeframe (0% = range low, 100% = range high).`)}
       ${cell("ATR", d.atr_pct==null?'—':d.atr_pct+'%', "Average True Range as a % of price — the coin's volatility. Stops are buffered by a fraction of this.")}
       ${cell("Open interest", (()=>{const o=d.open_interest; if(!o||o.oi_usd==null) return '—'; const m=o.oi_usd; const s=m>=1e9?'$'+(m/1e9).toFixed(2)+'B':m>=1e6?'$'+(m/1e6).toFixed(1)+'M':'$'+(m/1e3).toFixed(0)+'K'; return s+(o.chg24!=null?` <span class="rr">${o.chg24>=0?'+':''}${o.chg24.toFixed(1)}% 24h</span>`:''); })(), "Open interest — the total notional in open perpetual positions right now (holdVol × price). Rising OI as price rises = new money backing the move (conviction). Price rising while OI is flat or falling = short-covering or a thin move that can be a fake pump — confirm before chasing. Perps only.")}
+      ${cell("Liquidity tier", (()=>{const t=liqTier(d); return ({mega:'Mega-cap',large:'Large-cap',mid:'Mid',thin:'Thin / illiquid'})[t]; })(), "Size/liquidity tier from open interest + volatility. Mega/large-cap coins (big OI, low ATR — BTC/ETH/SOL-like) respect levels and wick far less, so the recommended STOP is allowed to sit tighter (better R:R, suits higher leverage). Thin/high-volatility coins get more wick clearance so a random spike doesn't stop you out.")}
       ${cell("BTC correlation", d.btc_corr==null?'—':('ρ '+(+d.btc_corr).toFixed(2)+(d.btc_corr>=0.85?' · just follows BTC':d.btc_corr<0.5?' · independent':' · partly linked')), "How closely this coin's 4h returns tracked BTC over the last ~10 days (Pearson ρ, −1 to +1). ρ≥0.85 means the move is largely just BTC beta — a 'breakout' here may only be BTC pulling it up. Low or negative ρ means the coin is trading on its own story, which is usually what you want for an independent setup.")}
       ${cell("Supertrend ("+(d.interval||'4h')+")", d.supertrend==null?'—':(fmtNum(d.supertrend)+' · '+(d.supertrend_role==='support'?'SUPPORT':'RESISTANCE')+pct(d.supertrend, d.supertrend_role==='support'?'-':'+')), `Supertrend (ATR 10×3) on the ${d.interval||'4h'} chart. When price is ABOVE the line the trend is up and the line acts as a trailing SUPPORT; when price is BELOW it the trend is down and it acts as RESISTANCE. Here it's ${d.supertrend_role||'—'} at ${d.supertrend==null?'—':fmtNum(d.supertrend)} — a level to watch for the trend flipping.`)}
       ${cell("Supports (distance)", (d.supports||[]).slice(0,3).map(v=>fmtNum(v)+pct(v,'-')).join(' · ')||'—', "Based on: swing-low pivots — prior candle lows the market previously bounced from — on this timeframe, nearest first, with the % below current price.")}
@@ -2334,9 +2349,24 @@ function azCard(d0){
 }
 // The "In plain English" bullet summary — rendered in the right-hand rail.
 function plainEnglishHtml(d){
-  const notes=((d&&d.notes)||[]).map(n=>`<li>${n}</li>`).join('');
-  if(!notes) return '';
-  return `<div class="azpe"><div class="azsec">In plain English <span class="azsub">— the read behind this coin</span></div><ul class="aznotes">${notes}</ul></div>`;
+  const notes=((d&&d.notes)||[]);
+  if(!notes.length) return '';
+  // Organise the read into labelled sections instead of one flat list.
+  const sec={trend:[],vol:[],levels:[],oi:[],bottom:[]};
+  for(const n of notes){ const t=(''+n).toLowerCase();
+    if(t.includes('open interest')) sec.oi.push(n);
+    else if(t.includes('active setup')||t.includes('directional lean')) sec.bottom.push(n);
+    else if(t.includes('volume')||t.includes('range')||t.includes('atr')) sec.vol.push(n);
+    else if(t.includes('support')||t.includes('resistance')||t.includes('supertrend')||t.includes('drawdown')) sec.levels.push(n);
+    else sec.trend.push(n); }
+  const block=(title,arr)=> arr.length? `<div class="azsubh">${title}</div><ul class="aznotes">${arr.map(n=>`<li>${n}</li>`).join('')}</ul>`:'';
+  return `<div class="azpe"><div class="azsec">Summary <span class="azsub">— the read behind this coin, at a glance</span></div>`
+    + block('Trend &amp; momentum', sec.trend)
+    + block('Volume &amp; volatility', sec.vol)
+    + block('Key levels', sec.levels)
+    + block('Open interest', sec.oi)
+    + block('Bottom line', sec.bottom)
+    + `</div>`;
 }
 function renderBanner(){
   const b=document.getElementById("banner");
