@@ -1882,6 +1882,30 @@ def _spot_live_price(sess: requests.Session, symbol: str) -> float | None:
     return float(p) if p else None
 
 
+def fetch_open_interest(sess: requests.Session, symbol: str) -> dict | None:
+    """Current open interest for a MEXC perp from the contract ticker.
+    Returns {oi, price, oi_usd, chg24} — oi is holdVol (contracts), oi_usd an
+    approximate notional (holdVol × last price), chg24 the 24h price move %
+    (for the price-vs-OI divergence read). None if unavailable."""
+    try:
+        r = sess.get(f"{FUTURES_BASE}/api/v1/contract/ticker",
+                     params={"symbol": to_contract(symbol)}, timeout=12)
+        r.raise_for_status()
+        d = r.json().get("data")
+        if isinstance(d, list):
+            d = d[0] if d else {}
+        if not d or d.get("holdVol") is None:
+            return None
+        oi = float(d["holdVol"])
+        price = float(d["lastPrice"]) if d.get("lastPrice") else None
+        chg = float(d["riseFallRate"]) * 100 if d.get("riseFallRate") is not None else None
+        return {"oi": oi, "price": price,
+                "oi_usd": (oi * price) if (oi and price) else None,
+                "chg24": chg}
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        return None
+
+
 def fetch_live_price(sess: requests.Session, symbol: str,
                      market: str) -> float | None:
     """The current LIVE last-traded price for one symbol — independent of the
@@ -2158,6 +2182,8 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     # falling back to the last closed candle if the ticker call fails.
     live = fetch_live_price(sess, symbol, mkt)
     price = live if live else closes[last]
+    # Open interest context (perps only) — is the move backed by real positioning?
+    oi_data = fetch_open_interest(sess, symbol) if mkt == "futures" else None
     ema_now = e[last]
     if ema_now is None:
         return {"error": "Not enough data to compute the 200 EMA."}
@@ -2610,6 +2636,15 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         matched.append(f"support bounce off {dB['tf']} support at {dB['support']:.6g} "
                        f"({dB['touches']} touches, score {dB['score']})")
     notes.append("Active setups: " + (", ".join(matched) if matched else "none right now") + ".")
+    if oi_data and oi_data.get("oi_usd"):
+        _m = oi_data["oi_usd"]
+        _oi_s = (f"${_m/1e9:.2f}B" if _m >= 1e9 else f"${_m/1e6:.1f}M" if _m >= 1e6 else f"${_m/1e3:.0f}K")
+        _c = oi_data.get("chg24")
+        notes.append(f"Open interest: ~{_oi_s} notional"
+                     + (f" · price {'+' if _c >= 0 else ''}{_c:.1f}% (24h)" if _c is not None else "")
+                     + ". Price rising WITH open interest = new money backing the move; "
+                       "price up while OI is flat or falling = a weaker, short-covering move "
+                       "(possible fake pump — confirm before chasing).")
     if direction == "Long":
         notes.append(f"Directional lean: <b>LONG</b> — bullish signals outweigh "
                      f"bearish ({long_pts} vs {short_pts}).")
@@ -2643,6 +2678,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "struct_reason": struct_reason,
         "rsi": r14,
         "atr_pct": atr_pct,
+        "open_interest": oi_data,
         "btc_corr": (round(btc_corr, 2) if btc_corr is not None else None),
         "supertrend": st_val,
         "supertrend_dir": st_dir,

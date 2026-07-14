@@ -742,6 +742,10 @@ PAGE = """<!doctype html>
        box-shadow:8px 0 12px -8px rgba(0,0,0,.55);
        white-space:normal;vertical-align:top;overflow:hidden;
        width:232px;min-width:232px;max-width:232px}
+  /* browsers ignore max-width on table cells in auto layout, so an inner fixed-width
+     div is what actually contains the badge cluster and stops it spilling over the
+     scrolling columns */
+  td.sym>.symbox{width:204px;overflow:hidden;white-space:normal}
   td.sym .wstar,td.sym>a{vertical-align:middle}
   /* badges wrap onto their own lines under the ticker and never spill into the
      scrolling columns */
@@ -2278,6 +2282,7 @@ function azCard(d0){
       ${cell("Rel volume", d.rvol==null?'—':(+d.rvol).toFixed(2)+'× latest bar', "The latest candle's volume ÷ its 20-bar average. Above 1× = the current move is happening on above-average participation = stronger confirmation. Below 1× = quiet, less conviction.")}
       ${cell("Range position", d.range_pos==null?'—':d.range_pos+'%', `Where price sits in its recent 120-candle range on the ${d.interval||'4h'} timeframe (0% = range low, 100% = range high).`)}
       ${cell("ATR", d.atr_pct==null?'—':d.atr_pct+'%', "Average True Range as a % of price — the coin's volatility. Stops are buffered by a fraction of this.")}
+      ${cell("Open interest", (()=>{const o=d.open_interest; if(!o||o.oi_usd==null) return '—'; const m=o.oi_usd; const s=m>=1e9?'$'+(m/1e9).toFixed(2)+'B':m>=1e6?'$'+(m/1e6).toFixed(1)+'M':'$'+(m/1e3).toFixed(0)+'K'; return s+(o.chg24!=null?` <span class="rr">${o.chg24>=0?'+':''}${o.chg24.toFixed(1)}% 24h</span>`:''); })(), "Open interest — the total notional in open perpetual positions right now (holdVol × price). Rising OI as price rises = new money backing the move (conviction). Price rising while OI is flat or falling = short-covering or a thin move that can be a fake pump — confirm before chasing. Perps only.")}
       ${cell("BTC correlation", d.btc_corr==null?'—':('ρ '+(+d.btc_corr).toFixed(2)+(d.btc_corr>=0.85?' · just follows BTC':d.btc_corr<0.5?' · independent':' · partly linked')), "How closely this coin's 4h returns tracked BTC over the last ~10 days (Pearson ρ, −1 to +1). ρ≥0.85 means the move is largely just BTC beta — a 'breakout' here may only be BTC pulling it up. Low or negative ρ means the coin is trading on its own story, which is usually what you want for an independent setup.")}
       ${cell("Supertrend ("+(d.interval||'4h')+")", d.supertrend==null?'—':(fmtNum(d.supertrend)+' · '+(d.supertrend_role==='support'?'SUPPORT':'RESISTANCE')+pct(d.supertrend, d.supertrend_role==='support'?'-':'+')), `Supertrend (ATR 10×3) on the ${d.interval||'4h'} chart. When price is ABOVE the line the trend is up and the line acts as a trailing SUPPORT; when price is BELOW it the trend is down and it acts as RESISTANCE. Here it's ${d.supertrend_role||'—'} at ${d.supertrend==null?'—':fmtNum(d.supertrend)} — a level to watch for the trend flipping.`)}
       ${cell("Supports (distance)", (d.supports||[]).slice(0,3).map(v=>fmtNum(v)+pct(v,'-')).join(' · ')||'—', "Based on: swing-low pivots — prior candle lows the market previously bounced from — on this timeframe, nearest first, with the % below current price.")}
@@ -2366,7 +2371,7 @@ function renderFlags(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</td>`+
+      `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</div></td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.pole_gain_pct).toFixed(1)}</td>`+
       `<td>${h.flag_bars}</td>`+
@@ -2394,7 +2399,7 @@ function render(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</td>`+
+      `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</div></td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.pct_above_ema).toFixed(2)}</td>`+
       `<td>${h.bars_since_cross}</td>`+
@@ -2444,7 +2449,7 @@ function renderBounce(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</td>`+
+      `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</div></td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${fmtNum(h.support)}</td>`+
       `<td><span class="tfpill tf-${(h.tf||'').toLowerCase()}">${h.tf||'—'}</span></td>`+
@@ -2473,7 +2478,7 @@ function renderCPR(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</td>`+
+      `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</div></td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.cpr_width_pct).toFixed(3)}</td>`+
       `<td>${h.position}</td>`+
@@ -2513,7 +2518,7 @@ function renderEarly(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</td>`+
+      `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</div></td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td data-tip="The strong support the coin is coiling on (daily/weekly swing low or base low).">${fmtNum(h.support)}</td>`+
       `<td data-tip="How far below its recent 120-bar high the coin is trading — how beaten down it is.">${h.drawdown_pct==null?'—':(+h.drawdown_pct).toFixed(0)}%</td>`+
@@ -2545,7 +2550,7 @@ function renderStb(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</td>`+
+      `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</div></td>`+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td data-tip="The Supertrend line value on the strongest confirming timeframe — acting as support below price.">${fmtNum(h.supertrend)}</td>`+
       `<td><span class="tfpill tf-${(h.tf||'').toLowerCase()}">${h.tf||'4h'}</span></td>`+
@@ -2674,7 +2679,7 @@ function renderShorts(){
     const tr=document.createElement("tr");
     tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</td>`+
+      `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</div></td>`+
       ratingCell(h._rating,h._why)+
       `<td data-tip="Live last-traded price — refreshes ~every 20s and is independent of the chart timeframe.">${fmtNum(h.live!=null?h.live:h.price)}</td>`+
       `<td>${(+h.pct_below_ema).toFixed(2)}</td>`+
@@ -2747,7 +2752,7 @@ function renderTop(){
     const tgtTip = o.rr.move? esc(`Target ${fmtNum(o.rr.tp)} — a +${(o.rr.move*100).toFixed(1)}% move, the basis for the R:R.`):'';
     const tr=document.createElement('tr'); tr.className=rowClass(h);
     tr.innerHTML =
-      `<td class="sym">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</td>`+
+      `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}${badges(h)}</div></td>`+
       ratingCell(o.rating,o.why)+
       `<td data-tip="${esc(o.f.setups)}">${o.f.nScans>1?'★ ':''}${o.f.nScans}</td>`+
       `<td>${fmtNum(P)}</td>`+
