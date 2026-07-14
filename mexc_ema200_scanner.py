@@ -1953,6 +1953,119 @@ def fetch_klines(sess: requests.Session, symbol: str, interval: str,
     return None
 
 
+def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
+                       ms, ksup, kres, rv, detectors) -> tuple:
+    """Grade the BEST LONG and BEST SHORT for this coin from data already computed
+    in the scan (no extra API calls). Returns (long_setup, short_setup) — each a
+    0-100 composite with a plain-English `why`, so the Top-setups tabs can rank the
+    whole universe instead of only the handful of pattern hits. Clicking a row opens
+    the full cross-timeframe Analyze card.
+
+    Blends: market structure, multi-timeframe bias agreement, 200-EMA side,
+    momentum (rate of change), relative volume, pattern-detector confluence, and
+    proximity to the nearest support (long) / resistance (short) for entry quality."""
+    price = closes[-1]
+    atr_val = atr(highs, lows, closes)
+    atr_pct = round(atr_val / price * 100, 2) if price else None
+    roc = (price / closes[-11] - 1) if len(closes) > 11 else 0.0
+    struct = ms.get("structure")
+    choch = ms.get("choch")
+    bull_tf = sum(1 for v in tfb.values() if v == "bullish")
+    bear_tf = sum(1 for v in tfb.values() if v == "bearish")
+    n_tf = sum(1 for v in tfb.values() if v)
+    # nearest support below / resistance above (closest of the per-TF levels)
+    sups = [s for s in (ksup.get("sup_4h"), ksup.get("sup_1d"), ksup.get("sup_1w"))
+            if s and s < price]
+    ress = [r for r in (kres.get("res_4h"), kres.get("res_1d"), kres.get("res_1w"))
+            if r and r > price]
+    near_sup = max(sups) if sups else None
+    near_res = min(ress) if ress else None
+    gap_sup = (price - near_sup) / price if near_sup else None
+    gap_res = (near_res - price) / price if near_res else None
+    bull_dets = [k for k in ("ema", "flag", "cpr", "bounce", "wedge", "stb", "early")
+                 if detectors.get(k)]
+    bear_dets = [k for k in ("short",) if detectors.get(k)]
+
+    def _tf_label(cnt, tot, word):
+        return f"{cnt}/{tot} timeframes {word}" if tot else None
+
+    # ---- LONG ----
+    ls, lw = 0.0, []
+    if struct == "uptrend":
+        ls += 25; lw.append("Uptrend structure")
+    elif choch == "bullish":
+        ls += 22; lw.append("Bullish CHoCH (structure just flipped up)")
+    elif struct == "range":
+        ls += 8; lw.append("Ranging (no clear trend)")
+    if bull_tf:
+        ls += min(18, bull_tf * 6)
+        lbl = _tf_label(bull_tf, n_tf, "bullish")
+        if lbl:
+            lw.append(lbl)
+    if ema_now and price > ema_now:
+        if price > ema_now * 1.25:
+            ls += 4; lw.append("Extended above 200-EMA (chasing risk)")
+        else:
+            ls += 10; lw.append("Above 200-EMA")
+    if roc > 0:
+        ls += min(12, roc * 80)
+        if roc > 0.03:
+            lw.append(f"+{roc*100:.1f}% momentum (10 candles)")
+    if rv and rv > 1:
+        ls += min(8, (rv - 1) * 8)
+        if rv > 1.3:
+            lw.append(f"{rv:.1f}× relative volume")
+    if bull_dets:
+        ls += min(20, len(bull_dets) * 5)
+        lw.append("Pattern confluence: " + ", ".join(bull_dets))
+    if gap_sup is not None and gap_sup < 0.08:
+        ls += 10 * max(0.0, 1 - gap_sup / 0.08)
+        lw.append(f"Near support ({gap_sup*100:.1f}% away) — clean entry")
+    ls = round(max(0.0, min(100.0, ls)), 1)
+
+    # ---- SHORT ----
+    ss, sw = 0.0, []
+    if struct == "downtrend":
+        ss += 25; sw.append("Downtrend structure")
+    elif choch == "bearish":
+        ss += 22; sw.append("Bearish CHoCH (structure just flipped down)")
+    elif struct == "range":
+        ss += 8; sw.append("Ranging (no clear trend)")
+    if bear_tf:
+        ss += min(18, bear_tf * 6)
+        lbl = _tf_label(bear_tf, n_tf, "bearish")
+        if lbl:
+            sw.append(lbl)
+    if ema_now and price < ema_now:
+        if price < ema_now * 0.75:
+            ss += 4; sw.append("Extended below 200-EMA (chasing risk)")
+        else:
+            ss += 10; sw.append("Below 200-EMA")
+    if roc < 0:
+        ss += min(12, -roc * 80)
+        if roc < -0.03:
+            sw.append(f"{roc*100:.1f}% momentum (10 candles)")
+    if rv and rv > 1:
+        ss += min(8, (rv - 1) * 8)
+        if rv > 1.3:
+            sw.append(f"{rv:.1f}× relative volume")
+    if bear_dets:
+        ss += min(20, len(bear_dets) * 12)
+        sw.append("Breakdown/retest confirmed")
+    if gap_res is not None and gap_res < 0.08:
+        ss += 10 * max(0.0, 1 - gap_res / 0.08)
+        sw.append(f"Near resistance ({gap_res*100:.1f}% away) — clean entry")
+    ss = round(max(0.0, min(100.0, ss)), 1)
+
+    base = {"symbol": symbol, "price": price, "atr_pct": atr_pct, "rvol": rv,
+            "bias": bias, "tf_bias": tfb}
+    long_setup = {**base, "side": "long", "score": ls, "why": lw,
+                  "near_level": near_sup, "near_kind": "support"}
+    short_setup = {**base, "side": "short", "score": ss, "why": sw,
+                   "near_level": near_res, "near_kind": "resistance"}
+    return long_setup, short_setup
+
+
 def scan_symbol(sess: requests.Session, symbol: str, interval: str,
                 cfg: dict) -> dict | None:
     return scan_symbol_multi(sess, symbol, interval, cfg)[0]
@@ -1987,12 +2100,14 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
                       cfg: dict) -> tuple:
     """Fetch klines ONCE and run every detector (200-EMA reclaim, bull flag,
     narrow CPR, support bounce, falling wedge, bearish breakdown/retest). One
-    request per symbol powers every scan. Returns an 8-tuple of dicts (each with
-    'symbol') or None: (ema, flag, cpr, bounce, wedge, short, st_bounce, early)."""
+    request per symbol powers every scan. Returns a 10-tuple: the 8 detector dicts
+    (each with 'symbol') or None — (ema, flag, cpr, bounce, wedge, short, st_bounce,
+    early) — plus a graded best-long and best-short setup for the coin (always
+    present) for the universe-wide Top-setups leaderboard."""
     raw = fetch_candles(sess, symbol, interval, cfg["kline_limit"],
                         cfg.get("market", "spot"))
     if not raw or len(raw) < EMA_PERIOD + 2:
-        return (None,) * 8
+        return (None,) * 10
     # MEXC kline row: [openTime, open, high, low, close, volume, closeTime, ...]
     rows = raw[:-1]                       # drop the still-forming candle
     try:
@@ -2005,6 +2120,7 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
 
     rv = rel_volume(vols)                       # relative volume of the latest candle
     ksup = key_supports(rows, lows, closes[-1])  # next 4h / daily / weekly support
+    kres = key_resistances(rows, highs, closes[-1])  # next 4h / daily / weekly resist.
     _stale = not _klines_fresh(raw, interval)   # frozen on both futures & spot
     # BTC correlation over the recent window (how much this coin just mirrors BTC).
     _btc_ret = cfg.get("btc_returns")
@@ -2113,8 +2229,20 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
     if ok8:
         early_hit = confirmed(el, boost=False)   # early = coiling, volume not required
 
+    # Universe-wide leaderboard: grade the best long AND best short for EVERY coin
+    # (not just pattern hits) so Top-setups can rank all ~500 pairs. Uses only data
+    # already computed above — no extra API calls.
+    _dets = {"ema": ema_hit, "flag": flag_hit, "cpr": cpr_hit, "bounce": bounce_hit,
+             "wedge": wedge_hit, "short": short_hit, "stb": st_bounce_hit,
+             "early": early_hit}
+    long_setup, short_setup = leaderboard_setups(
+        symbol, highs, lows, closes, vols, _ema_now, _tfb, _bias, _ms,
+        ksup, kres, rv, _dets)
+    if _stale:
+        long_setup["data_stale"] = short_setup["data_stale"] = True
+
     return (ema_hit, flag_hit, cpr_hit, bounce_hit, wedge_hit, short_hit,
-            st_bounce_hit, early_hit)
+            st_bounce_hit, early_hit, long_setup, short_setup)
 
 
 def supports_below(lows: list[float], upto: int, price: float,
