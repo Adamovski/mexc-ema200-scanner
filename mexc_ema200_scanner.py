@@ -2481,18 +2481,44 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         # would otherwise drop them. Low reach / high R:R — a bag to hold into strength.
         if side != "short":
             _hi_lb = highs[-500:] if len(highs) >= 500 else highs
+            _lo_lb = lows[-500:] if len(lows) >= 500 else lows
             _major_hi = max(_hi_lb) if _hi_lb else 0.0
+            _major_lo = min(_lo_lb) if _lo_lb else 0.0
             _runners = []
-            if _major_hi > price * 1.6:
-                _runners.append(((price + _major_hi) / 2.0, "halfway to the prior major high — breakout runner"))
-                _runners.append((_major_hi, "prior major high — breakout runner (if it breaks out)"))
-            elif _major_hi > price * 1.3:
-                _runners.append((_major_hi, "prior major high — breakout runner (if it breaks out)"))
+            # The most sensible runner targets are the REAL higher-timeframe resistance
+            # levels above price — the prior Daily/Weekly swing highs a recovery has to
+            # clear on the way up. We blend those with the Fibonacci levels of the whole
+            # decline (golden pocket / prior high / 1.618 extension) as measured-move
+            # projections. Low reach / high R:R — a bag to hold into strength.
+            for _p in htf_swing_highs(rows, 1):        # Daily swing highs
+                if _p > price * 1.12:
+                    _runners.append((_p, "Daily swing-high resistance — breakout runner"))
+            for _p in htf_swing_highs(rows, 7):        # Weekly swing highs
+                if _p > price * 1.12:
+                    _runners.append((_p, "Weekly swing-high resistance — breakout runner"))
+            if _major_hi > price * 1.25 and _major_hi > _major_lo > 0:
+                _rng = _major_hi - _major_lo
+                for _f, _lbl in ((0.618, "0.618 Fib — golden pocket of the decline"),
+                                 (1.0,   "prior major high (full retrace of the decline)"),
+                                 (1.618, "1.618 Fib extension beyond the prior high")):
+                    _lv = _major_lo + _rng * _f
+                    if _lv > price * 1.08:
+                        _runners.append((_lv, f"{_lbl} — breakout runner"))
+            # Dedupe among themselves + against existing rungs; keep the nearest few so
+            # the ladder isn't flooded with far targets.
+            _runners.sort(key=lambda x: x[0])
+            _radd = 0
             for lvl, kind in _runners:
-                if all(abs(lvl - p0) / lvl > 0.01 for p0, _ in picked):
-                    picked.append((lvl, kind))
+                if lvl <= price * 1.05:
+                    continue
+                if any(abs(lvl - p0) / lvl <= 0.012 for p0, _ in picked):
+                    continue
+                picked.append((lvl, kind))
+                _radd += 1
+                if _radd >= 5:
+                    break
             picked.sort(key=lambda x: x[0])
-            picked = picked[:10]
+            picked = picked[:12]
         target_ladder = [{"level": lvl, "kind": kind,
                           "pct": round((lvl - entry) / entry * 100, 1),
                           "rr": round((lvl - entry) / (entry - sl_tight), 2)
