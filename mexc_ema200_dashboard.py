@@ -108,6 +108,7 @@ class State:
         self.new_early_symbols: list[str] = []
         self.long_board: list[dict] = []           # top-25 best longs (whole universe)
         self.short_board: list[dict] = []          # top-25 best shorts (whole universe)
+        self.coil_board: list[dict] = []           # top-25 most coiled (imminent big move)
         self.both_symbols: list[str] = []          # appear on 2+ scans (confluence)
         self.prev_both: set[str] | None = None     # confluence set from previous scan
         self.watch: dict[str, float] = {}          # symbol -> flag breakout level (armed)
@@ -160,6 +161,7 @@ class State:
                 "early_new_symbols": list(self.new_early_symbols),
                 "long_board": withlive(self.long_board),
                 "short_board": withlive(self.short_board),
+                "coil_board": withlive(self.coil_board),
                 "both_symbols": list(self.both_symbols),
                 "breakout_events": list(self.breakout_events),
                 "error": self.error,
@@ -204,6 +206,7 @@ def run_one_scan(state: State) -> None:
     earlies: list[dict] = []
     long_board: list[dict] = []
     short_board: list[dict] = []
+    coil_board: list[dict] = []
     done = 0
     scan_cfg = {k: cfg[k] for k in
                 ("kline_limit", "lookback", "retest_tol", "break_tol",
@@ -229,13 +232,15 @@ def run_one_scan(state: State) -> None:
                 with state.lock:
                     state.progress = (done, len(symbols))
             try:
-                h, f, c, b, w, sh, sb, el, lng, sht = fut.result()
+                h, f, c, b, w, sh, sb, el, lng, sht, coil = fut.result()
             except Exception:
-                h, f, c, b, w, sh, sb, el, lng, sht = (None,) * 10
+                h, f, c, b, w, sh, sb, el, lng, sht, coil = (None,) * 11
             if lng:
                 long_board.append(lng)
             if sht:
                 short_board.append(sht)
+            if coil:
+                coil_board.append(coil)
             if el:
                 earlies.append(el)
             if h:
@@ -282,10 +287,13 @@ def run_one_scan(state: State) -> None:
     # scanned pair (skip frozen/delisted feeds). These power the Top-setups tabs.
     long_board = [d for d in long_board if not d.get("data_stale")]
     short_board = [d for d in short_board if not d.get("data_stale")]
+    coil_board = [d for d in coil_board if not d.get("data_stale")]
     long_board.sort(key=lambda d: d["score"], reverse=True)
     short_board.sort(key=lambda d: d["score"], reverse=True)
+    coil_board.sort(key=lambda d: d["score"], reverse=True)
     long_board = long_board[:25]
     short_board = short_board[:25]
+    coil_board = coil_board[:25]
 
     # Enrich ONLY the flagged coins with a 1h read (bias + formation) — a single 1h
     # fetch each, cheap since it's just the few dozen hits (not the ~500 universe).
@@ -361,6 +369,7 @@ def run_one_scan(state: State) -> None:
         state.early_hits, state.new_early_symbols, state.prev_early_symbols = elrows, elnew, elcur
         state.long_board = long_board
         state.short_board = short_board
+        state.coil_board = coil_board
         state.both_symbols = sorted(both)
 
         # Arm breakout alerts for the current bull flags (their breakout level).
@@ -690,6 +699,7 @@ PAGE = """<!doctype html>
   .scorepill.sc-b{background:rgba(240,180,41,.16);color:#f0b429;border-color:rgba(240,180,41,.5)}
   .scorepill.sc-c{background:rgba(139,152,173,.14);color:#c3ccd8}
   .scorepill.sc-d{background:rgba(139,152,173,.08);color:var(--dim)}
+  td.rrg b{color:var(--accent)} td.rry b{color:#f0b429} td.rrd{color:var(--dim)}
   .corrbadge{border-radius:6px;padding:0 6px;font-size:10.5px;font-weight:700;border:1px solid var(--line);margin-left:5px;font-variant-numeric:tabular-nums;cursor:help}
   .corr-hi{background:rgba(210,153,34,.16);color:#d29922;border-color:rgba(210,153,34,.45)}
   .corr-mid{background:rgba(139,152,173,.12);color:var(--dim)}
@@ -913,22 +923,23 @@ PAGE = """<!doctype html>
 <div class="bkbanner" id="bkbanner"></div>
 <div class="banner" id="banner"></div>
 <div class="tabs">
-  <div class="tab active" id="tabSetups" onclick="showTab('setups')">200-EMA reclaim</div>
+  <div class="tab" id="tabAnalyze" onclick="showTab('analyze')">🔎 Analyze a coin</div>
+  <div class="tab active" id="tabBestLong" onclick="showTab('bestlong')">🏆 Best longs</div>
+  <div class="tab" id="tabBestShort" onclick="showTab('bestshort')">🩸 Best shorts</div>
+  <div class="tab" id="tabWatch" onclick="showTab('watch')">📌 Watchlist</div>
+  <div class="tab" id="tabEarly" onclick="showTab('early')">⏳ Early</div>
+  <div class="tab" id="tabCoil" onclick="showTab('coil')">🚀 Coiled</div>
+  <div class="tab" id="tabSetups" onclick="showTab('setups')">200-EMA reclaim</div>
   <div class="tab" id="tabFlags" onclick="showTab('flags')">Bull flags</div>
   <div class="tab" id="tabCpr" onclick="showTab('cpr')">Narrow CPR</div>
   <div class="tab" id="tabBounce" onclick="showTab('bounce')">Support bounce</div>
   <div class="tab" id="tabStb" onclick="showTab('stb')">Supertrend support bounce</div>
   <div class="tab" id="tabShorts" onclick="showTab('shorts')">Shorts</div>
-  <div class="tab" id="tabEarly" onclick="showTab('early')">⏳ Early</div>
-  <div class="tab" id="tabBestLong" onclick="showTab('bestlong')">🏆 Best longs</div>
-  <div class="tab" id="tabBestShort" onclick="showTab('bestshort')">🩸 Best shorts</div>
-  <div class="tab" id="tabWatch" onclick="showTab('watch')">📌 Watchlist</div>
-  <div class="tab" id="tabAnalyze" onclick="showTab('analyze')">Analyze a coin</div>
   <div class="tab" id="tabInfo" onclick="showTab('info')">Info</div>
 </div>
 <div class="filterbar" id="filterbar"></div>
 
-<div class="view active" id="viewSetups">
+<div class="view" id="viewSetups">
 <div class="status">
   <span><span class="dot" id="dot"></span><span id="scanState">starting…</span></span>
   <span id="lastScan">last scan: —</span>
@@ -1160,7 +1171,7 @@ PAGE = """<!doctype html>
 </div>
 </div>
 
-<div class="view" id="viewBestLong">
+<div class="view active" id="viewBestLong">
 <div class="status">
   <span>🏆 Best longs — the <b>25 strongest LONG</b> setups ranked across <b>every</b> scanned pair (not just pattern hits). Each coin is graded on trend structure, multi-timeframe agreement, 200-EMA side, momentum, volume and proximity to support. Click any row (⚲) for the full cross-timeframe trade plan.</span>
   <span id="blCount"></span>
@@ -1174,8 +1185,10 @@ PAGE = """<!doctype html>
       <th data-tip="Live last-traded price (updates ~every 20s).">Price</th>
       <th data-tip="Market-structure bias from swing highs/lows.">Bias</th>
       <th data-tip="Per-timeframe market-structure bias (1h/4h/1D/1W): ▲ bullish, ▼ bearish, – neutral.">Timeframes</th>
-      <th data-tip="ATR as % of price — the coin's typical candle range / volatility. Higher = wider swings, size smaller.">ATR%</th>
-      <th data-tip="Nearest support below price — the natural stop reference and a clean pullback entry zone.">Near support</th>
+      <th data-tip="Recommended entry — a pullback to the nearest support (a value fill), or current price if support is far. Quick preview; click ⚲ for the full cross-timeframe entry.">Entry</th>
+      <th data-tip="Recommended stop — just beyond the next support below the entry (or an ATR buffer if none).">Stop</th>
+      <th data-tip="Recommended target — the nearest resistance above (or a 2R projection if none overhead).">Target</th>
+      <th data-tip="Reward:risk of the previewed trade (target vs stop from the entry).">R:R</th>
       <th data-tip="Plain-English reasons this coin ranks where it does.">Why</th>
     </tr></thead>
     <tbody id="blrows"></tbody>
@@ -1198,13 +1211,41 @@ PAGE = """<!doctype html>
       <th data-tip="Live last-traded price (updates ~every 20s).">Price</th>
       <th data-tip="Market-structure bias from swing highs/lows.">Bias</th>
       <th data-tip="Per-timeframe market-structure bias (1h/4h/1D/1W): ▲ bullish, ▼ bearish, – neutral.">Timeframes</th>
-      <th data-tip="ATR as % of price — the coin's typical candle range / volatility.">ATR%</th>
-      <th data-tip="Nearest resistance above price — the natural stop reference and a clean pullback entry zone for a short.">Near resist.</th>
+      <th data-tip="Recommended entry — a pullback to the nearest resistance (sell into strength), or current price if resistance is far. Quick preview; click ⚲ for the full cross-timeframe entry.">Entry</th>
+      <th data-tip="Recommended stop — just beyond the next resistance above the entry (or an ATR buffer if none).">Stop</th>
+      <th data-tip="Recommended target — the nearest support below (or a 2R projection if none beneath).">Target</th>
+      <th data-tip="Reward:risk of the previewed trade (target vs stop from the entry).">R:R</th>
       <th data-tip="Plain-English reasons this coin ranks where it does.">Why</th>
     </tr></thead>
     <tbody id="bsrows"></tbody>
   </table>
   <div class="empty" id="bsempty" style="display:none">No short setups yet — waiting for the first full scan…</div>
+</div>
+</div>
+
+<div class="view" id="viewCoil">
+<div class="status">
+  <span>🚀 Coiled — coins most likely to make a <b>big move soon</b>. Ranks every pair by how <b>compressed</b> it is: a Bollinger-band squeeze (band width near the tightest of its recent range), contracting ATR, and a tight coil. Quiet markets tend to expand — these are wound tightest. The <b>lean</b> and the break-up / break-down levels tell you which way and where the trigger is. Click ⚲ for the full plan.</span>
+  <span id="coilCount"></span>
+</div>
+<div class="wrap">
+  <table id="coiltbl">
+    <thead><tr>
+      <th>#</th>
+      <th>Symbol</th>
+      <th data-tip="Coil score (0–100) — how ready this coin is to expand. Blends Bollinger-band-width squeeze (60%), ATR contraction vs its prior baseline (25%), and how tight the recent price coil is (15%). Higher = wound tighter.">Coil</th>
+      <th data-tip="Squeeze depth — the current Bollinger-band width is tighter than this % of its recent range. 90%+ = an unusually tight squeeze.">Squeeze</th>
+      <th data-tip="Live last-traded price (updates ~every 20s).">Price</th>
+      <th data-tip="Directional lean from multi-timeframe structure — the more likely break direction. 'Neutral' = trade whichever way it breaks.">Lean</th>
+      <th data-tip="Per-timeframe market-structure bias (1h/4h/1D/1W): ▲ bullish, ▼ bearish, – neutral.">Timeframes</th>
+      <th data-tip="ATR as % of price — current volatility. It's low here by design (that's the squeeze); expect it to expand.">ATR%</th>
+      <th data-tip="Break-UP trigger — the nearest resistance above. A close above it is the long breakout.">Break ↑</th>
+      <th data-tip="Break-DOWN trigger — the nearest support below. A close below it is the short breakdown.">Break ↓</th>
+      <th data-tip="Plain-English reasons this coin is coiled.">Why</th>
+    </tr></thead>
+    <tbody id="coilrows"></tbody>
+  </table>
+  <div class="empty" id="coilempty" style="display:none">No coiled setups yet — waiting for the first full scan…</div>
 </div>
 </div>
 
@@ -1468,7 +1509,7 @@ let wSortKey="score", wSortDir=-1, wlatest=[];
 let sSortKey="score", sSortDir=-1, slatest=[];
 let xSortKey="score", xSortDir=-1, xlatest=[];
 let eeSortKey="score", eeSortDir=-1, eelatest=[];
-let activeTab="setups", lastData=null;
+let activeTab="bestlong", lastData=null;
 let topSyms=null, topNew=[];   // track coins newly entering Top setups
 // Per-tab filters so a filter on one tab never hides rows on another.
 const FILT={ setups:{bias:"all",biasTf:"4h",fresh:false}, flags:{bias:"all",biasTf:"4h",phase:"all"},
@@ -1820,12 +1861,13 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["coil","Coil"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
   if(which==="bestlong") renderBestLong();
   if(which==="bestshort") renderBestShort();
+  if(which==="coil") renderCoil();
   if(which==="watch"){ renderWatch(); loadWatch(); }
   renderBanner();  // banner follows the active scan tab
   renderFilterBar();  // filters are per-tab
@@ -2970,6 +3012,8 @@ function renderBoard(side){
     const P = h.live!=null? h.live : h.price;
     const why = (h.why||[]);
     const shortWhy = why.slice(0,2).join(' · ') || '—';
+    const rr = (h.rr!=null && isFinite(h.rr));
+    const rrCls = !rr? '' : (h.rr>=2?'rrg':h.rr>=1.5?'rry':'rrd');
     const tr=document.createElement('tr'); tr.className=rowClass(h);
     tr.innerHTML =
       `<td class="rnk">${rank}</td>`+
@@ -2978,14 +3022,49 @@ function renderBoard(side){
       `<td>${fmtNum(P)}</td>`+
       `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
       `<td class="tfstripcell">${tfBiasStrip(h.tf_bias)}</td>`+
-      `<td>${h.atr_pct==null?'—':(+h.atr_pct).toFixed(1)}%</td>`+
-      `<td data-tip="Nearest ${h.near_kind||'level'} — the natural stop reference / pullback entry zone.">${h.near_level!=null?fmtNum(h.near_level):'—'}</td>`+
+      `<td data-tip="Recommended entry — a value pullback to the nearest ${isLong?'support':'resistance'} (or current price if it's far). Click ⚲ for the full cross-timeframe plan.">${h.entry!=null?fmtNum(h.entry):fmtNum(P)}</td>`+
+      `<td data-tip="Recommended stop — beyond the next ${isLong?'support below':'resistance above'} the entry.">${h.stop!=null?fmtNum(h.stop):'—'}</td>`+
+      `<td data-tip="Recommended target — the nearest ${isLong?'resistance above':'support below'} (or a 2R projection).">${h.target!=null?fmtNum(h.target):'—'}</td>`+
+      `<td class="${rrCls}">${rr?'<b>'+h.rr.toFixed(2)+'</b>':'—'}</td>`+
       `<td class="whycell" data-tip="${esc(why.join(' · '))}">${esc(shortWhy)}</td>`;
     tb.appendChild(tr);
   }
 }
 function renderBestLong(){ renderBoard('long'); }
 function renderBestShort(){ renderBoard('short'); }
+function leanPill(lean){
+  const l=(lean||'neutral');
+  const cls = l==='bullish'?'b-bullish':l==='bearish'?'b-bearish':'b-range';
+  const txt = l==='bullish'?'Bullish ▲':l==='bearish'?'Bearish ▼':'Neutral';
+  return `<span class="biaspill2 ${cls}">${txt}</span>`;
+}
+function renderCoil(){
+  const rows=(lastData&&lastData.coil_board)||[];
+  const tb=document.getElementById('coilrows'); if(!tb) return; tb.innerHTML="";
+  const emp=document.getElementById('coilempty'); if(emp) emp.style.display=rows.length?'none':'block';
+  const cnt=document.getElementById('coilCount');
+  if(cnt) cnt.textContent=`${rows.length} of the whole universe (${(lastData&&lastData.universe)||'…'} pairs)`;
+  let rank=0;
+  for(const h of rows){
+    rank++;
+    const P=h.live!=null?h.live:h.price;
+    const why=(h.why||[]); const shortWhy=why.slice(0,2).join(' · ')||'—';
+    const tr=document.createElement('tr'); tr.className=rowClass(h);
+    tr.innerHTML=
+      `<td class="rnk">${rank}</td>`+
+      `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}</div></td>`+
+      `<td>${scoreBadge(h.score)}</td>`+
+      `<td data-tip="Band width tighter than ${h.squeeze_pct!=null?h.squeeze_pct:'—'}% of its recent range.">${h.squeeze_pct!=null?h.squeeze_pct+'%':'—'}</td>`+
+      `<td>${fmtNum(P)}</td>`+
+      `<td>${leanPill(h.side)}</td>`+
+      `<td class="tfstripcell">${tfBiasStrip(h.tf_bias)}</td>`+
+      `<td>${h.atr_pct==null?'—':(+h.atr_pct).toFixed(1)}%</td>`+
+      `<td data-tip="Nearest resistance — a close above is the upside breakout.">${h.near_res!=null?fmtNum(h.near_res):'—'}</td>`+
+      `<td data-tip="Nearest support — a close below is the downside breakdown.">${h.near_sup!=null?fmtNum(h.near_sup):'—'}</td>`+
+      `<td class="whycell" data-tip="${esc(why.join(' · '))}">${esc(shortWhy)}</td>`;
+    tb.appendChild(tr);
+  }
+}
 
 async function poll(){
   try{
@@ -2998,7 +3077,7 @@ async function poll(){
     xlatest=d.stb_hits||[]; renderStb();
     eelatest=d.early_hits||[]; renderEarly();
     slatest=d.short_hits||[]; renderShorts();
-    renderBestLong(); renderBestShort();
+    renderBestLong(); renderBestShort(); renderCoil();
     renderWatch();
     { const wc=document.getElementById("tabWatch"); if(wc) wc.textContent=`📌 Watchlist${WATCH.size?' ('+WATCH.size+')':''}`; }
     const evs=(d.breakout_events||[]).filter(e=>e.time>seenBreak);

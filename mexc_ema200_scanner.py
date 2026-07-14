@@ -2057,13 +2057,121 @@ def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
         sw.append(f"Near resistance ({gap_res*100:.1f}% away) — clean entry")
     ss = round(max(0.0, min(100.0, ss)), 1)
 
+    # Compact recommended trade for the leaderboard row — a pullback entry on the
+    # nearest structural level, a stop beyond the next level, target at the next level
+    # the other way, and the resulting R:R. It's a quick preview; the ⚲ click opens the
+    # full cross-timeframe engine (which can refine all three across timeframes).
+    atr_frac = (atr_val / price) if price else 0.02
+    buf = max(0.015, 1.2 * atr_frac)
+
+    def _plan(long):
+        if long:
+            ins = sorted(sups, reverse=True)                 # supports below, nearest first
+            outs = sorted(ress)                              # resistances above, nearest first
+            entry = ins[0] if (ins and (price - ins[0]) / price <= 0.06) else price
+            below = [s for s in ins if s < entry * 0.999]
+            stop = below[0] if below else entry * (1 - buf)
+            if (entry - stop) < entry * 0.005:
+                stop = entry * (1 - buf)
+            risk = entry - stop
+            if risk <= 0:
+                return {}
+            tgt = next((r for r in outs if r > entry * 1.005), None) or (entry + 2 * risk)
+            return {"entry": entry, "stop": stop, "target": tgt,
+                    "rr": round((tgt - entry) / risk, 2)}
+        ins = sorted(ress)                                   # resistances above, nearest first
+        outs = sorted(sups, reverse=True)                    # supports below, nearest first
+        entry = ins[0] if (ins and (ins[0] - price) / price <= 0.06) else price
+        above = [r for r in ins if r > entry * 1.001]
+        stop = above[0] if above else entry * (1 + buf)
+        if (stop - entry) < entry * 0.005:
+            stop = entry * (1 + buf)
+        risk = stop - entry
+        if risk <= 0:
+            return {}
+        tgt = next((s for s in outs if s < entry * 0.995), None) or (entry - 2 * risk)
+        return {"entry": entry, "stop": stop, "target": tgt,
+                "rr": round((entry - tgt) / risk, 2)}
+
     base = {"symbol": symbol, "price": price, "atr_pct": atr_pct, "rvol": rv,
             "bias": bias, "tf_bias": tfb}
     long_setup = {**base, "side": "long", "score": ls, "why": lw,
-                  "near_level": near_sup, "near_kind": "support"}
+                  "near_level": near_sup, "near_kind": "support", **_plan(True)}
     short_setup = {**base, "side": "short", "score": ss, "why": sw,
-                   "near_level": near_res, "near_kind": "resistance"}
+                   "near_level": near_res, "near_kind": "resistance", **_plan(False)}
     return long_setup, short_setup
+
+
+def squeeze_setup(symbol, highs, lows, closes, tfb, bias, atr_pct, ksup, kres):
+    """Grade how COILED a coin is — how likely it is to make a big move SOON — from a
+    volatility squeeze: Bollinger-band width compressed to a low of its own recent
+    range, ATR contracting vs its prior baseline, and price coiling in a tight range.
+    A market that has been quiet for a while tends to expand; this finds the quiet ones
+    that are wound tightest. Returns a 0-100 'coil' score with a directional lean and
+    the break-up / break-down trigger levels. No extra API calls — all from the scan's
+    own candles."""
+    n = len(closes)
+    if n < 60:
+        return None
+    price = closes[-1]
+    if not price:
+        return None
+
+    def _std(xs):
+        m = sum(xs) / len(xs)
+        return (sum((x - m) ** 2 for x in xs) / len(xs)) ** 0.5
+
+    per = 20
+    bbw = []                                   # Bollinger-band width (as % of price) series
+    for i in range(per, n + 1):
+        w = closes[i - per:i]
+        m = sum(w) / per
+        if m > 0:
+            bbw.append(4 * _std(w) / m)        # (upper − lower)/mid = 4σ/mid
+    if len(bbw) < 40:
+        return None
+    cur = bbw[-1]
+    recent = bbw[-120:]
+    rank = sum(1 for x in recent if x < cur) / len(recent)   # 0 = tightest in the window
+    squeeze = 1.0 - rank                                     # 1 = maximally squeezed
+    tighter_than = round((1.0 - rank) * 100)
+
+    rATR = atr(highs[-20:], lows[-20:], closes[-20:])
+    pATR = (atr(highs[-120:-20], lows[-120:-20], closes[-120:-20])
+            if n >= 120 else atr(highs[:-20], lows[:-20], closes[:-20]))
+    ratio = (rATR / pATR) if pATR else 1.0
+    contr = max(0.0, min(1.0, (1.0 - ratio) / 0.5))
+
+    tight_raw = _std(closes[-12:]) / price
+    tight = max(0.0, min(1.0, (0.03 - tight_raw) / 0.03))
+
+    score = round(100 * (0.60 * squeeze + 0.25 * contr + 0.15 * tight), 1)
+
+    bull = sum(1 for v in tfb.values() if v == "bullish")
+    bear = sum(1 for v in tfb.values() if v == "bearish")
+    lean = "bullish" if bull > bear else "bearish" if bear > bull else "neutral"
+    near_res = min([r for r in (kres.get("res_4h"), kres.get("res_1d"), kres.get("res_1w"))
+                    if r and r > price], default=None)
+    near_sup = max([s for s in (ksup.get("sup_4h"), ksup.get("sup_1d"), ksup.get("sup_1w"))
+                    if s and s < price], default=None)
+
+    why = []
+    if squeeze >= 0.55:
+        why.append(f"Bollinger squeeze — band width tighter than {tighter_than}% of its recent range")
+    if contr > 0.15:
+        why.append(f"Volatility contracting — ATR {round((1 - ratio) * 100)}% below its prior baseline")
+    if tight > 0.3:
+        why.append(f"Coiling in a tight {round(tight_raw * 100, 1)}% range")
+    if lean == "bullish" and near_res:
+        why.append("Leaning bullish — watch for a break UP through resistance")
+    elif lean == "bearish" and near_sup:
+        why.append("Leaning bearish — watch for a break DOWN through support")
+    else:
+        why.append("Direction unresolved — trade the break, either way")
+
+    return {"symbol": symbol, "side": lean, "score": score, "why": why,
+            "price": price, "atr_pct": atr_pct, "tf_bias": tfb, "bias": bias,
+            "squeeze_pct": tighter_than, "near_res": near_res, "near_sup": near_sup}
 
 
 def scan_symbol(sess: requests.Session, symbol: str, interval: str,
@@ -2100,14 +2208,14 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
                       cfg: dict) -> tuple:
     """Fetch klines ONCE and run every detector (200-EMA reclaim, bull flag,
     narrow CPR, support bounce, falling wedge, bearish breakdown/retest). One
-    request per symbol powers every scan. Returns a 10-tuple: the 8 detector dicts
+    request per symbol powers every scan. Returns an 11-tuple: the 8 detector dicts
     (each with 'symbol') or None — (ema, flag, cpr, bounce, wedge, short, st_bounce,
-    early) — plus a graded best-long and best-short setup for the coin (always
-    present) for the universe-wide Top-setups leaderboard."""
+    early) — plus a graded best-long and best-short setup, and a 'coil' (squeeze /
+    imminent-move) setup for the coin, all for the universe-wide leaderboards."""
     raw = fetch_candles(sess, symbol, interval, cfg["kline_limit"],
                         cfg.get("market", "spot"))
     if not raw or len(raw) < EMA_PERIOD + 2:
-        return (None,) * 10
+        return (None,) * 11
     # MEXC kline row: [openTime, open, high, low, close, volume, closeTime, ...]
     rows = raw[:-1]                       # drop the still-forming candle
     try:
@@ -2238,11 +2346,16 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
     long_setup, short_setup = leaderboard_setups(
         symbol, highs, lows, closes, vols, _ema_now, _tfb, _bias, _ms,
         ksup, kres, rv, _dets)
+    coil_setup = squeeze_setup(symbol, highs, lows, closes, _tfb, _bias,
+                               (round(atr(highs, lows, closes) / closes[-1] * 100, 2)
+                                if closes[-1] else None), ksup, kres)
     if _stale:
         long_setup["data_stale"] = short_setup["data_stale"] = True
+        if coil_setup:
+            coil_setup["data_stale"] = True
 
     return (ema_hit, flag_hit, cpr_hit, bounce_hit, wedge_hit, short_hit,
-            st_bounce_hit, early_hit, long_setup, short_setup)
+            st_bounce_hit, early_hit, long_setup, short_setup, coil_setup)
 
 
 def supports_below(lows: list[float], upto: int, price: float,
