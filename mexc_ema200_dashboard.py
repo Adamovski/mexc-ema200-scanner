@@ -639,6 +639,10 @@ PAGE = """<!doctype html>
   .soBE{color:var(--accent);font-weight:600}
   .socompact{background:transparent;border:0;padding:8px 0 0;margin:6px 0 0}
   .socompact .sohead{margin-bottom:4px}
+  .dcaplan{border-color:rgba(88,166,255,.35);background:rgba(88,166,255,.06)}
+  .dcaplan .solist li:before{color:#58a6ff}
+  .dcaavg{margin-top:7px;padding-top:7px;border-top:1px dashed var(--line2);font-size:12.5px;color:var(--txt)}
+  .dcaplan.socompact{background:transparent;border:0}
   .xtfcmp{font-size:12.5px;color:var(--txt);margin-top:8px;padding-top:7px;border-top:1px solid var(--line)}
   .xtfcmp b{color:var(--accent)}
   .xtfsub{font-size:11px;color:var(--dim2);font-weight:600;margin-left:auto}
@@ -916,7 +920,6 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabStb" onclick="showTab('stb')">Supertrend support bounce</div>
   <div class="tab" id="tabShorts" onclick="showTab('shorts')">Shorts</div>
   <div class="tab" id="tabEarly" onclick="showTab('early')">⏳ Early</div>
-  <div class="tab" id="tabTop" onclick="showTab('top')">⭐ Top setups</div>
   <div class="tab" id="tabBestLong" onclick="showTab('bestlong')">🏆 Best longs</div>
   <div class="tab" id="tabBestShort" onclick="showTab('bestshort')">🩸 Best shorts</div>
   <div class="tab" id="tabWatch" onclick="showTab('watch')">📌 Watchlist</div>
@@ -1154,32 +1157,6 @@ PAGE = """<!doctype html>
     <tbody id="erows"></tbody>
   </table>
   <div class="empty" id="eempty" style="display:none">No early/accumulation setups right now. The loop keeps scanning…</div>
-</div>
-</div>
-
-<div class="view" id="viewTop">
-<div class="status">
-  <span>Top setups — only the highest-conviction <b>LONG</b> opportunities. Aggregated across every bullish scan, then <b>filtered for quality</b>: each must clear a real reward:risk bar and earn a solid composite <b>conviction rating</b> (A+ → D). Hover the rating or "Why" for the full reasoning.</span>
-  <span id="topCount"></span>
-</div>
-<div class="wrap">
-  <table id="tbtbl">
-    <thead><tr>
-      <th>Symbol</th>
-      <th data-tip="Composite conviction rating (A+ → D, 0–100). Blends: multi-scan confluence (30%), realistic reward:risk (26%), the best detector's own score (18%), volume confirmation via RVol (13%), and market-structure alignment (13%). Only setups clearing a real R:R + rating bar are shown.">Rating</th>
-      <th data-tip="Which bullish scans this coin currently appears on. Appearing on 2+ (★) is strong confluence.">Setups</th>
-      <th data-tip="Live last-traded price (updates ~every 20s).">Price</th>
-      <th data-tip="Market-structure bias from swing highs/lows.">Bias</th>
-      <th data-tip="BTC correlation ρ over ~10 days. Low/negative = an independent mover (preferred); ≥0.85 = mostly just BTC beta and gets docked in the rating.">BTC ρ</th>
-      <th data-tip="Retest entry — a proper pullback level to wait for (nearest swing-low support / reclaimed EMA / Supertrend below price), rather than chasing the current candle. The R:R is measured from here over the tight stop.">Retest entry</th>
-      <th data-tip="Tight stop-loss for the best setup on this coin.">SL tight</th>
-      <th data-tip="The meaningful profit target (≥~2% away) used to judge the reward:risk.">Target</th>
-      <th data-tip="Realistic reward:risk to that target (capped at 8:1). This is the quality bar the setup had to clear.">R:R</th>
-      <th data-tip="Plain-English summary of what earns this coin its rating.">Why it's a top setup</th>
-    </tr></thead>
-    <tbody id="tbrows"></tbody>
-  </table>
-  <div class="empty" id="tbempty" style="display:none">No setups clear the quality bar right now — the loop keeps scanning. (Better to show nothing than a mediocre trade.)</div>
 </div>
 </div>
 
@@ -1843,7 +1820,7 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["top","Top"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
@@ -1981,7 +1958,7 @@ function xtfTradeBody(b,i){
       <span class="xtfi" data-tip="Target ${fmtNum(rec.lvl)} — the best take-profit by expected value that clears the 1.5:1 floor. From the ${tTf} chart. Why: ${esc(rec.kind||'overhead resistance')}."><i>Target</i>${fmtNum(rec.lvl)}${chip(tTf)}</span>
       <span class="xtfi" data-tip="Reward:risk from the recommended entry to the target over the stop. Only ≥1.5:1 shown."><i>R:R</i><b>${rec.rr.toFixed(2)}</b></span>
       <span class="xtfi" data-tip="Reach — estimated chance of hitting the target before the stop, from ATR distance adjusted for trend / momentum / volume."><i>Reach</i>${Math.round(rec.p*100)}%</span>
-    </div>${detailed?xtfWhy(b):''}${cmpLine}${detailed?scaleOutHtml(be.rt, be.level, true):''}</div>`;
+    </div>${detailed?xtfWhy(b):''}${cmpLine}${detailed?dcaPlanHtml(azLast, be.level, stop&&stop.level, rec.lvl, b.side, be.distATR, true):''}${detailed?scaleOutHtml(be.rt, be.level, true):''}</div>`;
 }
 // Plain-English rationale for why the top trade is the recommended one.
 function xtfWhy(b){
@@ -2180,6 +2157,40 @@ function scaleOutHtml(rtg, entry, compact){
   }).join('');
   return `<div class="soplan${compact?' socompact':''}" data-tip="A concrete way to take the trade off and manage risk: bank a first tranche at the nearest solid target and move your stop to break-even (so the trade can't turn into a loss), hold the core to the base target, and leave a runner for the stretch / breakout target with a trailing stop.">
     <div class="sohead">📤 Scale-out &amp; risk management</div><ul class="solist">${items}</ul></div>`;
+}
+// A DCA / laddered ENTRY plan — the mirror of the scale-out. For BIGGER swing setups
+// (a wide stop, or a deep patient pullback) you rarely nail the exact turn, so split
+// the position across a few limit orders from the recommended entry toward — but not
+// into — the stop. Better blended entry + bigger cushion; if the lower rungs never
+// fill you're simply in a smaller position at an even better R:R. One stop for the
+// whole position sits below the deepest rung. Returns '' for tight/scalp setups.
+function dcaPlanHtml(d, recE, stop, tp, side, distATR, compact){
+  if(recE==null||stop==null||tp==null) return '';
+  const long = side!=='short';
+  const risk = Math.abs(recE - stop);
+  if(!risk) return '';
+  const riskPct = risk/recE*100;
+  // Only worth laddering when the entry→stop zone is genuinely wide (a bigger swing
+  // setup). A tight-stop scalp — even a far, patient pullback — has too narrow a zone
+  // to spread across, so it just takes the single fill.
+  if(riskPct < 3) return '';
+  const floor = long ? stop + 0.25*risk : stop - 0.25*risk;   // keep a buffer to the stop
+  const span = recE - floor;
+  const rungs = [{w:0.30,p:recE},{w:0.35,p:recE - span*0.5},{w:0.35,p:floor}];
+  const avg = rungs.reduce((s,r)=> s + r.p*r.w, 0);
+  const rrAvg = Math.abs(tp - avg)/Math.abs(avg - stop);
+  const rrSingle = Math.abs(tp - recE)/Math.abs(recE - stop);
+  const dir = long?'Buy':'Sell';
+  const items = rungs.map((r,i)=>{
+    const dp = (r.p/recE - 1)*100;
+    const tag = i===0? 'at recommended entry' : (Math.abs(dp).toFixed(1)+'% '+(long?'lower':'higher'));
+    const last = i===rungs.length-1? ` <span style="color:var(--dim)">— deepest rung, still buffered above ${long?'':'below '}the stop</span>` : '';
+    return `<li><b>${dir} ${Math.round(r.w*100)}%</b> at <b>${fmtNum(r.p)}</b> <span class="rr">${tag}</span>${last}</li>`;
+  }).join('');
+  return `<div class="soplan dcaplan${compact?' socompact':''}" data-tip="For a bigger swing setup you rarely catch the exact turn — so ladder in instead of chasing one price. Split the position across 3 limit orders from the recommended entry toward (but not into) the stop. You get a better blended entry and a bigger cushion; if price reverses before the lower rungs fill you're simply in a smaller position at an even better R:R. The single stop sits beyond the deepest rung and the R:R below is measured from the AVERAGE fill.">
+    <div class="sohead">🧩 DCA / laddered entry <span class="azsub">bigger setup — scale in across ${rungs.length} orders, don't chase one price</span></div>
+    <ul class="solist">${items}</ul>
+    <div class="dcaavg">Average entry ≈ <b>${fmtNum(avg)}</b> · R:R from avg <b>${rrAvg.toFixed(2)}</b> <span style="color:var(--dim)">(vs ${rrSingle.toFixed(2)} single-fill) · one stop for the whole position at ${fmtNum(stop)}</span></div></div>`;
 }
 function pickEntry(d){
   const side=(d.side||'long'), long=side!=='short', price=d.price, atr=d.atr_pct||0;
@@ -2414,6 +2425,7 @@ function azCard(d0){
     ${be?`<div class="azrec" data-tip="The smartest place to get IN — not necessarily near the current price. If price is extended or correcting, a deeper pullback (a support / EMA / Supertrend retest) makes a better, more realistic trade; a short can wait to sell into a higher rally. Chosen to maximise the resulting reward:risk while staying a fill that's likely to actually print. Based on: ${esc(be.basis)}.">🎯 Recommended entry: <b>${fmtNum(recE)}</b> <span class="rr">${sgn}${be.distPct.toFixed(1)}%${be.distATR?` · ${be.distATR.toFixed(1)}×ATR`:''} ${(d.side||'long')==='short'?'above':'below'} price</span> <span style="color:var(--dim)">— ${esc(be.basis)}${crossTfNote}${(be.distATR&&be.distATR>2)?' · patient fill — wait for it, don\\'t chase':''}</span></div>`:''}
     ${rstop?`<div class="azrec azstop" data-tip="The recommended stop, judged for THIS chart — not a fixed % or a blanket 'go wide'. It sits just beyond the nearest real level that would invalidate the setup (swing low, Supertrend, EMA, HTF support), once clear of noise (≥ max(1.5%, 1.1× ATR)). Distance is shown in ×ATR because that's the honest measure of 'tight' — a big % on a volatile coin can still be only ~1.5× ATR. ${rstop.note?esc(rstop.note.charAt(0).toUpperCase()+rstop.note.slice(1))+'. ':''}It's the stop the recommended R:R is measured against. Based on: ${esc(rstop.basis)}">🛑 Recommended stop-loss: <b>${fmtNum(rstop.level)}</b> <span class="rr">${sgn}${rstop.pct.toFixed(1)}%${rstop.atrx?` · ${rstop.atrx.toFixed(1)}×ATR`:''} from entry</span> <span style="color:var(--dim)">— ${esc(rstop.basis)}${rstop.note?' · '+esc(rstop.note):''}</span></div>`:''}
     ${rec.tp!=null?`<div class="azrec" data-tip="Recommended by EXPECTED VALUE, not raw ratio: reward:risk × how reachable the target is. Reachability decays with distance (in ATR units) but stretches out when the trend, momentum and volume back the move — so a far target isn't dismissed if the setup is strong, and a nearby one isn't over-rated if it's weak. Measured from the recommended entry (${fmtNum(recE)}) over the recommended stop (${rstop?fmtNum(rstop.level):'—'}), capped 8:1, and only shown because it clears the 1.5:1 floor. Grade blends R:R and reachability.">⭐ Recommended take-profit: <b>${fmtNum(rec.tp)}</b> <span class="rr">${(d.side||'long')==='short'?'−':'+'}${(rec.move*100).toFixed(1)}% · R:R <b>${rec.rr.toFixed(2)}</b> · ~${Math.round(rec.p*100)}% reach · grade <b>${planGrade}</b></span>${rec.kind?` <span style="color:var(--dim)">— ${esc(rec.kind)}${tgtTf&&/Daily|Weekly/.test(rec.kind||'')?` <span class="tfsrc">${tgtTf} chart</span>`:''}</span>`:''}</div>
+    ${rec.tp!=null?dcaPlanHtml(d, recE, rstop?rstop.level:null, rec.tp, d.side||'long', be?be.distATR:null):''}
     ${scaleOutHtml(rtg, recE)}
     <div class="sidenote" data-tip="How the same trade looks if you enter NOW at the current market price instead of waiting for the 🎯 recommended pullback — same stop and target, worse fill, so a lower R:R. Use it to decide: take it now, or wait for the better entry.">⚡ Enter now at market (CMP ${fmtNum(cmpE)}): ${rrAt(cmpE)!=null?`R:R <b>${rrAt(cmpE).toFixed(2)}</b> to the base target`:'stop is already in the way — no clean entry here'} <span style="color:var(--dim)">vs ${rec.rr.toFixed(2)} waiting for ${fmtNum(recE)}${(rrAt(cmpE)!=null&&rrAt(cmpE)<1.5)?' — under 1.5:1 now, better to wait for the pullback':(cmpE!=null&&recE!=null&&Math.abs(cmpE-recE)/recE<0.005?' — basically at the entry already':'')}</span></div>`
     :`<div class="azrec" style="color:#f0b429" data-tip="No target on the correct side clears a 1.5:1 reward:risk from a sensible stop. In crypto a sub-1.5 R:R trade isn't worth the risk — this is a 'no trade / wait' call, not a setup. Wait for a deeper entry (better R:R), a tighter valid stop level, or a different coin.">⛔ No trade here — best realistic R:R is only <b>${rtg?rtg.bestRR.toFixed(2):'—'}</b>, under the 1.5 minimum. Wait for a better entry or setup.</div>`}
@@ -2936,7 +2948,6 @@ async function poll(){
     xlatest=d.stb_hits||[]; renderStb();
     eelatest=d.early_hits||[]; renderEarly();
     slatest=d.short_hits||[]; renderShorts();
-    renderTop();
     renderBestLong(); renderBestShort();
     renderWatch();
     { const wc=document.getElementById("tabWatch"); if(wc) wc.textContent=`📌 Watchlist${WATCH.size?' ('+WATCH.size+')':''}`; }
