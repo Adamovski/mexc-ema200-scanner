@@ -2324,9 +2324,27 @@ def squeeze_setup(symbol, highs, lows, closes, tfb, bias, atr_pct, ksup, kres):
     else:
         why.append("Direction unresolved — trade the break, either way")
 
+    # Both breakout plays off the coil: LONG on a break above the range top, SHORT
+    # on a break below the range bottom. Stop goes back INSIDE the range (mid — the
+    # break failed); target is a 1× measured move (the range height projected from the
+    # break) → a clean ~2:1. The recommended side follows the coin's lean.
+    band = max((atr_pct or 1.5) / 100 * 2, 0.012)
+    top = near_res if near_res else price * (1 + band)
+    bot = near_sup if near_sup else price * (1 - band)
+    plan_long = plan_short = None
+    if top > bot:
+        rng = top - bot
+        mid = (top + bot) / 2.0
+        plan_long = {"entry": top, "stop": mid, "target": top + rng,
+                     "rr": round(rng / (top - mid), 2) if top > mid else None}
+        plan_short = {"entry": bot, "stop": mid, "target": bot - rng,
+                      "rr": round(rng / (mid - bot), 2) if mid > bot else None}
+    rec_side = "long" if lean == "bullish" else "short" if lean == "bearish" else "either"
+
     return {"symbol": symbol, "side": lean, "score": score, "why": why,
             "price": price, "atr_pct": atr_pct, "tf_bias": tfb, "bias": bias,
-            "squeeze_pct": tighter_than, "near_res": near_res, "near_sup": near_sup}
+            "squeeze_pct": tighter_than, "near_res": near_res, "near_sup": near_sup,
+            "plan_long": plan_long, "plan_short": plan_short, "rec_side": rec_side}
 
 
 def scan_symbol(sess: requests.Session, symbol: str, interval: str,

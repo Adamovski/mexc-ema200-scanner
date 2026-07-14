@@ -704,6 +704,9 @@ PAGE = """<!doctype html>
   .derivbox.derivgood{border-color:rgba(63,185,80,.5);background:rgba(63,185,80,.08)}
   .derivbox.derivwarn{border-color:rgba(240,180,41,.55);background:rgba(240,180,41,.09)}
   .derivbox.derivneu{border-color:var(--line2)}
+  .coilset{white-space:nowrap;font-variant-numeric:tabular-nums}
+  .coilrec-l{background:rgba(63,185,80,.13);box-shadow:inset 3px 0 0 var(--accent);font-weight:700}
+  .coilrec-s{background:rgba(248,81,73,.13);box-shadow:inset 3px 0 0 #f85149;font-weight:700}
   .corrbadge{border-radius:6px;padding:0 6px;font-size:10.5px;font-weight:700;border:1px solid var(--line);margin-left:5px;font-variant-numeric:tabular-nums;cursor:help}
   .corr-hi{background:rgba(210,153,34,.16);color:#d29922;border-color:rgba(210,153,34,.45)}
   .corr-mid{background:rgba(139,152,173,.12);color:var(--dim)}
@@ -1243,8 +1246,8 @@ PAGE = """<!doctype html>
       <th data-tip="Directional lean from multi-timeframe structure — the more likely break direction. 'Neutral' = trade whichever way it breaks.">Lean</th>
       <th data-tip="Per-timeframe market-structure bias (1h/4h/1D/1W): ▲ bullish, ▼ bearish, – neutral.">Timeframes</th>
       <th data-tip="ATR as % of price — current volatility. It's low here by design (that's the squeeze); expect it to expand.">ATR%</th>
-      <th data-tip="Break-UP trigger — the nearest resistance above. A close above it is the long breakout.">Break ↑</th>
-      <th data-tip="Break-DOWN trigger — the nearest support below. A close below it is the short breakdown.">Break ↓</th>
+      <th data-tip="LONG breakout setup — enter on a break above the range, stop back inside the range (break failed), target a 1× measured move (range height). Shows entry & R:R; hover for the full plan. Highlighted green when it's the recommended side (coin leans bullish).">▲ Long break</th>
+      <th data-tip="SHORT breakdown setup — enter on a break below the range, stop back inside the range, target a 1× measured move down. Shows entry & R:R; hover for the full plan. Highlighted red when it's the recommended side (coin leans bearish).">▼ Short break</th>
       <th data-tip="Plain-English reasons this coin is coiled.">Why</th>
     </tr></thead>
     <tbody id="coilrows"></tbody>
@@ -3086,11 +3089,28 @@ function renderCoil(){
       `<td>${leanPill(h.side)}</td>`+
       `<td class="tfstripcell">${tfBiasStrip(h.tf_bias)}</td>`+
       `<td>${h.atr_pct==null?'—':(+h.atr_pct).toFixed(1)}%</td>`+
-      `<td data-tip="Nearest resistance — a close above is the upside breakout.">${h.near_res!=null?fmtNum(h.near_res):'—'}</td>`+
-      `<td data-tip="Nearest support — a close below is the downside breakdown.">${h.near_sup!=null?fmtNum(h.near_sup):'—'}</td>`+
+      coilSetupCell(h,'long')+
+      coilSetupCell(h,'short')+
       `<td class="whycell" data-tip="${esc(why.join(' · '))}">${esc(shortWhy)}</td>`;
     tb.appendChild(tr);
   }
+}
+// One breakout-setup cell for the Coiled row (long or short). Shows the break
+// entry + R:R, full plan on hover, and a ★ + colour highlight when it's the
+// recommended side (the coin's lean).
+function coilSetupCell(h, side){
+  const p = side==='long'? h.plan_long : h.plan_short;
+  if(!p || p.entry==null) return `<td>—</td>`;
+  const rec = h.rec_side===side;
+  const arrow = side==='long'?'▲':'▼';
+  const word = side==='long'?'break above':'break below';
+  const tip = `${side==='long'?'LONG':'SHORT'} breakout: enter on a ${word} ${fmtNum(p.entry)}, `
+            + `stop ${fmtNum(p.stop)} (back inside the range = break failed), target ${fmtNum(p.target)} `
+            + `(1× measured move)${p.rr!=null?` — R:R ${p.rr.toFixed(2)}`:''}.`
+            + (rec?' ★ Recommended side (matches the coil\\'s lean).':'');
+  const cls = 'coilset '+(rec?(side==='long'?'coilrec-l':'coilrec-s'):'');
+  return `<td class="${cls}" data-tip="${esc(tip)}">${rec?'★ ':''}${arrow} ${fmtNum(p.entry)} `
+       + `<span class="rr">${p.rr!=null?'R '+p.rr.toFixed(2):''}</span></td>`;
 }
 
 async function poll(){
