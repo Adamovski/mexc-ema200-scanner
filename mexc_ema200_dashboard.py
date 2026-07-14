@@ -1777,9 +1777,7 @@ const AZ_TFS=['15m','1h','4h','1d','1w'];
 let azTfCache={};
 function azCachePut(sym,tf,d){ sym=(sym||'').toUpperCase(); (azTfCache[sym]=azTfCache[sym]||{})[tf]={d,ts:Date.now()}; }
 function renderAz(){ const box=document.getElementById("azResult"); if(!box||!azLast) return;
-  // Two columns: the full coin analysis on the left, the cross-timeframe recommendation
-  // summary as a sticky overview panel on the right (stacks above on narrow screens).
-  box.innerHTML=`<div class="azcols"><div class="azmain">${azCard(azLast)}</div><aside class="azside">${azXtfHtml||''}</aside></div>`; }
+  box.innerHTML=(azXtfHtml||'')+azCard(azLast); }
 async function analyze(){
   const inp=document.getElementById("azInput");
   const btn=document.getElementById("azBtn");
