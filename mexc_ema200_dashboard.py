@@ -778,6 +778,13 @@ PAGE = """<!doctype html>
   .azhead .sym{font-size:20px;font-weight:800;letter-spacing:-.01em}
   /* verdict bar — the bottom line, up top */
   /* cross-timeframe summary block (sits above the per-timeframe Analyze card) */
+  /* two-column Analyze layout: coin analysis left, recommendation summary right */
+  .azcols{display:flex;gap:16px;align-items:flex-start}
+  .azmain{flex:1 1 auto;min-width:0}
+  .azside{flex:0 0 400px;width:400px;position:sticky;top:12px;max-height:calc(100vh - 24px);overflow-y:auto}
+  .azside .azxtf{margin:0}
+  .xtfexp{font-size:11px}
+  @media(max-width:1150px){ .azcols{flex-direction:column} .azside{order:-1;width:100%;flex:1 1 auto;position:static;max-height:none;overflow:visible} }
   .azxtf{margin:0 0 14px;padding:12px 16px;border-radius:13px;border:1px solid var(--line2);
        background:linear-gradient(90deg,rgba(63,185,80,.10),rgba(20,25,36,.30))}
   .azxtf-short{background:linear-gradient(90deg,rgba(248,81,73,.10),rgba(20,25,36,.30))}
@@ -1757,6 +1764,8 @@ function setAzTf(tf){ azTf=tf;
 }
 // Long/Short perspective toggle for the Analyze card. null = the coin's own lean.
 let azLast=null, azSide=null, azXtfHtml='', azXtfSide=null;   // azXtfSide: null=auto, 'long', 'short'
+let azXtfTop=null, azXtfOpen={};   // cached top-3 candidates + which alternatives are expanded
+function toggleXtfTrade(i){ azXtfOpen[i]=!azXtfOpen[i]; if(azXtfTop){ azXtfHtml=xtfRender(azXtfTop); renderAz(); } }
 function setXtfSide(s){ azXtfSide=(azXtfSide===s)?null:s;
   if(azLast){ azXtfHtml='<div class="azxtf azxtf-load">⏳ Re-scanning timeframes for the best '+(azXtfSide||'auto')+' plan…</div>'; renderAz(); crossTfSummary(azLast.symbol); } }
 function xtfToggle(){ return `<span class="xtftog" data-tip="Pick which side to find the single best plan for across every timeframe: Auto = the coin's own lean per chart, or force the best LONG or best SHORT.">`
@@ -1768,7 +1777,9 @@ const AZ_TFS=['15m','1h','4h','1d','1w'];
 let azTfCache={};
 function azCachePut(sym,tf,d){ sym=(sym||'').toUpperCase(); (azTfCache[sym]=azTfCache[sym]||{})[tf]={d,ts:Date.now()}; }
 function renderAz(){ const box=document.getElementById("azResult"); if(!box||!azLast) return;
-  box.innerHTML=(azXtfHtml||'')+azCard(azLast); }
+  // Two columns: the full coin analysis on the left, the cross-timeframe recommendation
+  // summary as a sticky overview panel on the right (stacks above on narrow screens).
+  box.innerHTML=`<div class="azcols"><div class="azmain">${azCard(azLast)}</div><aside class="azside">${azXtfHtml||''}</aside></div>`; }
 async function analyze(){
   const inp=document.getElementById("azInput");
   const btn=document.getElementById("azBtn");
@@ -1832,6 +1843,7 @@ async function crossTfSummary(sym){
   for(const c of cands){ if(top.length>=3) break;
     if(top.some(t=> t.side===c.side && Math.abs(t.be.level-c.be.level)/(c.be.level||1)<0.006)) continue;
     top.push(c); }
+  azXtfTop=top; azXtfOpen={};
   azXtfHtml = top.length? xtfRender(top)
     : `<div class="azxtf"><div class="xtfhead"><span class="xtftitle">⭐ Best across timeframes</span>${xtfToggle()}</div>`
       +`<div style="color:var(--dim);font-size:13px;margin-top:2px">No clean ≥1.5 R:R ${azXtfSide?azXtfSide.toUpperCase()+' ':''}plan on any timeframe (15m→Weekly) right now — better to wait${azXtfSide?', or try Auto / the other side':''}.</div></div>`;
@@ -1844,20 +1856,21 @@ function xtfRender(top){
     ${top.map((b,i)=> xtfTradeBody(b,i)).join('')}</div>`;
 }
 function xtfTradeBody(b,i){
-  const long=b.side!=='short', be=b.be, rec=b.rec, stop=be.rs, tfN=TFNAME[b.tf]||b.tf, detailed=(i===0);
+  const long=b.side!=='short', be=b.be, rec=b.rec, stop=be.rs, tfN=TFNAME[b.tf]||b.tf, detailed=(i===0)||!!azXtfOpen[i];
   const eTf=be.tf?(TFNAME[be.tf]||be.tf):tfN, sTf=tfLabelOf(stop&&stop.basis)||tfN, tTf=tfLabelOf(rec.kind)||tfN;
   const chip=(tf)=> tf?` <span class="tfsrc">${tf}</span>`:'';
   const rank=['①','②','③','④','⑤'][i]||('#'+(i+1));
   const cmp=azLast?(azLast.live!=null?azLast.live:azLast.price):null;
   let cmpRR=null;
   if(cmp!=null && stop && rec){ const t=rec.lvl, s=stop.level;
-    if(long?(t>cmp&&s<cmp):(t<cmp&&s>cmp)) cmpRR=Math.min(Math.abs(t-cmp)/Math.abs(cmp-s),8); }
+    if(long?(t>cmp&&s<cmp):(t<cmp&&s>cmp)) cmpRR=Math.abs(t-cmp)/Math.abs(cmp-s); }
   const cmpLine = (!detailed||cmp==null)?'' : `<div class="xtfcmp" data-tip="What this trade looks like if you enter NOW at the current market price (${fmtNum(cmp)}) instead of waiting for the recommended ${fmtNum(be.level)} pullback — same stop and target, so usually a lower reward:risk.">⚡ Enter now (CMP ${fmtNum(cmp)}): ${cmpRR!=null?`R:R <b>${cmpRR.toFixed(2)}</b> to target`:'the stop is already in the way — no clean entry here yet'} <span style="color:var(--dim2)">· vs ${rec.rr.toFixed(2)} waiting for ${fmtNum(be.level)}</span></div>`;
   return `<div class="xtftrade${detailed?' xtftrade-top':''}">
     <div class="xtfhead2"><span class="xtfrank">${rank}</span>
       <span class="xtfside ${long?'v-long':'v-short'}">${long?'LONG ▲':'SHORT ▼'}</span>
       <span class="vgrade" data-tip="Plan quality (A+→C), blending reward:risk with how reachable the target is. A+ needs a strong R:R and a ≥55% chance of reaching target.">Grade ${b.gr}</span>
       <span class="xtftf" data-tip="The timeframe whose plan graded highest for this trade — the individual levels below can each come from a different chart.">${tfN} chart</span>
+      ${i>0?`<button class="wlbtn xtfexp" onclick="toggleXtfTrade(${i})">${detailed?'− collapse':'+ expand'}</button>`:''}
       ${b.tf!==azTf?`<button class="wlbtn" onclick="setAzTf('${b.tf}')">View on ${tfN} ↗</button>`:`<span class="xtfcur">— viewing this timeframe</span>`}</div>
     <div class="xtfrow">
       <span class="xtfi" data-tip="Entry ${fmtNum(be.level)} — the recommended fill: the best value-area pullback that maximises reward:risk while still being a level price is likely to reach. From the ${eTf} chart. Why: ${esc(be.basis||'best value-area level')}."><i>Entry</i>${fmtNum(be.level)}${chip(eTf)}</span>
@@ -1982,10 +1995,10 @@ function recTargets(d, entry, stopLevel){
     if(lvl==null) return; if(long? lvl<=entry : lvl>=entry) return;
     const move=Math.abs((lvl-entry)/entry); if(move<0.015) return;
     if(seen.some(x=>Math.abs(x-lvl)/lvl<0.004)) return; seen.push(lvl);
-    const rr=Math.min(Math.abs(lvl-entry)/risk,8);
+    const rr=Math.abs(lvl-entry)/risk;                 // true R:R, uncapped (for display)
     const dATR=atr? (move*100)/atr : null;
     const p=reachProb(dATR, pot);
-    cand.push({lvl,kind,move,rr,p,dATR,ev:rr*p});
+    cand.push({lvl,kind,move,rr,p,dATR,ev:Math.min(rr,8)*p});   // cap only the internal EV math
   };
   if(d.target_ladder&&d.target_ladder.length){ for(const t of d.target_ladder) push(t.level,t.kind); }
   else { for(let i=1;i<=5;i++) push(d['tp'+i], d['tp'+i+'_basis']); }
@@ -2190,20 +2203,20 @@ function azCard(d0){
   const rrAt=(en)=>{ if(en==null||rec.tp==null||!rstop) return null; const stop=rstop.level;
     const long=(d.side||'long')!=='short';
     if(long?(rec.tp<=en||stop>=en):(rec.tp>=en||stop<=en)) return null;
-    return Math.min(Math.abs(rec.tp-en)/Math.abs(en-stop),8); };
+    return Math.abs(rec.tp-en)/Math.abs(en-stop); };
   const rrTag=(en)=>{ const r=rrAt(en); return r!=null?` <span class="rr">R:R ${r.toFixed(2)}</span>`:''; };
   const cmpE=(d.live!=null?d.live:d.price);   // current market price ("enter now")
   // Reward:risk of a target measured from the retest entry over a given stop
   // (side-aware, only counts targets on the right side, capped at 8:1).
   const rrOn=(tpv,stop)=>{ if(tpv==null||recE==null||stop==null||recE===stop) return null;
     const long=(d.side||'long')!=='short'; if(long? tpv<=recE : tpv>=recE) return null;
-    return Math.min(Math.abs(tpv-recE)/Math.abs(recE-stop),8); };
+    return Math.abs(tpv-recE)/Math.abs(recE-stop); };
   const recRR=(tpv)=> rrOn(tpv, rstop?rstop.level:d.sl_tight);
   const tightRR=(tpv)=> rrOn(tpv, d.sl_tight);
   // R:R if you enter NOW at the current market price (over the recommended stop).
   const cmpRR=(tpv)=>{ const stop=rstop?rstop.level:d.sl_tight; if(tpv==null||cmpE==null||stop==null||cmpE===stop) return null;
     const long=(d.side||'long')!=='short'; if(long? tpv<=cmpE : tpv>=cmpE) return null;
-    return Math.min(Math.abs(tpv-cmpE)/Math.abs(cmpE-stop),8); };
+    return Math.abs(tpv-cmpE)/Math.abs(cmpE-stop); };
   // A trade-plan TP cell: R:R to the RECOMMENDED stop (what we advise), tight-stop
   // R:R in the hover. ◎ flags the 200-EMA reclaim target.
   const aztp=(dd,n)=>{
@@ -2566,12 +2579,12 @@ function realisticRR(h, entryArg){
   const consider=(tp)=>{
     if(tp==null) return; if(long? tp<=E : tp>=E) return;
     const move=Math.abs((tp-E)/E);
-    if(move>=0.02){ const rr=Math.min(Math.abs(tp-E)/risk,8);
+    if(move>=0.02){ const rr=Math.abs(tp-E)/risk;
       if(rr>best.rr) best={rr:rr,tp:tp,move:move,entry:E}; }
   };
   for(let i=1;i<=5;i++) consider(h['tp'+i]);
   if(best.rr===0){ for(let i=1;i<=5;i++){ const tp=h['tp'+i];
-    if(tp!=null && (long?tp>E:tp<E)){ best={rr:Math.min(Math.abs(tp-E)/risk,8),tp:tp,
+    if(tp!=null && (long?tp>E:tp<E)){ best={rr:Math.abs(tp-E)/risk,tp:tp,
       move:Math.abs((tp-E)/E),entry:E}; break; } } }
   return best;
 }
