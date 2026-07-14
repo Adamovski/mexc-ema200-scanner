@@ -2164,31 +2164,81 @@ function scaleOutHtml(rtg, entry, compact){
 // into — the stop. Better blended entry + bigger cushion; if the lower rungs never
 // fill you're simply in a smaller position at an even better R:R. One stop for the
 // whole position sits below the deepest rung. Returns '' for tight/scalp setups.
+// Candidate structural levels between the entry and the stop that a DCA rung could
+// sit on — real places price reacts (HTF swing supports/resistances, the 200-EMA,
+// Supertrend, this-TF swing pivots), each with a label and a strength (higher-TF =
+// stronger, gets hit first on a pullback).
+function dcaLevels(d, side, recE){
+  const long = side!=='short', tl = d.tf_levels||{}, cand=[];
+  const push=(lvl,label,str)=>{ if(lvl!=null && isFinite(+lvl)) cand.push({lvl:+lvl,label,str}); };
+  if(long){
+    push(tl['1w']&&tl['1w'].sup,'Weekly support',4);
+    push(tl['1d']&&tl['1d'].sup,'Daily support',3);
+    push(tl['4h']&&tl['4h'].sup,'4h support',2);
+    push(tl['1h']&&tl['1h'].sup,'1h support',1);
+    if(d.ema!=null && d.ema<recE) push(d.ema,'200-EMA',3);
+    if(d.supertrend!=null && d.supertrend_role==='support' && d.supertrend<recE) push(d.supertrend,'Supertrend',2);
+    (d.supports||[]).forEach(s=> push(s,'swing low',1));
+    return cand.filter(c=> c.lvl < recE);
+  }
+  push(tl['1w']&&tl['1w'].res,'Weekly resistance',4);
+  push(tl['1d']&&tl['1d'].res,'Daily resistance',3);
+  push(tl['4h']&&tl['4h'].res,'4h resistance',2);
+  push(tl['1h']&&tl['1h'].res,'1h resistance',1);
+  if(d.ema!=null && d.ema>recE) push(d.ema,'200-EMA',3);
+  if(d.supertrend!=null && d.supertrend_role==='resistance' && d.supertrend>recE) push(d.supertrend,'Supertrend',2);
+  (d.resistances||[]).forEach(s=> push(s,'swing high',1));
+  return cand.filter(c=> c.lvl > recE);
+}
+// A DCA / laddered ENTRY plan for BIGGER swing setups (wide entry→stop zone). Rather
+// than mechanically slicing the zone, each deeper rung is SNAPPED to the nearest real
+// structural level (weekly/daily/4h support, 200-EMA, Supertrend) so limit orders sit
+// where price is actually likely to bounce — falling back to a pullback-zone price
+// only where no level is nearby. Better blended entry + bigger cushion; if the lower
+// rungs never fill you're simply in a smaller position at an even better R:R, and one
+// stop covers the whole position, just beyond the deepest rung.
 function dcaPlanHtml(d, recE, stop, tp, side, distATR, compact){
-  if(recE==null||stop==null||tp==null) return '';
+  if(!d||recE==null||stop==null||tp==null) return '';
   const long = side!=='short';
   const risk = Math.abs(recE - stop);
   if(!risk) return '';
   const riskPct = risk/recE*100;
-  // Only worth laddering when the entry→stop zone is genuinely wide (a bigger swing
-  // setup). A tight-stop scalp — even a far, patient pullback — has too narrow a zone
-  // to spread across, so it just takes the single fill.
-  if(riskPct < 3) return '';
-  const floor = long ? stop + 0.25*risk : stop - 0.25*risk;   // keep a buffer to the stop
-  const span = recE - floor;
-  const rungs = [{w:0.30,p:recE},{w:0.35,p:recE - span*0.5},{w:0.35,p:floor}];
-  const avg = rungs.reduce((s,r)=> s + r.p*r.w, 0);
+  if(riskPct < 3) return '';                    // tight setups just take the single fill
+  const zoneLo = long ? stop + 0.15*risk : stop - 0.15*risk;   // deepest allowable rung — keep a buffer to the stop
+  const span = recE - zoneLo;                   // signed (+ve long, −ve short)
+  const cand = dcaLevels(d, side, recE).filter(c=> long ? c.lvl>=zoneLo : c.lvl<=zoneLo);
+  const tol = 0.32*Math.abs(span);
+  const used=[recE];
+  const near=(v)=> used.some(u=> Math.abs(u-v)/(recE||1) < 0.004);
+  function snap(target){
+    let best=null,bd=1e18;
+    for(const c of cand){
+      if(near(c.lvl)) continue;
+      const dd=Math.abs(c.lvl-target);
+      if(dd<=tol && (best==null || c.str>best.str || (c.str===best.str && dd<bd))){ best=c; bd=dd; }
+    }
+    return best;
+  }
+  const rungs=[{p:recE,label:'recommended entry'}];
+  [[0.45,'pullback zone'],[0.85,'deep pullback']].forEach(([f,fb])=>{
+    const target = recE - span*f;
+    const s = snap(target);
+    if(s){ rungs.push({p:s.lvl,label:s.label}); used.push(s.lvl); }
+    else if(!near(target)){ rungs.push({p:target,label:fb}); used.push(target); }
+  });
+  if(rungs.length<2) return '';                 // couldn't build a real ladder
+  const W = rungs.length===3? [0.30,0.33,0.37] : [0.42,0.58];
+  const avg = rungs.reduce((s,r,i)=> s + r.p*W[i], 0);
   const rrAvg = Math.abs(tp - avg)/Math.abs(avg - stop);
   const rrSingle = Math.abs(tp - recE)/Math.abs(recE - stop);
   const dir = long?'Buy':'Sell';
   const items = rungs.map((r,i)=>{
-    const dp = (r.p/recE - 1)*100;
-    const tag = i===0? 'at recommended entry' : (Math.abs(dp).toFixed(1)+'% '+(long?'lower':'higher'));
-    const last = i===rungs.length-1? ` <span style="color:var(--dim)">— deepest rung, still buffered above ${long?'':'below '}the stop</span>` : '';
-    return `<li><b>${dir} ${Math.round(r.w*100)}%</b> at <b>${fmtNum(r.p)}</b> <span class="rr">${tag}</span>${last}</li>`;
+    const dp = Math.abs(r.p/recE - 1)*100;
+    const where = i===0? 'at recommended entry' : `${dp.toFixed(1)}% ${long?'lower':'higher'} · ${r.label}`;
+    return `<li><b>${dir} ${Math.round(W[i]*100)}%</b> at <b>${fmtNum(r.p)}</b> <span class="rr">${where}</span></li>`;
   }).join('');
-  return `<div class="soplan dcaplan${compact?' socompact':''}" data-tip="For a bigger swing setup you rarely catch the exact turn — so ladder in instead of chasing one price. Split the position across 3 limit orders from the recommended entry toward (but not into) the stop. You get a better blended entry and a bigger cushion; if price reverses before the lower rungs fill you're simply in a smaller position at an even better R:R. The single stop sits beyond the deepest rung and the R:R below is measured from the AVERAGE fill.">
-    <div class="sohead">🧩 DCA / laddered entry <span class="azsub">bigger setup — scale in across ${rungs.length} orders, don't chase one price</span></div>
+  return `<div class="soplan dcaplan${compact?' socompact':''}" data-tip="For a bigger swing setup you rarely catch the exact turn — so ladder in. Each deeper rung is placed on a REAL level price tends to react at (weekly/daily/4h support, the 200-EMA or Supertrend), not an arbitrary fraction — so your limit orders sit where a bounce is actually plausible. You get a better blended entry and a bigger cushion; if price reverses before the lower rungs fill you're simply in a smaller position at an even better R:R. One stop covers the whole position, just beyond the deepest rung, and the R:R below is measured from the AVERAGE fill.">
+    <div class="sohead">🧩 DCA / laddered entry <span class="azsub">bigger setup — scale in on real levels, don't chase one price</span></div>
     <ul class="solist">${items}</ul>
     <div class="dcaavg">Average entry ≈ <b>${fmtNum(avg)}</b> · R:R from avg <b>${rrAvg.toFixed(2)}</b> <span style="color:var(--dim)">(vs ${rrSingle.toFixed(2)} single-fill) · one stop for the whole position at ${fmtNum(stop)}</span></div></div>`;
 }
