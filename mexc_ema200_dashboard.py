@@ -50,7 +50,7 @@ try:
     from mexc_ema200_scanner import (
         list_symbols, scan_symbol_multi, get_session, EMA_PERIOD,
         analyze_symbol, normalize_symbol, fetch_candles, pct_returns, CORR_WINDOW,
-        bias_on_tf, enrich_1h, best_pattern,
+        bias_on_tf, enrich_1h, best_pattern, coil_tfs_finer,
     )
 except ImportError:
     sys.exit("Could not import mexc_ema200_scanner.py — keep both files in the "
@@ -285,8 +285,16 @@ def run_one_scan(state: State) -> None:
 
     # Universe-wide leaderboards: the 25 best longs and 25 best shorts across every
     # scanned pair (skip frozen/delisted feeds). These power the Top-setups tabs.
-    long_board = [d for d in long_board if not d.get("data_stale")]
-    short_board = [d for d in short_board if not d.get("data_stale")]
+    # A top long/short must have a tradeable reward:risk (≥1) — a strong trend with no
+    # room to run isn't a setup. Filter junk R:R, relaxing only if too few qualify.
+    def _tradeable(board, floor):
+        keep = [d for d in board if not d.get("data_stale")
+                and d.get("rr") is not None and d.get("rr") >= floor]
+        return keep
+    _lb = [d for d in long_board if not d.get("data_stale")]
+    _sb = [d for d in short_board if not d.get("data_stale")]
+    long_board = _tradeable(_lb, 1.2) or _tradeable(_lb, 1.0) or _lb
+    short_board = _tradeable(_sb, 1.2) or _tradeable(_sb, 1.0) or _sb
     coil_board = [d for d in coil_board if not d.get("data_stale")]
     long_board.sort(key=lambda d: d["score"], reverse=True)
     short_board.sort(key=lambda d: d["score"], reverse=True)
@@ -294,6 +302,21 @@ def run_one_scan(state: State) -> None:
     long_board = long_board[:25]
     short_board = short_board[:25]
     coil_board = coil_board[:25]
+    # Complete the coiled-timeframes picture for the top coils only: 15m & 1h squeeze
+    # (finer than the 4h scan) — a cheap second pass (~50 calls) just for these 25.
+    if coil_board:
+        _mkt = cfg.get("market", "futures")
+        with ThreadPoolExecutor(max_workers=8) as _ex:
+            _futs = {_ex.submit(coil_tfs_finer, sess, d["symbol"], _mkt): d
+                     for d in coil_board}
+            for _f in as_completed(_futs):
+                _d = _futs[_f]
+                try:
+                    _fine = _f.result()
+                except Exception:
+                    _fine = {}
+                if _fine:
+                    _d.setdefault("coiled_tfs", {}).update(_fine)
 
     # Enrich ONLY the flagged coins with a 1h read (bias + formation) — a single 1h
     # fetch each, cheap since it's just the few dozen hits (not the ~500 universe).
@@ -707,6 +730,10 @@ PAGE = """<!doctype html>
   .coilset{white-space:nowrap;font-variant-numeric:tabular-nums}
   .coilrec-l{background:rgba(63,185,80,.13);box-shadow:inset 3px 0 0 var(--accent);font-weight:700}
   .coilrec-s{background:rgba(248,81,73,.13);box-shadow:inset 3px 0 0 #f85149;font-weight:700}
+  .ctf{display:inline-block;border-radius:5px;padding:0 5px;font-size:10px;font-weight:700;margin-left:4px;cursor:help;font-variant-numeric:tabular-nums;border:1px solid var(--line)}
+  .ctf-hot{background:rgba(63,185,80,.2);color:var(--accent);border-color:rgba(63,185,80,.55)}
+  .ctf-warm{background:rgba(240,180,41,.16);color:#f0b429;border-color:rgba(240,180,41,.5)}
+  .ctf-cool{background:rgba(139,152,173,.1);color:var(--dim)}
   .corrbadge{border-radius:6px;padding:0 6px;font-size:10.5px;font-weight:700;border:1px solid var(--line);margin-left:5px;font-variant-numeric:tabular-nums;cursor:help}
   .corr-hi{background:rgba(210,153,34,.16);color:#d29922;border-color:rgba(210,153,34,.45)}
   .corr-mid{background:rgba(139,152,173,.12);color:var(--dim)}
@@ -1180,7 +1207,7 @@ PAGE = """<!doctype html>
 
 <div class="view active" id="viewBestLong">
 <div class="status">
-  <span>🏆 Best longs — the <b>25 strongest LONG</b> setups ranked across <b>every</b> scanned pair (not just pattern hits). Each coin is graded on trend structure, multi-timeframe agreement, 200-EMA side, momentum, volume and proximity to support. Click any row (⚲) for the full cross-timeframe trade plan.</span>
+  <span>🏆 Best longs — the <b>25 strongest LONG</b> setups ranked across <b>every</b> scanned pair (not just pattern hits). Graded on trend structure, multi-timeframe agreement, momentum, volume, pattern confluence and proximity to support — <b>then weighted by the trade's reward:risk</b>, so a strong trend with no room to run doesn't top the list. Only tradeable R:R (≥1) shown. Click any row (⚲) for the full cross-timeframe plan.</span>
   <span id="blCount"></span>
 </div>
 <div class="wrap">
@@ -1188,7 +1215,7 @@ PAGE = """<!doctype html>
     <thead><tr>
       <th>#</th>
       <th>Symbol</th>
-      <th data-tip="Long conviction score (0–100). Blends market-structure trend, how many timeframes agree, 200-EMA side, 10-candle momentum, relative volume, pattern confluence, and how close price is to support (entry quality).">Score</th>
+      <th data-tip="Setup score (0–100) = trend conviction (structure, timeframe agreement, momentum, volume, pattern confluence, proximity to support) MULTIPLIED by an R:R factor. A high-conviction coin with a poor reward:risk is dragged down, so the top rows are strong AND tradeable.">Score</th>
       <th data-tip="Live last-traded price (updates ~every 20s).">Price</th>
       <th data-tip="Market-structure bias from swing highs/lows.">Bias</th>
       <th data-tip="Per-timeframe market-structure bias (1h/4h/1D/1W): ▲ bullish, ▼ bearish, – neutral.">Timeframes</th>
@@ -1206,7 +1233,7 @@ PAGE = """<!doctype html>
 
 <div class="view" id="viewBestShort">
 <div class="status">
-  <span>🩸 Best shorts — the <b>25 strongest SHORT</b> setups ranked across <b>every</b> scanned pair. Each coin is graded on downtrend structure, multi-timeframe agreement, 200-EMA side, downside momentum, volume and proximity to resistance. Click any row (⚲) for the full cross-timeframe trade plan (opens forced to the short side).</span>
+  <span>🩸 Best shorts — the <b>25 strongest SHORT</b> setups ranked across <b>every</b> scanned pair. Graded on downtrend structure, multi-timeframe agreement, downside momentum, volume and proximity to resistance — <b>then weighted by the trade's reward:risk</b>, so poor-R:R shorts don't top the list. Only tradeable R:R (≥1) shown. Click any row (⚲) for the full cross-timeframe plan (opens forced to the short side).</span>
   <span id="bsCount"></span>
 </div>
 <div class="wrap">
@@ -1214,7 +1241,7 @@ PAGE = """<!doctype html>
     <thead><tr>
       <th>#</th>
       <th>Symbol</th>
-      <th data-tip="Short conviction score (0–100). Blends downtrend structure, how many timeframes agree bearish, 200-EMA side, 10-candle downside momentum, relative volume, breakdown confluence, and how close price is to resistance (entry quality).">Score</th>
+      <th data-tip="Setup score (0–100) = trend conviction (downtrend structure, timeframe agreement, downside momentum, volume, breakdown confluence, proximity to resistance) MULTIPLIED by an R:R factor. A high-conviction coin with a poor reward:risk is dragged down, so the top rows are strong AND tradeable.">Score</th>
       <th data-tip="Live last-traded price (updates ~every 20s).">Price</th>
       <th data-tip="Market-structure bias from swing highs/lows.">Bias</th>
       <th data-tip="Per-timeframe market-structure bias (1h/4h/1D/1W): ▲ bullish, ▼ bearish, – neutral.">Timeframes</th>
@@ -1232,7 +1259,7 @@ PAGE = """<!doctype html>
 
 <div class="view" id="viewCoil">
 <div class="status">
-  <span>🚀 Coiled — coins most likely to make a <b>big move soon</b>. Ranks every pair by how <b>compressed</b> it is: a Bollinger-band squeeze (band width near the tightest of its recent range), contracting ATR, and a tight coil. Quiet markets tend to expand — these are wound tightest. The <b>lean</b> and the break-up / break-down levels tell you which way and where the trigger is. Click ⚲ for the full plan.</span>
+  <span>🚀 Coiled — coins most likely to make a <b>big move soon</b>. Ranks every pair by how <b>compressed</b> it is: a Bollinger-band squeeze, contracting ATR, and a tight coil — with a bonus when it's coiled on <b>multiple timeframes</b> (15m→1W, shown per row). Quiet markets expand. Each side has a full breakout plan — two limit entries, a tight stop, and a <b>3-target ladder</b> (measured move → 1.618× Fib → 2×/next HTF level) with a scale-out — on hover. The recommended side (the lean) is highlighted.</span>
   <span id="coilCount"></span>
 </div>
 <div class="wrap">
@@ -1244,9 +1271,9 @@ PAGE = """<!doctype html>
       <th data-tip="Squeeze depth — the current Bollinger-band width is tighter than this % of its recent range. 90%+ = an unusually tight squeeze.">Squeeze</th>
       <th data-tip="Live last-traded price (updates ~every 20s).">Price</th>
       <th data-tip="Directional lean from multi-timeframe structure — the more likely break direction. 'Neutral' = trade whichever way it breaks.">Lean</th>
-      <th data-tip="Per-timeframe market-structure bias (1h/4h/1D/1W): ▲ bullish, ▼ bearish, – neutral.">Timeframes</th>
+      <th data-tip="WHICH timeframes are coiled right now (15m → 1W). Each shows its squeeze %; brighter = tighter. A coil confirmed on MULTIPLE timeframes is a bigger, more explosive setup (and gets a score bonus). 15m/1h are computed live for these top coils.">Coiled on</th>
       <th data-tip="ATR as % of price — current volatility. It's low here by design (that's the squeeze); expect it to expand.">ATR%</th>
-      <th data-tip="LONG breakout setup — enter on a break above the range, stop back inside the range (break failed), target a 1× measured move (range height). Shows entry & R:R; hover for the full plan. Highlighted green when it's the recommended side (coin leans bullish).">▲ Long break</th>
+      <th data-tip="LONG breakout play — two limit entries (a retest limit at the range top + a break-confirm just above), a tight stop back inside the range, and a 3-target ladder (1× measured move, 1.618× Fib, 2×/next HTF resistance). Cell shows the entry and the R:R to the FINAL target; hover for the full plan with all TPs and the scale-out. Highlighted green when it's the recommended side.">▲ Long break</th>
       <th data-tip="SHORT breakdown setup — enter on a break below the range, stop back inside the range, target a 1× measured move down. Shows entry & R:R; hover for the full plan. Highlighted red when it's the recommended side (coin leans bearish).">▼ Short break</th>
       <th data-tip="Plain-English reasons this coin is coiled.">Why</th>
     </tr></thead>
@@ -1289,6 +1316,7 @@ PAGE = """<!doctype html>
     <button id="azBtn" onclick="analyze()">Analyze</button>
   </div>
   <div class="aztfs">Timeframe:
+    <span class="tfbtn" data-tf="5m" onclick="setAzTf('5m')" title="5-minute — the lowest timeframe; scalps + precise entries and low-TF context for the higher frames">5m</span>
     <span class="tfbtn" data-tf="15m" onclick="setAzTf('15m')" title="15-minute — for scalps / fast intraday setups">15m</span>
     <span class="tfbtn" data-tf="1h" onclick="setAzTf('1h')">1h</span>
     <span class="tfbtn active" data-tf="4h" onclick="setAzTf('4h')">4h</span>
@@ -1681,7 +1709,7 @@ function setupsCell(d, on){
   if(d){ if(d.ema_reclaim) tags.push('200-EMA reclaim'); if(d.bull_flag) tags.push('Bull flag');
     if(d.support_bounce) tags.push('Support bounce'); }
   for(const nm of on){ if(!tags.includes(nm)) tags.push(nm); }
-  const tfs=[['1h','1h'],['4h','4h'],['1d','1D'],['1w','1W']];
+  const tfs=[['5m','5m'],['15m','15m'],['1h','1h'],['4h','4h'],['1d','1D'],['1w','1W']];
   const t=tags.length?tags.slice(0,3).join(', ')+(tags.length>3?` +${tags.length-3}`:''):'<span style="color:var(--dim2)">— no active scan setup —</span>';
   // Chart patterns across EVERY timeframe (1h / 4h / Daily / Weekly), not just 4h.
   let pats='';
@@ -1800,9 +1828,9 @@ function tfBiasStrip(tb){
   const sym={bullish:'▲',bearish:'▼',neutral:'–'};
   const cls={bullish:'pat-bull',bearish:'pat-bear',neutral:'pat-neu'};
   let out='';
-  for(const [k,lbl] of [['1h','1h'],['4h','4h'],['1d','1D'],['1w','1W']]){
+  for(const [k,lbl] of [['5m','5m'],['15m','15m'],['1h','1h'],['4h','4h'],['1d','1D'],['1w','1W']]){
     const b=tb[k]; if(!b) continue;
-    out+=`<span class="tfbias ${cls[b]}" data-tip="Market-structure bias on the ${lbl} chart: ${b} (from swing highs/lows + CHoCH).">${lbl}${sym[b]}</span>`;
+    out+=`<span class="tfbias ${cls[b]}" data-tip="Market-structure bias on the ${lbl} chart: ${b} (from swing highs/lows + CHoCH). Lower timeframes (5m/15m) give early context for where the higher frames are heading.">${lbl}${sym[b]}</span>`;
   }
   return out;
 }
@@ -1895,7 +1923,7 @@ function xtfToggle(){ return `<span class="xtftog" data-tip="Pick which side to 
   +`<button class="${azXtfSide==='long'?'on':''}" onclick="setXtfSide('long')">Long</button>`
   +`<button class="${azXtfSide==='short'?'on short':''}" onclick="setXtfSide('short')">Short</button></span>`; }
 // Cache of /analyze results per symbol per timeframe (for the cross-TF summary).
-const AZ_TFS=['15m','1h','4h','1d','1w'];
+const AZ_TFS=['5m','15m','1h','4h','1d','1w'];
 let azTfCache={};
 function azCachePut(sym,tf,d){ sym=(sym||'').toUpperCase(); (azTfCache[sym]=azTfCache[sym]||{})[tf]={d,ts:Date.now()}; }
 function renderAz(){ const box=document.getElementById("azResult"); if(!box||!azLast) return;
@@ -2167,7 +2195,7 @@ function recTargets(d, entry, stopLevel){
 // TFs and (b) build the "shield": price should turn at the nearest strong HTF
 // level before reaching anything deeper.
 const TFRANK={'15m':0,'1h':1,'4h':2,'1d':3,'1w':4};
-const TFNAME={'15m':'15m','1h':'1h','4h':'4h','1d':'Daily','1w':'Weekly'};
+const TFNAME={'5m':'5m','15m':'15m','1h':'1h','4h':'4h','1d':'Daily','1w':'Weekly'};
 // Global basis→timeframe label (used by the cross-timeframe summary).
 function tfLabelOf(b){ b=(''+(b||'')).toLowerCase();
   if(/weekly|1w/.test(b)) return 'Weekly'; if(/daily|1d/.test(b)) return 'Daily';
@@ -2511,6 +2539,7 @@ function azCard(d0){
     <div class="azgrid">
       ${cell("Structure", (d.structure||'—')+(d.choch?` · ${d.choch} CHoCH`:''), d.struct_reason||"Market structure from swing highs/lows. CHoCH = the first break the other way — an early reversal cue that can appear inside a trend.")}
       ${cell("RSI (14)", d.rsi==null?'—':(+d.rsi).toFixed(0)+(d.rsi<30?' oversold':d.rsi>70?' overbought':''), "Relative Strength Index (0-100) — momentum. Below 30 = oversold (bounce potential), above 70 = overbought (pullback risk).")}
+      ${d.rsi_div?cell("RSI divergence", (()=>{const v=d.rsi_div; const ic=v.dir==='bullish'?'✅':'⚠'; return `${ic} ${v.label.replace(' RSI divergence','')}`; })(), esc(d.rsi_div.label+' — '+d.rsi_div.note+' Regular divergence = reversal signal; hidden divergence = trend-continuation signal. It feeds the directional lean.')):''}
       ${cell("Volume", (d.vol_trend||'—')+(d.vol_ratio?` ×${d.vol_ratio}`:''), `Recent volume is ${d.vol_trend||'—'} vs its average. Rising volume in an uptrend = buyers committed (bullish confirmation); rising volume in a downtrend = sellers in control (bearish confirmation). Falling volume during a move usually means momentum is fading — expect consolidation or a possible reversal. Here the trend is ${d.trend||'flat'}.`)}
       ${cell("Pressure", d.pressure||'—', `Buyers vs sellers over recent candles (volume on up-candles vs down-candles). '${d.pressure||'—'}' are in control. Buyers-in-control backs a long; sellers-in-control backs a short; balanced = indecision.`)}
       ${cell("Rel volume", d.rvol==null?'—':(+d.rvol).toFixed(2)+'× latest bar', "The latest candle's volume ÷ its 20-bar average. Above 1× = the current move is happening on above-average participation = stronger confirmation. Below 1× = quiet, less conviction.")}
@@ -3087,7 +3116,7 @@ function renderCoil(){
       `<td data-tip="Band width tighter than ${h.squeeze_pct!=null?h.squeeze_pct:'—'}% of its recent range.">${h.squeeze_pct!=null?h.squeeze_pct+'%':'—'}</td>`+
       `<td>${fmtNum(P)}</td>`+
       `<td>${leanPill(h.side)}</td>`+
-      `<td class="tfstripcell">${tfBiasStrip(h.tf_bias)}</td>`+
+      `<td class="tfstripcell">${coilTfStrip(h.coiled_tfs)}</td>`+
       `<td>${h.atr_pct==null?'—':(+h.atr_pct).toFixed(1)}%</td>`+
       coilSetupCell(h,'long')+
       coilSetupCell(h,'short')+
@@ -3095,22 +3124,45 @@ function renderCoil(){
     tb.appendChild(tr);
   }
 }
-// One breakout-setup cell for the Coiled row (long or short). Shows the break
-// entry + R:R, full plan on hover, and a ★ + colour highlight when it's the
-// recommended side (the coin's lean).
+// Which timeframes are coiled — a 15m→1W strip, each labelled with its squeeze %.
+// Brighter/green = tighter (≥85 hot, ≥70 warm); dim = not really coiled or no data.
+function coilTfStrip(ct){
+  if(!ct) return '<span style="color:var(--dim2)">—</span>';
+  let out='';
+  for(const [k,lbl] of [['15m','15m'],['1h','1h'],['4h','4h'],['1d','1D'],['1w','1W']]){
+    const v=ct[k];
+    if(v==null){ continue; }
+    const cls = v>=85?'ctf-hot' : v>=70?'ctf-warm' : 'ctf-cool';
+    out+=`<span class="ctf ${cls}" data-tip="${lbl} squeeze: band width tighter than ${v}% of its recent range.${v>=70?' Coiled on this timeframe.':''}">${lbl} ${v}</span>`;
+  }
+  return out || '<span style="color:var(--dim2)">—</span>';
+}
+// One breakout-setup cell for the Coiled row (long or short). Shows the entry and the
+// R:R to the FINAL target; the hover carries the whole plan — two limit entries, the
+// tight stop, a 3-TP ladder with each R:R, and a scale-out plan. ★ + colour when it's
+// the recommended (lean) side.
 function coilSetupCell(h, side){
   const p = side==='long'? h.plan_long : h.plan_short;
-  if(!p || p.entry==null) return `<td>—</td>`;
+  if(!p || p.entry==null || !p.tps || !p.tps.length) return `<td>—</td>`;
   const rec = h.rec_side===side;
   const arrow = side==='long'?'▲':'▼';
   const word = side==='long'?'break above':'break below';
-  const tip = `${side==='long'?'LONG':'SHORT'} breakout: enter on a ${word} ${fmtNum(p.entry)}, `
-            + `stop ${fmtNum(p.stop)} (back inside the range = break failed), target ${fmtNum(p.target)} `
-            + `(1× measured move)${p.rr!=null?` — R:R ${p.rr.toFixed(2)}`:''}.`
-            + (rec?' ★ Recommended side (matches the coil\\'s lean).':'');
+  const tps = p.tps;
+  const tpTxt = tps.map((t,i)=> `TP${i+1} ${fmtNum(t.lvl)}${t.rr!=null?` (R ${t.rr.toFixed(1)})`:''}`).join(' · ');
+  // Scale-out: bank the first tranche + move stop to break-even, hold to TP2, runner to TP3.
+  const scale = tps.length>=3
+    ? `Scale-out: sell 40% at TP1 → move stop to break-even (${fmtNum(p.entry)}), 35% at TP2, hold 25% runner to TP3 (trail the stop up).`
+    : `Scale-out: sell 60% at TP1 → stop to break-even, hold 40% runner to TP2.`;
+  const maxR = p.rr!=null? p.rr : (tps[tps.length-1].rr);
+  const tip = `${side==='long'?'LONG break-up':'SHORT break-down'} plan. `
+            + `Entries (limit): ${fmtNum(p.entry)} on the ${word} retest`
+            + (p.entry_break!=null?`, or ${fmtNum(p.entry_break)} on the break-confirm`:'')
+            + `. Stop ${fmtNum(p.stop)} — back inside the range (break failed). `
+            + `Targets: ${tpTxt}. ${scale}`
+            + (rec?' ★ Recommended side — matches the coil\\'s lean.':'');
   const cls = 'coilset '+(rec?(side==='long'?'coilrec-l':'coilrec-s'):'');
   return `<td class="${cls}" data-tip="${esc(tip)}">${rec?'★ ':''}${arrow} ${fmtNum(p.entry)} `
-       + `<span class="rr">${p.rr!=null?'R '+p.rr.toFixed(2):''}</span></td>`;
+       + `<span class="rr">${maxR!=null?'R '+(+maxR).toFixed(1):''}</span></td>`;
 }
 
 async function poll(){

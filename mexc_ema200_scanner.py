@@ -169,6 +169,34 @@ def rsi(closes: list[float], period: int = 14) -> float | None:
     return round(100 - 100 / (1 + rs), 1)
 
 
+def rsi_series(closes: list[float], period: int = 14) -> list:
+    """RSI at every candle (Wilder-smoothed), so we can compare RSI at successive
+    price swings to spot divergences. First `period` entries are None (warm-up)."""
+    n = len(closes)
+    if n < period + 1:
+        return [None] * n
+    out = [None] * period
+    gains = losses = 0.0
+    for i in range(1, period + 1):
+        ch = closes[i] - closes[i - 1]
+        gains += ch if ch > 0 else 0.0
+        losses += -ch if ch < 0 else 0.0
+    ag, al = gains / period, losses / period
+
+    def _r(ag, al):
+        if al == 0:
+            return 100.0
+        return 100 - 100 / (1 + ag / al)
+
+    out.append(round(_r(ag, al), 2))
+    for i in range(period + 1, n):
+        ch = closes[i] - closes[i - 1]
+        ag = (ag * (period - 1) + (ch if ch > 0 else 0.0)) / period
+        al = (al * (period - 1) + (-ch if ch < 0 else 0.0)) / period
+        out.append(round(_r(ag, al), 2))
+    return out
+
+
 def swing_points(highs: list[float], lows: list[float], left: int = 3,
                  right: int = 3, window: int = 80):
     """Return (swing_highs, swing_lows) as lists of (index, price), most recent
@@ -186,6 +214,57 @@ def swing_points(highs: list[float], lows: list[float], left: int = 3,
            all(l <= lows[i + d] for d in range(1, right + 1)):
             sl.append((i, l))
     return sh, sl
+
+
+def detect_rsi_divergence(highs, lows, closes, rsi_vals=None, window: int = 60,
+                          recent: int = 18):
+    """RSI divergence between the last two price swings — a leading momentum signal.
+      • REGULAR bullish  = price lower-low  but RSI higher-low  → downtrend weakening (reversal up).
+      • REGULAR bearish  = price higher-high but RSI lower-high → uptrend weakening (reversal down).
+      • HIDDEN  bullish  = price higher-low  but RSI lower-low  → uptrend continuation (buy the dip).
+      • HIDDEN  bearish  = price lower-high  but RSI higher-high→ downtrend continuation (sell the rip).
+    Returns the most RECENT qualifying divergence as {kind, dir, label, note} or None."""
+    if rsi_vals is None:
+        rsi_vals = rsi_series(closes)
+    n = len(closes)
+    if n < 30 or not rsi_vals:
+        return None
+    sh, sl = swing_points(highs, lows, left=3, right=3, window=window)
+
+    def _rsi_at(i):
+        return rsi_vals[i] if 0 <= i < len(rsi_vals) and rsi_vals[i] is not None else None
+
+    cands = []
+    # --- lows → bullish signals ---
+    if len(sl) >= 2:
+        (i1, p1), (i2, p2) = sl[-2], sl[-1]
+        r1, r2 = _rsi_at(i1), _rsi_at(i2)
+        if r1 is not None and r2 is not None and (n - 1 - i2) <= recent and abs(r2 - r1) >= 3:
+            if p2 < p1 * 0.999 and r2 > r1 + 2:
+                cands.append((i2, {"kind": "regular_bull", "dir": "bullish",
+                    "label": "Regular bullish RSI divergence",
+                    "note": "price made a lower low but RSI made a higher low — selling momentum is fading, a reversal UP is likely."}))
+            elif p2 > p1 * 1.001 and r2 < r1 - 2:
+                cands.append((i2, {"kind": "hidden_bull", "dir": "bullish",
+                    "label": "Hidden bullish RSI divergence",
+                    "note": "price made a higher low while RSI made a lower low — an uptrend pullback that usually resumes UP (buy-the-dip continuation)."}))
+    # --- highs → bearish signals ---
+    if len(sh) >= 2:
+        (i1, p1), (i2, p2) = sh[-2], sh[-1]
+        r1, r2 = _rsi_at(i1), _rsi_at(i2)
+        if r1 is not None and r2 is not None and (n - 1 - i2) <= recent and abs(r2 - r1) >= 3:
+            if p2 > p1 * 1.001 and r2 < r1 - 2:
+                cands.append((i2, {"kind": "regular_bear", "dir": "bearish",
+                    "label": "Regular bearish RSI divergence",
+                    "note": "price made a higher high but RSI made a lower high — buying momentum is fading, a reversal DOWN is likely."}))
+            elif p2 < p1 * 0.999 and r2 > r1 + 2:
+                cands.append((i2, {"kind": "hidden_bear", "dir": "bearish",
+                    "label": "Hidden bearish RSI divergence",
+                    "note": "price made a lower high while RSI made a higher high — a downtrend bounce that usually resumes DOWN (sell-the-rip continuation)."}))
+    if not cands:
+        return None
+    cands.sort(key=lambda c: c[0])           # most recent second-pivot wins
+    return cands[-1][1]
 
 
 def market_structure(highs: list[float], lows: list[float],
@@ -975,7 +1054,7 @@ def tf_levels_for(sess, symbol: str, price: float, cfg: dict) -> dict:
     lacks history (common on weekly for newer alts)."""
     mkt = cfg.get("market", "futures")
     out: dict[str, dict] = {}
-    for tf in ("1h", "4h", "1d", "1w"):
+    for tf in ("5m", "15m", "1h", "4h", "1d", "1w"):
         rr = fetch_candles(sess, symbol, tf, 400, mkt)
         if not rr or len(rr) < 30:
             out[tf] = {"sup": None, "res": None}
@@ -2248,13 +2327,53 @@ def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
         return {"entry": entry, "stop": stop, "target": tgt,
                 "rr": round((entry - tgt) / risk, 2)}
 
+    lp, sp = _plan(True), _plan(False)
+
+    # A great setup needs BOTH conviction AND a tradeable reward:risk. A strong trend
+    # with no room to run (target already at resistance → poor R:R) is NOT a top setup.
+    # Final rank score = conviction × an R:R multiplier, so junk-R:R coins sink.
+    def _quality(conv, plan):
+        rr = plan.get("rr")
+        if rr is None:
+            mult = 0.45
+        else:
+            mult = max(0.40, min(1.30, 0.45 + 0.28 * min(rr, 3.0)))
+        return round(max(0.0, min(100.0, conv * mult)), 1)
+
     base = {"symbol": symbol, "price": price, "atr_pct": atr_pct, "rvol": rv,
             "bias": bias, "tf_bias": tfb}
-    long_setup = {**base, "side": "long", "score": ls, "why": lw,
-                  "near_level": near_sup, "near_kind": "support", **_plan(True)}
-    short_setup = {**base, "side": "short", "score": ss, "why": sw,
-                   "near_level": near_res, "near_kind": "resistance", **_plan(False)}
+    long_setup = {**base, "side": "long", "score": _quality(ls, lp), "conviction": ls,
+                  "why": lw, "near_level": near_sup, "near_kind": "support", **lp}
+    short_setup = {**base, "side": "short", "score": _quality(ss, sp), "conviction": ss,
+                   "why": sw, "near_level": near_res, "near_kind": "resistance", **sp}
     return long_setup, short_setup
+
+
+def bbw_squeeze_pct(closes, per: int = 20, window: int = 120):
+    """How squeezed a close series is RIGHT NOW: the percentile of the current
+    Bollinger-band width within its own recent range. Returns 0-100 (100 = tightest
+    it's been in `window` bars) or None if there isn't enough history. Reusable across
+    timeframes so we can say WHICH timeframes are coiled."""
+    n = len(closes)
+    if n < max(40, per + 20):
+        return None
+
+    def _std(xs):
+        m = sum(xs) / len(xs)
+        return (sum((x - m) ** 2 for x in xs) / len(xs)) ** 0.5
+
+    bbw = []
+    for i in range(per, n + 1):
+        w = closes[i - per:i]
+        m = sum(w) / per
+        if m > 0:
+            bbw.append(4 * _std(w) / m)
+    if len(bbw) < 30:
+        return None
+    cur = bbw[-1]
+    recent = bbw[-window:]
+    rank = sum(1 for x in recent if x < cur) / len(recent)
+    return round((1.0 - rank) * 100)
 
 
 def squeeze_setup(symbol, highs, lows, closes, tfb, bias, atr_pct, ksup, kres):
@@ -2310,6 +2429,23 @@ def squeeze_setup(symbol, highs, lows, closes, tfb, bias, atr_pct, ksup, kres):
     near_sup = max([s for s in (ksup.get("sup_4h"), ksup.get("sup_1d"), ksup.get("sup_1w"))
                     if s and s < price], default=None)
 
+    # WHICH timeframes are coiled — squeeze % on 4h (native) plus Daily/Weekly
+    # downsampled from the 4h closes (cheap). 15m/1h are filled in a second pass for
+    # the top coils (they need finer candles). A coil confirmed on MULTIPLE timeframes
+    # is a bigger, more explosive setup, so we bonus the score for TF confluence.
+    coiled_tfs = {"4h": tighter_than}
+    _d_cl = closes[5::6]          # ~Daily closes from 4h candles
+    _w_cl = closes[41::42]        # ~Weekly closes from 4h candles
+    _pd = bbw_squeeze_pct(_d_cl)
+    if _pd is not None:
+        coiled_tfs["1d"] = _pd
+    _pw = bbw_squeeze_pct(_w_cl)
+    if _pw is not None:
+        coiled_tfs["1w"] = _pw
+    _n_coiled = sum(1 for v in coiled_tfs.values() if v >= 70)
+    if _n_coiled >= 2:
+        score = round(min(100.0, score + 4 * (_n_coiled - 1)), 1)   # multi-TF confluence bonus
+
     why = []
     if squeeze >= 0.55:
         why.append(f"Bollinger squeeze — band width tighter than {tighter_than}% of its recent range")
@@ -2324,10 +2460,11 @@ def squeeze_setup(symbol, highs, lows, closes, tfb, bias, atr_pct, ksup, kres):
     else:
         why.append("Direction unresolved — trade the break, either way")
 
-    # Both breakout plays off the coil: LONG on a break above the range top, SHORT
-    # on a break below the range bottom. Stop goes back INSIDE the range (mid — the
-    # break failed); target is a 1× measured move (the range height projected from the
-    # break) → a clean ~2:1. The recommended side follows the coin's lean.
+    # Full breakout plan off the coil, BOTH ways. LONG on a break above the range top,
+    # SHORT below the bottom. Two limit entries (a retest limit at the edge + a break-
+    # confirm just beyond), a tight stop back INSIDE the range (break failed), and a
+    # THREE-target ladder — a 1× measured move, a 1.618× Fibonacci extension, and a 2×
+    # / next higher-timeframe level — so the R:R runs well past 2 into the real move.
     band = max((atr_pct or 1.5) / 100 * 2, 0.012)
     top = near_res if near_res else price * (1 + band)
     bot = near_sup if near_sup else price * (1 - band)
@@ -2335,16 +2472,63 @@ def squeeze_setup(symbol, highs, lows, closes, tfb, bias, atr_pct, ksup, kres):
     if top > bot:
         rng = top - bot
         mid = (top + bot) / 2.0
-        plan_long = {"entry": top, "stop": mid, "target": top + rng,
-                     "rr": round(rng / (top - mid), 2) if top > mid else None}
-        plan_short = {"entry": bot, "stop": mid, "target": bot - rng,
-                      "rr": round(rng / (mid - bot), 2) if mid > bot else None}
+
+        def _tp_row(lvl, entry, stop, long):
+            risk = (entry - stop) if long else (stop - entry)
+            rr = round((lvl - entry) / risk, 2) if long and risk > 0 else \
+                 round((entry - lvl) / risk, 2) if (not long) and risk > 0 else None
+            return {"lvl": round(lvl, 10), "rr": rr}
+
+        # LONG break-up
+        l_stop = mid
+        _res_far = sorted([r for r in (kres.get("res_1d"), kres.get("res_1w"))
+                           if r and r > top + 1.9 * rng])
+        l_lvls = [top + rng, top + 1.618 * rng,
+                  (_res_far[0] if _res_far else top + 2.5 * rng)]
+        plan_long = {
+            "entry": round(top, 10),                       # retest limit at the break level
+            "entry_break": round(top * 1.002, 10),         # break-confirm entry
+            "stop": round(l_stop, 10),
+            "tps": [_tp_row(x, top, l_stop, True) for x in l_lvls],
+            "rr": _tp_row(l_lvls[-1], top, l_stop, True)["rr"],
+        }
+        # SHORT break-down
+        s_stop = mid
+        _sup_far = sorted([s for s in (ksup.get("sup_1d"), ksup.get("sup_1w"))
+                           if s and s < bot - 1.9 * rng], reverse=True)
+        s_lvls = [bot - rng, bot - 1.618 * rng,
+                  (_sup_far[0] if _sup_far else bot - 2.5 * rng)]
+        plan_short = {
+            "entry": round(bot, 10),
+            "entry_break": round(bot * 0.998, 10),
+            "stop": round(s_stop, 10),
+            "tps": [_tp_row(x, bot, s_stop, False) for x in s_lvls if x > 0],
+            "rr": _tp_row(s_lvls[-1], bot, s_stop, False)["rr"] if s_lvls[-1] > 0 else None,
+        }
     rec_side = "long" if lean == "bullish" else "short" if lean == "bearish" else "either"
 
     return {"symbol": symbol, "side": lean, "score": score, "why": why,
             "price": price, "atr_pct": atr_pct, "tf_bias": tfb, "bias": bias,
-            "squeeze_pct": tighter_than, "near_res": near_res, "near_sup": near_sup,
+            "squeeze_pct": tighter_than, "coiled_tfs": coiled_tfs,
+            "near_res": near_res, "near_sup": near_sup,
             "plan_long": plan_long, "plan_short": plan_short, "rec_side": rec_side}
+
+
+def coil_tfs_finer(sess: requests.Session, symbol: str, market: str) -> dict:
+    """5m / 15m / 1h squeeze % for one coin — the finer timeframes the 4h universe
+    scan can't derive. Called only for the top coils (cheap), to complete the 5m→1W
+    coiled-timeframes picture."""
+    out = {}
+    for iv, key in (("5m", "5m"), ("15m", "15m"), ("1h", "1h")):
+        try:
+            rr = fetch_candles(sess, symbol, iv, 400, market)
+            if rr and len(rr) > 41:
+                p = bbw_squeeze_pct([float(x[4]) for x in rr[:-1]])
+                if p is not None:
+                    out[key] = p
+        except (requests.RequestException, ValueError, IndexError, TypeError):
+            pass
+    return out
 
 
 def scan_symbol(sess: requests.Session, symbol: str, interval: str,
@@ -2649,7 +2833,9 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         except (ValueError, IndexError):
             return []
         return detect_chart_patterns(H, L, C, V)
-    patterns = {"1h": _tf_patterns("1h"),
+    patterns = {"5m": _tf_patterns("5m"),
+                "15m": _tf_patterns("15m"),
+                "1h": _tf_patterns("1h"),
                 "4h": detect_chart_patterns(highs, lows, closes, vols)
                 if interval == "4h" else _tf_patterns("4h"),
                 "1d": _tf_patterns("1d"),
@@ -2677,7 +2863,9 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         if m["structure"] == "downtrend" or m["choch"] == "bearish":
             return "bearish"
         return "neutral"
-    tf_bias = {"1h": _bias_of("1h"),
+    tf_bias = {"5m": _bias_of("5m"),
+               "15m": _bias_of("15m"),
+               "1h": _bias_of("1h"),
                "4h": _bias_of("4h", (highs, lows, closes) if interval == "4h" else None),
                "1d": _bias_of("1d"),
                "1w": _bias_of("1w")}
@@ -2694,6 +2882,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     except (requests.RequestException, ValueError, IndexError, TypeError):
         btc_corr = None
     r14 = rsi(closes)
+    rsi_div = detect_rsi_divergence(highs, lows, closes)       # regular / hidden RSI divergence
     st_val, st_dir = supertrend(highs, lows, closes)          # 4h Supertrend (or the selected TF)
     st_role = None
     if st_val is not None:
@@ -2742,6 +2931,11 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         long_pts += 1        # oversold — bounce potential
     if r14 is not None and r14 > 70:
         short_pts += 1        # overbought — pullback risk
+    if rsi_div:              # momentum divergence is a leading signal — weight it
+        if rsi_div["dir"] == "bullish":
+            long_pts += 1
+        elif rsi_div["dir"] == "bearish":
+            short_pts += 1
     net = long_pts - short_pts
     direction = "Long" if net >= 2 else ("Short" if net <= -2 else "Neutral")
 
@@ -3013,6 +3207,9 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     if r14 is not None:
         state = ("oversold" if r14 < 30 else "overbought" if r14 > 70 else "neutral")
         notes.append(f"RSI(14) is {r14} ({state}).")
+    if rsi_div:
+        _di = "✅" if rsi_div["dir"] == "bullish" else "⚠"
+        notes.append(f"{_di} {rsi_div['label']} — {rsi_div['note']}")
     if st_val is not None:
         notes.append(
             f"Supertrend ({interval}) is at <b>{st_val:.6g}</b>, "
@@ -3119,6 +3316,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "dir_reason": dir_reason,
         "struct_reason": struct_reason,
         "rsi": r14,
+        "rsi_div": rsi_div,
         "atr_pct": atr_pct,
         "open_interest": oi_data,
         "derivatives": deriv,
