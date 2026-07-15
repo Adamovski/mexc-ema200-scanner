@@ -3070,6 +3070,16 @@ def scalp_setup(sess, symbol, market, side, htf_conv, htf_tf_bias):
             tps.append({"lvl": round(entry - k * risk, 10), "rr": float(k), "basis": f"{k}R measured move"})
             k += 1
 
+    # A scalp doesn't need a tight ladder — TPs 0.2% apart are just noise and fees. Keep
+    # ONE clean primary target and add a runner ONLY if it's meaningfully further out
+    # (≥1.6× the first target's reward AND ≥0.8% beyond it). Otherwise, take 100% at TP1.
+    if tps:
+        _prim = tps[0]
+        _runner = next((t for t in tps[1:]
+                        if (t.get("rr") or 0) >= (_prim.get("rr") or 0) * 1.6
+                        and abs(t["lvl"] - _prim["lvl"]) / entry >= 0.008), None)
+        tps = [_prim] + ([_runner] if _runner else [])
+
     risk_frac = risk / entry
     if risk_frac > 0.04 or not tps:            # too wide to be a scalp
         return None
