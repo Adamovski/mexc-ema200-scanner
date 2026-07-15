@@ -2121,7 +2121,9 @@ def _spot_live_price(sess: requests.Session, symbol: str) -> float | None:
 # a request counts as one call, so this is used ON DEMAND (Analyze a coin), not
 # across the whole universe.
 # ---------------------------------------------------------------------------
-COINALYZE_KEY = os.environ.get("COINALYZE_API_KEY", "").strip()
+# Tolerate a key pasted WITH surrounding quotes (a very common mistake when copying
+# from a .env line) — strip quotes/whitespace so the header is the raw token.
+COINALYZE_KEY = os.environ.get("COINALYZE_API_KEY", "").strip().strip('"').strip("'").strip()
 COINALYZE_BASE = "https://api.coinalyze.net/v1"
 _CX_SESS = requests.Session()
 _cx_symbol_map: dict | None = None      # BASE asset (e.g. 'BTC') -> coinalyze perp symbol
@@ -2140,6 +2142,32 @@ def _cx_get(path: str, params: dict, timeout: int = 15):
         return r.json()
     except (requests.RequestException, ValueError):
         return None
+
+
+def coinalyze_status() -> dict:
+    """Non-secret diagnostic of the Coinalyze integration: is a key present, does a
+    test call succeed, and did the symbol map build? Never returns the key itself."""
+    out = {"key_present": bool(COINALYZE_KEY), "key_len": len(COINALYZE_KEY)}
+    if not COINALYZE_KEY:
+        return out
+    try:
+        r = _CX_SESS.get(f"{COINALYZE_BASE}/future-markets",
+                         params={"api_key": COINALYZE_KEY}, timeout=12)
+        out["test_status"] = r.status_code
+        try:
+            j = r.json()
+            out["markets"] = len(j) if isinstance(j, list) else None
+        except Exception:
+            out["body"] = (r.text or "")[:140]
+    except Exception as e:
+        out["error"] = str(e)[:140]
+    try:
+        m = _cx_build_symbol_map()
+        out["map_size"] = len(m)
+        out["btc_symbol"] = m.get("BTC")
+    except Exception as e:
+        out["map_error"] = str(e)[:140]
+    return out
 
 
 def _cx_build_symbol_map() -> dict:

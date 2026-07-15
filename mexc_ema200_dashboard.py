@@ -1361,6 +1361,7 @@ PAGE = """<!doctype html>
   .spark{width:90px;height:22px;vertical-align:middle}
   .histnote{font-size:12.5px;color:var(--dim);line-height:1.5;margin:2px 0 10px;padding:8px 11px;border-left:2px solid var(--line);background:rgba(139,152,173,.04);border-radius:0 6px 6px 0}
   .histnote b{color:var(--fg,#e6edf3)}
+  .histcard{min-width:150px} .histcard-desc{font-size:11px;color:var(--dim);margin-top:6px;line-height:1.4}
   .tprcell{white-space:normal}
   .tpr{display:inline-block;border-radius:5px;padding:1px 7px;font-size:11px;font-weight:700;margin:2px 4px 2px 0;border:1px solid var(--line);font-variant-numeric:tabular-nums;cursor:help}
   .tpr-hi{background:rgba(63,185,80,.18);color:var(--accent);border-color:rgba(63,185,80,.5)}
@@ -4264,11 +4265,23 @@ function renderHistory(){
   // ---- RIGHT NOW band: the current regime in plain language ----
   const capV=v=>(v||'—').charAt(0).toUpperCase()+(v||'—').slice(1);
   out+=`<div class="perfsub">Right now — the current market read</div>`;
+  const btcDesc = now.btc_v==='bullish'?'Big-picture uptrend — the tide is with longs'
+                : now.btc_v==='bearish'?'Big-picture downtrend — the tide is with shorts'
+                : 'No strong direction across 15m→1W — chop';
+  const brdDesc = now.alt_above>=60?'Most majors are healthy (above their key averages) — risk-on'
+                : now.alt_above<=40?'Most majors are weak (below their key averages) — risk-off'
+                : 'Majors are split — no clear risk-on/off';
+  const dayDesc = now.day_longs==='favorable'?'Intraday: a good day to hunt longs'
+                : now.day_longs==='avoid'?'Intraday: a better day to hunt shorts'
+                : 'Intraday: no clear edge — be picky';
+  const wkDesc  = now.week_longs==='favorable'?'Swing: conditions favor longs this week'
+                : now.week_longs==='avoid'?'Swing: conditions favor shorts this week'
+                : 'Swing: mixed — no clear weekly bias';
   out+=`<div class="mc-cards">
-    ${mcStat('BTC trend', capV(now.btc_v), mcVerdictClass(now.btc_v==='bullish'?'favorable':now.btc_v==='bearish'?'avoid':''))}
-    ${mcStat('Alt breadth', (now.alt_above!=null?now.alt_above+'%':'—'), now.alt_above>=60?'mc-bull':now.alt_above<=40?'mc-bear':'mc-mid')}
-    ${mcStat('Today → longs', (now.day_longs||'—').toUpperCase(), mcVerdictClass(now.day_longs))}
-    ${mcStat('This week → longs', (now.week_longs||'—').toUpperCase(), mcVerdictClass(now.week_longs))}
+    ${histStat('BTC trend', capV(now.btc_v), btcDesc, mcVerdictClass(now.btc_v==='bullish'?'favorable':now.btc_v==='bearish'?'avoid':''))}
+    ${histStat('Alt breadth', (now.alt_above!=null?now.alt_above+'%':'—'), brdDesc, now.alt_above>=60?'mc-bull':now.alt_above<=40?'mc-bear':'mc-mid')}
+    ${histStat('Today → longs', (now.day_longs||'—').toUpperCase(), dayDesc, mcVerdictClass(now.day_longs))}
+    ${histStat('This week → longs', (now.week_longs||'—').toUpperCase(), wkDesc, mcVerdictClass(now.week_longs))}
   </div>`;
   out+=`<div class="histnote">${histSentence(now)}</div>`;
   // Explainer
@@ -4343,6 +4356,11 @@ function renderHistory(){
     out+=`</tbody></table>`;
   }
   body.innerHTML=out;
+}
+// A "Right now" card: big value, label, and a plain-language description line.
+function histStat(label,val,desc,cls){
+  return `<div class="mc-stat histcard"><div class="mc-stat-v ${cls||''}">${val}</div>`
+    +`<div class="mc-stat-l">${label}</div><div class="histcard-desc">${desc||''}</div></div>`;
 }
 // Plain-language one-liner describing the current regime.
 function histSentence(p){
@@ -4833,6 +4851,8 @@ def make_handler(state: State):
                 try:
                     import mexc_ema200_scanner as _sc
                     _hp["coinalyze"] = bool(_sc.COINALYZE_KEY)
+                    if self.path.startswith("/history?diag") or "diag" in self.path:
+                        _hp["cx_diag"] = _sc.coinalyze_status()
                 except Exception:
                     _hp["coinalyze"] = False
                 body = json.dumps(_hp).encode()
