@@ -1359,6 +1359,8 @@ PAGE = """<!doctype html>
   .histleg{display:flex;gap:16px;margin:4px 0 2px;font-size:11px;color:var(--dim)}
   .hleg i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:middle}
   .spark{width:90px;height:22px;vertical-align:middle}
+  .histnote{font-size:12.5px;color:var(--dim);line-height:1.5;margin:2px 0 10px;padding:8px 11px;border-left:2px solid var(--line);background:rgba(139,152,173,.04);border-radius:0 6px 6px 0}
+  .histnote b{color:var(--fg,#e6edf3)}
   .tprcell{white-space:normal}
   .tpr{display:inline-block;border-radius:5px;padding:1px 7px;font-size:11px;font-weight:700;margin:2px 4px 2px 0;border:1px solid var(--line);font-variant-numeric:tabular-nums;cursor:help}
   .tpr-hi{background:rgba(63,185,80,.18);color:var(--accent);border-color:rgba(63,185,80,.5)}
@@ -4254,19 +4256,42 @@ function renderHistory(){
   if(!h||!((h.market||[]).length)){ if(emp) emp.style.display='block'; body.innerHTML=''; if(meta) meta.textContent=''; return; }
   if(emp) emp.style.display='none';
   const mkt=h.market||[];
-  if(meta){ const span=h.span; meta.textContent=(mkt.length+' snapshots'+(span?' · since '+new Date(span[0]*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit'}):'')+(h.upstash?' · durable':' · in-memory (add Upstash)')); }
+  const now=mkt[mkt.length-1]||{};
+  const span=h.span;
+  const hrs=span?((span[1]-span[0])/3600):0;
+  if(meta){ meta.textContent=(mkt.length+' snapshots'+(span?' · over '+(hrs<1?Math.round(hrs*60)+' min':hrs.toFixed(1)+'h'):'')+(h.upstash?' · durable ✓':' · in-memory')); }
   let out='';
+  // ---- RIGHT NOW band: the current regime in plain language ----
+  const capV=v=>(v||'—').charAt(0).toUpperCase()+(v||'—').slice(1);
+  out+=`<div class="perfsub">Right now — the current market read</div>`;
+  out+=`<div class="mc-cards">
+    ${mcStat('BTC trend', capV(now.btc_v), mcVerdictClass(now.btc_v==='bullish'?'favorable':now.btc_v==='bearish'?'avoid':''))}
+    ${mcStat('Alt breadth', (now.alt_above!=null?now.alt_above+'%':'—'), now.alt_above>=60?'mc-bull':now.alt_above<=40?'mc-bear':'mc-mid')}
+    ${mcStat('Today → longs', (now.day_longs||'—').toUpperCase(), mcVerdictClass(now.day_longs))}
+    ${mcStat('This week → longs', (now.week_longs||'—').toUpperCase(), mcVerdictClass(now.week_longs))}
+  </div>`;
+  out+=`<div class="histnote">${histSentence(now)}</div>`;
+  // Explainer
+  out+=`<details class="perfhelp"><summary>What am I looking at on this tab?</summary><div class="perfhelpbody">
+    <p>Apex saves a <b>snapshot every scan</b> (~every 10 min). This tab is its memory of how the market has moved, so you can see change over time instead of just this instant:</p>
+    <p><b>Right now</b> = the latest reading — is BTC trending, how many alts are healthy, and whether it's a good day/week to look for longs.</p>
+    <p><b>Regime chart</b> = those readings plotted over time. The green line is BTC's trend score (−1 fully bearish → +1 fully bullish); the blue line is alt breadth (how much of the majors are above their key averages). Watch for the lines crossing zero — that's the market flipping.</p>
+    <p><b>Signal leaders</b> = which coins keep showing up at the top of the boards across scans — the names worth watching.</p>
+    <p><b>Open interest / funding</b> = the derivatives path of the majors from Coinalyze (needs the API key).</p>
+    <p>It looks sparse at first — it fills out as more scans record. A few hours in, the chart becomes readable.</p>
+  </div></details>`;
   // 1) Regime chart: BTC trend score + alt breadth (mapped to -1..1)
   const btcPts=mkt.filter(p=>p.btc!=null).map(p=>[p.t,p.btc]);
   const brdPts=mkt.filter(p=>p.alt_above!=null).map(p=>[p.t,(p.alt_above-50)/50]);
-  out+=`<div class="perfsub">Market regime over time — trend & breadth</div>`;
+  out+=`<div class="perfsub">Market regime over time — BTC trend & alt breadth</div>`;
+  if(mkt.length<8) out+=`<div class="histnote">📈 Still collecting — ${mkt.length} snapshot${mkt.length===1?'':'s'} so far. The lines below fill in and become meaningful after a few hours of scans. Above 0 = bullish, below 0 = bearish.</div>`;
   out+=svgChart([{name:'BTC trend',color:'#3fb950',pts:btcPts},{name:'Alt breadth',color:'#58a6ff',pts:brdPts}],
                 {ymin:-1,ymax:1,fmtY:v=>v>0?'+'+v.toFixed(1):v.toFixed(1)});
   // BTC price chart
   const pxPts=mkt.filter(p=>p.btc_px!=null).map(p=>[p.t,p.btc_px]);
   if(pxPts.length>1){ out+=`<div class="perfsub">BTC price</div>`+svgChart([{name:'BTC',color:'#f0b429',pts:pxPts}],{fmtY:v=>fmtNum(v)}); }
   // 2) Recent snapshots table (verdict flips)
-  out+=`<div class="perfsub">Recent market snapshots</div>`;
+  out+=`<div class="perfsub">Recent snapshots — each scan's read (newest first)</div>`;
   out+=`<table class="bt"><thead><tr><th>When</th><th>BTC</th><th>Day → longs</th><th>Week → longs</th><th>Alt breadth</th><th>Alts 24h</th></tr></thead><tbody>`;
   const vpill=v=>`<span class="${mcVerdictClass(v)}">${(v||'—')}</span>`;
   for(const p of mkt.slice().reverse().slice(0,24)){
@@ -4285,7 +4310,8 @@ function renderHistory(){
     for(const s of sigs){ for(const side of ['longs','shorts','coils']){ for(const it of (s[side]||[])){
       const k=it.s; tally[k]=tally[k]||{s:k,long:0,short:0,coil:0}; tally[k][side.slice(0,-1)]++; } } }
     const lead=Object.values(tally).map(x=>({...x,tot:x.long+x.short+x.coil})).sort((a,b)=>b.tot-a.tot).slice(0,14);
-    out+=`<div class="perfsub">Signal leaders — most-frequently top-ranked (last ${sigs.length} scans)</div>`;
+    out+=`<div class="perfsub">Signal leaders — coins that keep topping the boards (last ${sigs.length} scans)</div>`;
+    out+=`<div class="histnote">The names that repeatedly rank highest — the ones worth watching. A high long count = persistently strong; high short count = persistently weak.</div>`;
     out+=`<table class="bt"><thead><tr><th>Coin</th><th># times as top long</th><th># as top short</th><th># as top coil</th></tr></thead><tbody>`;
     for(const x of lead){ out+=`<tr><td class="sym"><a href="${tvLink(x.s)}" target="_blank" rel="noopener">${dispSym(x.s)}</a></td>`
       +`<td class="pf-good">${x.long||'—'}</td><td class="pf-bad">${x.short||'—'}</td><td>${x.coil||'—'}</td></tr>`; }
@@ -4296,7 +4322,11 @@ function renderHistory(){
   const cks=Object.keys(coins);
   out+=`<div class="perfsub">Open interest, funding & price — majors (from Coinalyze)</div>`;
   if(!cks.length){
-    out+=`<div class="bt-empty">No derivatives history yet. This lights up once <b>COINALYZE_API_KEY</b> is set in Render → Environment — then Apex backloads ~7 days of OI/funding and keeps appending.</div>`;
+    if(h.coinalyze){
+      out+=`<div class="histnote">🔑 Coinalyze key detected — but no derivatives have come back yet. This backloads on the <b>next completed scan</b> (it pulls ~7 days of OI/funding for the majors), so check back after a scan or two. If it stays empty, the key may be invalid or Coinalyze may be rate-limiting.</div>`;
+    } else {
+      out+=`<div class="bt-empty">No <b>COINALYZE_API_KEY</b> detected. Add it in Render → Environment and Apex will backload ~7 days of OI/funding for the majors and keep appending.</div>`;
+    }
   } else {
     out+=`<table class="bt"><thead><tr><th>Coin</th><th>OI now</th><th>OI 7d</th><th>Funding</th><th>Price</th><th>Price 7d</th><th>OI trend</th></tr></thead><tbody>`;
     for(const k of cks){
@@ -4313,6 +4343,16 @@ function renderHistory(){
     out+=`</tbody></table>`;
   }
   body.innerHTML=out;
+}
+// Plain-language one-liner describing the current regime.
+function histSentence(p){
+  if(!p||!p.btc_v) return 'Waiting for the first reading…';
+  const btc = p.btc_v==='bullish'?'trending up':p.btc_v==='bearish'?'trending down':'range-bound / mixed';
+  const brd = p.alt_above>=60?'most alts are healthy (risk-on)':p.alt_above<=40?'most alts are weak (risk-off)':'alts are mixed';
+  const day = (p.day_longs==='favorable')?'a good day to look for longs'
+            : (p.day_longs==='avoid')?'a better day to look for shorts'
+            : 'no clear intraday edge — be selective';
+  return `Bitcoin is <b>${btc}</b> and ${brd} (${p.alt_above!=null?p.alt_above+'%':'—'} above key averages). Net: <b>${day}</b>.`;
 }
 // Tiny sparkline for a value array.
 function svgSpark(vals,color){
@@ -4789,7 +4829,13 @@ def make_handler(state: State):
                 body = json.dumps(state.snapshot()).encode()
                 self._send(200, body, "application/json")
             elif self.path.startswith("/history"):
-                body = json.dumps(HISTORY.payload()).encode()
+                _hp = HISTORY.payload()
+                try:
+                    import mexc_ema200_scanner as _sc
+                    _hp["coinalyze"] = bool(_sc.COINALYZE_KEY)
+                except Exception:
+                    _hp["coinalyze"] = False
+                body = json.dumps(_hp).encode()
                 self._send(200, body, "application/json")
             elif self.path.startswith("/track"):
                 self._track()
