@@ -86,12 +86,26 @@ class Tracker:
         self.lock = threading.Lock()
         self.open: dict[str, dict] = {}
         self.closed: list[dict] = []
+        # After a setup resolves, don't re-track the SAME idea (same board:sym:side at
+        # ~the same entry) for a cooldown window — otherwise a setup that keeps appearing
+        # on the board gets re-taken and re-stopped every scan (compounding one loss).
+        self.cooldowns: dict[str, dict] = {}
         try:
             self.path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                      "apex_perf.json")
         except Exception:
             self.path = "apex_perf.json"
         self._load()
+
+    @staticmethod
+    def _cooldown_secs(tf):
+        """After a setup fails, rest it for a MULTIPLE of its own timeframe — bigger
+        multiple on faster timeframes, smaller on slower ones. So a 5m scalp rests ~40min,
+        a 4h setup ~16h, a daily ~2 days. (base_seconds, multiple) per timeframe."""
+        table = {"5m": (300, 8), "15m": (900, 6), "1h": (3600, 5), "4h": (14400, 4),
+                 "1d": (86400, 2), "daily": (86400, 2), "1w": (604800, 1), "weekly": (604800, 1)}
+        base, mult = table.get(str(tf or "").strip().lower(), (14400, 4))   # default 4h
+        return base * mult
 
     def _up(self):
         u = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip()
@@ -121,11 +135,13 @@ class Tracker:
                 d = json.loads(raw)
                 self.open = d.get("open", {})
                 self.closed = d.get("closed", [])
+                self.cooldowns = d.get("cooldowns", {})
             except Exception:
                 pass
 
     def _save(self):
-        blob = json.dumps({"open": self.open, "closed": self.closed[-1000:]})
+        blob = json.dumps({"open": self.open, "closed": self.closed[-1000:],
+                           "cooldowns": self.cooldowns})
         try:
             with open(self.path, "w") as f:
                 f.write(blob)
@@ -196,6 +212,12 @@ class Tracker:
                     continue
                 k = f"{board}:{sym}:{side}"
                 if k in self.open:
+                    continue
+                # Cooldown: skip if this SAME setup (≈same entry) resolved recently, so a
+                # setup that keeps re-appearing isn't re-taken and re-stopped every scan.
+                cd = self.cooldowns.get(k)
+                if cd and now < cd.get("until", 0) \
+                        and cd.get("entry") and abs(float(entry) - cd["entry"]) / float(entry) < 0.004:
                     continue
                 self.open[k] = self._mk(board, sym, side, entry, stop, tps, px, now,
                                         regime=s.get("regime", ""))
@@ -311,6 +333,14 @@ class Tracker:
                 t["r"] = round(r, 2)
                 t["closed_ts"] = now
                 self.closed.append(t)
+                # Start a timeframe-scaled cooldown for this exact setup so it isn't
+                # re-taken next scan — a failed 5m scalp rests ~1h, a 4h setup ~2 days.
+                self.cooldowns[f"{t['board']}:{t['symbol']}:{t['side']}"] = {
+                    "entry": t.get("entry"), "stop": t.get("stop"), "ts": now,
+                    "until": now + self._cooldown_secs(t.get("tf"))}
+            # Forget expired cooldowns so genuinely new setups can register again.
+            self.cooldowns = {kk: v for kk, v in self.cooldowns.items()
+                              if now < v.get("until", v.get("ts", 0) + 12 * 3600)}
             self.closed = self.closed[-1000:]
             if done:
                 self._save()
@@ -822,6 +852,10 @@ def run_one_scan(state: State) -> None:
     _breadth = (((_alts.get("pct_above_200ema") or 50) - 50) / 50.0)
     _reg = 0.45 * (_day or 0.0) + 0.35 * (_week or 0.0) + 0.20 * _breadth
 
+    def _align_for(side):
+        favor = _reg if side == "long" else -_reg
+        return "with" if favor >= 0.20 else ("against" if favor <= -0.20 else "neutral")
+
     def _apply_regime(board, side):
         for d in board:
             favor = _reg if side == "long" else -_reg   # >0 = regime favours this side
@@ -836,9 +870,61 @@ def run_one_scan(state: State) -> None:
     long_board.sort(key=lambda d: d["score"], reverse=True)
     short_board.sort(key=lambda d: d["score"], reverse=True)
     coil_board.sort(key=lambda d: d["score"], reverse=True)
-    long_board = long_board[:25]
-    short_board = short_board[:25]
-    coil_board = coil_board[:25]
+
+    # ---- QUALITY GATE: only RECOMMEND setups that clear a real bar. Fewer, cleaner
+    # trades beat 25 forced ones. A setup must have genuine conviction AND R:R, must not
+    # fight the regime (unless it's elite), and must not be chasing a stretched extreme.
+    # If nothing qualifies, the board is intentionally empty ("no trade").
+    CONV_FLOOR, RR_FLOOR = 60.0, 1.8
+
+    def _quality_keep(board, side):
+        kept = []
+        for d in board:
+            conv = d.get("conviction", 0) or 0
+            rr = d.get("rr")
+            reg = d.get("regime", "neutral")
+            pv = d.get("pct_vs_ema")
+            if rr is None or rr < RR_FLOOR:
+                d["gate"] = "low R:R"
+                continue
+            if conv < CONV_FLOOR:
+                d["gate"] = "low conviction"
+                continue
+            if reg == "against":
+                d["gate"] = "against regime"
+                continue
+            if side == "long" and pv is not None and pv > 30:
+                d["gate"] = "over-extended"
+                continue
+            if side == "short" and pv is not None and pv < -30:
+                d["gate"] = "over-extended"
+                continue
+            d["gate"] = "pass"
+            kept.append(d)
+        return kept
+
+    long_board = _quality_keep(long_board, "long")[:25]
+    short_board = _quality_keep(short_board, "short")[:25]
+
+    # Coiled: don't force a squeeze that has no clear lean or no room to run. Require a
+    # recommended side AND a tradeable R:R on that side's plan, plus a real squeeze score.
+    def _coil_keep(board):
+        kept = []
+        for d in board:
+            rs = d.get("rec_side")
+            pl = d.get("plan_long") if rs == "long" else d.get("plan_short") if rs == "short" else None
+            rr = (pl or {}).get("rr")
+            reg = _align_for(rs) if rs else "neutral"
+            if not rs or not pl or rr is None or rr < 1.8 or (d.get("score", 0) or 0) < 55:
+                d["gate"] = "no clear coil"
+                continue
+            if reg == "against":
+                d["gate"] = "against regime"
+                continue
+            d["gate"] = "pass"
+            kept.append(d)
+        return kept
+    coil_board = _coil_keep(coil_board)[:25]
     _mkt = cfg.get("market", "futures")
     # Complete the coiled-timeframes picture for the top coils only: 15m & 1h squeeze
     # (finer than the 4h scan) — a cheap second pass (~50 calls) just for these 25.
@@ -879,15 +965,32 @@ def run_one_scan(state: State) -> None:
                 if _sc:
                     scalp_board.append(_sc)
         scalp_board.sort(key=lambda d: d["score"], reverse=True)
-        scalp_board = scalp_board[:25]
 
-    # Regime alignment for a given side, reused for scalps & coils.
-    def _align_for(side):
-        favor = _reg if side == "long" else -_reg
-        return "with" if favor >= 0.20 else ("against" if favor <= -0.20 else "neutral")
     for _d in scalp_board:
         _d["regime"] = _align_for(_d.get("side", "long"))
         _d["regime_score"] = round(_reg, 3)
+
+    # Scalps: don't force. Require a genuine grade, tradeable R:R, alignment with the
+    # regime, and no chasing an already-exhausted RSI extreme on the entry timeframe.
+    def _scalp_keep(board):
+        kept = []
+        for d in board:
+            rr = d.get("rr")
+            rsi = d.get("rsi")
+            long = d.get("side") != "short"
+            if rr is None or rr < 1.4 or (d.get("score", 0) or 0) < 55:
+                d["gate"] = "weak scalp"
+                continue
+            if d.get("regime") == "against":
+                d["gate"] = "against regime"
+                continue
+            if rsi is not None and ((long and rsi > 75) or ((not long) and rsi < 25)):
+                d["gate"] = "RSI exhausted"
+                continue
+            d["gate"] = "pass"
+            kept.append(d)
+        return kept
+    scalp_board = _scalp_keep(scalp_board)[:25]
 
     # Performance tracking — register each board's fresh setups (resolved later against
     # the live price feed). Coil registers the recommended side's breakout plan.
@@ -1942,7 +2045,7 @@ PAGE = """<!doctype html>
     </tr></thead>
     <tbody id="blrows"></tbody>
   </table>
-  <div class="empty" id="blempty" style="display:none">No long setups yet — waiting for the first full scan…</div>
+  <div class="empty" id="blempty" style="display:none">🚫 No long setups clear the quality bar right now — Apex won't force a trade into a tape that isn't offering clean longs. Check the 🧭 Market tab for the regime, or come back next scan.</div>
 </div>
 </div>
 
@@ -1968,7 +2071,7 @@ PAGE = """<!doctype html>
     </tr></thead>
     <tbody id="bsrows"></tbody>
   </table>
-  <div class="empty" id="bsempty" style="display:none">No short setups yet — waiting for the first full scan…</div>
+  <div class="empty" id="bsempty" style="display:none">🚫 No short setups clear the quality bar right now — Apex won't force a short when the tape isn't offering clean ones. Check the 🧭 Market tab, or come back next scan.</div>
 </div>
 </div>
 
@@ -1994,7 +2097,7 @@ PAGE = """<!doctype html>
     </tr></thead>
     <tbody id="coilrows"></tbody>
   </table>
-  <div class="empty" id="coilempty" style="display:none">No coiled setups yet — waiting for the first full scan…</div>
+  <div class="empty" id="coilempty" style="display:none">🚫 No coiled setups with a clear lean and tradeable R:R right now — Apex won't force a squeeze that has no direction. Come back next scan.</div>
 </div>
 </div>
 
@@ -2020,7 +2123,7 @@ PAGE = """<!doctype html>
     </tr></thead>
     <tbody id="scalprows"></tbody>
   </table>
-  <div class="empty" id="scalpempty" style="display:none">No scalps yet — waiting for the first full scan (scalps are computed from the top HTF setups)…</div>
+  <div class="empty" id="scalpempty" style="display:none">🚫 No scalps clear the quality bar right now — scalps are only taken WITH the higher-timeframe direction and regime, so when there's no clean HTF setup, Apex sits out. Come back next scan.</div>
 </div>
 </div>
 

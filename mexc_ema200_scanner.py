@@ -2667,7 +2667,8 @@ def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
         return round(max(0.0, min(100.0, conv * mult)), 1)
 
     base = {"symbol": symbol, "price": price, "atr_pct": atr_pct, "rvol": rv,
-            "bias": bias, "tf_bias": tfb}
+            "bias": bias, "tf_bias": tfb,
+            "pct_vs_ema": (round((price / ema_now - 1) * 100, 2) if ema_now else None)}
     long_setup = {**base, "side": "long", "score": _quality(ls, lp), "conviction": ls,
                   "why": lw, "near_level": near_sup, "near_kind": "support", **lp}
     short_setup = {**base, "side": "short", "score": _quality(ss, sp), "conviction": ss,
