@@ -2709,45 +2709,88 @@ def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
             ins = sorted(sups, reverse=True)                 # supports below, nearest first
             outs = sorted(ress)                              # resistances above, nearest first
             near = ins[0] if (ins and (price - ins[0]) / price <= 0.06) else None
-            entry = near if near is not None else price
-            entry_tf = _tf_of(entry, _sup_map)
-            entry_basis = (f"{entry_tf} swing-low support — buy the pullback"
-                           if entry_tf else "current price (nearest support is too far to wait for)")
-            below = [s for s in ins if s < entry * 0.999]
-            stop = below[0] if below else round(entry * (1 - buf), 10)
-            if (entry - stop) < entry * 0.005:
-                stop = round(entry * (1 - buf), 10)
-            stop_tf = _tf_of(stop, _sup_map)
-            stop_basis = (f"below the {stop_tf} swing low" if stop_tf
-                          else "≈1.2×ATR below entry (volatility stop)")
+            # BREAKOUT entry: with real up-momentum and a resistance just overhead — and
+            # price NOT already sitting on support — the smart entry is the BREAK above
+            # that resistance (a limit ABOVE current price), stopped if the break fails.
+            brk = next((r for r in outs if (r - price) / price <= 0.045), None)
+            use_brk = (brk is not None and roc > 0.008
+                       and (struct == "uptrend" or choch == "bullish")
+                       and (near is None or (price - near) / price > 0.025))
+            if use_brk:
+                entry = round(brk * 1.0015, 10)
+                entry_tf = _tf_of(brk, _res_map)
+                entry_basis = ((f"break above the {entry_tf} resistance" if entry_tf
+                                else "break above overhead resistance")
+                               + " — momentum entry (buy-stop ABOVE price)")
+                stop = round(brk * (1 - max(0.006, 0.8 * buf)), 10)
+                _bs = [s for s in ins if s < stop]
+                if _bs:
+                    stop = _bs[0]
+                stop_tf = _tf_of(stop, _sup_map)
+                stop_basis = ("back below the broken level"
+                              + (f" ({stop_tf} swing low)" if stop_tf else "") + " — break failed")
+            else:
+                entry = near if near is not None else price
+                entry_tf = _tf_of(entry, _sup_map)
+                entry_basis = (f"{entry_tf} swing-low support — buy the pullback"
+                               if entry_tf else "current price (nearest support is too far to wait for)")
+                below = [s for s in ins if s < entry * 0.999]
+                stop = below[0] if below else round(entry * (1 - buf), 10)
+                if (entry - stop) < entry * 0.005:
+                    stop = round(entry * (1 - buf), 10)
+                stop_tf = _tf_of(stop, _sup_map)
+                stop_basis = (f"below the {stop_tf} swing low" if stop_tf
+                              else "≈1.2×ATR below entry (volatility stop)")
             risk = entry - stop
             if risk <= 0:
                 return {}
             tps = _smart_tps(True, entry, risk)
             return {"entry": round(entry, 10), "entry_basis": entry_basis, "entry_tf": entry_tf,
                     "stop": round(stop, 10), "stop_basis": stop_basis, "stop_tf": stop_tf,
+                    "breakout": bool(use_brk),
                     "target": tps[0]["lvl"], "rr": tps[0]["rr"],
                     "rr_max": tps[-1]["rr"], "tps": tps}
         ins = sorted(ress)                                   # resistances above, nearest first
         outs = sorted(sups, reverse=True)                    # supports below, nearest first
         near = ins[0] if (ins and (ins[0] - price) / price <= 0.06) else None
-        entry = near if near is not None else price
-        entry_tf = _tf_of(entry, _res_map)
-        entry_basis = (f"{entry_tf} swing-high resistance — sell into strength"
-                       if entry_tf else "current price (nearest resistance is too far to wait for)")
-        above = [r for r in ins if r > entry * 1.001]
-        stop = above[0] if above else round(entry * (1 + buf), 10)
-        if (stop - entry) < entry * 0.005:
-            stop = round(entry * (1 + buf), 10)
-        stop_tf = _tf_of(stop, _res_map)
-        stop_basis = (f"above the {stop_tf} swing high" if stop_tf
-                      else "≈1.2×ATR above entry (volatility stop)")
+        # BREAKDOWN entry (mirror): down-momentum + support just below → SHORT the break
+        # below that support (a sell-stop BELOW current price).
+        brk = next((s for s in outs if (price - s) / price <= 0.045), None)
+        use_brk = (brk is not None and roc < -0.008
+                   and (struct == "downtrend" or choch == "bearish")
+                   and (near is None or (near - price) / price > 0.025))
+        if use_brk:
+            entry = round(brk * 0.9985, 10)
+            entry_tf = _tf_of(brk, _sup_map)
+            entry_basis = ((f"break below the {entry_tf} support" if entry_tf
+                            else "break below support")
+                           + " — momentum entry (sell-stop BELOW price)")
+            stop = round(brk * (1 + max(0.006, 0.8 * buf)), 10)
+            _bs = [r for r in ins if r > stop]
+            if _bs:
+                stop = _bs[0]
+            stop_tf = _tf_of(stop, _res_map)
+            stop_basis = ("back above the broken level"
+                          + (f" ({stop_tf} swing high)" if stop_tf else "") + " — break failed")
+        else:
+            entry = near if near is not None else price
+            entry_tf = _tf_of(entry, _res_map)
+            entry_basis = (f"{entry_tf} swing-high resistance — sell into strength"
+                           if entry_tf else "current price (nearest resistance is too far to wait for)")
+            above = [r for r in ins if r > entry * 1.001]
+            stop = above[0] if above else round(entry * (1 + buf), 10)
+            if (stop - entry) < entry * 0.005:
+                stop = round(entry * (1 + buf), 10)
+            stop_tf = _tf_of(stop, _res_map)
+            stop_basis = (f"above the {stop_tf} swing high" if stop_tf
+                          else "≈1.2×ATR above entry (volatility stop)")
         risk = stop - entry
         if risk <= 0:
             return {}
         tps = _smart_tps(False, entry, risk)
         return {"entry": round(entry, 10), "entry_basis": entry_basis, "entry_tf": entry_tf,
                 "stop": round(stop, 10), "stop_basis": stop_basis, "stop_tf": stop_tf,
+                "breakout": bool(use_brk),
                 "target": (tps[0]["lvl"] if tps else None), "rr": (tps[0]["rr"] if tps else None),
                 "rr_max": (tps[-1]["rr"] if tps else None), "tps": tps}
 
