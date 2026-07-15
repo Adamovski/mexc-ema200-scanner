@@ -141,7 +141,8 @@ class Tracker:
                 pass
 
     @staticmethod
-    def _mk(board, sym, side, entry, stop, tps, px, now, tf="", note="", state="pending"):
+    def _mk(board, sym, side, entry, stop, tps, px, now, tf="", note="", state="pending",
+            regime=""):
         """Build a two-phase, scale-out-aware trade. Phase 1 = wait for the recommended
         ENTRY to fill (measured fairly from the fill, not from when it was flagged).
         Phase 2 = a full TP ladder with a stop that RATCHETS UP as targets bank (→ break-
@@ -168,6 +169,7 @@ class Tracker:
                 "tps": clean, "weights": w, "phase": 0, "realized": 0.0,
                 "cur_stop": stop, "cur_stop_r": -1.0, "px0": px, "ts": now,
                 "tf": tf, "note": note, "tps_hit": [], "rr": (clean[0]["rr"] if clean else None),
+                "regime": regime,
                 "state": state, "fill_up": (entry > px), "filled_ts": (now if state == "active" else None)}
 
     def register(self, board, setups):
@@ -195,7 +197,8 @@ class Tracker:
                 k = f"{board}:{sym}:{side}"
                 if k in self.open:
                     continue
-                self.open[k] = self._mk(board, sym, side, entry, stop, tps, px, now)
+                self.open[k] = self._mk(board, sym, side, entry, stop, tps, px, now,
+                                        regime=s.get("regime", ""))
                 changed = True
         if changed:
             with self.lock:
@@ -344,7 +347,7 @@ class Tracker:
                         "tp_rates": tp_rates, "allout": allout_exp}
             _cf = ("board", "symbol", "side", "entry", "stop", "tps", "rr", "status",
                    "r", "ts", "closed_ts", "tf", "note", "px0", "tps_hit", "state",
-                   "phase", "filled_ts")
+                   "phase", "filled_ts", "regime")
             _pk = lambda t: {c: t.get(c) for c in _cf}
             _active = sum(1 for t in self.open.values() if t.get("state") == "active")
             _pending = sum(1 for t in self.open.values() if t.get("state") == "pending")
@@ -359,9 +362,15 @@ class Tracker:
                     "open": [_pk(t) for t in _open_all if t.get("board") == b][:60],
                     "closed": [_pk(t) for t in _closed_rev if t.get("board") == b][:60],
                 }
+            # Learning signal: win-rate WITH the market regime vs AGAINST it. If
+            # against-regime setups bleed (as they should), this proves it in numbers.
+            auto = [t for t in res if t.get("board") in ("long", "short", "coil", "scalp")]
+            by_regime = {r: agg([t for t in auto if (t.get("regime") or "neutral") == r])
+                         for r in ("with", "against", "neutral")}
             return {"overall": agg(res),
                     "by_board": {b: agg([t for t in res if t["board"] == b])
                                  for b in ("long", "short", "coil", "scalp", "call")},
+                    "by_regime": by_regime,
                     "board_rows": board_rows,
                     "open": len(self.open), "active": _active, "pending": _pending,
                     "missed": _missed,
@@ -777,6 +786,29 @@ def run_one_scan(state: State) -> None:
     long_board = _tradeable(_lb, 1.2) or _tradeable(_lb, 1.0) or _lb
     short_board = _tradeable(_sb, 1.2) or _tradeable(_sb, 1.0) or _sb
     coil_board = [d for d in coil_board if not d.get("data_stale")]
+    # ---- REGIME-AWARE RANKING: fight the tape less. Blend the live market read
+    # (intraday + swing verdict + alt breadth) into one score (−1 fully favours
+    # shorts → +1 fully favours longs). Down-rank setups that fight it and tag every
+    # row's alignment so we (a) surface with-regime setups first and (b) can later
+    # measure with- vs against-regime win-rate (learning from our own losses).
+    _mc = state.market_context or {}
+    _day = (_mc.get("day") or {}).get("score")
+    _week = (_mc.get("week") or {}).get("score")
+    _alts = _mc.get("alts") or {}
+    _breadth = (((_alts.get("pct_above_200ema") or 50) - 50) / 50.0)
+    _reg = 0.45 * (_day or 0.0) + 0.35 * (_week or 0.0) + 0.20 * _breadth
+
+    def _apply_regime(board, side):
+        for d in board:
+            favor = _reg if side == "long" else -_reg   # >0 = regime favours this side
+            align = "with" if favor >= 0.20 else ("against" if favor <= -0.20 else "neutral")
+            # Down-rank against-regime setups so fewer reach the top 25; nudge with-regime up.
+            fac = 1.15 if align == "with" else (0.55 if align == "against" else 1.0)
+            d["regime"] = align
+            d["regime_score"] = round(_reg, 3)
+            d["score"] = d.get("score", 0) * fac
+    _apply_regime(long_board, "long")
+    _apply_regime(short_board, "short")
     long_board.sort(key=lambda d: d["score"], reverse=True)
     short_board.sort(key=lambda d: d["score"], reverse=True)
     coil_board.sort(key=lambda d: d["score"], reverse=True)
@@ -825,6 +857,14 @@ def run_one_scan(state: State) -> None:
         scalp_board.sort(key=lambda d: d["score"], reverse=True)
         scalp_board = scalp_board[:25]
 
+    # Regime alignment for a given side, reused for scalps & coils.
+    def _align_for(side):
+        favor = _reg if side == "long" else -_reg
+        return "with" if favor >= 0.20 else ("against" if favor <= -0.20 else "neutral")
+    for _d in scalp_board:
+        _d["regime"] = _align_for(_d.get("side", "long"))
+        _d["regime_score"] = round(_reg, 3)
+
     # Performance tracking — register each board's fresh setups (resolved later against
     # the live price feed). Coil registers the recommended side's breakout plan.
     TRACKER.register("long", long_board)
@@ -837,7 +877,8 @@ def run_one_scan(state: State) -> None:
         if _pl and _pl.get("entry"):
             _coil_regs.append({"symbol": _d["symbol"], "side": _rs, "entry": _pl["entry"],
                                "stop": _pl["stop"], "tps": _pl.get("tps"),
-                               "rr": _pl.get("rr"), "price": _d.get("price")})
+                               "rr": _pl.get("rr"), "price": _d.get("price"),
+                               "regime": _align_for(_rs) if _rs else "neutral"})
     TRACKER.register("coil", _coil_regs)
 
     # Enrich ONLY the flagged coins with a 1h read (bias + formation) — a single 1h
@@ -1362,6 +1403,9 @@ PAGE = """<!doctype html>
   .histnote{font-size:12.5px;color:var(--dim);line-height:1.5;margin:2px 0 10px;padding:8px 11px;border-left:2px solid var(--line);background:rgba(139,152,173,.04);border-radius:0 6px 6px 0}
   .histnote b{color:var(--fg,#e6edf3)}
   .histcard{min-width:150px} .histcard-desc{font-size:11px;color:var(--dim);margin-top:6px;line-height:1.4}
+  .rgb{display:inline-block;font-size:10px;font-weight:700;padding:1px 6px;border-radius:4px;margin-left:4px;cursor:help;white-space:nowrap}
+  .rgb-w{color:var(--accent);background:rgba(63,185,80,.14);border:1px solid rgba(63,185,80,.4)}
+  .rgb-a{color:#f85149;background:rgba(248,81,73,.12);border:1px solid rgba(248,81,73,.4)}
   .tprcell{white-space:normal}
   .tpr{display:inline-block;border-radius:5px;padding:1px 7px;font-size:11px;font-weight:700;margin:2px 4px 2px 0;border:1px solid var(--line);font-variant-numeric:tabular-nums;cursor:help}
   .tpr-hi{background:rgba(63,185,80,.18);color:var(--accent);border-color:rgba(63,185,80,.5)}
@@ -2050,10 +2094,15 @@ PAGE = """<!doctype html>
       <th data-tip="Average R if every trade exited its whole position at TP2 (missing TP2 = −1R).">All-out at TP2</th>
       <th data-tip="Average R if every trade exited its whole position at TP3 (missing TP3 = −1R).">All-out at TP3</th>
     </tr></thead><tbody id="perfaorows"></tbody></table>
+  <div class="perfsub">Learning — with the market regime vs against it</div>
+  <div class="histnote" id="perfRegimeNote">Apex now tilts the boards toward the side the market favours and tags each setup <b>with-regime</b> or <b>against-regime</b>. This is the payoff: does trading with the tape actually win more? (Fills in as regime-tagged trades resolve.)</div>
+  <table id="perfregtbl"><thead><tr>
+      <th>Alignment</th><th>Trades</th><th>Win rate</th><th>Expectancy</th>
+    </tr></thead><tbody id="perfregrows"></tbody></table>
   <div class="perfsub">Recent resolved trades</div>
   <table id="perftrtbl"><thead><tr>
       <th>Closed</th><th>Board</th><th>Symbol</th><th>Side</th>
-      <th>Entry</th><th>Stop</th><th>Target</th><th>Result</th>
+      <th>Entry</th><th>Stop</th><th data-tip="The furthest level price actually reached before the trade closed — the highest TP hit, or the stop.">Reached</th><th>Result</th>
     </tr></thead><tbody id="perftrrows"></tbody></table>
   <div class="empty" id="perfempty" style="display:none">No resolved setups yet — the tracker records setups as they appear and closes them when price hits a target or stop. Check back after a few scans.</div>
 </div>
@@ -2072,7 +2121,7 @@ PAGE = """<!doctype html>
     </tr></thead><tbody id="callsopenrows"></tbody></table>
   <div class="perfsub">Resolved calls</div>
   <table id="callsclosed"><thead><tr>
-      <th>Closed</th><th>Symbol</th><th>Side</th><th>TF</th><th>Entry</th><th>Stop</th><th>TPs hit</th><th>Result</th>
+      <th>Closed</th><th>Symbol</th><th>Side</th><th>TF</th><th>Entry</th><th>Stop</th><th data-tip="The furthest level price reached before close — highest TP hit, or the stop.">Reached</th><th>Result</th>
     </tr></thead><tbody id="callsclosedrows"></tbody></table>
   <div class="empty" id="callsempty" style="display:none">No tracked calls yet. Open <b>🔎 Analyze a coin</b>, and on any setup that clears the R:R bar you'll see a <b>📌 Track this setup</b> button — click it to start tracking.</div>
 </div>
@@ -4116,16 +4165,33 @@ function renderPerf(){
     }
     if(!aorows.children.length) aorows.innerHTML='<tr><td colspan="4" class="rr">No resolved trades yet.</td></tr>';
   }
+  const regrows=document.getElementById('perfregrows');
+  if(regrows){ regrows.innerHTML='';
+    const byreg=(perf&&perf.by_regime)||{};
+    const labels={with:'✓ With regime',against:'✗ Against regime',neutral:'– Neutral'};
+    let any=false;
+    for(const k of ['with','against','neutral']){
+      const a=byreg[k]||{}; if(!(a.n||0)) continue; any=true;
+      const wcls=a.winrate==null?'':(a.winrate>=50?'pf-good':a.winrate>=40?'':'pf-bad');
+      const ecls=a.exp==null?'':(a.exp>0?'pf-good':'pf-bad');
+      const kc=k==='with'?'pf-good':k==='against'?'pf-bad':'';
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td class="${kc}"><b>${labels[k]}</b></td><td>${a.n||0}</td>`
+        +`<td class="${wcls}">${a.winrate==null?'—':a.winrate+'%'}${a.n?` <span class="rr">(${a.wins}W/${a.n-a.wins}L)</span>`:''}</td>`
+        +`<td class="${ecls}">${a.exp==null?'—':(a.exp>0?'+':'')+a.exp+'R'}</td>`;
+      regrows.appendChild(tr);
+    }
+    if(!any) regrows.innerHTML='<tr><td colspan="4" class="rr">No regime-tagged trades resolved yet — this fills in over the next scans.</td></tr>';
+  }
   if(trrows){ trrows.innerHTML='';
     for(const t of ((perf&&perf.recent)||[])){
-      const tgt=((t.tps||[]).length?fmtNum(t.tps[t.tps.length-1].lvl):'—');
       const when=t.closed_ts?new Date(t.closed_ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
       const tr=document.createElement('tr');
       tr.innerHTML=`<td style="color:var(--dim);white-space:nowrap">${when}</td>`
-        +`<td>${({long:'Long',short:'Short',coil:'Coil',scalp:'Scalp'})[t.board]||t.board}</td>`
+        +`<td>${({long:'Long',short:'Short',coil:'Coil',scalp:'Scalp'})[t.board]||t.board} ${regimeBadge(t)}</td>`
         +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></div></td>`
-        +`<td>${leanPill(t.side==='short'?'bearish':'bullish')}</td>`
-        +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${tgt}</td>`
+        +`<td>${sideLabel(t)}</td>`
+        +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${reachedHtml(t)}</td>`
         +`<td>${perfStatusHtml(t)}</td>`;
       trrows.appendChild(tr);
     }
@@ -4404,17 +4470,38 @@ function boardTradesHtml(bd){
   } else h+='<div class="bt-empty">No open setups on this board right now.</div>';
   h+=`<div class="bt-h">Resolved (${closedR.length})</div>`;
   if(closedR.length){
-    h+='<table class="bt"><thead><tr><th>Closed</th><th>Symbol</th><th>Side</th><th>TF</th><th>Entry</th><th>Stop</th><th>Target</th><th>Result</th></tr></thead><tbody>';
+    h+='<table class="bt"><thead><tr><th>Closed</th><th>Symbol</th><th>Side</th><th>TF</th><th>Entry</th><th>Stop</th><th>Reached</th><th>Result</th></tr></thead><tbody>';
     for(const t of closedR){
       h+=`<tr><td class="dim">${fmtWhen(t.closed_ts)}</td>`
         +`<td class="sym"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></td>`
-        +`<td>${leanPill(t.side==='short'?'bearish':'bullish')}</td><td>${t.tf||'—'}</td>`
-        +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${tgtOf(t)}</td><td>${perfStatusHtml(t)}</td></tr>`;
+        +`<td>${sideLabel(t)} ${regimeBadge(t)}</td><td>${t.tf||'—'}</td>`
+        +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${reachedHtml(t)}</td><td>${perfStatusHtml(t)}</td></tr>`;
     }
     h+='</tbody></table>';
   } else h+='<div class="bt-empty">Nothing resolved on this board yet.</div>';
   h+='</div>';
   return h;
+}
+// Explicit Long/Short label (not just a colour).
+function sideLabel(t){ return (t.side==='short')
+  ? '<span class="pf-bad" style="font-weight:700">SHORT ▼</span>'
+  : '<span class="pf-good" style="font-weight:700">LONG ▲</span>'; }
+// The final level price reached before the trade closed (max TP hit, else stop/entry).
+function reachedHtml(t){
+  const hi=(t.tps_hit&&t.tps_hit.length)?Math.max.apply(null,t.tps_hit):0;
+  if(hi>0){ const lvl=(t.tps&&t.tps[hi-1])?fmtNum(t.tps[hi-1].lvl):''; return `<span class="pf-good">TP${hi}${lvl?' @ '+lvl:''}</span>`; }
+  if(t.status==='loss') return `<span class="pf-bad">Stop @ ${fmtNum(t.stop)}</span>`;
+  if(t.status==='be') return `<span class="pf-be">Break-even @ ${fmtNum(t.entry)}</span>`;
+  if(t.status==='missed') return `<span class="pf-miss">Never filled</span>`;
+  if(t.status==='expired') return `<span class="pf-miss">Never filled</span>`;
+  return '—';
+}
+// Small badge: was this setup WITH or AGAINST the market regime when it was taken?
+function regimeBadge(t){
+  const r=t.regime;
+  if(r==='with') return `<span class="rgb rgb-w" data-tip="Taken WITH the market regime (the tape favoured this side).">✓ with regime</span>`;
+  if(r==='against') return `<span class="rgb rgb-a" data-tip="Taken AGAINST the market regime (fighting the tape) — historically the weaker bucket.">✗ against regime</span>`;
+  return '';
 }
 function perfStatusHtml(t){
   const s=t.status, r=(t.r!=null)?(+t.r):null;
@@ -4457,14 +4544,13 @@ function renderCalls(){
   }
   if(closedrows){ closedrows.innerHTML='';
     for(const t of closed){
-      const win=(t.r||0)>0, when=t.closed_ts?new Date(t.closed_ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
-      const hits=(t.tps_hit&&t.tps_hit.length)?('TP'+Math.max.apply(null,t.tps_hit)):'none';
+      const when=t.closed_ts?new Date(t.closed_ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
       const tr=document.createElement('tr');
       tr.innerHTML=`<td style="color:var(--dim);white-space:nowrap">${when}</td>`
         +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></div></td>`
-        +`<td>${leanPill(t.side==='short'?'bearish':'bullish')}</td><td>${t.tf||'—'}</td>`
-        +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${hits}</td>`
-        +`<td class="${win?'pf-good':((t.r||0)<0?'pf-bad':'')}"><b>${win?'WIN +'+(+t.r).toFixed(2)+'R':(t.r<0?'LOSS −1R':'BE 0R')}</b></td>`;
+        +`<td>${sideLabel(t)}</td><td>${t.tf||'—'}</td>`
+        +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${reachedHtml(t)}</td>`
+        +`<td>${perfStatusHtml(t)}</td>`;
       closedrows.appendChild(tr);
     }
   }
