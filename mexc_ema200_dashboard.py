@@ -139,11 +139,34 @@ class Tracker:
             except Exception:
                 pass
 
+    @staticmethod
+    def _mk(board, sym, side, entry, stop, tps, px, now, tf="", note=""):
+        """Build a scale-out-aware trade: a full TP ladder with weights, a stop that
+        RATCHETS UP as targets are banked (→ break-even after TP1, → TP1 after TP2), so
+        once TP1 is reached the trade can no longer be a full loss."""
+        entry, stop = float(entry), float(stop)
+        risk = abs(entry - stop) or 1e-9
+        clean = []
+        for t in (tps or []):
+            lvl = t.get("lvl")
+            if lvl is None:
+                continue
+            rr = t.get("rr")
+            clean.append({"lvl": float(lvl),
+                          "rr": (float(rr) if rr is not None else round(abs(float(lvl) - entry) / risk, 2))})
+        clean = clean[:6]                                  # track up to 6 TPs, each individually
+        n = len(clean)
+        w = {1: [1.0], 2: [0.6, 0.4], 3: [0.4, 0.35, 0.25], 4: [0.35, 0.3, 0.2, 0.15],
+             5: [0.3, 0.25, 0.2, 0.15, 0.1],
+             6: [0.25, 0.22, 0.18, 0.15, 0.12, 0.08]}.get(n, [1.0])
+        return {"board": board, "symbol": sym, "side": side, "entry": entry, "stop": stop,
+                "tps": clean, "weights": w, "phase": 0, "realized": 0.0,
+                "cur_stop": stop, "cur_stop_r": -1.0, "px0": float(px), "ts": now,
+                "tf": tf, "note": note, "tps_hit": [], "rr": (clean[0]["rr"] if clean else None)}
+
     def register(self, board, setups):
-        """Record newly-appeared setups. Only tracks well-posed ones: the flag price
-        must sit BETWEEN the stop and the first target (so 'did it reach target before
-        stop' is meaningful) — this naturally filters pullback entries that haven't
-        set up and lower-half coils."""
+        """Record newly-appeared setups (full TP ladder). Only tracks well-posed ones:
+        the flag price must sit BETWEEN the stop and the first target."""
         now = time.time()
         changed = False
         with self.lock:
@@ -152,9 +175,9 @@ class Tracker:
                 side = s.get("side", "long")
                 entry = s.get("entry")
                 stop = s.get("stop")
-                tps = s.get("tps") or []
-                tp1 = (tps[0].get("lvl") if tps else s.get("target"))
+                tps = s.get("tps") or ([{"lvl": s.get("target")}] if s.get("target") else [])
                 px = s.get("live") or s.get("price") or entry
+                tp1 = (tps[0].get("lvl") if tps else None)
                 if not (sym and entry and stop and tp1 and px):
                     continue
                 long = side != "short"
@@ -165,17 +188,48 @@ class Tracker:
                 k = f"{board}:{sym}:{side}"
                 if k in self.open:
                     continue
-                self.open[k] = {"board": board, "symbol": sym, "side": side,
-                                "entry": entry, "stop": stop, "tp1": tp1,
-                                "rr": s.get("rr"), "px0": px, "ts": now}
+                self.open[k] = self._mk(board, sym, side, entry, stop, tps, px, now)
                 changed = True
         if changed:
             with self.lock:
                 self._save()
 
+    def add_call(self, symbol, side, targets, entry, stop, tf="", note=""):
+        """Manually track a curated 'call' (from the Analyze tab), with its full TP
+        ladder. `targets` is a comma-separated string of TP levels. Recorded with a
+        unique key so the same coin can be called more than once."""
+        try:
+            entry, stop = float(entry), float(stop)
+        except (TypeError, ValueError):
+            return False
+        tps = []
+        for x in str(targets).split(","):
+            x = x.strip()
+            if x:
+                try:
+                    tps.append({"lvl": float(x)})
+                except ValueError:
+                    pass
+        if not (symbol and entry and stop and tps):
+            return False
+        long = side != "short"
+        t1 = tps[0]["lvl"]
+        if long and not (stop < entry < t1):
+            return False
+        if (not long) and not (t1 < entry < stop):
+            return False
+        now = time.time()
+        with self.lock:
+            self.open[f"call:{symbol}:{int(now)}"] = self._mk(
+                "call", symbol, side, entry, stop, tps, entry, now, tf, (note or "")[:120])
+            self._save()
+        return True
+
     def resolve(self, prices):
-        """Check open trades against the live prices; close any that reached their
-        first target (win, +planned R) or stop (loss, −1R). Expire after 5 days."""
+        """Scale-out-aware resolution. Bank each TP by its weight as price reaches it,
+        ratcheting the stop up (break-even after TP1, TP1 after TP2 …). A stop-out
+        BEFORE any TP = full −1R loss; after TP1 the trade closes at the banked R (≥0)
+        — never a full loss. R = weighted realised R across the scaled-out position."""
         if not prices:
             return
         now = time.time()
@@ -185,19 +239,42 @@ class Tracker:
                 p = prices.get(t["symbol"])
                 if p is None:
                     if now - t["ts"] > 5 * 86400:
-                        done.append((k, "expired", 0.0))
+                        done.append((k, ("win" if t["realized"] > 0 else "expired"),
+                                     round(t["realized"], 3)))
                     continue
                 long = t["side"] != "short"
-                hit_tp = (p >= t["tp1"]) if long else (p <= t["tp1"])
-                hit_sl = (p <= t["stop"]) if long else (p >= t["stop"])
-                if hit_sl and not hit_tp:
-                    done.append((k, "loss", -1.0))
-                elif hit_tp and not hit_sl:
-                    done.append((k, "win", float(t.get("rr") or 1.0)))
-                elif hit_tp and hit_sl:
-                    done.append((k, "loss", -1.0))          # both in one tick — conservative
-                elif now - t["ts"] > 5 * 86400:
-                    done.append((k, "expired", 0.0))
+                tps = t["tps"]
+                closed = False
+                while True:
+                    hit_stop = (p <= t["cur_stop"]) if long else (p >= t["cur_stop"])
+                    ph = t["phase"]
+                    nxt = tps[ph] if ph < len(tps) else None
+                    hit_tp = nxt is not None and ((p >= nxt["lvl"]) if long else (p <= nxt["lvl"]))
+                    if hit_stop and ph == 0:
+                        done.append((k, "loss", -1.0)); closed = True; break
+                    if hit_stop and ph >= 1:
+                        rem = sum(t["weights"][ph:])
+                        r = t["realized"] + rem * t["cur_stop_r"]
+                        done.append((k, "win" if r > 1e-4 else "be" if abs(r) <= 1e-4 else "loss",
+                                     round(r, 3))); closed = True; break
+                    if hit_tp:
+                        t["realized"] += t["weights"][ph] * (nxt["rr"] or 0)
+                        t["tps_hit"].append(ph + 1)
+                        t["phase"] = ph + 1
+                        if t["phase"] >= len(tps):
+                            done.append((k, "win", round(t["realized"], 3))); closed = True; break
+                        if t["phase"] == 1:
+                            t["cur_stop"], t["cur_stop_r"] = t["entry"], 0.0
+                        else:
+                            t["cur_stop"] = tps[t["phase"] - 2]["lvl"]
+                            t["cur_stop_r"] = tps[t["phase"] - 2]["rr"]
+                        continue
+                    break
+                if not closed and now - t["ts"] > 5 * 86400:
+                    if t["phase"] >= 1:
+                        done.append((k, "win" if t["realized"] > 0 else "be", round(t["realized"], 3)))
+                    else:
+                        done.append((k, "expired", 0.0))
             for k, outcome, r in done:
                 t = self.open.pop(k, None)
                 if not t:
@@ -212,23 +289,40 @@ class Tracker:
 
     def stats(self):
         with self.lock:
-            res = [t for t in self.closed if t.get("status") in ("win", "loss")]
+            res = [t for t in self.closed if t.get("status") in ("win", "loss", "be")]
 
             def agg(rows):
                 n = len(rows)
                 if not n:
-                    return {"n": 0, "wins": 0, "winrate": None, "exp": None}
-                w = sum(1 for t in rows if t["status"] == "win")
+                    return {"n": 0, "wins": 0, "winrate": None, "exp": None, "tp_rates": []}
+                w = sum(1 for t in rows if (t.get("r") or 0) > 1e-4)
+                # Per-TP hit rate: % of these trades that reached at least TP1, TP2, TP3 …
+                tp_hits, maxtp = {}, 0
+                for t in rows:
+                    hits = t.get("tps_hit") or []
+                    hi = max(hits) if hits else 0
+                    maxtp = max(maxtp, len(t.get("tps") or []))
+                    for i in range(1, hi + 1):
+                        tp_hits[i] = tp_hits.get(i, 0) + 1
+                tp_rates = [{"tp": i, "n": tp_hits.get(i, 0), "rate": round(tp_hits.get(i, 0) / n * 100, 1)}
+                            for i in range(1, maxtp + 1)]
                 return {"n": n, "wins": w, "winrate": round(w / n * 100, 1),
-                        "exp": round(sum(t["r"] for t in rows) / n, 2)}
+                        "exp": round(sum((t.get("r") or 0) for t in rows) / n, 2),
+                        "tp_rates": tp_rates}
+            _cf = ("board", "symbol", "side", "entry", "stop", "tps", "rr", "status",
+                   "r", "ts", "closed_ts", "tf", "note", "px0", "tps_hit")
             return {"overall": agg(res),
                     "by_board": {b: agg([t for t in res if t["board"] == b])
-                                 for b in ("long", "short", "coil", "scalp")},
+                                 for b in ("long", "short", "coil", "scalp", "call")},
                     "open": len(self.open),
                     "upstash": bool(self._up()),
-                    "recent": [{c: t.get(c) for c in ("board", "symbol", "side", "entry",
-                                "stop", "tp1", "rr", "status", "r", "ts", "closed_ts")}
-                               for t in list(reversed(self.closed))[:60]]}
+                    "recent": [{c: t.get(c) for c in _cf}
+                               for t in list(reversed(self.closed))[:60]],
+                    "calls_open": [{c: t.get(c) for c in _cf}
+                                   for t in self.open.values() if t.get("board") == "call"],
+                    "calls_closed": [{c: t.get(c) for c in _cf}
+                                     for t in list(reversed(self.closed))
+                                     if t.get("board") == "call"][:60]}
 
 
 TRACKER = Tracker()
@@ -970,6 +1064,15 @@ PAGE = """<!doctype html>
   .pclab{font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--dim);margin-top:6px}
   .perfsub{font-size:11px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;color:var(--dim2);margin:16px 0 6px}
   .pf-good{color:var(--accent)} .pf-bad{color:#f85149}
+  .tprcell{white-space:normal}
+  .tpr{display:inline-block;border-radius:5px;padding:1px 7px;font-size:11px;font-weight:700;margin:2px 4px 2px 0;border:1px solid var(--line);font-variant-numeric:tabular-nums;cursor:help}
+  .tpr-hi{background:rgba(63,185,80,.18);color:var(--accent);border-color:rgba(63,185,80,.5)}
+  .tpr-mid{background:rgba(240,180,41,.14);color:#f0b429}
+  .tpr-lo{background:rgba(139,152,173,.1);color:var(--dim)}
+  .trackrow{display:flex;align-items:center;gap:10px;margin:10px 0 2px}
+  .trackbtn{padding:7px 14px;border-radius:9px;border:1px solid rgba(63,185,80,.5);background:rgba(63,185,80,.12);color:var(--accent);font-weight:700;font-size:13px;cursor:pointer}
+  .trackbtn:hover{background:rgba(63,185,80,.2)}
+  .trackmsg{font-size:12.5px;color:var(--dim)}
   .corrbadge{border-radius:6px;padding:0 6px;font-size:10.5px;font-weight:700;border:1px solid var(--line);margin-left:5px;font-variant-numeric:tabular-nums;cursor:help}
   .corr-hi{background:rgba(210,153,34,.16);color:#d29922;border-color:rgba(210,153,34,.45)}
   .corr-mid{background:rgba(139,152,173,.12);color:var(--dim)}
@@ -1207,6 +1310,7 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabStb" onclick="showTab('stb')">Supertrend support bounce</div>
   <div class="tab" id="tabShorts" onclick="showTab('shorts')">Shorts</div>
   <div class="tab" id="tabPerf" onclick="showTab('perf')">📊 Performance</div>
+  <div class="tab" id="tabCalls" onclick="showTab('calls')">📌 My calls</div>
   <div class="tab" id="tabInfo" onclick="showTab('info')">Info</div>
 </div>
 <div class="filterbar" id="filterbar"></div>
@@ -1602,11 +1706,12 @@ PAGE = """<!doctype html>
 </div>
 <div class="wrap">
   <div id="perfCards" class="perfcards"></div>
-  <div class="perfsub">By board</div>
+  <div class="perfsub">By board — win rate, expectancy & per-TP hit rates</div>
   <table id="perftbl"><thead><tr>
-      <th>Board</th><th data-tip="Resolved setups (target or stop hit).">Trades</th>
-      <th data-tip="% that reached the first target before the stop.">Win rate</th>
-      <th data-tip="Average R per trade — wins bank the planned R:R, losses are −1R. Above 0 = a positive edge.">Expectancy</th>
+      <th>Board</th><th data-tip="Resolved setups.">Trades</th>
+      <th data-tip="% that reached at least TP1 (after which the stop moves to break-even, so it can't be a full loss).">Win rate</th>
+      <th data-tip="Average R per trade across the scaled-out position. Above 0 = a positive edge.">Expectancy</th>
+      <th data-tip="What % of these trades reached each target — TP1, TP2, TP3 … Shows how far price typically runs.">TP hit rates</th>
     </tr></thead><tbody id="perfrows"></tbody></table>
   <div class="perfsub">Recent resolved trades</div>
   <table id="perftrtbl"><thead><tr>
@@ -1614,6 +1719,25 @@ PAGE = """<!doctype html>
       <th>Entry</th><th>Stop</th><th>Target</th><th>Result</th>
     </tr></thead><tbody id="perftrrows"></tbody></table>
   <div class="empty" id="perfempty" style="display:none">No resolved setups yet — the tracker records setups as they appear and closes them when price hits a target or stop. Check back after a few scans.</div>
+</div>
+</div>
+
+<div class="view" id="viewCalls">
+<div class="status">
+  <span>📌 My calls — setups you chose to track (via <b>📌 Track this setup</b> on the Analyze tab). Apex watches the live price and grades each one exactly like the plan: banks each TP, moves the stop to <b>break-even after TP1</b>, and scores the result in R. Their win-rate and per-TP hit rates are kept <b>separate</b> from the auto boards.</span>
+  <span id="callsMeta"></span>
+</div>
+<div class="wrap">
+  <div id="callsCards" class="perfcards"></div>
+  <div class="perfsub">Open calls</div>
+  <table id="callsopen"><thead><tr>
+      <th>Added</th><th>Symbol</th><th>Side</th><th>TF</th><th>Entry</th><th>Stop</th><th>Targets</th><th>Progress</th>
+    </tr></thead><tbody id="callsopenrows"></tbody></table>
+  <div class="perfsub">Resolved calls</div>
+  <table id="callsclosed"><thead><tr>
+      <th>Closed</th><th>Symbol</th><th>Side</th><th>TF</th><th>Entry</th><th>Stop</th><th>TPs hit</th><th>Result</th>
+    </tr></thead><tbody id="callsclosedrows"></tbody></table>
+  <div class="empty" id="callsempty" style="display:none">No tracked calls yet. Open <b>🔎 Analyze a coin</b>, and on any setup that clears the R:R bar you'll see a <b>📌 Track this setup</b> button — click it to start tracking.</div>
 </div>
 </div>
 
@@ -2182,7 +2306,7 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["coil","Coil"],["scalp","Scalp"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["coil","Coil"],["scalp","Scalp"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
@@ -2191,6 +2315,7 @@ function showTab(which){
   if(which==="coil") renderCoil();
   if(which==="scalp") renderScalp();
   if(which==="perf") renderPerf();
+  if(which==="calls") renderCalls();
   if(which==="watch"){ renderWatch(); loadWatch(); }
   renderBanner();  // banner follows the active scan tab
   renderFilterBar();  // filters are per-tab
@@ -2202,6 +2327,17 @@ function setAzTf(tf){ azTf=tf;
 }
 // Long/Short perspective toggle for the Analyze card. null = the coin's own lean.
 let azLast=null, azSide=null, azXtfHtml='', azXtfSide=null;   // azXtfSide: null=auto, 'long', 'short'
+let azRec=null;   // the currently-shown recommended trade, for the "Track this setup" button
+async function trackSetup(ev){ if(ev) ev.stopPropagation();
+  if(!azRec){ return; }
+  const q=new URLSearchParams({symbol:azRec.symbol||'', side:azRec.side||'long',
+    entry:azRec.entry, stop:azRec.stop, targets:(azRec.targets||[]).join(','), tf:azRec.tf||''});
+  const m=document.getElementById('trackmsg'); if(m) m.textContent='…';
+  try{ const r=await fetch('/track?'+q.toString(),{cache:'no-store'}); const d=await r.json();
+    if(m) m.textContent = d.ok? '✓ Tracking — see 📌 My calls' : '✗ Could not track (check entry sits between stop & target)';
+    if(d.ok){ try{ const rr=await fetch('/data',{cache:'no-store'}); lastData=await rr.json(); renderPerf(); renderCalls(); }catch(e){} }
+  }catch(e){ if(m) m.textContent='✗ Failed'; }
+}
 let azXtfTop=null, azXtfOpen={};   // cached top-3 candidates + which alternatives are expanded
 function toggleXtfTrade(i){ azXtfOpen[i]=!azXtfOpen[i]; if(azXtfTop){ azXtfHtml=xtfRender(azXtfTop); renderAz(); } }
 function setXtfSide(s){ azXtfSide=(azXtfSide===s)?null:s;
@@ -2727,6 +2863,13 @@ function azCard(d0){
   else { recE=(d.retest_entry!=null?d.retest_entry:(d.optimal_entry!=null?d.optimal_entry:d.entry));
          const ee=evalEntry(d, recE);
          rstop=ee?ee.stop:null; rtg=ee?ee.rtg:recTargets(d, recE, rstop?rstop.level:d.sl_tight); }
+  // Capture the recommended trade (scale-out TP ladder) for the "Track this setup" button.
+  try{
+    const _tps=(scaleOutRows(rtg)||[]).map(r=>r.t&&r.t.lvl).filter(x=>x!=null);
+    azRec=(recE!=null && rstop && _tps.length)
+      ? {symbol:d0.symbol, side:(d.side||activeSide||'long'), entry:recE, stop:rstop.level, targets:_tps, tf:azTf}
+      : null;
+  }catch(e){ azRec=null; }
   // When the winning entry comes from a HIGHER timeframe than the one being viewed,
   // say so — that's the whole "take the Daily support over the deeper 4h dip" idea.
   const viewRankAz=TFRANK[d.interval||'4h']||2;
@@ -2827,7 +2970,7 @@ function azCard(d0){
     <div class="azgrid">
       ${cell("Structure", (d.structure||'—')+(d.choch?` · ${d.choch} CHoCH`:''), d.struct_reason||"Market structure from swing highs/lows. CHoCH = the first break the other way — an early reversal cue that can appear inside a trend.")}
       ${cell("RSI (14)", d.rsi==null?'—':(+d.rsi).toFixed(0)+(d.rsi<30?' oversold':d.rsi>70?' overbought':''), "Relative Strength Index (0-100) — momentum. Below 30 = oversold (bounce potential), above 70 = overbought (pullback risk).")}
-      ${d.rsi_div?cell("RSI divergence", (()=>{const v=d.rsi_div; const ic=v.dir==='bullish'?'✅':'⚠'; return `${ic} ${v.label.replace(' RSI divergence','')}`; })(), esc(d.rsi_div.label+' — '+d.rsi_div.note+' Regular divergence = reversal signal; hidden divergence = trend-continuation signal. It feeds the directional lean.')):''}
+      ${cell("RSI divergence", (()=>{const v=d.rsi_div; if(!v) return '<span style="color:var(--dim2)">none on this TF</span>'; const ic=v.dir==='bullish'?'✅':'⚠'; return `${ic} ${v.label.replace(' RSI divergence','')}`; })(), d.rsi_div?esc(d.rsi_div.label+' — '+d.rsi_div.note+' Regular divergence = reversal signal; hidden divergence = trend-continuation signal. It feeds the directional lean.'):"RSI divergence between the last two price swings vs RSI — checked on this timeframe. Regular (reversal) and hidden (continuation) divergences are detected; 'none' means no clean divergence right now. When present, it feeds the directional lean.")}
       ${cell("Volume", (d.vol_trend||'—')+(d.vol_ratio?` ×${d.vol_ratio}`:''), `Recent volume is ${d.vol_trend||'—'} vs its average. Rising volume in an uptrend = buyers committed (bullish confirmation); rising volume in a downtrend = sellers in control (bearish confirmation). Falling volume during a move usually means momentum is fading — expect consolidation or a possible reversal. Here the trend is ${d.trend||'flat'}.`)}
       ${cell("Pressure", d.pressure||'—', `Buyers vs sellers over recent candles (volume on up-candles vs down-candles). '${d.pressure||'—'}' are in control. Buyers-in-control backs a long; sellers-in-control backs a short; balanced = indecision.`)}
       ${cell("Rel volume", d.rvol==null?'—':(+d.rvol).toFixed(2)+'× latest bar', "The latest candle's volume ÷ its 20-bar average. Above 1× = the current move is happening on above-average participation = stronger confirmation. Below 1× = quiet, less conviction.")}
@@ -2867,6 +3010,7 @@ function azCard(d0){
     ${rec.tp!=null?`<div class="azrec" data-tip="Recommended by EXPECTED VALUE, not raw ratio: reward:risk × how reachable the target is. Reachability decays with distance (in ATR units) but stretches out when the trend, momentum and volume back the move — so a far target isn't dismissed if the setup is strong, and a nearby one isn't over-rated if it's weak. Measured from the recommended entry (${fmtNum(recE)}) over the recommended stop (${rstop?fmtNum(rstop.level):'—'}), capped 8:1, and only shown because it clears the 1.5:1 floor. Grade blends R:R and reachability.">⭐ Recommended take-profit: <b>${fmtNum(rec.tp)}</b> <span class="rr">${(d.side||'long')==='short'?'−':'+'}${(rec.move*100).toFixed(1)}% · R:R <b>${rec.rr.toFixed(2)}</b> · ~${Math.round(rec.p*100)}% reach · grade <b>${planGrade}</b></span>${rec.kind?` <span style="color:var(--dim)">— ${esc(rec.kind)}${tgtTf&&/Daily|Weekly/.test(rec.kind||'')?` <span class="tfsrc">${tgtTf} chart</span>`:''}</span>`:''}</div>
     ${rec.tp!=null?dcaPlanHtml(d, recE, rstop?rstop.level:null, rec.tp, d.side||'long', be?be.distATR:null):''}
     ${scaleOutHtml(rtg, recE)}
+    ${(rec.tp!=null&&azRec)?`<div class="trackrow"><button class="trackbtn" onclick="trackSetup(event)" data-tip="Record this exact setup (entry, stop, full TP ladder) into 📌 My calls. Apex then watches the live price and grades it: banks each TP, moves the stop to break-even after TP1, and scores the result in R. Win-rate + per-TP hit rates are on the My calls tab.">📌 Track this setup</button><span id="trackmsg" class="trackmsg"></span></div>`:''}
     <div class="sidenote" data-tip="How the same trade looks if you enter NOW at the current market price instead of waiting for the 🎯 recommended pullback — same stop and target, worse fill, so a lower R:R. Use it to decide: take it now, or wait for the better entry.">⚡ Enter now at market (CMP ${fmtNum(cmpE)}): ${rrAt(cmpE)!=null?`R:R <b>${rrAt(cmpE).toFixed(2)}</b> to the base target`:'stop is already in the way — no clean entry here'} <span style="color:var(--dim)">vs ${rec.rr.toFixed(2)} waiting for ${fmtNum(recE)}${(rrAt(cmpE)!=null&&rrAt(cmpE)<1.5)?' — under 1.5:1 now, better to wait for the pullback':(cmpE!=null&&recE!=null&&Math.abs(cmpE-recE)/recE<0.005?' — basically at the entry already':'')}</span></div>`
     :`<div class="azrec" style="color:#f0b429" data-tip="No target on the correct side clears a 1.5:1 reward:risk from a sensible stop. In crypto a sub-1.5 R:R trade isn't worth the risk — this is a 'no trade / wait' call, not a setup. Wait for a deeper entry (better R:R), a tighter valid stop level, or a different coin.">⛔ No trade here — best realistic R:R is only <b>${rtg?rtg.bestRR.toFixed(2):'—'}</b>, under the 1.5 minimum. Wait for a better entry or setup.</div>`}
     ${stopsSection(d.stop_levels, d.side||'long', rstop?rstop.level:null)}
@@ -3537,6 +3681,13 @@ function renderScalp(){
 function perfCard(label,val,cls){
   return `<div class="perfcard ${cls}"><div class="pcval">${val}</div><div class="pclab">${label}</div></div>`;
 }
+function tpRatesHtml(tp_rates){
+  if(!tp_rates||!tp_rates.length) return '<span style="color:var(--dim2)">—</span>';
+  return tp_rates.map(t=>{
+    const cls=t.rate>=60?'tpr-hi':t.rate>=35?'tpr-mid':'tpr-lo';
+    return `<span class="tpr ${cls}" data-tip="${t.n} of these trades reached TP${t.tp}.">TP${t.tp} ${t.rate}%</span>`;
+  }).join('');
+}
 function renderPerf(){
   const perf=(lastData&&lastData.perf)||null;
   const cards=document.getElementById('perfCards'); if(!cards) return;
@@ -3561,7 +3712,8 @@ function renderPerf(){
       const tr=document.createElement('tr');
       tr.innerHTML=`<td>${names[b]}</td><td>${a.n||0}</td>`
         +`<td class="${wcls}">${a.winrate==null?'—':a.winrate+'%'}${a.n?` <span class="rr">(${a.wins}W/${a.n-a.wins}L)</span>`:''}</td>`
-        +`<td class="${ecls}">${a.exp==null?'—':(a.exp>0?'+':'')+a.exp+'R'}</td>`;
+        +`<td class="${ecls}">${a.exp==null?'—':(a.exp>0?'+':'')+a.exp+'R'}</td>`
+        +`<td class="tprcell">${tpRatesHtml(a.tp_rates)}</td>`;
       rows.appendChild(tr);
     }
   }
@@ -3577,6 +3729,50 @@ function renderPerf(){
         +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${fmtNum(t.tp1)}</td>`
         +`<td class="${win?'pf-good':'pf-bad'}"><b>${win?'WIN +'+(t.r!=null?(+t.r).toFixed(1):'')+'R':'LOSS −1R'}</b></td>`;
       trrows.appendChild(tr);
+    }
+  }
+}
+function renderCalls(){
+  const perf=(lastData&&lastData.perf)||null;
+  const cards=document.getElementById('callsCards'); if(!cards) return;
+  const openrows=document.getElementById('callsopenrows'), closedrows=document.getElementById('callsclosedrows');
+  const meta=document.getElementById('callsMeta'), emp=document.getElementById('callsempty');
+  const a=((perf&&perf.by_board)||{}).call||{};
+  const opens=(perf&&perf.calls_open)||[], closed=(perf&&perf.calls_closed)||[];
+  const has=opens.length||closed.length;
+  if(emp) emp.style.display=has?'none':'block';
+  if(meta) meta.textContent=`${opens.length} open · ${a.n||0} resolved`;
+  cards.innerHTML=
+     perfCard('Win rate', a.winrate==null?'—':a.winrate+'%', a.winrate==null?'':(a.winrate>=50?'pcg':a.winrate>=40?'':'pcb'))
+    +perfCard('Expectancy', a.exp==null?'—':(a.exp>0?'+':'')+a.exp+'R', a.exp==null?'':(a.exp>0?'pcg':'pcb'))
+    +perfCard('Resolved', a.n||0, '')
+    +perfCard('Open now', opens.length, '')
+    +`<div class="perfcard" style="flex:2"><div class="pclab" style="margin:0 0 6px">TP hit rates</div><div class="tprcell">${tpRatesHtml(a.tp_rates)}</div></div>`;
+  const tgts=t=>((t.tps||[]).map(x=>fmtNum(x.lvl)).join(' · '))||fmtNum(t.tp1||t.tp1);
+  if(openrows){ openrows.innerHTML='';
+    for(const t of opens){
+      const when=t.ts?new Date(t.ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
+      const prog=(t.tps_hit&&t.tps_hit.length)?`TP${Math.max.apply(null,t.tps_hit)} hit → stop at ${t.phase>=1?'break-even+':'—'}`:'watching…';
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td style="color:var(--dim);white-space:nowrap">${when}</td>`
+        +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></div></td>`
+        +`<td>${leanPill(t.side==='short'?'bearish':'bullish')}</td><td>${t.tf||'—'}</td>`
+        +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td class="whycell">${tgts(t)}</td>`
+        +`<td>${prog}</td>`;
+      openrows.appendChild(tr);
+    }
+  }
+  if(closedrows){ closedrows.innerHTML='';
+    for(const t of closed){
+      const win=(t.r||0)>0, when=t.closed_ts?new Date(t.closed_ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
+      const hits=(t.tps_hit&&t.tps_hit.length)?('TP'+Math.max.apply(null,t.tps_hit)):'none';
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td style="color:var(--dim);white-space:nowrap">${when}</td>`
+        +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></div></td>`
+        +`<td>${leanPill(t.side==='short'?'bearish':'bullish')}</td><td>${t.tf||'—'}</td>`
+        +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${hits}</td>`
+        +`<td class="${win?'pf-good':((t.r||0)<0?'pf-bad':'')}"><b>${win?'WIN +'+(+t.r).toFixed(2)+'R':(t.r<0?'LOSS −1R':'BE 0R')}</b></td>`;
+      closedrows.appendChild(tr);
     }
   }
 }
@@ -3619,7 +3815,7 @@ async function poll(){
     xlatest=d.stb_hits||[]; renderStb();
     eelatest=d.early_hits||[]; renderEarly();
     slatest=d.short_hits||[]; renderShorts();
-    renderBestLong(); renderBestShort(); renderCoil(); renderScalp(); renderPerf();
+    renderBestLong(); renderBestShort(); renderCoil(); renderScalp(); renderPerf(); renderCalls();
     renderWatch();
     { const wc=document.getElementById("tabWatch"); if(wc) wc.textContent=`📌 Watchlist${WATCH.size?' ('+WATCH.size+')':''}`; }
     const evs=(d.breakout_events||[]).filter(e=>e.time>seenBreak);
@@ -3954,6 +4150,8 @@ def make_handler(state: State):
             if self.path.startswith("/data"):
                 body = json.dumps(state.snapshot()).encode()
                 self._send(200, body, "application/json")
+            elif self.path.startswith("/track"):
+                self._track()
             elif self.path.startswith("/analyze"):
                 self._analyze()
             elif self.path in ("/", "/index.html"):
@@ -3961,12 +4159,22 @@ def make_handler(state: State):
             else:
                 self._send(404, b"not found", "text/plain")
 
+        def _track(self):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            g = lambda k: (q.get(k) or [""])[0]
+            sym = normalize_symbol(g("symbol"), state.cfg.get("quote", "USDT"))
+            ok = TRACKER.add_call(sym, g("side") or "long", g("targets") or g("target"),
+                                  g("entry"), g("stop"), g("tf"), g("note"))
+            self._send(200, json.dumps({"ok": bool(ok), "symbol": sym}).encode(),
+                       "application/json")
+
         def _analyze(self):
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(self.path).query)
             raw = (q.get("symbol") or [""])[0]
             iv = (q.get("interval") or [state.cfg["interval"]])[0]
-            if iv not in ("15m", "1h", "4h", "1d", "1w"):
+            if iv not in ("5m", "15m", "1h", "4h", "1d", "1w"):
                 iv = "4h"
             sym = normalize_symbol(raw, state.cfg.get("quote", "USDT"))
             if not sym:
