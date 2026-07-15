@@ -183,7 +183,8 @@ class Tracker:
                 continue
             rr = t.get("rr")
             clean.append({"lvl": float(lvl),
-                          "rr": (float(rr) if rr is not None else round(abs(float(lvl) - entry) / risk, 2))})
+                          "rr": (float(rr) if rr is not None else round(abs(float(lvl) - entry) / risk, 2)),
+                          "basis": t.get("basis") or ""})
         clean = clean[:6]                                  # track up to 6 TPs, each individually
         n = len(clean)
         # Adaptive scale-out: take MORE off the more-reachable (lower-R) near targets and
@@ -4666,7 +4667,7 @@ function boardTradesHtml(bd){
       h+=`<tr><td class="dim">${fmtWhen(t.ts)}</td>`
         +`<td class="sym"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></td>`
         +`<td>${leanPill(t.side==='short'?'bearish':'bullish')}</td><td>${t.tf||'—'}</td>`
-        +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${tgtOf(t)}</td><td>${statePill(t)}</td></tr>`;
+        +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${tgtLadderHtml(t)}</td><td>${statePill(t)}</td></tr>`;
     }
     h+='</tbody></table>';
   } else h+='<div class="bt-empty">No open setups on this board right now.</div>';
@@ -4688,15 +4689,28 @@ function boardTradesHtml(bd){
 function sideLabel(t){ return (t.side==='short')
   ? '<span class="pf-bad" style="font-weight:700">SHORT ▼</span>'
   : '<span class="pf-good" style="font-weight:700">LONG ▲</span>'; }
-// The final level price reached before the trade closed (max TP hit, else stop/entry).
+// The final level price reached before the trade closed (max TP hit, else stop/entry),
+// with a hover explaining WHY that level was chosen and what timeframe the trade was on.
 function reachedHtml(t){
+  const tfnote = t.tf ? ` · trade based on the ${t.tf} timeframe` : '';
   const hi=(t.tps_hit&&t.tps_hit.length)?Math.max.apply(null,t.tps_hit):0;
-  if(hi>0){ const lvl=(t.tps&&t.tps[hi-1])?fmtNum(t.tps[hi-1].lvl):''; return `<span class="pf-good">TP${hi}${lvl?' @ '+lvl:''}</span>`; }
-  if(t.status==='loss') return `<span class="pf-bad">Stop @ ${fmtNum(t.stop)}</span>`;
-  if(t.status==='be') return `<span class="pf-be">Break-even @ ${fmtNum(t.entry)}</span>`;
-  if(t.status==='missed') return `<span class="pf-miss">Never filled</span>`;
-  if(t.status==='expired') return `<span class="pf-miss">Never filled</span>`;
+  if(hi>0){ const tp=(t.tps&&t.tps[hi-1])||{}; const lvl=tp.lvl!=null?fmtNum(tp.lvl):'';
+    const tip=esc(`Reached TP${hi}${lvl?' at '+lvl:''}${tp.basis?' — '+tp.basis:''}${tfnote}`);
+    return `<span class="pf-good" data-tip="${tip}">TP${hi}${lvl?' @ '+lvl:''}</span>`; }
+  if(t.status==='loss') return `<span class="pf-bad" data-tip="${esc('Stopped out at '+fmtNum(t.stop)+' before any target'+tfnote)}">Stop @ ${fmtNum(t.stop)}</span>`;
+  if(t.status==='be') return `<span class="pf-be" data-tip="${esc('TP1 hit, then price returned to the break-even stop (entry) — banked the TP1 partial'+tfnote)}">Break-even @ ${fmtNum(t.entry)}</span>`;
+  if(t.status==='missed') return `<span class="pf-miss" data-tip="Price ran to the first target without ever filling the entry — no trade taken.">Never filled</span>`;
+  if(t.status==='expired') return `<span class="pf-miss" data-tip="The entry never filled within the allotted window — cancelled, no trade.">Never filled</span>`;
   return '—';
+}
+// A target-ladder cell whose hover lists every TP with its price, R:R and 'why'.
+function tgtLadderHtml(t){
+  const tps=(t.tps||[]);
+  if(!tps.length) return '—';
+  const last=tps[tps.length-1];
+  const rows=tps.map((x,i)=>`TP${i+1} ${fmtNum(x.lvl)}${x.rr!=null?' (R '+(+x.rr).toFixed(1)+')':''}${x.basis?' — '+x.basis:''}`).join('  ·  ');
+  const tip=esc(`Target ladder${t.tf?' ('+t.tf+' timeframe)':''} — `+rows);
+  return `<span data-tip="${tip}">${fmtNum(last.lvl)}${tps.length>1?' <span class="rr">(+'+(tps.length-1)+')</span>':''}</span>`;
 }
 // Small badge: was this setup WITH or AGAINST the market regime when it was taken?
 function regimeBadge(t){
