@@ -2303,7 +2303,29 @@ def fetch_derivatives(display_symbol: str, bars: int = 24) -> dict | None:
     fr = hist("/funding-rate-history")            # c = funding rate
     lsr = hist("/long-short-ratio-history")       # r = long/short ratio
     ohlcv = hist("/ohlcv-history")                # {t,o,h,l,c,v,...}
+    liq = hist("/liquidation-history")            # {t,l,s} — l=long liqs, s=short liqs ($)
     out: dict = {"source": "coinalyze"}
+
+    # Recent liquidation FLOW — which side just got flushed. Heavy LONG liquidations =
+    # longs capitulating (often near a local bottom / bounce); heavy SHORT liquidations =
+    # shorts squeezed (often near a local top / fade). A read, not a resting-liq heatmap.
+    if liq:
+        ll = sum((x.get("l") or 0) for x in liq)
+        sl = sum((x.get("s") or 0) for x in liq)
+        out["liq_long"], out["liq_short"], out["liq_total"] = ll, sl, (ll + sl)
+        if (ll + sl) > 0:
+            share = ll / (ll + sl)
+            if share >= 0.70:
+                out["liq_side"] = "long"
+                out["liq_note"] = ("longs were just liquidated hard — forced selling that "
+                                   "often flushes into a local bottom (watch for a bounce)")
+            elif share <= 0.30:
+                out["liq_side"] = "short"
+                out["liq_note"] = ("shorts were just squeezed hard — forced buying that "
+                                   "often marks a local top (fade-the-rip risk)")
+            else:
+                out["liq_side"] = "balanced"
+                out["liq_note"] = "liquidations roughly balanced both sides — no one-sided flush"
 
     if oi and len(oi) >= 4:
         oi_now = oi[-1].get("c")
@@ -2348,6 +2370,24 @@ def fetch_derivatives(display_symbol: str, bars: int = 24) -> dict | None:
             out["divergence"] = "neutral"
             out["divergence_note"] = "open interest roughly flat vs price — no clear divergence"
     return out if len(out) > 1 else None
+
+
+def estimate_liq_zones(price: float) -> dict | None:
+    """Approximate liquidation MAGNETS around price. We don't have an order-book heatmap
+    (that needs a paid source), so we estimate where over-leveraged positions get
+    liquidated by common leverage tiers: longs get liquidated BELOW price (magnets that
+    can pull price down to hunt stops), shorts ABOVE. Clearly an estimate, not exact
+    resting liquidity — but the clusters are where price often gets 'magneted'."""
+    if not price or price <= 0:
+        return None
+    levs = [100, 50, 25, 10]     # nearest → furthest
+    below = [{"lev": lv, "level": round(price * (1 - 1.0 / lv), 10), "pct": round(-100.0 / lv, 1)}
+             for lv in levs]     # long liquidations below
+    above = [{"lev": lv, "level": round(price * (1 + 1.0 / lv), 10), "pct": round(100.0 / lv, 1)}
+             for lv in levs]     # short liquidations above
+    return {"below_long_liqs": below, "above_short_liqs": above,
+            "note": "Estimated leverage-liquidation magnets (10×–100×). Price often reaches "
+                    "toward these clusters to trigger stops — use as context, not exact levels."}
 
 
 def fetch_deriv_series(display_symbol: str, bars: int = 168) -> dict | None:
@@ -3423,6 +3463,15 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
             long_pts += 1
         elif rsi_div["dir"] == "bearish":
             short_pts += 1
+    # Liquidation flush is contrarian: a heavy one-sided flush near an RSI extreme often
+    # marks exhaustion — longs flushed into weakness = bounce; shorts squeezed into
+    # strength = fade. Only nudge when the extreme confirms (avoids catching a knife).
+    if deriv:
+        _lqs = deriv.get("liq_side")
+        if _lqs == "long" and r14 is not None and r14 < 42:
+            long_pts += 1        # capitulation flush — bounce potential
+        elif _lqs == "short" and r14 is not None and r14 > 58:
+            short_pts += 1       # short squeeze into strength — fade potential
     net = long_pts - short_pts
     direction = "Long" if net >= 2 else ("Short" if net <= -2 else "Neutral")
 
@@ -3781,6 +3830,9 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
             _bias = ("more longs than shorts" if _ls > 1.05 else
                      "more shorts than longs" if _ls < 0.95 else "balanced")
             notes.append(f"Long/short accounts ratio: {_ls:.2f} ({_bias}).")
+        if deriv.get("liq_note"):
+            _lqic = "🩸" if deriv.get("liq_side") in ("long", "short") else "•"
+            notes.append(f"{_lqic} Liquidations (24h): {deriv['liq_note']}.")
     if direction == "Long":
         notes.append(f"Directional lean: <b>LONG</b> — bullish signals outweigh "
                      f"bearish ({long_pts} vs {short_pts}).")
@@ -3818,6 +3870,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "atr_pct": atr_pct,
         "open_interest": oi_data,
         "derivatives": deriv,
+        "liq_zones": estimate_liq_zones(price),
         "btc_corr": (round(btc_corr, 2) if btc_corr is not None else None),
         "supertrend": st_val,
         "supertrend_dir": st_dir,
