@@ -51,7 +51,7 @@ try:
         list_symbols, scan_symbol_multi, get_session, EMA_PERIOD,
         analyze_symbol, normalize_symbol, fetch_candles, pct_returns, CORR_WINDOW,
         bias_on_tf, enrich_1h, best_pattern, coil_tfs_finer, scalp_setup,
-        compute_market_context, fetch_deriv_series,
+        compute_market_context, fetch_deriv_series, backfill_market_history,
     )
 except ImportError:
     sys.exit("Could not import mexc_ema200_scanner.py — keep both files in the "
@@ -322,7 +322,7 @@ class Tracker:
             def agg(rows):
                 n = len(rows)
                 if not n:
-                    return {"n": 0, "wins": 0, "winrate": None, "exp": None, "tp_rates": []}
+                    return {"n": 0, "wins": 0, "winrate": None, "exp": None, "sumR": 0, "tp_rates": []}
                 w = sum(1 for t in rows if (t.get("r") or 0) > 1e-4)
                 # Per-TP hit rate: % of these trades that reached at least TP1, TP2, TP3 …
                 tp_hits, maxtp = {}, 0
@@ -344,6 +344,7 @@ class Tracker:
                               for kk, v in sorted(allout.items())]
                 return {"n": n, "wins": w, "winrate": round(w / n * 100, 1),
                         "exp": round(sum((t.get("r") or 0) for t in rows) / n, 2),
+                        "sumR": round(sum((t.get("r") or 0) for t in rows), 2),
                         "tp_rates": tp_rates, "allout": allout_exp}
             _cf = ("board", "symbol", "side", "entry", "stop", "tps", "rr", "status",
                    "r", "ts", "closed_ts", "tf", "note", "px0", "tps_hit", "state",
@@ -414,6 +415,7 @@ class History:
         self.signals: list[dict] = []
         self.coins: dict[str, dict] = {}   # sym -> {"oi":[[t,c]],"funding":[[t,c]],"price":[[t,c]]}
         self._coins_backloaded = False
+        self._market_backfilled = False
         try:
             self.path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                      "apex_hist.json")
@@ -452,6 +454,7 @@ class History:
                 self.signals = d.get("signals", [])
                 self.coins = d.get("coins", {})
                 self._coins_backloaded = bool(self.coins)
+                self._market_backfilled = bool(d.get("market_backfilled"))
             except Exception:
                 pass
 
@@ -459,7 +462,8 @@ class History:
         blob = json.dumps({"market": self.market[-self.MAXP:],
                            "boards": self.boards[-self.MAXP:],
                            "signals": self.signals[-self.MAXSIG:],
-                           "coins": self.coins})
+                           "coins": self.coins,
+                           "market_backfilled": self._market_backfilled})
         try:
             with open(self.path, "w") as f:
                 f.write(blob)
@@ -498,6 +502,26 @@ class History:
             self.market = self.market[-self.MAXP:]
             self.boards = self.boards[-self.MAXP:]
             self.signals = self.signals[-self.MAXSIG:]
+            self._save()
+
+    def backfill_market(self, fetch_backfill):
+        """One-time: seed the market series with MONTHS of reconstructed history from
+        daily candles, so the regime chart is meaningful immediately. `fetch_backfill`
+        is scanner.backfill_market_history. Historical (daily) points are merged ahead
+        of the live (10-min) points; runs once, then persists the flag."""
+        if self._market_backfilled:
+            return
+        try:
+            pts = fetch_backfill()
+        except Exception:
+            pts = None
+        if not pts:
+            return
+        with self.lock:
+            have = {int(p["t"]) for p in self.market}
+            hist = [p for p in pts if int(p["t"]) not in have]
+            self.market = sorted(hist + self.market, key=lambda p: p["t"])[-self.MAXP:]
+            self._market_backfilled = True
             self._save()
 
     def update_coins(self, fetch_series):
@@ -992,6 +1016,11 @@ def run_one_scan(state: State) -> None:
         signals = {"longs": _top(long_board), "shorts": _top(short_board),
                    "coils": _top(coil_board)}
         HISTORY.record_scan(state.market_context, boards_summary, signals)
+    except Exception:
+        pass
+    # One-time: seed the regime chart with ~4 months of reconstructed daily history.
+    try:
+        HISTORY.backfill_market(lambda: backfill_market_history(sess, cfg.get("market", "futures"), 120))
     except Exception:
         pass
     # Per-coin OI/funding/price history (Coinalyze) — backloads on first run.
@@ -2086,6 +2115,7 @@ PAGE = """<!doctype html>
       <th>Board</th><th data-tip="Filled setups that have resolved.">Trades</th>
       <th data-tip="% that reached at least TP1 (after which the stop moves to break-even, so it can't be a full loss).">Win rate</th>
       <th data-tip="Average R per trade across the scaled-out position. Above 0 = a positive edge.">Expectancy</th>
+      <th data-tip="Cumulative R booked across every resolved trade on this board — the running total.">Total R</th>
       <th data-tip="What % of these trades reached each target — TP1, TP2, TP3 … Shows how far price typically runs.">TP hit rates</th>
     </tr></thead><tbody id="perfrows"></tbody></table>
   <div class="perfsub">If you took 100% off at one target — R per exit choice</div>
@@ -4116,10 +4146,11 @@ function renderPerf(){
   const hasData=(o.n||0)>0;
   if(emp) emp.style.display=hasData?'none':'block';
   if(meta) meta.textContent=`${(perf&&perf.active)||0} live · ${(perf&&perf.pending)||0} waiting for entry · ${(perf&&perf.missed)||0} missed · ${o.n||0} resolved${perf&&perf.upstash?' · durable storage on':' · in-memory (add Upstash to persist)'}`;
-  const wr=o.winrate, exp=o.exp;
+  const wr=o.winrate, exp=o.exp, tot=o.sumR;
   cards.innerHTML=
      perfCard('Win rate', wr==null?'—':wr+'%', wr==null?'':(wr>=50?'pcg':wr>=40?'':'pcb'))
     +perfCard('Expectancy', exp==null?'—':(exp>0?'+':'')+exp+'R', exp==null?'':(exp>0?'pcg':'pcb'))
+    +perfCard('Total R', tot==null?'—':(tot>0?'+':'')+tot+'R', tot==null?'':(tot>0?'pcg':tot<0?'pcb':''))
     +perfCard('Resolved', (o.n||0), '')
     +perfCard('Open now', (perf&&perf.open)||0, '');
   const names={long:'🏆 Best longs',short:'🩸 Best shorts',coil:'🚀 Coiled',scalp:'⚡ Scalps'};
@@ -4138,6 +4169,7 @@ function renderPerf(){
           +(canExp?` <span class="rr">(${nOpen} open · ${nClosed} resolved)</span>`:'')+`</td><td>${a.n||0}</td>`
         +`<td class="${wcls}">${a.winrate==null?'—':a.winrate+'%'}${a.n?` <span class="rr">(${a.wins}W/${a.n-a.wins}L)</span>`:''}</td>`
         +`<td class="${ecls}">${a.exp==null?'—':(a.exp>0?'+':'')+a.exp+'R'}</td>`
+        +`<td class="${a.sumR>0?'pf-good':a.sumR<0?'pf-bad':''}">${a.sumR==null?'—':(a.sumR>0?'+':'')+a.sumR+'R'}</td>`
         +`<td class="tprcell">${tpRatesHtml(a.tp_rates)}</td>`;
       if(canExp) tr.onclick=()=>{ if(perfOpenBoards.has(b))perfOpenBoards.delete(b); else perfOpenBoards.add(b); renderPerf(); };
       rows.appendChild(tr);
@@ -4525,6 +4557,7 @@ function renderCalls(){
   cards.innerHTML=
      perfCard('Win rate', a.winrate==null?'—':a.winrate+'%', a.winrate==null?'':(a.winrate>=50?'pcg':a.winrate>=40?'':'pcb'))
     +perfCard('Expectancy', a.exp==null?'—':(a.exp>0?'+':'')+a.exp+'R', a.exp==null?'':(a.exp>0?'pcg':'pcb'))
+    +perfCard('Total R', a.sumR==null?'—':(a.sumR>0?'+':'')+a.sumR+'R', a.sumR>0?'pcg':a.sumR<0?'pcb':'')
     +perfCard('Resolved', a.n||0, '')
     +perfCard('Open now', opens.length, '')
     +`<div class="perfcard" style="flex:2"><div class="pclab" style="margin:0 0 6px">TP hit rates</div><div class="tprcell">${tpRatesHtml(a.tp_rates)}</div></div>`;

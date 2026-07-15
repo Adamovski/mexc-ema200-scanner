@@ -2067,6 +2067,64 @@ def compute_market_context(sess: requests.Session, market: str) -> dict:
     return out
 
 
+def backfill_market_history(sess: requests.Session, market: str, days: int = 120) -> list:
+    """Reconstruct the market-regime chart for the PAST `days` from real daily candles
+    (no waiting for live scans to accumulate). For each historical day we recompute the
+    daily-timeframe BTC trend score (price vs 200/20 EMA + RSI) and the alt breadth
+    (share of the basket above its own 200-day EMA that day). Returns points matching
+    the live market-history schema, tagged backfill=True."""
+    need = days + 220
+    braw = fetch_candles(sess, "BTCUSDT", "1d", min(need, 1000), market)
+    if not braw or len(braw) < 230:
+        return []
+    bc = [float(x[4]) for x in braw[:-1]]
+    bt = [int(x[0]) // 1000 for x in braw[:-1]]
+    e200, e20 = ema(bc, 200), ema(bc, 20)
+    rsis = rsi_series(bc)
+    N = len(bc)
+    # Alt basket daily closes + their 200-EMA, aligned to BTC by index-from-end.
+    alt = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {ex.submit(fetch_candles, sess, s, "1d", min(need, 1000), market): s
+                for s in ALT_BASKET}
+        for f in as_completed(futs):
+            try:
+                r = f.result()
+            except Exception:
+                r = None
+            if r and len(r) >= 210:
+                c = [float(x[4]) for x in r[:-1]]
+                alt.append((c, ema(c, 200)))
+    pts = []
+    start = max(210, N - days)
+    for i in range(start, N):
+        el, e2, rs, px = e200[i], e20[i], rsis[i], bc[i]
+        if el is None:
+            continue
+        s = 0.5 if (px / el - 1) > 0 else -0.5
+        if e2 and el:
+            s += 0.25 if e2 > el else -0.25
+        if e2:
+            s += 0.15 if px > e2 else -0.15
+        if rs is not None:
+            s += 0.10 if rs >= 55 else (-0.10 if rs <= 45 else 0.0)
+        s = max(-1.0, min(1.0, s))
+        verdict = "bullish" if s >= 0.3 else ("bearish" if s <= -0.3 else "mixed")
+        above = tot = 0
+        for c, e2h in alt:
+            j = len(c) - (N - i)                 # same calendar day, index-from-end
+            if 0 <= j < len(c) and e2h[j] is not None:
+                tot += 1
+                if c[j] > e2h[j]:
+                    above += 1
+        pct = round(above / tot * 100) if tot else None
+        av = ("risk-on" if (pct or 0) >= 60 else "risk-off" if (pct or 0) <= 40 else "mixed")
+        pts.append({"t": bt[i], "btc": round(s, 3), "btc_v": verdict, "btc_px": px,
+                    "day": None, "day_longs": None, "week": None, "week_longs": None,
+                    "alt_above": pct, "alt_v": av, "alt_chg": None, "backfill": True})
+    return pts
+
+
 def enrich_1h(sess: requests.Session, symbol: str, market: str) -> tuple:
     """One 1h fetch → (bias_label, primary_1h_pattern). Used to enrich flagged
     coins with a 1h read (bias + formation) that can't be aggregated from 4h."""
