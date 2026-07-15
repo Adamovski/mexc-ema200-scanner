@@ -2499,6 +2499,19 @@ def fetch_klines(sess: requests.Session, symbol: str, interval: str,
     return None
 
 
+def _round_number(price, above):
+    """Nearest psychological round-number level just above/below price (traders cluster
+    orders there, so it acts as a magnet). Scales to the coin's magnitude."""
+    import math
+    if not price or price <= 0:
+        return None
+    step = 10 ** (math.floor(math.log10(price)) - 1)
+    if step <= 0:
+        return None
+    lv = (math.floor(price / step) + 1) * step if above else math.floor(price / step) * step
+    return lv if lv > 0 else None
+
+
 def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
                        ms, ksup, kres, rv, detectors) -> tuple:
     """Grade the BEST LONG and BEST SHORT for this coin from data already computed
@@ -2622,6 +2635,75 @@ def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
                 return lbl
         return None
 
+    # Recent swing for projection-based targets (Fib extensions / measured moves).
+    _sw = 40 if len(closes) >= 40 else len(closes)
+    _hi = max(highs[-_sw:]) if _sw >= 5 else price
+    _lo = min(lows[-_sw:]) if _sw >= 5 else price
+    _rng = max(_hi - _lo, price * 0.005, 1e-9)
+
+    def _smart_tps(long, entry, risk):
+        """A SMARTER target ladder: blend real structure (swing highs/lows per TF) with
+        Fibonacci extensions of the recent swing, measured moves, round numbers and the
+        leverage-liquidation magnets — deduped, sorted, each labelled with its 'why'. So
+        targets aren't just 'the next swing high' but the levels price is actually pulled to."""
+        cands = []
+        if long:
+            for r in sorted([x for x in ress if x > entry * 1.005]):
+                tf = _tf_of(r, _res_map)
+                cands.append((r, f"{tf} swing-high resistance" if tf else "overhead resistance"))
+            for k, lab in ((0.272, "0.27"), (0.618, "0.62"), (1.0, "1.0"), (1.618, "1.62")):
+                lv = _hi + k * _rng
+                if lv > entry * 1.01:
+                    cands.append((lv, f"{lab}× Fib extension of the swing"))
+            for m in (2.0, 3.5):
+                cands.append((entry + m * risk, f"{m:g}R measured move"))
+            rn = _round_number(entry, True)
+            if rn and rn > entry * 1.01:
+                cands.append((rn, "round-number magnet"))
+            for z in _liq_above:
+                if z > entry * 1.01:
+                    cands.append((z, "short-liquidation magnet (est.)"))
+            cands = [c for c in cands if c[0] > entry * 1.005]
+            cands.sort(key=lambda c: c[0])
+        else:
+            for s in sorted([x for x in sups if x < entry * 0.995], reverse=True):
+                tf = _tf_of(s, _sup_map)
+                cands.append((s, f"{tf} swing-low support" if tf else "support below"))
+            for k, lab in ((0.272, "0.27"), (0.618, "0.62"), (1.0, "1.0"), (1.618, "1.62")):
+                lv = _lo - k * _rng
+                if 0 < lv < entry * 0.99:
+                    cands.append((lv, f"{lab}× Fib extension of the swing"))
+            for m in (2.0, 3.5):
+                lv = entry - m * risk
+                if lv > 0:
+                    cands.append((lv, f"{m:g}R measured move"))
+            rn = _round_number(entry, False)
+            if rn and 0 < rn < entry * 0.99:
+                cands.append((rn, "round-number magnet"))
+            for z in _liq_below:
+                if 0 < z < entry * 0.99:
+                    cands.append((z, "long-liquidation magnet (est.)"))
+            cands = [c for c in cands if 0 < c[0] < entry * 0.995]
+            cands.sort(key=lambda c: -c[0])
+        tps = []
+        for lvl, basis in cands:
+            if tps and abs(lvl - tps[-1]["lvl"]) / max(tps[-1]["lvl"], 1e-9) < 0.006:
+                continue
+            tps.append({"lvl": round(lvl, 10), "rr": round(abs(lvl - entry) / risk, 2), "basis": basis})
+            if len(tps) >= 4:
+                break
+        k = 2
+        while len(tps) < 2:
+            lvl = entry + k * risk if long else entry - k * risk
+            if lvl > 0:
+                tps.append({"lvl": round(lvl, 10), "rr": float(k), "basis": f"{k}R measured move"})
+            k += 1
+        return tps
+
+    # Estimated leverage-liquidation magnets around price (used as target context).
+    _liq_below = [price * (1 - 1.0 / lv) for lv in (25, 10)]     # long liqs below
+    _liq_above = [price * (1 + 1.0 / lv) for lv in (25, 10)]     # short liqs above
+
     def _plan(long):
         if long:
             ins = sorted(sups, reverse=True)                 # supports below, nearest first
@@ -2641,19 +2723,7 @@ def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
             risk = entry - stop
             if risk <= 0:
                 return {}
-            tps = []
-            for r in outs:
-                if r > entry * 1.005 and (not tps or r > tps[-1]["lvl"] * 1.004):
-                    tf = _tf_of(r, _res_map)
-                    tps.append({"lvl": round(r, 10), "rr": round((r - entry) / risk, 2),
-                                "basis": (f"{tf} swing-high resistance" if tf else "overhead resistance")})
-                if len(tps) >= 3:
-                    break
-            k = 2
-            while len(tps) < 2:
-                tps.append({"lvl": round(entry + k * risk, 10), "rr": float(k),
-                            "basis": f"{k}R measured move"})
-                k += 1
+            tps = _smart_tps(True, entry, risk)
             return {"entry": round(entry, 10), "entry_basis": entry_basis, "entry_tf": entry_tf,
                     "stop": round(stop, 10), "stop_basis": stop_basis, "stop_tf": stop_tf,
                     "target": tps[0]["lvl"], "rr": tps[0]["rr"],
@@ -2675,19 +2745,7 @@ def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
         risk = stop - entry
         if risk <= 0:
             return {}
-        tps = []
-        for s in outs:
-            if s < entry * 0.995 and (not tps or s < tps[-1]["lvl"] * 0.996):
-                tf = _tf_of(s, _sup_map)
-                tps.append({"lvl": round(s, 10), "rr": round((entry - s) / risk, 2),
-                            "basis": (f"{tf} swing-low support" if tf else "support below")})
-            if len(tps) >= 3:
-                break
-        k = 2
-        while len(tps) < 2 and entry - k * risk > 0:
-            tps.append({"lvl": round(entry - k * risk, 10), "rr": float(k),
-                        "basis": f"{k}R measured move"})
-            k += 1
+        tps = _smart_tps(False, entry, risk)
         return {"entry": round(entry, 10), "entry_basis": entry_basis, "entry_tf": entry_tf,
                 "stop": round(stop, 10), "stop_basis": stop_basis, "stop_tf": stop_tf,
                 "target": (tps[0]["lvl"] if tps else None), "rr": (tps[0]["rr"] if tps else None),

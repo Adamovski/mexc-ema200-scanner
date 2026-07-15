@@ -405,10 +405,12 @@ class Tracker:
             _closed_cur = [t for t in _closed_rev if t.get("ver", "v1 · pre-gate") == APP_VERSION]
             # Per-board trade lists so each board row on the Performance tab can EXPAND
             # to show its own open (live + waiting) and resolved setups. Capped per board.
+            # Expansion shows ALL live/waiting trades (operationally relevant regardless of
+            # version) plus this version's resolved ones — so you can always drill in.
             board_rows = {}
             for b in ("long", "short", "coil", "scalp"):
                 board_rows[b] = {
-                    "open": [_pk(t) for t in _open_cur if t.get("board") == b][:60],
+                    "open": [_pk(t) for t in _open_all if t.get("board") == b][:80],
                     "closed": [_pk(t) for t in _closed_cur if t.get("board") == b][:60],
                 }
             # Learning signal: win-rate WITH the market regime vs AGAINST it. If
