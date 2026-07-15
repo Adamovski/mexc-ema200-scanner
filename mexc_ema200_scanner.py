@@ -2297,35 +2297,89 @@ def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
     # full cross-timeframe engine (which can refine all three across timeframes).
     atr_frac = (atr_val / price) if price else 0.02
     buf = max(0.015, 1.2 * atr_frac)
+    _sup_map = [(ksup.get("sup_4h"), "4h"), (ksup.get("sup_1d"), "Daily"),
+                (ksup.get("sup_1w"), "Weekly")]
+    _res_map = [(kres.get("res_4h"), "4h"), (kres.get("res_1d"), "Daily"),
+                (kres.get("res_1w"), "Weekly")]
+
+    def _tf_of(lvl, mp):
+        if lvl is None:
+            return None
+        for v, lbl in mp:
+            if v is not None and abs(v - lvl) / max(abs(lvl), 1e-12) < 1e-6:
+                return lbl
+        return None
 
     def _plan(long):
         if long:
             ins = sorted(sups, reverse=True)                 # supports below, nearest first
             outs = sorted(ress)                              # resistances above, nearest first
-            entry = ins[0] if (ins and (price - ins[0]) / price <= 0.06) else price
+            near = ins[0] if (ins and (price - ins[0]) / price <= 0.06) else None
+            entry = near if near is not None else price
+            entry_tf = _tf_of(entry, _sup_map)
+            entry_basis = (f"{entry_tf} swing-low support — buy the pullback"
+                           if entry_tf else "current price (nearest support is too far to wait for)")
             below = [s for s in ins if s < entry * 0.999]
-            stop = below[0] if below else entry * (1 - buf)
+            stop = below[0] if below else round(entry * (1 - buf), 10)
             if (entry - stop) < entry * 0.005:
-                stop = entry * (1 - buf)
+                stop = round(entry * (1 - buf), 10)
+            stop_tf = _tf_of(stop, _sup_map)
+            stop_basis = (f"below the {stop_tf} swing low" if stop_tf
+                          else "≈1.2×ATR below entry (volatility stop)")
             risk = entry - stop
             if risk <= 0:
                 return {}
-            tgt = next((r for r in outs if r > entry * 1.005), None) or (entry + 2 * risk)
-            return {"entry": entry, "stop": stop, "target": tgt,
-                    "rr": round((tgt - entry) / risk, 2)}
+            tps = []
+            for r in outs:
+                if r > entry * 1.005 and (not tps or r > tps[-1]["lvl"] * 1.004):
+                    tf = _tf_of(r, _res_map)
+                    tps.append({"lvl": round(r, 10), "rr": round((r - entry) / risk, 2),
+                                "basis": (f"{tf} swing-high resistance" if tf else "overhead resistance")})
+                if len(tps) >= 3:
+                    break
+            k = 2
+            while len(tps) < 2:
+                tps.append({"lvl": round(entry + k * risk, 10), "rr": float(k),
+                            "basis": f"{k}R measured move"})
+                k += 1
+            return {"entry": round(entry, 10), "entry_basis": entry_basis, "entry_tf": entry_tf,
+                    "stop": round(stop, 10), "stop_basis": stop_basis, "stop_tf": stop_tf,
+                    "target": tps[0]["lvl"], "rr": tps[0]["rr"],
+                    "rr_max": tps[-1]["rr"], "tps": tps}
         ins = sorted(ress)                                   # resistances above, nearest first
         outs = sorted(sups, reverse=True)                    # supports below, nearest first
-        entry = ins[0] if (ins and (ins[0] - price) / price <= 0.06) else price
+        near = ins[0] if (ins and (ins[0] - price) / price <= 0.06) else None
+        entry = near if near is not None else price
+        entry_tf = _tf_of(entry, _res_map)
+        entry_basis = (f"{entry_tf} swing-high resistance — sell into strength"
+                       if entry_tf else "current price (nearest resistance is too far to wait for)")
         above = [r for r in ins if r > entry * 1.001]
-        stop = above[0] if above else entry * (1 + buf)
+        stop = above[0] if above else round(entry * (1 + buf), 10)
         if (stop - entry) < entry * 0.005:
-            stop = entry * (1 + buf)
+            stop = round(entry * (1 + buf), 10)
+        stop_tf = _tf_of(stop, _res_map)
+        stop_basis = (f"above the {stop_tf} swing high" if stop_tf
+                      else "≈1.2×ATR above entry (volatility stop)")
         risk = stop - entry
         if risk <= 0:
             return {}
-        tgt = next((s for s in outs if s < entry * 0.995), None) or (entry - 2 * risk)
-        return {"entry": entry, "stop": stop, "target": tgt,
-                "rr": round((entry - tgt) / risk, 2)}
+        tps = []
+        for s in outs:
+            if s < entry * 0.995 and (not tps or s < tps[-1]["lvl"] * 0.996):
+                tf = _tf_of(s, _sup_map)
+                tps.append({"lvl": round(s, 10), "rr": round((entry - s) / risk, 2),
+                            "basis": (f"{tf} swing-low support" if tf else "support below")})
+            if len(tps) >= 3:
+                break
+        k = 2
+        while len(tps) < 2 and entry - k * risk > 0:
+            tps.append({"lvl": round(entry - k * risk, 10), "rr": float(k),
+                        "basis": f"{k}R measured move"})
+            k += 1
+        return {"entry": round(entry, 10), "entry_basis": entry_basis, "entry_tf": entry_tf,
+                "stop": round(stop, 10), "stop_basis": stop_basis, "stop_tf": stop_tf,
+                "target": (tps[0]["lvl"] if tps else None), "rr": (tps[0]["rr"] if tps else None),
+                "rr_max": (tps[-1]["rr"] if tps else None), "tps": tps}
 
     lp, sp = _plan(True), _plan(False)
 
@@ -2473,37 +2527,53 @@ def squeeze_setup(symbol, highs, lows, closes, tfb, bias, atr_pct, ksup, kres):
         rng = top - bot
         mid = (top + bot) / 2.0
 
-        def _tp_row(lvl, entry, stop, long):
+        def _tp_row(lvl, entry, stop, long, basis):
             risk = (entry - stop) if long else (stop - entry)
             rr = round((lvl - entry) / risk, 2) if long and risk > 0 else \
                  round((entry - lvl) / risk, 2) if (not long) and risk > 0 else None
-            return {"lvl": round(lvl, 10), "rr": rr}
+            return {"lvl": round(lvl, 10), "rr": rr, "basis": basis}
 
+        _top_tf = ("4h" if near_res == kres.get("res_4h") else
+                   "Daily" if near_res == kres.get("res_1d") else
+                   "Weekly" if near_res == kres.get("res_1w") else None)
+        _bot_tf = ("4h" if near_sup == ksup.get("sup_4h") else
+                   "Daily" if near_sup == ksup.get("sup_1d") else
+                   "Weekly" if near_sup == ksup.get("sup_1w") else None)
         # LONG break-up
         l_stop = mid
         _res_far = sorted([r for r in (kres.get("res_1d"), kres.get("res_1w"))
                            if r and r > top + 1.9 * rng])
-        l_lvls = [top + rng, top + 1.618 * rng,
-                  (_res_far[0] if _res_far else top + 2.5 * rng)]
+        _l_far_basis = ("Daily/Weekly resistance overhead" if _res_far else "2× measured move")
+        l_lvls = [(top + rng, "1× measured move (range height projected)"),
+                  (top + 1.618 * rng, "1.618× Fibonacci extension"),
+                  ((_res_far[0] if _res_far else top + 2.5 * rng), _l_far_basis)]
         plan_long = {
             "entry": round(top, 10),                       # retest limit at the break level
             "entry_break": round(top * 1.002, 10),         # break-confirm entry
+            "entry_basis": (f"break above the range top ({_top_tf} resistance)" if _top_tf
+                            else "break above the range top"),
             "stop": round(l_stop, 10),
-            "tps": [_tp_row(x, top, l_stop, True) for x in l_lvls],
-            "rr": _tp_row(l_lvls[-1], top, l_stop, True)["rr"],
+            "stop_basis": "mid-range — a close back inside the range = the break failed",
+            "tps": [_tp_row(x, top, l_stop, True, b) for x, b in l_lvls],
+            "rr": _tp_row(l_lvls[-1][0], top, l_stop, True, "")["rr"],
         }
         # SHORT break-down
         s_stop = mid
         _sup_far = sorted([s for s in (ksup.get("sup_1d"), ksup.get("sup_1w"))
                            if s and s < bot - 1.9 * rng], reverse=True)
-        s_lvls = [bot - rng, bot - 1.618 * rng,
-                  (_sup_far[0] if _sup_far else bot - 2.5 * rng)]
+        _s_far_basis = ("Daily/Weekly support below" if _sup_far else "2× measured move")
+        s_lvls = [(bot - rng, "1× measured move (range height projected)"),
+                  (bot - 1.618 * rng, "1.618× Fibonacci extension"),
+                  ((_sup_far[0] if _sup_far else bot - 2.5 * rng), _s_far_basis)]
         plan_short = {
             "entry": round(bot, 10),
             "entry_break": round(bot * 0.998, 10),
+            "entry_basis": (f"break below the range bottom ({_bot_tf} support)" if _bot_tf
+                            else "break below the range bottom"),
             "stop": round(s_stop, 10),
-            "tps": [_tp_row(x, bot, s_stop, False) for x in s_lvls if x > 0],
-            "rr": _tp_row(s_lvls[-1], bot, s_stop, False)["rr"] if s_lvls[-1] > 0 else None,
+            "stop_basis": "mid-range — a close back inside the range = the break failed",
+            "tps": [_tp_row(x, bot, s_stop, False, b) for x, b in s_lvls if x > 0],
+            "rr": _tp_row(s_lvls[-1][0], bot, s_stop, False, "")["rr"] if s_lvls[-1][0] > 0 else None,
         }
     rec_side = "long" if lean == "bullish" else "short" if lean == "bearish" else "either"
 

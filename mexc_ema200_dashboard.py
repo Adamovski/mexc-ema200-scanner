@@ -734,6 +734,27 @@ PAGE = """<!doctype html>
   .ctf-hot{background:rgba(63,185,80,.2);color:var(--accent);border-color:rgba(63,185,80,.55)}
   .ctf-warm{background:rgba(240,180,41,.16);color:#f0b429;border-color:rgba(240,180,41,.5)}
   .ctf-cool{background:rgba(139,152,173,.1);color:var(--dim)}
+  .expander{display:inline-block;color:var(--accent);font-weight:800;width:12px;cursor:pointer;transition:transform .1s}
+  tr.rowsel{background:rgba(63,185,80,.06)}
+  .rmax{color:var(--dim2);font-size:11px;font-weight:600}
+  .planrow>td{background:var(--bg2);padding:0 14px 12px 40px;border-top:0}
+  .planpair{display:flex;gap:16px;flex-wrap:wrap}
+  .planpanel{flex:1;min-width:320px;margin-top:10px;padding:12px 15px;border:1px solid var(--line2);border-radius:12px;background:var(--panel);font-family:"Inter",sans-serif}
+  .planpanel.pp-long{border-left:3px solid var(--accent)}
+  .planpanel.pp-short{border-left:3px solid #f85149}
+  .pphead{font-size:12px;font-weight:800;letter-spacing:.03em;margin-bottom:8px}
+  .pline{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;font-size:13px;margin:3px 0;font-variant-numeric:tabular-nums}
+  .pline .plab{display:inline-block;min-width:44px;color:var(--dim);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+  .pline b{color:var(--txt)}
+  .pbasis{color:var(--dim);font-size:12px}
+  .pmv{color:var(--dim2);font-size:12px;font-variant-numeric:tabular-nums}
+  .pmv.risk{color:#f0b429}
+  .prr{color:var(--accent);font-weight:700;font-size:12px;min-width:44px}
+  .ptps{margin:8px 0 4px;padding-top:8px;border-top:1px dashed var(--line2)}
+  .ptpsh{font-size:10.5px;font-weight:800;letter-spacing:.05em;color:var(--dim2);text-transform:uppercase;margin-bottom:4px}
+  .ptp .plab{min-width:36px;color:var(--accent)}
+  .pscale{margin-top:8px;font-size:12.5px;color:#c3ccd8}
+  .coilnote{margin:10px 0 0;font-size:12.5px;color:var(--dim)}
   .corrbadge{border-radius:6px;padding:0 6px;font-size:10.5px;font-weight:700;border:1px solid var(--line);margin-left:5px;font-variant-numeric:tabular-nums;cursor:help}
   .corr-hi{background:rgba(210,153,34,.16);color:#d29922;border-color:rgba(210,153,34,.45)}
   .corr-mid{background:rgba(139,152,173,.12);color:var(--dim)}
@@ -3056,6 +3077,40 @@ function scoreBadge(s){
   const cls = v>=75?'sc-a' : v>=60?'sc-b' : v>=45?'sc-c' : 'sc-d';
   return `<span class="scorepill ${cls}">${v.toFixed(0)}</span>`;
 }
+// Which leaderboard/coil rows are expanded to show their full plan.
+let rowOpen={};
+function toggleRowPlan(key, ev){ if(ev){ ev.stopPropagation(); }
+  rowOpen[key]=!rowOpen[key]; renderBestLong(); renderBestShort(); renderCoil(); }
+// A clean, readable trade-plan panel: entry (with the timeframe + why), stop (with
+// its basis + % risk), a target ladder where every TP shows its %move, R:R and WHICH
+// level/timeframe it's from, and a concrete scale-out plan.
+function planPanelHtml(p, side){
+  if(!p || p.entry==null) return '<div class="planpanel">No tradeable plan on this side right now.</div>';
+  const long = side!=='short';
+  const riskPct = Math.abs((p.entry-p.stop)/p.entry*100);
+  const tfChip = t => t?`<span class="tfsrc">${t}</span>`:'';
+  const tps=(p.tps||[]).map((t,i)=>{
+    const mv=Math.abs((t.lvl-p.entry)/p.entry*100);
+    return `<div class="pline ptp"><span class="plab">TP${i+1}</span><b>${fmtNum(t.lvl)}</b>`
+         + `<span class="pmv">${long?'+':'−'}${mv.toFixed(1)}%</span>`
+         + `<span class="prr">R ${t.rr!=null?(+t.rr).toFixed(1):'—'}</span>`
+         + `<span class="pbasis">${esc(t.basis||'')}</span></div>`;
+  }).join('');
+  const nT=(p.tps||[]).length;
+  const scale = nT>=3
+    ? `Sell 40% at TP1 → move stop to break-even (${fmtNum(p.entry)}), 35% at TP2, hold 25% runner to TP3 (trail the stop).`
+    : `Sell 60% at TP1 → stop to break-even, hold the 40% runner to TP2.`;
+  const entryLine = p.entry_break!=null
+    ? `<b>${fmtNum(p.entry)}</b> <span class="pbasis">limit / retest</span> &nbsp;·&nbsp; <b>${fmtNum(p.entry_break)}</b> <span class="pbasis">break-confirm</span>`
+    : `<b>${fmtNum(p.entry)}</b>`;
+  return `<div class="planpanel ${long?'pp-long':'pp-short'}">
+     <div class="pphead">${long?'🟢 LONG plan':'🔴 SHORT plan'}</div>
+     <div class="pline"><span class="plab">Entry</span>${entryLine} ${tfChip(p.entry_tf)}<span class="pbasis">${esc(p.entry_basis||'')}</span></div>
+     <div class="pline"><span class="plab">Stop</span><b>${fmtNum(p.stop)}</b> <span class="pmv risk">${riskPct.toFixed(1)}% risk</span> ${tfChip(p.stop_tf)}<span class="pbasis">${esc(p.stop_basis||'')}</span></div>
+     <div class="ptps"><div class="ptpsh">Targets — take profit in stages</div>${tps}</div>
+     <div class="pscale">📤 Scale-out: ${scale}</div>
+   </div>`;
+}
 function renderBoard(side){
   const isLong = side==='long';
   const rows = (lastData && (isLong?lastData.long_board:lastData.short_board)) || [];
@@ -3073,20 +3128,28 @@ function renderBoard(side){
     const shortWhy = why.slice(0,2).join(' · ') || '—';
     const rr = (h.rr!=null && isFinite(h.rr));
     const rrCls = !rr? '' : (h.rr>=2?'rrg':h.rr>=1.5?'rry':'rrd');
-    const tr=document.createElement('tr'); tr.className=rowClass(h);
+    const key=side+':'+h.symbol, open=!!rowOpen[key];
+    const rrTxt = rr? ('<b>'+h.rr.toFixed(2)+'</b>'+(h.rr_max!=null&&h.rr_max>h.rr+0.2?` <span class="rmax">→${(+h.rr_max).toFixed(1)}</span>`:'')) : '—';
+    const tr=document.createElement('tr'); tr.className=rowClass(h)+(open?' rowsel':''); tr.style.cursor='pointer';
+    tr.setAttribute('onclick',`toggleRowPlan('${key}')`);
     tr.innerHTML =
-      `<td class="rnk">${rank}</td>`+
-      `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeSideBtn(h.symbol,side)}</div></td>`+
+      `<td class="rnk"><span class="expander">${open?'▾':'▸'}</span> ${rank}</td>`+
+      `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${dispSym(h.symbol)}</a>${analyzeSideBtn(h.symbol,side)}</div></td>`+
       `<td>${scoreBadge(h.score)}</td>`+
       `<td>${fmtNum(P)}</td>`+
       `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
       `<td class="tfstripcell">${tfBiasStrip(h.tf_bias)}</td>`+
-      `<td data-tip="Recommended entry — a value pullback to the nearest ${isLong?'support':'resistance'} (or current price if it's far). Click ⚲ for the full cross-timeframe plan.">${h.entry!=null?fmtNum(h.entry):fmtNum(P)}</td>`+
-      `<td data-tip="Recommended stop — beyond the next ${isLong?'support below':'resistance above'} the entry.">${h.stop!=null?fmtNum(h.stop):'—'}</td>`+
-      `<td data-tip="Recommended target — the nearest ${isLong?'resistance above':'support below'} (or a 2R projection).">${h.target!=null?fmtNum(h.target):'—'}</td>`+
-      `<td class="${rrCls}">${rr?'<b>'+h.rr.toFixed(2)+'</b>':'—'}</td>`+
+      `<td data-tip="Recommended entry — ${esc(h.entry_basis||'a value pullback to the nearest level')}. Click the row for the full plan.">${h.entry!=null?fmtNum(h.entry):fmtNum(P)}${h.entry_tf?` <span class="tfsrc">${h.entry_tf}</span>`:''}</td>`+
+      `<td data-tip="Recommended stop — ${esc(h.stop_basis||'beyond the next level')}.">${h.stop!=null?fmtNum(h.stop):'—'}</td>`+
+      `<td data-tip="Base target — ${esc((h.tps&&h.tps[0]&&h.tps[0].basis)||'the nearest level the other way')}. Row expands to the full ladder.">${h.target!=null?fmtNum(h.target):'—'}</td>`+
+      `<td class="${rrCls}" data-tip="Reward:risk to the base target${h.rr_max!=null?`; the arrow shows R:R to the furthest target (${(+h.rr_max).toFixed(1)}R)`:''}. Click the row for the full ladder.">${rrTxt}</td>`+
       `<td class="whycell" data-tip="${esc(why.join(' · '))}">${esc(shortWhy)}</td>`;
     tb.appendChild(tr);
+    if(open){
+      const dr=document.createElement('tr'); dr.className='planrow';
+      dr.innerHTML=`<td colspan="11">${planPanelHtml(h, side)}</td>`;
+      tb.appendChild(dr);
+    }
   }
 }
 function renderBestLong(){ renderBoard('long'); }
@@ -3108,10 +3171,12 @@ function renderCoil(){
     rank++;
     const P=h.live!=null?h.live:h.price;
     const why=(h.why||[]); const shortWhy=why.slice(0,2).join(' · ')||'—';
-    const tr=document.createElement('tr'); tr.className=rowClass(h);
+    const key='coil:'+h.symbol, open=!!rowOpen[key];
+    const tr=document.createElement('tr'); tr.className=rowClass(h)+(open?' rowsel':''); tr.style.cursor='pointer';
+    tr.setAttribute('onclick',`toggleRowPlan('${key}')`);
     tr.innerHTML=
-      `<td class="rnk">${rank}</td>`+
-      `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}</div></td>`+
+      `<td class="rnk"><span class="expander">${open?'▾':'▸'}</span> ${rank}</td>`+
+      `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}</div></td>`+
       `<td>${scoreBadge(h.score)}</td>`+
       `<td data-tip="Band width tighter than ${h.squeeze_pct!=null?h.squeeze_pct:'—'}% of its recent range.">${h.squeeze_pct!=null?h.squeeze_pct+'%':'—'}</td>`+
       `<td>${fmtNum(P)}</td>`+
@@ -3122,6 +3187,18 @@ function renderCoil(){
       coilSetupCell(h,'short')+
       `<td class="whycell" data-tip="${esc(why.join(' · '))}">${esc(shortWhy)}</td>`;
     tb.appendChild(tr);
+    if(open){
+      const dr=document.createElement('tr'); dr.className='planrow';
+      const recFirst = h.rec_side==='short';
+      const both = recFirst
+        ? planPanelHtml(h.plan_short,'short')+planPanelHtml(h.plan_long,'long')
+        : planPanelHtml(h.plan_long,'long')+planPanelHtml(h.plan_short,'short');
+      const recNote = h.rec_side==='either'
+        ? 'Neutral lean — trade whichever way it breaks; both plans shown.'
+        : `Recommended side: <b>${h.rec_side==='long'?'LONG ▲':'SHORT ▼'}</b> (matches the coil\\'s lean) — shown first.`;
+      dr.innerHTML=`<td colspan="11"><div class="coilnote">${recNote}</div><div class="planpair">${both}</div></td>`;
+      tb.appendChild(dr);
+    }
   }
 }
 // Which timeframes are coiled — a 15m→1W strip, each labelled with its squeeze %.
