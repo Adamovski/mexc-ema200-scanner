@@ -51,6 +51,7 @@ try:
         list_symbols, scan_symbol_multi, get_session, EMA_PERIOD,
         analyze_symbol, normalize_symbol, fetch_candles, pct_returns, CORR_WINDOW,
         bias_on_tf, enrich_1h, best_pattern, coil_tfs_finer, scalp_setup,
+        compute_market_context,
     )
 except ImportError:
     sys.exit("Could not import mexc_ema200_scanner.py — keep both files in the "
@@ -342,22 +343,32 @@ class Tracker:
                         "exp": round(sum((t.get("r") or 0) for t in rows) / n, 2),
                         "tp_rates": tp_rates, "allout": allout_exp}
             _cf = ("board", "symbol", "side", "entry", "stop", "tps", "rr", "status",
-                   "r", "ts", "closed_ts", "tf", "note", "px0", "tps_hit", "state")
+                   "r", "ts", "closed_ts", "tf", "note", "px0", "tps_hit", "state",
+                   "phase", "filled_ts")
+            _pk = lambda t: {c: t.get(c) for c in _cf}
             _active = sum(1 for t in self.open.values() if t.get("state") == "active")
             _pending = sum(1 for t in self.open.values() if t.get("state") == "pending")
             _missed = sum(1 for t in self.closed if t.get("status") == "missed")
+            _open_all = list(self.open.values())
+            _closed_rev = list(reversed(self.closed))
+            # Per-board trade lists so each board row on the Performance tab can EXPAND
+            # to show its own open (live + waiting) and resolved setups. Capped per board.
+            board_rows = {}
+            for b in ("long", "short", "coil", "scalp"):
+                board_rows[b] = {
+                    "open": [_pk(t) for t in _open_all if t.get("board") == b][:60],
+                    "closed": [_pk(t) for t in _closed_rev if t.get("board") == b][:60],
+                }
             return {"overall": agg(res),
                     "by_board": {b: agg([t for t in res if t["board"] == b])
                                  for b in ("long", "short", "coil", "scalp", "call")},
+                    "board_rows": board_rows,
                     "open": len(self.open), "active": _active, "pending": _pending,
                     "missed": _missed,
                     "upstash": bool(self._up()),
-                    "recent": [{c: t.get(c) for c in _cf}
-                               for t in list(reversed(self.closed))[:60]],
-                    "calls_open": [{c: t.get(c) for c in _cf}
-                                   for t in self.open.values() if t.get("board") == "call"],
-                    "calls_closed": [{c: t.get(c) for c in _cf}
-                                     for t in list(reversed(self.closed))
+                    "recent": [_pk(t) for t in _closed_rev[:80]],
+                    "calls_open": [_pk(t) for t in _open_all if t.get("board") == "call"],
+                    "calls_closed": [_pk(t) for t in _closed_rev
                                      if t.get("board") == "call"][:60]}
 
 
@@ -412,6 +423,7 @@ class State:
         self.scanning: bool = False
         self.progress: tuple[int, int] = (0, 0)  # (done, total)
         self.universe: int = 0
+        self.market_context: dict | None = None    # BTC + alts big-picture read
         self.error: str = ""
 
     def snapshot(self) -> dict:
@@ -455,6 +467,7 @@ class State:
                 "short_board": withlive(self.short_board),
                 "coil_board": withlive(self.coil_board),
                 "scalp_board": withlive(self.scalp_board),
+                "market_context": self.market_context,
                 "perf": TRACKER.stats(),
                 "both_symbols": list(self.both_symbols),
                 "breakout_events": list(self.breakout_events),
@@ -515,6 +528,13 @@ def run_one_scan(state: State) -> None:
         if _braw and len(_braw) > 2:
             _bcl = [float(x[4]) for x in _braw[:-1]]
             scan_cfg["btc_returns"] = pct_returns(_bcl)[-CORR_WINDOW:]
+    except Exception:
+        pass
+    # Big-picture market read (BTC multi-TF + alt breadth) — good day/week for longs?
+    try:
+        _mc = compute_market_context(sess, scan_cfg["market"])
+        with state.lock:
+            state.market_context = _mc
     except Exception:
         pass
     with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
@@ -1107,6 +1127,42 @@ PAGE = """<!doctype html>
   .perfhelpbody{padding:4px 14px 10px}
   .perfhelpbody p{margin:9px 0;font-size:12.5px;line-height:1.55;color:var(--dim)}
   .perfhelpbody b{color:var(--fg,#e6edf3)}
+  tr.perfexp{cursor:pointer} tr.perfexp:hover{background:rgba(139,152,173,.06)}
+  tr.perfexp .cae{display:inline-block;width:14px;color:var(--dim);font-size:10px}
+  tr.perfexp.on{background:rgba(139,152,173,.05)}
+  tr.perfdetail>td{padding:0 0 10px!important;background:rgba(139,152,173,.03)}
+  .bt-wrap{padding:6px 10px 2px}
+  .bt-h{font-size:10.5px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;color:var(--dim2);margin:8px 0 4px}
+  table.bt{width:100%;border-collapse:collapse;font-size:12px}
+  table.bt th{text-align:left;color:var(--dim2);font-weight:700;font-size:10px;text-transform:uppercase;letter-spacing:.04em;padding:3px 8px;border-bottom:1px solid var(--line)}
+  table.bt td{padding:4px 8px;border-bottom:1px solid rgba(139,152,173,.08);font-variant-numeric:tabular-nums}
+  table.bt td.dim{color:var(--dim);white-space:nowrap} table.bt td.sym a{color:var(--accent);text-decoration:none}
+  .bt-empty{font-size:12px;color:var(--dim);padding:4px 8px 8px}
+  .bt-wait{color:#f0b429;font-weight:700;cursor:help} .bt-live{color:var(--accent);font-weight:700}
+  .mc-bull{color:var(--accent)} .mc-bear{color:#f85149} .mc-mid{color:#f0b429}
+  .mc-heads{display:flex;gap:14px;flex-wrap:wrap;margin:6px 0 4px}
+  .mc-head{flex:1;min-width:280px;border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:rgba(139,152,173,.04)}
+  .mc-head.mc-bull{border-color:rgba(63,185,80,.5);background:rgba(63,185,80,.08)}
+  .mc-head.mc-bear{border-color:rgba(248,81,73,.45);background:rgba(248,81,73,.08)}
+  .mc-head.mc-mid{border-color:rgba(240,180,41,.4);background:rgba(240,180,41,.07)}
+  .mc-head-lab{font-size:11px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:var(--dim2)}
+  .mc-head-line{font-size:14px;font-weight:650;margin:7px 0 10px;line-height:1.45}
+  .mc-head-row{display:flex;gap:18px;font-size:12.5px;color:var(--dim)}
+  .mc-btcbar{display:flex;align-items:center;justify-content:space-between;gap:18px;flex-wrap:wrap;font-size:13px;margin:2px 0 8px}
+  .mcgauge{position:relative;flex:1;min-width:220px;height:10px;border-radius:6px;background:rgba(139,152,173,.15);overflow:hidden}
+  .mcgauge-fill{position:absolute;left:0;top:0;bottom:0;border-radius:6px;opacity:.85}
+  .mcgauge-mid{position:absolute;left:50%;top:-2px;bottom:-2px;width:1px;background:var(--dim2)}
+  .mcpill{display:inline-block;border-radius:5px;padding:1px 8px;font-size:11px;font-weight:700;border:1px solid var(--line)}
+  .mcpill.mc-bull{background:rgba(63,185,80,.16);border-color:rgba(63,185,80,.5)}
+  .mcpill.mc-bear{background:rgba(248,81,73,.14);border-color:rgba(248,81,73,.45)}
+  .mcpill.mc-mid{background:rgba(240,180,41,.13)}
+  .mc-cards{display:flex;gap:12px;flex-wrap:wrap;margin:2px 0 6px}
+  .mc-stat{flex:1;min-width:120px;border:1px solid var(--line);border-radius:10px;padding:11px 13px;background:rgba(139,152,173,.04)}
+  .mc-stat-v{font-size:20px;font-weight:800;font-variant-numeric:tabular-nums}
+  .mc-stat-l{font-size:11px;color:var(--dim);margin-top:3px}
+  #mcbtctbl td,#mcalttbl td{padding:5px 10px;border-bottom:1px solid rgba(139,152,173,.08);font-variant-numeric:tabular-nums}
+  #mcbtctbl th,#mcalttbl th{text-align:left;color:var(--dim2);font-size:10px;text-transform:uppercase;letter-spacing:.04em;padding:4px 10px;border-bottom:1px solid var(--line);cursor:help}
+  #mcalttbl td.sym a{color:var(--accent);text-decoration:none}
   .tprcell{white-space:normal}
   .tpr{display:inline-block;border-radius:5px;padding:1px 7px;font-size:11px;font-weight:700;margin:2px 4px 2px 0;border:1px solid var(--line);font-variant-numeric:tabular-nums;cursor:help}
   .tpr-hi{background:rgba(63,185,80,.18);color:var(--accent);border-color:rgba(63,185,80,.5)}
@@ -1339,6 +1395,7 @@ PAGE = """<!doctype html>
 <div class="bkbanner" id="bkbanner"></div>
 <div class="banner" id="banner"></div>
 <div class="tabs">
+  <div class="tab" id="tabMarket" onclick="showTab('market')">🧭 Market</div>
   <div class="tab" id="tabAnalyze" onclick="showTab('analyze')">🔎 Analyze a coin</div>
   <div class="tab active" id="tabBestLong" onclick="showTab('bestlong')">🏆 Best longs</div>
   <div class="tab" id="tabBestShort" onclick="showTab('bestshort')">🩸 Best shorts</div>
@@ -1716,6 +1773,17 @@ PAGE = """<!doctype html>
     <tbody id="wlrows"></tbody>
   </table>
   <div class="empty" id="wlempty" style="display:none">Your watchlist is empty. Click the ☆ next to any coin's symbol (on any tab or in Analyze) to add it here.</div>
+</div>
+</div>
+
+<div class="view" id="viewMarket">
+<div class="status">
+  <span>🧭 Market context — is it a good <b>day</b> or <b>week</b> to be hunting longs or shorts? A multi-timeframe read on <b>BTC</b> (15m → 1W) plus <b>alt-market breadth</b> (how much of the majors are trading above their key moving averages). The whole market tends to follow BTC, so this frames every setup on the other tabs.</span>
+  <span id="marketMeta"></span>
+</div>
+<div class="wrap">
+  <div id="marketBody"></div>
+  <div class="empty" id="marketempty" style="display:none">Market read is being computed on the next scan — check back in a moment.</div>
 </div>
 </div>
 
@@ -2364,10 +2432,11 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["coil","Coil"],["scalp","Scalp"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["market","Market"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["coil","Coil"],["scalp","Scalp"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
+  if(which==="market") renderMarket();
   if(which==="bestlong") renderBestLong();
   if(which==="bestshort") renderBestShort();
   if(which==="coil") renderCoil();
@@ -3793,17 +3862,30 @@ function renderPerf(){
     +perfCard('Resolved', (o.n||0), '')
     +perfCard('Open now', (perf&&perf.open)||0, '');
   const names={long:'🏆 Best longs',short:'🩸 Best shorts',coil:'🚀 Coiled',scalp:'⚡ Scalps'};
+  const brows=(perf&&perf.board_rows)||{};
   if(rows){ rows.innerHTML='';
     for(const b of ['long','short','coil','scalp']){
       const a=((perf&&perf.by_board)||{})[b]||{};
       const wcls=a.winrate==null?'':(a.winrate>=50?'pf-good':a.winrate>=40?'':'pf-bad');
       const ecls=a.exp==null?'':(a.exp>0?'pf-good':'pf-bad');
+      const bd=brows[b]||{open:[],closed:[]};
+      const nOpen=(bd.open||[]).length, nClosed=(bd.closed||[]).length;
+      const canExp=(nOpen+nClosed)>0;
       const tr=document.createElement('tr');
-      tr.innerHTML=`<td>${names[b]}</td><td>${a.n||0}</td>`
+      if(canExp) tr.className='perfexp'+(perfOpenBoards.has(b)?' on':'');
+      tr.innerHTML=`<td>${canExp?`<span class="cae">${perfOpenBoards.has(b)?'▾':'▸'}</span>`:''}${names[b]}`
+          +(canExp?` <span class="rr">(${nOpen} open · ${nClosed} resolved)</span>`:'')+`</td><td>${a.n||0}</td>`
         +`<td class="${wcls}">${a.winrate==null?'—':a.winrate+'%'}${a.n?` <span class="rr">(${a.wins}W/${a.n-a.wins}L)</span>`:''}</td>`
         +`<td class="${ecls}">${a.exp==null?'—':(a.exp>0?'+':'')+a.exp+'R'}</td>`
         +`<td class="tprcell">${tpRatesHtml(a.tp_rates)}</td>`;
+      if(canExp) tr.onclick=()=>{ if(perfOpenBoards.has(b))perfOpenBoards.delete(b); else perfOpenBoards.add(b); renderPerf(); };
       rows.appendChild(tr);
+      if(canExp && perfOpenBoards.has(b)){
+        const dtr=document.createElement('tr'); dtr.className='perfdetail';
+        const td=document.createElement('td'); td.colSpan=5;
+        td.innerHTML=boardTradesHtml(bd);
+        dtr.appendChild(td); rows.appendChild(dtr);
+      }
     }
   }
   const aorows=document.getElementById('perfaorows');
@@ -3836,6 +3918,121 @@ function renderPerf(){
       trrows.appendChild(tr);
     }
   }
+}
+// ---- Market context tab ----
+function mcVerdictClass(v){ return v==='bullish'||v==='favorable'||v==='risk-on'?'mc-bull'
+  : v==='bearish'||v==='avoid'||v==='risk-off'?'mc-bear':'mc-mid'; }
+function mcBiasPill(b){ const c=b==='bull'?'mc-bull':b==='bear'?'mc-bear':'mc-mid';
+  const t=b==='bull'?'Bullish':b==='bear'?'Bearish':'Neutral'; return `<span class="mcpill ${c}">${t}</span>`; }
+function signed(x,suf){ if(x==null) return '—'; return (x>0?'+':'')+x+(suf||''); }
+function renderMarket(){
+  const body=document.getElementById('marketBody'); if(!body) return;
+  const mc=(lastData&&lastData.market_context)||null;
+  const emp=document.getElementById('marketempty');
+  const meta=document.getElementById('marketMeta');
+  if(!mc||(!mc.btc&&!mc.alts)){ if(emp) emp.style.display='block'; body.innerHTML=''; return; }
+  if(emp) emp.style.display='none';
+  if(meta) meta.textContent = mc.asof? ('as of '+ago(mc.asof)) : '';
+  const day=mc.day||{}, week=mc.week||{}, btc=mc.btc||{}, alts=mc.alts||{};
+  // Headline verdict cards (day + week)
+  const headCard=(label,o)=>{
+    const cls=mcVerdictClass(o.longs);
+    return `<div class="mc-head ${cls}">
+      <div class="mc-head-lab">${label}</div>
+      <div class="mc-head-line">${o.headline||'—'}</div>
+      <div class="mc-head-row">
+        <span>Longs: <b class="${mcVerdictClass(o.longs)}">${(o.longs||'—').toUpperCase()}</b></span>
+        <span>Shorts: <b class="${mcVerdictClass(o.shorts)}">${(o.shorts||'—').toUpperCase()}</b></span>
+      </div></div>`;
+  };
+  let h=`<div class="mc-heads">${headCard('📅 Today',day)}${headCard('🗓️ This week',week)}</div>`;
+  // BTC section
+  h+=`<div class="perfsub">₿ Bitcoin — multi-timeframe trend</div>`;
+  h+=`<div class="mc-btcbar"><div>Overall BTC read: <b class="${mcVerdictClass(btc.verdict)}">${(btc.verdict||'—').toUpperCase()}</b>`
+    +`${btc.price?` <span class="rr">· BTC ${fmtNum(btc.price)}</span>`:''}</div>${mcBar(btc.score)}</div>`;
+  h+=`<table id="mcbtctbl"><thead><tr>
+      <th data-tip="Chart timeframe.">TF</th>
+      <th data-tip="Bull/bear/neutral read from EMA side, EMA stack and RSI on this timeframe.">Bias</th>
+      <th data-tip="How far price sits above (+) or below (−) its long EMA on this timeframe.">Price vs EMA</th>
+      <th data-tip="20 / long EMA arrangement — 'stacked up' = clean uptrend, 'stacked down' = clean downtrend.">EMA stack</th>
+      <th data-tip="RSI(14) on this timeframe.">RSI</th>
+      <th data-tip="Bollinger-band squeeze percentile — high = coiled, a big move may be near.">Squeeze</th>
+      <th data-tip="Last closed candle % change.">Last</th>
+    </tr></thead><tbody>`;
+  for(const r of (btc.tfs||[])){
+    h+=`<tr><td><b>${r.tf}</b></td><td>${mcBiasPill(r.bias)}</td>`
+      +`<td class="${(r.px_vs_ema||0)>=0?'pf-good':'pf-bad'}">${signed(r.px_vs_ema,'%')}</td>`
+      +`<td>${r.ema_stack||'—'}</td>`
+      +`<td>${r.rsi!=null?r.rsi:'—'}</td>`
+      +`<td>${r.squeeze!=null?(r.squeeze+(r.squeeze>=70?' 🔥':'')):'—'}</td>`
+      +`<td class="${(r.chg||0)>=0?'pf-good':'pf-bad'}">${signed(r.chg,'%')}</td></tr>`;
+  }
+  h+=`</tbody></table>`;
+  // Alts section
+  if(alts&&alts.n){
+    h+=`<div class="perfsub">🪙 Alt-market breadth (majors, daily)</div>`;
+    h+=`<div class="mc-cards">
+      ${mcStat('Above 200-EMA', alts.pct_above_200ema+'%', alts.pct_above_200ema>=60?'mc-bull':alts.pct_above_200ema<=40?'mc-bear':'mc-mid')}
+      ${mcStat('In a clean uptrend', alts.pct_stacked_up+'%','')}
+      ${mcStat('Up / Down today', alts.up+' / '+alts.down, alts.up>alts.down?'mc-bull':alts.up<alts.down?'mc-bear':'mc-mid')}
+      ${mcStat('Avg 24h change', signed(alts.avg_chg,'%'), (alts.avg_chg||0)>=0?'mc-bull':'mc-bear')}
+      ${mcStat('Breadth', (alts.verdict||'—').toUpperCase(), mcVerdictClass(alts.verdict))}
+    </div>`;
+    h+=`<table id="mcalttbl"><thead><tr><th>Coin</th><th>Bias</th><th data-tip="Price vs its 200-day EMA.">vs 200-EMA</th><th>RSI</th><th data-tip="Squeeze percentile — high = coiling.">Squeeze</th><th>24h</th></tr></thead><tbody>`;
+    for(const r of (alts.members||[])){
+      h+=`<tr><td class="sym"><a href="${tvLink(r.symbol)}" target="_blank" rel="noopener">${dispSym(r.symbol)}</a></td>`
+        +`<td>${mcBiasPill(r.bias)}</td>`
+        +`<td class="${(r.px_vs_ema||0)>=0?'pf-good':'pf-bad'}">${signed(r.px_vs_ema,'%')}</td>`
+        +`<td>${r.rsi!=null?r.rsi:'—'}</td>`
+        +`<td>${r.squeeze!=null?(r.squeeze+(r.squeeze>=70?' 🔥':'')):'—'}</td>`
+        +`<td class="${(r.chg||0)>=0?'pf-good':'pf-bad'}">${signed(r.chg,'%')}</td></tr>`;
+    }
+    h+=`</tbody></table>`;
+  }
+  body.innerHTML=h;
+}
+function mcBar(score){ // score -1..+1 -> a left/right gauge
+  const s=Math.max(-1,Math.min(1,score||0)); const pct=Math.round((s+1)/2*100);
+  const c=s>=0.3?'var(--accent)':s<=-0.3?'#f85149':'#f0b429';
+  return `<div class="mcgauge" data-tip="Aggregate BTC trend score across timeframes (−1 fully bearish → +1 fully bullish)."><div class="mcgauge-fill" style="width:${pct}%;background:${c}"></div><div class="mcgauge-mid"></div></div>`;
+}
+function mcStat(lab,val,cls){ return `<div class="mc-stat"><div class="mc-stat-v ${cls||''}">${val}</div><div class="mc-stat-l">${lab}</div></div>`; }
+const perfOpenBoards=new Set();
+// Expanded per-board trade lists: waiting-for-entry + live (open), then resolved.
+function boardTradesHtml(bd){
+  const openR=(bd.open||[]), closedR=(bd.closed||[]);
+  const fmtWhen=ts=>ts?new Date(ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
+  const tgtOf=t=>((t.tps||[]).length?fmtNum(t.tps[t.tps.length-1].lvl):'—');
+  const statePill=t=>{
+    if(t.state==='pending') return `<span class="bt-wait" data-tip="Waiting for price to reach the entry before the trade starts.">⏳ waiting for entry</span>`;
+    const hi=(t.tps_hit&&t.tps_hit.length)?Math.max.apply(null,t.tps_hit):0;
+    return hi?`<span class="pf-good">live · TP${hi} hit, stop at BE+</span>`:`<span class="bt-live">● live · watching</span>`;
+  };
+  let h='<div class="bt-wrap">';
+  h+=`<div class="bt-h">Open (${openR.length})</div>`;
+  if(openR.length){
+    h+='<table class="bt"><thead><tr><th>Added</th><th>Symbol</th><th>Side</th><th>TF</th><th>Entry</th><th>Stop</th><th>Target</th><th>Status</th></tr></thead><tbody>';
+    for(const t of openR){
+      h+=`<tr><td class="dim">${fmtWhen(t.ts)}</td>`
+        +`<td class="sym"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></td>`
+        +`<td>${leanPill(t.side==='short'?'bearish':'bullish')}</td><td>${t.tf||'—'}</td>`
+        +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${tgtOf(t)}</td><td>${statePill(t)}</td></tr>`;
+    }
+    h+='</tbody></table>';
+  } else h+='<div class="bt-empty">No open setups on this board right now.</div>';
+  h+=`<div class="bt-h">Resolved (${closedR.length})</div>`;
+  if(closedR.length){
+    h+='<table class="bt"><thead><tr><th>Closed</th><th>Symbol</th><th>Side</th><th>TF</th><th>Entry</th><th>Stop</th><th>Target</th><th>Result</th></tr></thead><tbody>';
+    for(const t of closedR){
+      h+=`<tr><td class="dim">${fmtWhen(t.closed_ts)}</td>`
+        +`<td class="sym"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></td>`
+        +`<td>${leanPill(t.side==='short'?'bearish':'bullish')}</td><td>${t.tf||'—'}</td>`
+        +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${tgtOf(t)}</td><td>${perfStatusHtml(t)}</td></tr>`;
+    }
+    h+='</tbody></table>';
+  } else h+='<div class="bt-empty">Nothing resolved on this board yet.</div>';
+  h+='</div>';
+  return h;
 }
 function perfStatusHtml(t){
   const s=t.status, r=(t.r!=null)?(+t.r):null;
@@ -3932,7 +4129,7 @@ async function poll(){
     eelatest=d.early_hits||[]; renderEarly();
     slatest=d.short_hits||[]; renderShorts();
     renderBestLong(); renderBestShort(); renderCoil(); renderScalp(); renderPerf(); renderCalls();
-    renderWatch();
+    renderMarket(); renderWatch();
     { const wc=document.getElementById("tabWatch"); if(wc) wc.textContent=`📌 Watchlist${WATCH.size?' ('+WATCH.size+')':''}`; }
     const evs=(d.breakout_events||[]).filter(e=>e.time>seenBreak);
     if(evs.length){ seenBreak=Math.max(seenBreak, ...evs.map(e=>e.time)); if(alertsOn) fireBreakout(evs); }

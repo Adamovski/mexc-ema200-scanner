@@ -1919,6 +1919,154 @@ def bias_on_tf(sess: requests.Session, symbol: str, interval: str,
     return "neutral"
 
 
+# Fixed basket of liquid alts used to gauge broad "alt-season" breadth cheaply
+# (one daily fetch each) without scanning the whole universe again.
+ALT_BASKET = ["ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT",
+              "AVAXUSDT", "LINKUSDT", "TONUSDT", "TRXUSDT", "DOTUSDT", "MATICUSDT",
+              "NEARUSDT", "APTUSDT", "SUIUSDT", "LTCUSDT"]
+
+
+def _tf_read(sess, symbol, interval, market):
+    """One-timeframe health read for a symbol: price vs its 200-EMA (or the longest
+    EMA the history allows), the 20/50/200 EMA stack, RSI(14), Bollinger squeeze
+    percentile, and last-closed-candle % change. Returns a dict or None."""
+    rr = fetch_candles(sess, symbol, interval, 400, market)
+    if not rr or len(rr) < 30:
+        return None
+    rws = rr[:-1]
+    try:
+        C = [float(x[4]) for x in rws]
+    except (ValueError, IndexError):
+        return None
+    if len(C) < 30:
+        return None
+    px = C[-1]
+    per_long = 200 if len(C) >= 210 else (100 if len(C) >= 110 else 50)
+    e_l = ema(C, per_long)[-1]
+    e20 = ema(C, 20)[-1]
+    e50 = ema(C, 50)[-1] if len(C) >= 60 else None
+    rs = rsi_series(C)
+    rsi = next((v for v in reversed(rs) if v is not None), None)
+    sq = bbw_squeeze_pct(C)
+    chg = (C[-1] / C[-2] - 1.0) * 100 if len(C) >= 2 and C[-2] else 0.0
+    px_vs_long = ((px / e_l - 1.0) * 100) if e_l else None
+    # Directional score in [-1,+1] from EMA side, EMA stack and RSI.
+    s = 0.0
+    if px_vs_long is not None:
+        s += 0.5 if px_vs_long > 0 else -0.5
+    if e20 and e_l:
+        s += 0.25 if e20 > e_l else -0.25
+    if e20 and px:
+        s += 0.15 if px > e20 else -0.15
+    if rsi is not None:
+        s += 0.10 if rsi >= 55 else (-0.10 if rsi <= 45 else 0.0)
+    s = max(-1.0, min(1.0, s))
+    bias = "bull" if s >= 0.35 else ("bear" if s <= -0.35 else "neutral")
+    if e20 and e_l:
+        stack = "stacked up" if (px > e20 > e_l) else ("stacked down" if (px < e20 < e_l) else "mixed")
+    else:
+        stack = "mixed"
+    return {"tf": interval, "px_vs_ema": round(px_vs_long, 2) if px_vs_long is not None else None,
+            "ema_stack": stack, "rsi": round(rsi, 1) if rsi is not None else None,
+            "squeeze": sq, "chg": round(chg, 2), "score": round(s, 3), "bias": bias,
+            "ema_len": per_long}
+
+
+def compute_market_context(sess: requests.Session, market: str) -> dict:
+    """Big-picture read: is it a good day/week to be hunting longs or shorts?
+    Combines a multi-timeframe BTC health check (15m→1W) with alt-market breadth
+    (share of a liquid alt basket above its 200-/50-day EMAs, plus up/down count).
+    Returns a self-describing dict the dashboard renders as the Market tab."""
+    out = {"asof": time.time(), "btc": None, "alts": None, "day": None, "week": None}
+    # --- BTC across timeframes ---
+    tfs = ["15m", "1h", "4h", "1d", "1w"]
+    reads = []
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futs = {ex.submit(_tf_read, sess, "BTCUSDT", tf, market): tf for tf in tfs}
+        got = {}
+        for f in as_completed(futs):
+            try:
+                got[futs[f]] = f.result()
+            except Exception:
+                got[futs[f]] = None
+    reads = [got.get(tf) for tf in tfs]
+    reads = [r for r in reads if r]
+    btc_px = None
+    try:
+        _b = fetch_candles(sess, "BTCUSDT", "1h", 3, market)
+        if _b:
+            btc_px = float(_b[-1][4])
+    except Exception:
+        pass
+    if reads:
+        # Weight higher timeframes more for the overall trend read.
+        w = {"15m": 0.5, "1h": 0.8, "4h": 1.2, "1d": 1.6, "1w": 1.4}
+        tot = sum(w.get(r["tf"], 1.0) for r in reads)
+        score = sum(r["score"] * w.get(r["tf"], 1.0) for r in reads) / tot if tot else 0.0
+        verdict = "bullish" if score >= 0.3 else ("bearish" if score <= -0.3 else "mixed")
+        out["btc"] = {"price": btc_px, "tfs": reads, "score": round(score, 3),
+                      "verdict": verdict}
+        # Day read = intraday TFs; Week read = swing TFs.
+        def _sub(names):
+            rs = [r for r in reads if r["tf"] in names]
+            if not rs:
+                return None
+            tw = sum(w.get(r["tf"], 1.0) for r in rs)
+            return sum(r["score"] * w.get(r["tf"], 1.0) for r in rs) / tw if tw else 0.0
+        day_s = _sub({"15m", "1h", "4h"})
+        week_s = _sub({"4h", "1d", "1w"})
+    else:
+        score = day_s = week_s = 0.0
+    # --- Alt breadth (daily) ---
+    alt_reads = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {ex.submit(_tf_read, sess, s, "1d", market): s for s in ALT_BASKET}
+        for f in as_completed(futs):
+            try:
+                r = f.result()
+            except Exception:
+                r = None
+            if r:
+                r["symbol"] = futs[f]
+                alt_reads.append(r)
+    alts = None
+    breadth_s = 0.0
+    if alt_reads:
+        n = len(alt_reads)
+        above = sum(1 for r in alt_reads if (r.get("px_vs_ema") or 0) > 0)
+        up = sum(1 for r in alt_reads if (r.get("chg") or 0) > 0)
+        above_20 = sum(1 for r in alt_reads if r.get("ema_stack") == "stacked up")
+        avg_chg = sum((r.get("chg") or 0) for r in alt_reads) / n
+        pct_above = round(above / n * 100)
+        breadth_s = (above / n - 0.5) * 2.0  # -1..+1
+        bverdict = "risk-on" if pct_above >= 60 else ("risk-off" if pct_above <= 40 else "mixed")
+        alts = {"n": n, "pct_above_200ema": pct_above,
+                "pct_stacked_up": round(above_20 / n * 100),
+                "up": up, "down": n - up, "avg_chg": round(avg_chg, 2),
+                "verdict": bverdict,
+                "members": sorted(alt_reads, key=lambda r: (r.get("px_vs_ema") or -999),
+                                  reverse=True)}
+    out["alts"] = alts
+
+    # --- Combined day/week verdicts ---
+    def _combine(trend_s, horizon):
+        # Blend BTC trend with alt breadth for a longs/shorts recommendation.
+        c = 0.7 * (trend_s or 0.0) + 0.3 * breadth_s
+        if c >= 0.28:
+            longs, shorts = "favorable", "avoid"
+            head = f"Good {horizon} to look for LONGS — BTC is trending up and alt breadth is supportive."
+        elif c <= -0.28:
+            longs, shorts = "avoid", "favorable"
+            head = f"Good {horizon} to look for SHORTS — BTC is trending down and alt breadth is weak."
+        else:
+            longs, shorts = "cautious", "cautious"
+            head = f"Mixed {horizon} — no clear edge either way; be selective and trade the cleanest setups only."
+        return {"score": round(c, 3), "longs": longs, "shorts": shorts, "headline": head}
+    out["day"] = _combine(day_s, "day")
+    out["week"] = _combine(week_s, "week")
+    return out
+
+
 def enrich_1h(sess: requests.Session, symbol: str, market: str) -> tuple:
     """One 1h fetch → (bias_label, primary_1h_pattern). Used to enrich flagged
     coins with a 1h read (bias + formation) that can't be aggregated from 4h."""
