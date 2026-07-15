@@ -50,7 +50,7 @@ try:
     from mexc_ema200_scanner import (
         list_symbols, scan_symbol_multi, get_session, EMA_PERIOD,
         analyze_symbol, normalize_symbol, fetch_candles, pct_returns, CORR_WINDOW,
-        bias_on_tf, enrich_1h, best_pattern, coil_tfs_finer,
+        bias_on_tf, enrich_1h, best_pattern, coil_tfs_finer, scalp_setup,
     )
 except ImportError:
     sys.exit("Could not import mexc_ema200_scanner.py — keep both files in the "
@@ -109,6 +109,7 @@ class State:
         self.long_board: list[dict] = []           # top-25 best longs (whole universe)
         self.short_board: list[dict] = []          # top-25 best shorts (whole universe)
         self.coil_board: list[dict] = []           # top-25 most coiled (imminent big move)
+        self.scalp_board: list[dict] = []          # top-25 LTF scalps (tight SL, HTF-aligned)
         self.both_symbols: list[str] = []          # appear on 2+ scans (confluence)
         self.prev_both: set[str] | None = None     # confluence set from previous scan
         self.watch: dict[str, float] = {}          # symbol -> flag breakout level (armed)
@@ -162,6 +163,7 @@ class State:
                 "long_board": withlive(self.long_board),
                 "short_board": withlive(self.short_board),
                 "coil_board": withlive(self.coil_board),
+                "scalp_board": withlive(self.scalp_board),
                 "both_symbols": list(self.both_symbols),
                 "breakout_events": list(self.breakout_events),
                 "error": self.error,
@@ -302,10 +304,10 @@ def run_one_scan(state: State) -> None:
     long_board = long_board[:25]
     short_board = short_board[:25]
     coil_board = coil_board[:25]
+    _mkt = cfg.get("market", "futures")
     # Complete the coiled-timeframes picture for the top coils only: 15m & 1h squeeze
     # (finer than the 4h scan) — a cheap second pass (~50 calls) just for these 25.
     if coil_board:
-        _mkt = cfg.get("market", "futures")
         with ThreadPoolExecutor(max_workers=8) as _ex:
             _futs = {_ex.submit(coil_tfs_finer, sess, d["symbol"], _mkt): d
                      for d in coil_board}
@@ -317,6 +319,32 @@ def run_one_scan(state: State) -> None:
                     _fine = {}
                 if _fine:
                     _d.setdefault("coiled_tfs", {}).update(_fine)
+
+    # Best scalps: a 15m/5m tight setup taken WITH the higher-timeframe direction, for
+    # the top HTF-graded candidates (long_board → long side, short_board → short side).
+    # Second pass (2 fetches each) just for these — HTF gives direction, LTF gives the
+    # tight entry/stop.
+    scalp_src = {}
+    for d in long_board:
+        scalp_src[d["symbol"]] = ("long", d.get("conviction", 50), d.get("tf_bias"), d["score"])
+    for d in short_board:
+        s = d["symbol"]
+        if s not in scalp_src or d["score"] > scalp_src[s][3]:
+            scalp_src[s] = ("short", d.get("conviction", 50), d.get("tf_bias"), d["score"])
+    scalp_board = []
+    if scalp_src:
+        with ThreadPoolExecutor(max_workers=8) as _ex:
+            _sf = {_ex.submit(scalp_setup, sess, sym, _mkt, v[0], v[1], v[2]): sym
+                   for sym, v in scalp_src.items()}
+            for _f in as_completed(_sf):
+                try:
+                    _sc = _f.result()
+                except Exception:
+                    _sc = None
+                if _sc:
+                    scalp_board.append(_sc)
+        scalp_board.sort(key=lambda d: d["score"], reverse=True)
+        scalp_board = scalp_board[:25]
 
     # Enrich ONLY the flagged coins with a 1h read (bias + formation) — a single 1h
     # fetch each, cheap since it's just the few dozen hits (not the ~500 universe).
@@ -393,6 +421,7 @@ def run_one_scan(state: State) -> None:
         state.long_board = long_board
         state.short_board = short_board
         state.coil_board = coil_board
+        state.scalp_board = scalp_board
         state.both_symbols = sorted(both)
 
         # Arm breakout alerts for the current bull flags (their breakout level).
@@ -984,6 +1013,7 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabWatch" onclick="showTab('watch')">📌 Watchlist</div>
   <div class="tab" id="tabEarly" onclick="showTab('early')">⏳ Early</div>
   <div class="tab" id="tabCoil" onclick="showTab('coil')">🚀 Coiled</div>
+  <div class="tab" id="tabScalp" onclick="showTab('scalp')">⚡ Best scalps</div>
   <div class="tab" id="tabSetups" onclick="showTab('setups')">200-EMA reclaim</div>
   <div class="tab" id="tabFlags" onclick="showTab('flags')">Bull flags</div>
   <div class="tab" id="tabCpr" onclick="showTab('cpr')">Narrow CPR</div>
@@ -1301,6 +1331,32 @@ PAGE = """<!doctype html>
     <tbody id="coilrows"></tbody>
   </table>
   <div class="empty" id="coilempty" style="display:none">No coiled setups yet — waiting for the first full scan…</div>
+</div>
+</div>
+
+<div class="view" id="viewScalp">
+<div class="status">
+  <span>⚡ Best scalps — quick <b>lower-timeframe</b> trades taken <b>with</b> the higher-timeframe trend. The 4h/Daily/Weekly context sets the direction; the <b>15m</b> gives a precise entry near a swing level with a <b>tight stop</b> just beyond it (so the risk % is small and the R:R high). Only setups aligned with the HTF are listed. Click a row for the full plan (entries, tight stop, 15m target ladder, scale-out).</span>
+  <span id="scalpCount"></span>
+</div>
+<div class="wrap">
+  <table id="scalptbl">
+    <thead><tr>
+      <th>#</th>
+      <th>Symbol</th>
+      <th data-tip="Scalp score (0–100) = higher-timeframe conviction × R:R × how tight the stop is × 15m alignment. High = strong HTF trend + a clean, tight 15m entry.">Score</th>
+      <th data-tip="Direction — taken WITH the higher-timeframe trend. Long = HTF bullish, Short = HTF bearish.">Side</th>
+      <th data-tip="Higher- and lower-timeframe bias (5m/15m/4h/1D/1W): ▲ bullish, ▼ bearish, – neutral. The scalp direction follows the HIGHER frames; the 15m gives the entry.">Timeframes</th>
+      <th data-tip="Live last-traded price (updates ~every 20s).">Price</th>
+      <th data-tip="Scalp entry — a 15m swing level in the HTF direction (or current price on 15m momentum).">Entry</th>
+      <th data-tip="Tight stop — just beyond the next 15m swing, shown with its % risk. Scalps keep this small.">Stop</th>
+      <th data-tip="First 15m target. The row expands to the full ladder.">Target</th>
+      <th data-tip="Reward:risk to the first target; the arrow shows R:R to the furthest.">R:R</th>
+      <th data-tip="Plain-English reasons — HTF alignment, 15m trigger, stop tightness.">Why</th>
+    </tr></thead>
+    <tbody id="scalprows"></tbody>
+  </table>
+  <div class="empty" id="scalpempty" style="display:none">No scalps yet — waiting for the first full scan (scalps are computed from the top HTF setups)…</div>
 </div>
 </div>
 
@@ -1917,13 +1973,14 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["coil","Coil"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["coil","Coil"],["scalp","Scalp"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
   if(which==="bestlong") renderBestLong();
   if(which==="bestshort") renderBestShort();
   if(which==="coil") renderCoil();
+  if(which==="scalp") renderScalp();
   if(which==="watch"){ renderWatch(); loadWatch(); }
   renderBanner();  // banner follows the active scan tab
   renderFilterBar();  // filters are per-tab
@@ -2566,6 +2623,7 @@ function azCard(d0){
       ${cell("Rel volume", d.rvol==null?'—':(+d.rvol).toFixed(2)+'× latest bar', "The latest candle's volume ÷ its 20-bar average. Above 1× = the current move is happening on above-average participation = stronger confirmation. Below 1× = quiet, less conviction.")}
       ${cell("Range position", d.range_pos==null?'—':d.range_pos+'%', `Where price sits in its recent 120-candle range on the ${d.interval||'4h'} timeframe (0% = range low, 100% = range high).`)}
       ${cell("ATR", d.atr_pct==null?'—':d.atr_pct+'%', "Average True Range as a % of price — the coin's volatility. Stops are buffered by a fraction of this.")}
+      ${d.squeeze_pct!=null?cell("Volatility squeeze", (()=>{const s=d.squeeze_pct; const lbl=s>=85?'🚀 very tight':s>=70?'🚀 coiled':s<=25?'wide':'normal'; return `${s}% <span class="rr">${lbl}</span>`; })(), `Bollinger-band-width squeeze on the ${d.interval||'4h'}: the current band width is tighter than this % of its recent range. 70%+ = coiled/compressed → a bigger move (expansion) tends to follow, so trade the break. Low = bands already wide (mid-move). See the 🚀 Coiled tab for the whole universe ranked by this.`):''}
       ${cell("Open interest", (()=>{const o=d.open_interest; if(!o||o.oi_usd==null) return '—'; const m=o.oi_usd; const s=m>=1e9?'$'+(m/1e9).toFixed(2)+'B':m>=1e6?'$'+(m/1e6).toFixed(1)+'M':'$'+(m/1e3).toFixed(0)+'K'; return s+(o.chg24!=null?` <span class="rr">${o.chg24>=0?'+':''}${o.chg24.toFixed(1)}% 24h</span>`:''); })(), "Open interest — the total notional in open perpetual positions right now (holdVol × price). Rising OI as price rises = new money backing the move (conviction). Price rising while OI is flat or falling = short-covering or a thin move that can be a fake pump — confirm before chasing. Perps only.")}
       ${cell("Liquidity tier", (()=>{const t=liqTier(d); return ({mega:'Mega-cap',large:'Large-cap',mid:'Mid',thin:'Thin / illiquid'})[t]; })(), "Size/liquidity tier from open interest + volatility. Mega/large-cap coins (big OI, low ATR — BTC/ETH/SOL-like) respect levels and wick far less, so the recommended STOP is allowed to sit tighter (better R:R, suits higher leverage). Thin/high-volatility coins get more wick clearance so a random spike doesn't stop you out.")}
       ${(d.derivatives&&d.derivatives.oi_chg_pct!=null)?cell("OI trend (24h)", (()=>{const v=d.derivatives; const oc=v.oi_chg_pct; const dv=v.divergence; const dl=dv==='fake_up'?'⚠ fake-pump risk':dv==='real_up'?'✅ real up':dv==='real_down'?'✅ real down':dv==='exhaust_down'?'⚠ selloff exhausting':'flat'; return `${oc>=0?'+':''}${oc}% <span class="rr">${dl}</span>`; })(), "Open-interest change over 24h vs price, from Coinalyze. Price up + OI up = new money (real). Price up + OI down = short-covering / fake pump. Price down + OI up = fresh shorts (real). Price down + OI down = longs unwinding (selloff may be exhausting)."):''}
@@ -3084,11 +3142,24 @@ function toggleRowPlan(key, ev){ if(ev){ ev.stopPropagation(); }
 // A clean, readable trade-plan panel: entry (with the timeframe + why), stop (with
 // its basis + % risk), a target ladder where every TP shows its %move, R:R and WHICH
 // level/timeframe it's from, and a concrete scale-out plan.
-function planPanelHtml(p, side){
+function planPanelHtml(p, side, cmp){
   if(!p || p.entry==null) return '<div class="planpanel">No tradeable plan on this side right now.</div>';
   const long = side!=='short';
   const riskPct = Math.abs((p.entry-p.stop)/p.entry*100);
   const tfChip = t => t?`<span class="tfsrc">${t}</span>`:'';
+  // Enter-now-at-CMP option: R:R to the base target over the stop from the current price.
+  let cmpLine='';
+  if(cmp!=null && p.stop!=null && p.tps && p.tps.length){
+    const t=p.tps[0].lvl, s=p.stop;
+    const ok = long?(cmp>s && t>cmp):(cmp<s && t<cmp);
+    if(ok){
+      const cmpRR=Math.abs(t-cmp)/Math.abs(cmp-s);
+      const near=Math.abs(cmp-p.entry)/p.entry < 0.003;
+      cmpLine=`<div class="pline pcmp"><span class="plab">Now</span><b>${fmtNum(cmp)}</b> <span class="pbasis">enter at market (CMP)</span> <span class="prr">R ${cmpRR.toFixed(1)}</span>${near?' <span class="pbasis">≈ already at the entry</span>':' <span class="pbasis">vs waiting for the pullback</span>'}</div>`;
+    } else {
+      cmpLine=`<div class="pline pcmp"><span class="plab">Now</span><span class="pbasis">at market (${fmtNum(cmp)}) the stop/target isn\\'t cleanly placed — better to wait for the entry.</span></div>`;
+    }
+  }
   const tps=(p.tps||[]).map((t,i)=>{
     const mv=Math.abs((t.lvl-p.entry)/p.entry*100);
     return `<div class="pline ptp"><span class="plab">TP${i+1}</span><b>${fmtNum(t.lvl)}</b>`
@@ -3106,6 +3177,7 @@ function planPanelHtml(p, side){
   return `<div class="planpanel ${long?'pp-long':'pp-short'}">
      <div class="pphead">${long?'🟢 LONG plan':'🔴 SHORT plan'}</div>
      <div class="pline"><span class="plab">Entry</span>${entryLine} ${tfChip(p.entry_tf)}<span class="pbasis">${esc(p.entry_basis||'')}</span></div>
+     ${cmpLine}
      <div class="pline"><span class="plab">Stop</span><b>${fmtNum(p.stop)}</b> <span class="pmv risk">${riskPct.toFixed(1)}% risk</span> ${tfChip(p.stop_tf)}<span class="pbasis">${esc(p.stop_basis||'')}</span></div>
      <div class="ptps"><div class="ptpsh">Targets — take profit in stages</div>${tps}</div>
      <div class="pscale">📤 Scale-out: ${scale}</div>
@@ -3147,7 +3219,7 @@ function renderBoard(side){
     tb.appendChild(tr);
     if(open){
       const dr=document.createElement('tr'); dr.className='planrow';
-      dr.innerHTML=`<td colspan="11">${planPanelHtml(h, side)}</td>`;
+      dr.innerHTML=`<td colspan="11">${planPanelHtml(h, side, P)}</td>`;
       tb.appendChild(dr);
     }
   }
@@ -3191,8 +3263,8 @@ function renderCoil(){
       const dr=document.createElement('tr'); dr.className='planrow';
       const recFirst = h.rec_side==='short';
       const both = recFirst
-        ? planPanelHtml(h.plan_short,'short')+planPanelHtml(h.plan_long,'long')
-        : planPanelHtml(h.plan_long,'long')+planPanelHtml(h.plan_short,'short');
+        ? planPanelHtml(h.plan_short,'short',P)+planPanelHtml(h.plan_long,'long',P)
+        : planPanelHtml(h.plan_long,'long',P)+planPanelHtml(h.plan_short,'short',P);
       const recNote = h.rec_side==='either'
         ? 'Neutral lean — trade whichever way it breaks; both plans shown.'
         : `Recommended side: <b>${h.rec_side==='long'?'LONG ▲':'SHORT ▼'}</b> (matches the coil\\'s lean) — shown first.`;
@@ -3213,6 +3285,44 @@ function coilTfStrip(ct){
     out+=`<span class="ctf ${cls}" data-tip="${lbl} squeeze: band width tighter than ${v}% of its recent range.${v>=70?' Coiled on this timeframe.':''}">${lbl} ${v}</span>`;
   }
   return out || '<span style="color:var(--dim2)">—</span>';
+}
+function renderScalp(){
+  const rows=(lastData&&lastData.scalp_board)||[];
+  const tb=document.getElementById('scalprows'); if(!tb) return; tb.innerHTML="";
+  const emp=document.getElementById('scalpempty'); if(emp) emp.style.display=rows.length?'none':'block';
+  const cnt=document.getElementById('scalpCount');
+  if(cnt) cnt.textContent=`${rows.length} tight LTF setups aligned with the higher-timeframe trend`;
+  let rank=0;
+  for(const h of rows){
+    rank++;
+    const P=h.live!=null?h.live:h.price;
+    const side=h.side||'long';
+    const why=(h.why||[]); const shortWhy=why.slice(0,2).join(' · ')||'—';
+    const rr=(h.rr!=null&&isFinite(h.rr));
+    const rrCls=!rr?'':(h.rr>=2?'rrg':h.rr>=1.5?'rry':'rrd');
+    const rrTxt=rr?('<b>'+h.rr.toFixed(2)+'</b>'+(h.rr_max!=null&&h.rr_max>h.rr+0.2?` <span class="rmax">→${(+h.rr_max).toFixed(1)}</span>`:'')):'—';
+    const key='scalp:'+h.symbol, open=!!rowOpen[key];
+    const tr=document.createElement('tr'); tr.className=rowClass(h)+(open?' rowsel':''); tr.style.cursor='pointer';
+    tr.setAttribute('onclick',`toggleRowPlan('${key}')`);
+    tr.innerHTML=
+      `<td class="rnk"><span class="expander">${open?'▾':'▸'}</span> ${rank}</td>`+
+      `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${dispSym(h.symbol)}</a>${analyzeSideBtn(h.symbol,side)}</div></td>`+
+      `<td>${scoreBadge(h.score)}</td>`+
+      `<td>${leanPill(side==='long'?'bullish':'bearish')}</td>`+
+      `<td class="tfstripcell">${tfBiasStrip(h.tf_bias)}</td>`+
+      `<td>${fmtNum(P)}</td>`+
+      `<td data-tip="${esc(h.entry_basis||'15m entry')}">${h.entry!=null?fmtNum(h.entry):'—'}</td>`+
+      `<td data-tip="${esc(h.stop_basis||'tight 15m stop')}">${h.stop!=null?fmtNum(h.stop):'—'} <span class="rr">${h.stop_pct!=null?h.stop_pct+'%':''}</span></td>`+
+      `<td data-tip="${esc((h.tps&&h.tps[0]&&h.tps[0].basis)||'first 15m target')}">${h.target!=null?fmtNum(h.target):'—'}</td>`+
+      `<td class="${rrCls}">${rrTxt}</td>`+
+      `<td class="whycell" data-tip="${esc(why.join(' · '))}">${esc(shortWhy)}</td>`;
+    tb.appendChild(tr);
+    if(open){
+      const dr=document.createElement('tr'); dr.className='planrow';
+      dr.innerHTML=`<td colspan="11">${planPanelHtml(h, side, P)}</td>`;
+      tb.appendChild(dr);
+    }
+  }
 }
 // One breakout-setup cell for the Coiled row (long or short). Shows the entry and the
 // R:R to the FINAL target; the hover carries the whole plan — two limit entries, the
@@ -3253,7 +3363,7 @@ async function poll(){
     xlatest=d.stb_hits||[]; renderStb();
     eelatest=d.early_hits||[]; renderEarly();
     slatest=d.short_hits||[]; renderShorts();
-    renderBestLong(); renderBestShort(); renderCoil();
+    renderBestLong(); renderBestShort(); renderCoil(); renderScalp();
     renderWatch();
     { const wc=document.getElementById("tabWatch"); if(wc) wc.textContent=`📌 Watchlist${WATCH.size?' ('+WATCH.size+')':''}`; }
     const evs=(d.breakout_events||[]).filter(e=>e.time>seenBreak);

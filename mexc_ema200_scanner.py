@@ -2601,6 +2601,140 @@ def coil_tfs_finer(sess: requests.Session, symbol: str, market: str) -> dict:
     return out
 
 
+def scalp_setup(sess, symbol, market, side, htf_conv, htf_tf_bias):
+    """A LOWER-timeframe (15m) scalp aligned WITH the higher-timeframe direction:
+    a tight entry near a 15m swing level, a tight stop just beyond it, quick 15m
+    target ladder, high R:R. Higher-timeframe trend gives the DIRECTION (only long
+    scalps on an HTF-bullish coin, short on bearish); the 15m gives the precise,
+    tight setup. Second-pass fetch (15m + 5m for context) — top HTF candidates only."""
+    r15 = fetch_candles(sess, symbol, "15m", 400, market)
+    if not r15 or len(r15) < 60:
+        return None
+    rows = r15[:-1]
+    try:
+        H = [float(x[2]) for x in rows]
+        L = [float(x[3]) for x in rows]
+        C = [float(x[4]) for x in rows]
+        Vv = [float(x[5]) for x in rows]
+    except (ValueError, IndexError):
+        return None
+    price = C[-1]
+    if not price:
+        return None
+    a = atr(H, L, C)
+    atrp = round(a / price * 100, 2)
+    ms15 = market_structure(H, L, C)
+    r14 = rsi(C)
+    rvv = rel_volume(Vv)
+    last = len(L) - 1
+    sups = [s for s in supports_below(L, last, price, max_n=4, min_gap=0.003) if s < price]
+    ress = [r for r in resistances_above(H, last, price, max_n=4, min_gap=0.003) if r > price]
+
+    # 5m bias for extra low-timeframe context (cheap second fetch)
+    def _bias5():
+        rr = fetch_candles(sess, symbol, "5m", 300, market)
+        if not rr or len(rr) < 30:
+            return None
+        rws = rr[:-1]
+        try:
+            m = market_structure([float(x[2]) for x in rws],
+                                 [float(x[3]) for x in rws],
+                                 [float(x[4]) for x in rws])
+        except (ValueError, IndexError):
+            return None
+        return ("bullish" if m["structure"] == "uptrend" or m["choch"] == "bullish"
+                else "bearish" if m["structure"] == "downtrend" or m["choch"] == "bearish"
+                else "neutral")
+    bias5 = _bias5()
+    bias15 = ("bullish" if ms15["structure"] == "uptrend" or ms15["choch"] == "bullish"
+              else "bearish" if ms15["structure"] == "downtrend" or ms15["choch"] == "bearish"
+              else "neutral")
+
+    long = side == "long"
+    if long:
+        near = sups[0] if sups else price * (1 - 0.006)
+        entry = near if (price - near) / price <= 0.01 else price
+        entry_basis = ("15m swing-low support — buy the dip" if (price - near) / price <= 0.01
+                       else "current price (15m momentum entry)")
+        below = sups[1] if len(sups) > 1 else near * 0.997
+        stop = min(below - 0.3 * a, entry - 0.4 * a)
+        stop_basis = "just below the next 15m swing low (tight)"
+        risk = entry - stop
+        if risk <= 0:
+            return None
+        tps = []
+        for r in ress:
+            if r > entry * 1.002 and (not tps or r > tps[-1]["lvl"] * 1.002):
+                tps.append({"lvl": round(r, 10), "rr": round((r - entry) / risk, 2),
+                            "basis": "15m swing-high resistance"})
+            if len(tps) >= 3:
+                break
+        k = 2
+        while len(tps) < 2:
+            tps.append({"lvl": round(entry + k * risk, 10), "rr": float(k),
+                        "basis": f"{k}R measured move"})
+            k += 1
+    else:
+        near = ress[0] if ress else price * (1 + 0.006)
+        entry = near if (near - price) / price <= 0.01 else price
+        entry_basis = ("15m swing-high resistance — sell the rip" if (near - price) / price <= 0.01
+                       else "current price (15m momentum entry)")
+        above = ress[1] if len(ress) > 1 else near * 1.003
+        stop = max(above + 0.3 * a, entry + 0.4 * a)
+        stop_basis = "just above the next 15m swing high (tight)"
+        risk = stop - entry
+        if risk <= 0:
+            return None
+        tps = []
+        for s in sups:
+            if s < entry * 0.998 and (not tps or s < tps[-1]["lvl"] * 0.998):
+                tps.append({"lvl": round(s, 10), "rr": round((entry - s) / risk, 2),
+                            "basis": "15m swing-low support"})
+            if len(tps) >= 3:
+                break
+        k = 2
+        while len(tps) < 2 and entry - k * risk > 0:
+            tps.append({"lvl": round(entry - k * risk, 10), "rr": float(k),
+                        "basis": f"{k}R measured move"})
+            k += 1
+
+    risk_frac = risk / entry
+    if risk_frac > 0.04 or not tps:            # too wide to be a scalp
+        return None
+    rr_base = tps[0]["rr"]
+    mult_rr = max(0.4, min(1.3, 0.45 + 0.28 * min(rr_base, 3.0)))
+    tight = max(0.0, min(1.0, (0.03 - risk_frac) / 0.025))
+    opp = (long and ms15["structure"] == "downtrend") or (not long and ms15["structure"] == "uptrend")
+    align = 0.6 if opp else 1.0
+    score = round(max(0.0, min(100.0, (htf_conv or 50) * mult_rr * align * (0.8 + 0.2 * tight))), 1)
+
+    _hb = [v for v in (htf_tf_bias or {}).values()]
+    _n_up = sum(1 for v in _hb if v == "bullish")
+    _n_dn = sum(1 for v in _hb if v == "bearish")
+    why = []
+    why.append(f"HTF {'bullish' if long else 'bearish'} — "
+               f"{(_n_up if long else _n_dn)}/{len(_hb) or 1} higher timeframes aligned")
+    why.append(f"15m structure {ms15['structure']}"
+               + (" ⚠ against the HTF" if opp else ""))
+    why.append(f"Tight {risk_frac*100:.1f}% stop (15m structure)")
+    why.append(f"R:R {rr_base} to the first 15m target")
+    if rvv and rvv > 1.3:
+        why.append(f"{rvv:.1f}× 15m relative volume")
+
+    tf_bias = dict(htf_tf_bias or {})
+    if bias5:
+        tf_bias["5m"] = bias5
+    tf_bias["15m"] = bias15
+
+    return {"symbol": symbol, "side": side, "score": score, "why": why,
+            "price": price, "atr_pct": atrp, "tf_bias": tf_bias, "ltf5": bias5, "ltf15": bias15,
+            "entry": round(entry, 10), "entry_basis": entry_basis,
+            "stop": round(stop, 10), "stop_basis": stop_basis,
+            "stop_pct": round(risk_frac * 100, 2),
+            "target": tps[0]["lvl"], "rr": rr_base, "rr_max": tps[-1]["rr"], "tps": tps,
+            "rsi": r14}
+
+
 def scan_symbol(sess: requests.Session, symbol: str, interval: str,
                 cfg: dict) -> dict | None:
     return scan_symbol_multi(sess, symbol, interval, cfg)[0]
@@ -2953,6 +3087,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         btc_corr = None
     r14 = rsi(closes)
     rsi_div = detect_rsi_divergence(highs, lows, closes)       # regular / hidden RSI divergence
+    squeeze_pct = bbw_squeeze_pct(closes)                       # Bollinger-band squeeze / coil (0-100)
     st_val, st_dir = supertrend(highs, lows, closes)          # 4h Supertrend (or the selected TF)
     st_role = None
     if st_val is not None:
@@ -3280,6 +3415,13 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     if rsi_div:
         _di = "✅" if rsi_div["dir"] == "bullish" else "⚠"
         notes.append(f"{_di} {rsi_div['label']} — {rsi_div['note']}")
+    if squeeze_pct is not None and squeeze_pct >= 70:
+        notes.append(f"🚀 Volatility squeeze — the Bollinger bands are tighter than {squeeze_pct}% of "
+                     f"their recent range on the {interval} (a narrow, coiled range). Compressed markets "
+                     f"tend to EXPAND soon, so expect a bigger move; trade the break of the range.")
+    elif squeeze_pct is not None and squeeze_pct <= 25:
+        notes.append(f"Bollinger bands are wide (squeeze {squeeze_pct}%) — volatility is already elevated "
+                     f"on the {interval}, so this is less a coiled setup and more likely mid-move.")
     if st_val is not None:
         notes.append(
             f"Supertrend ({interval}) is at <b>{st_val:.6g}</b>, "
@@ -3387,6 +3529,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         "struct_reason": struct_reason,
         "rsi": r14,
         "rsi_div": rsi_div,
+        "squeeze_pct": squeeze_pct,
         "atr_pct": atr_pct,
         "open_interest": oi_data,
         "derivatives": deriv,
