@@ -74,6 +74,167 @@ def send_telegram(cfg: dict, text: str) -> None:
 
 
 # ----------------------------------------------------------------------------
+# Performance tracker — the app's own forward test. Every setup the boards produce
+# is recorded; each is then resolved as target-hit (win) or stop-hit (loss) against
+# the live price feed, from the moment it was flagged. Gives real win-rate + average
+# R per board. Persists to a JSON file, and to Upstash Redis if configured (durable
+# across redeploys): set UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN.
+# ----------------------------------------------------------------------------
+class Tracker:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.open: dict[str, dict] = {}
+        self.closed: list[dict] = []
+        try:
+            self.path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "apex_perf.json")
+        except Exception:
+            self.path = "apex_perf.json"
+        self._load()
+
+    def _up(self):
+        u = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip()
+        t = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
+        return (u, t) if (u and t) else None
+
+    def _load(self):
+        raw = None
+        up = self._up()
+        if up:
+            try:
+                import requests
+                r = requests.post(up[0], json=["GET", "apex_perf"],
+                                  headers={"Authorization": f"Bearer {up[1]}"}, timeout=8)
+                if r.status_code == 200:
+                    raw = r.json().get("result")
+            except Exception:
+                raw = None
+        if raw is None:
+            try:
+                with open(self.path) as f:
+                    raw = f.read()
+            except Exception:
+                raw = None
+        if raw:
+            try:
+                d = json.loads(raw)
+                self.open = d.get("open", {})
+                self.closed = d.get("closed", [])
+            except Exception:
+                pass
+
+    def _save(self):
+        blob = json.dumps({"open": self.open, "closed": self.closed[-1000:]})
+        try:
+            with open(self.path, "w") as f:
+                f.write(blob)
+        except Exception:
+            pass
+        up = self._up()
+        if up:
+            try:
+                import requests
+                requests.post(up[0], json=["SET", "apex_perf", blob],
+                              headers={"Authorization": f"Bearer {up[1]}"}, timeout=8)
+            except Exception:
+                pass
+
+    def register(self, board, setups):
+        """Record newly-appeared setups. Only tracks well-posed ones: the flag price
+        must sit BETWEEN the stop and the first target (so 'did it reach target before
+        stop' is meaningful) — this naturally filters pullback entries that haven't
+        set up and lower-half coils."""
+        now = time.time()
+        changed = False
+        with self.lock:
+            for s in (setups or []):
+                sym = s.get("symbol")
+                side = s.get("side", "long")
+                entry = s.get("entry")
+                stop = s.get("stop")
+                tps = s.get("tps") or []
+                tp1 = (tps[0].get("lvl") if tps else s.get("target"))
+                px = s.get("live") or s.get("price") or entry
+                if not (sym and entry and stop and tp1 and px):
+                    continue
+                long = side != "short"
+                if long and not (stop < px < tp1):
+                    continue
+                if (not long) and not (tp1 < px < stop):
+                    continue
+                k = f"{board}:{sym}:{side}"
+                if k in self.open:
+                    continue
+                self.open[k] = {"board": board, "symbol": sym, "side": side,
+                                "entry": entry, "stop": stop, "tp1": tp1,
+                                "rr": s.get("rr"), "px0": px, "ts": now}
+                changed = True
+        if changed:
+            with self.lock:
+                self._save()
+
+    def resolve(self, prices):
+        """Check open trades against the live prices; close any that reached their
+        first target (win, +planned R) or stop (loss, −1R). Expire after 5 days."""
+        if not prices:
+            return
+        now = time.time()
+        done = []
+        with self.lock:
+            for k, t in list(self.open.items()):
+                p = prices.get(t["symbol"])
+                if p is None:
+                    if now - t["ts"] > 5 * 86400:
+                        done.append((k, "expired", 0.0))
+                    continue
+                long = t["side"] != "short"
+                hit_tp = (p >= t["tp1"]) if long else (p <= t["tp1"])
+                hit_sl = (p <= t["stop"]) if long else (p >= t["stop"])
+                if hit_sl and not hit_tp:
+                    done.append((k, "loss", -1.0))
+                elif hit_tp and not hit_sl:
+                    done.append((k, "win", float(t.get("rr") or 1.0)))
+                elif hit_tp and hit_sl:
+                    done.append((k, "loss", -1.0))          # both in one tick — conservative
+                elif now - t["ts"] > 5 * 86400:
+                    done.append((k, "expired", 0.0))
+            for k, outcome, r in done:
+                t = self.open.pop(k, None)
+                if not t:
+                    continue
+                t["status"] = outcome
+                t["r"] = round(r, 2)
+                t["closed_ts"] = now
+                self.closed.append(t)
+            self.closed = self.closed[-1000:]
+            if done:
+                self._save()
+
+    def stats(self):
+        with self.lock:
+            res = [t for t in self.closed if t.get("status") in ("win", "loss")]
+
+            def agg(rows):
+                n = len(rows)
+                if not n:
+                    return {"n": 0, "wins": 0, "winrate": None, "exp": None}
+                w = sum(1 for t in rows if t["status"] == "win")
+                return {"n": n, "wins": w, "winrate": round(w / n * 100, 1),
+                        "exp": round(sum(t["r"] for t in rows) / n, 2)}
+            return {"overall": agg(res),
+                    "by_board": {b: agg([t for t in res if t["board"] == b])
+                                 for b in ("long", "short", "coil", "scalp")},
+                    "open": len(self.open),
+                    "upstash": bool(self._up()),
+                    "recent": [{c: t.get(c) for c in ("board", "symbol", "side", "entry",
+                                "stop", "tp1", "rr", "status", "r", "ts", "closed_ts")}
+                               for t in list(reversed(self.closed))[:60]]}
+
+
+TRACKER = Tracker()
+
+
+# ----------------------------------------------------------------------------
 # Shared state (updated by the scan loop, read by the HTTP handler)
 # ----------------------------------------------------------------------------
 class State:
@@ -164,6 +325,7 @@ class State:
                 "short_board": withlive(self.short_board),
                 "coil_board": withlive(self.coil_board),
                 "scalp_board": withlive(self.scalp_board),
+                "perf": TRACKER.stats(),
                 "both_symbols": list(self.both_symbols),
                 "breakout_events": list(self.breakout_events),
                 "error": self.error,
@@ -346,6 +508,21 @@ def run_one_scan(state: State) -> None:
         scalp_board.sort(key=lambda d: d["score"], reverse=True)
         scalp_board = scalp_board[:25]
 
+    # Performance tracking — register each board's fresh setups (resolved later against
+    # the live price feed). Coil registers the recommended side's breakout plan.
+    TRACKER.register("long", long_board)
+    TRACKER.register("short", short_board)
+    TRACKER.register("scalp", scalp_board)
+    _coil_regs = []
+    for _d in coil_board:
+        _rs = _d.get("rec_side")
+        _pl = _d.get("plan_long") if _rs == "long" else _d.get("plan_short") if _rs == "short" else None
+        if _pl and _pl.get("entry"):
+            _coil_regs.append({"symbol": _d["symbol"], "side": _rs, "entry": _pl["entry"],
+                               "stop": _pl["stop"], "tps": _pl.get("tps"),
+                               "rr": _pl.get("rr"), "price": _d.get("price")})
+    TRACKER.register("coil", _coil_regs)
+
     # Enrich ONLY the flagged coins with a 1h read (bias + formation) — a single 1h
     # fetch each, cheap since it's just the few dozen hits (not the ~500 universe).
     # This completes the 1h/4h/1D/1W bias strip AND the multi-timeframe pattern set.
@@ -485,6 +662,7 @@ def breakout_watcher(state: State) -> None:
             state.live_prices = prices
             watch = dict(state.watch)
             fired = set(state.watch_fired)
+        TRACKER.resolve(prices)          # close any tracked setups that hit target/stop
         if not watch:
             continue
         events = []
@@ -784,6 +962,14 @@ PAGE = """<!doctype html>
   .ptp .plab{min-width:36px;color:var(--accent)}
   .pscale{margin-top:8px;font-size:12.5px;color:#c3ccd8}
   .coilnote{margin:10px 0 0;font-size:12.5px;color:var(--dim)}
+  .perfcards{display:flex;gap:12px;flex-wrap:wrap;margin:6px 0 14px}
+  .perfcard{flex:1;min-width:150px;padding:16px 18px;border:1px solid var(--line2);border-radius:14px;background:var(--panel)}
+  .perfcard.pcg{border-color:rgba(63,185,80,.5);background:rgba(63,185,80,.07)}
+  .perfcard.pcb{border-color:rgba(248,81,73,.45);background:rgba(248,81,73,.06)}
+  .pcval{font-size:26px;font-weight:800;font-variant-numeric:tabular-nums;line-height:1}
+  .pclab{font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--dim);margin-top:6px}
+  .perfsub{font-size:11px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;color:var(--dim2);margin:16px 0 6px}
+  .pf-good{color:var(--accent)} .pf-bad{color:#f85149}
   .corrbadge{border-radius:6px;padding:0 6px;font-size:10.5px;font-weight:700;border:1px solid var(--line);margin-left:5px;font-variant-numeric:tabular-nums;cursor:help}
   .corr-hi{background:rgba(210,153,34,.16);color:#d29922;border-color:rgba(210,153,34,.45)}
   .corr-mid{background:rgba(139,152,173,.12);color:var(--dim)}
@@ -1020,6 +1206,7 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabBounce" onclick="showTab('bounce')">Support bounce</div>
   <div class="tab" id="tabStb" onclick="showTab('stb')">Supertrend support bounce</div>
   <div class="tab" id="tabShorts" onclick="showTab('shorts')">Shorts</div>
+  <div class="tab" id="tabPerf" onclick="showTab('perf')">📊 Performance</div>
   <div class="tab" id="tabInfo" onclick="showTab('info')">Info</div>
 </div>
 <div class="filterbar" id="filterbar"></div>
@@ -1405,6 +1592,28 @@ PAGE = """<!doctype html>
      market structure &amp; CHoCH, RSI, volume, multi-timeframe support/resistance, and a full
      entry / two-stop / target-ladder plan with R:R. Hover any box for what it means.
      A technical estimate to speed up your own analysis — not financial advice.</p>
+</div>
+</div>
+
+<div class="view" id="viewPerf">
+<div class="status">
+  <span>📊 Performance — Apex's own <b>forward test</b>. Every setup the boards produce is recorded and then resolved against the live price: did price reach the <b>first target</b> before the <b>stop</b>, from the moment it was flagged? Shows real win-rate and average R (expectancy) per board. A win banks the setup's planned R:R; a loss is −1R.</span>
+  <span id="perfMeta"></span>
+</div>
+<div class="wrap">
+  <div id="perfCards" class="perfcards"></div>
+  <div class="perfsub">By board</div>
+  <table id="perftbl"><thead><tr>
+      <th>Board</th><th data-tip="Resolved setups (target or stop hit).">Trades</th>
+      <th data-tip="% that reached the first target before the stop.">Win rate</th>
+      <th data-tip="Average R per trade — wins bank the planned R:R, losses are −1R. Above 0 = a positive edge.">Expectancy</th>
+    </tr></thead><tbody id="perfrows"></tbody></table>
+  <div class="perfsub">Recent resolved trades</div>
+  <table id="perftrtbl"><thead><tr>
+      <th>Closed</th><th>Board</th><th>Symbol</th><th>Side</th>
+      <th>Entry</th><th>Stop</th><th>Target</th><th>Result</th>
+    </tr></thead><tbody id="perftrrows"></tbody></table>
+  <div class="empty" id="perfempty" style="display:none">No resolved setups yet — the tracker records setups as they appear and closes them when price hits a target or stop. Check back after a few scans.</div>
 </div>
 </div>
 
@@ -1973,7 +2182,7 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["coil","Coil"],["scalp","Scalp"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["coil","Coil"],["scalp","Scalp"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
@@ -1981,6 +2190,7 @@ function showTab(which){
   if(which==="bestshort") renderBestShort();
   if(which==="coil") renderCoil();
   if(which==="scalp") renderScalp();
+  if(which==="perf") renderPerf();
   if(which==="watch"){ renderWatch(); loadWatch(); }
   renderBanner();  // banner follows the active scan tab
   renderFilterBar();  // filters are per-tab
@@ -3324,6 +3534,52 @@ function renderScalp(){
     }
   }
 }
+function perfCard(label,val,cls){
+  return `<div class="perfcard ${cls}"><div class="pcval">${val}</div><div class="pclab">${label}</div></div>`;
+}
+function renderPerf(){
+  const perf=(lastData&&lastData.perf)||null;
+  const cards=document.getElementById('perfCards'); if(!cards) return;
+  const rows=document.getElementById('perfrows'), trrows=document.getElementById('perftrrows');
+  const meta=document.getElementById('perfMeta'), emp=document.getElementById('perfempty');
+  const o=(perf&&perf.overall)||{};
+  const hasData=(o.n||0)>0;
+  if(emp) emp.style.display=hasData?'none':'block';
+  if(meta) meta.textContent=`${(perf&&perf.open)||0} open · ${o.n||0} resolved${perf&&perf.upstash?' · durable storage on':' · in-memory (add Upstash to persist)'}`;
+  const wr=o.winrate, exp=o.exp;
+  cards.innerHTML=
+     perfCard('Win rate', wr==null?'—':wr+'%', wr==null?'':(wr>=50?'pcg':wr>=40?'':'pcb'))
+    +perfCard('Expectancy', exp==null?'—':(exp>0?'+':'')+exp+'R', exp==null?'':(exp>0?'pcg':'pcb'))
+    +perfCard('Resolved', (o.n||0), '')
+    +perfCard('Open now', (perf&&perf.open)||0, '');
+  const names={long:'🏆 Best longs',short:'🩸 Best shorts',coil:'🚀 Coiled',scalp:'⚡ Scalps'};
+  if(rows){ rows.innerHTML='';
+    for(const b of ['long','short','coil','scalp']){
+      const a=((perf&&perf.by_board)||{})[b]||{};
+      const wcls=a.winrate==null?'':(a.winrate>=50?'pf-good':a.winrate>=40?'':'pf-bad');
+      const ecls=a.exp==null?'':(a.exp>0?'pf-good':'pf-bad');
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td>${names[b]}</td><td>${a.n||0}</td>`
+        +`<td class="${wcls}">${a.winrate==null?'—':a.winrate+'%'}${a.n?` <span class="rr">(${a.wins}W/${a.n-a.wins}L)</span>`:''}</td>`
+        +`<td class="${ecls}">${a.exp==null?'—':(a.exp>0?'+':'')+a.exp+'R'}</td>`;
+      rows.appendChild(tr);
+    }
+  }
+  if(trrows){ trrows.innerHTML='';
+    for(const t of ((perf&&perf.recent)||[])){
+      const win=t.status==='win';
+      const when=t.closed_ts?new Date(t.closed_ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td style="color:var(--dim);white-space:nowrap">${when}</td>`
+        +`<td>${({long:'Long',short:'Short',coil:'Coil',scalp:'Scalp'})[t.board]||t.board}</td>`
+        +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></div></td>`
+        +`<td>${leanPill(t.side==='short'?'bearish':'bullish')}</td>`
+        +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${fmtNum(t.tp1)}</td>`
+        +`<td class="${win?'pf-good':'pf-bad'}"><b>${win?'WIN +'+(t.r!=null?(+t.r).toFixed(1):'')+'R':'LOSS −1R'}</b></td>`;
+      trrows.appendChild(tr);
+    }
+  }
+}
 // One breakout-setup cell for the Coiled row (long or short). Shows the entry and the
 // R:R to the FINAL target; the hover carries the whole plan — two limit entries, the
 // tight stop, a 3-TP ladder with each R:R, and a scale-out plan. ★ + colour when it's
@@ -3363,7 +3619,7 @@ async function poll(){
     xlatest=d.stb_hits||[]; renderStb();
     eelatest=d.early_hits||[]; renderEarly();
     slatest=d.short_hits||[]; renderShorts();
-    renderBestLong(); renderBestShort(); renderCoil(); renderScalp();
+    renderBestLong(); renderBestShort(); renderCoil(); renderScalp(); renderPerf();
     renderWatch();
     { const wc=document.getElementById("tabWatch"); if(wc) wc.textContent=`📌 Watchlist${WATCH.size?' ('+WATCH.size+')':''}`; }
     const evs=(d.breakout_events||[]).filter(e=>e.time>seenBreak);
