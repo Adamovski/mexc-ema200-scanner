@@ -156,9 +156,12 @@ class Tracker:
                           "rr": (float(rr) if rr is not None else round(abs(float(lvl) - entry) / risk, 2))})
         clean = clean[:6]                                  # track up to 6 TPs, each individually
         n = len(clean)
-        w = {1: [1.0], 2: [0.6, 0.4], 3: [0.4, 0.35, 0.25], 4: [0.35, 0.3, 0.2, 0.15],
-             5: [0.3, 0.25, 0.2, 0.15, 0.1],
-             6: [0.25, 0.22, 0.18, 0.15, 0.12, 0.08]}.get(n, [1.0])
+        # Adaptive scale-out: take MORE off the more-reachable (lower-R) near targets and
+        # leave a runner on the far, high-R ones. Weight ∝ 1/(1+0.5·R), normalised — so
+        # the split adapts to each setup's actual target spacing (never a fixed 40/35/25).
+        raw = [1.0 / (1.0 + 0.5 * max(t.get("rr") or 1.0, 0.1)) for t in clean]
+        tot = sum(raw) or 1.0
+        w = [x / tot for x in raw] if n else [1.0]
         return {"board": board, "symbol": sym, "side": side, "entry": entry, "stop": stop,
                 "tps": clean, "weights": w, "phase": 0, "realized": 0.0,
                 "cur_stop": stop, "cur_stop_r": -1.0, "px0": float(px), "ts": now,
@@ -2327,16 +2330,30 @@ function setAzTf(tf){ azTf=tf;
 }
 // Long/Short perspective toggle for the Analyze card. null = the coin's own lean.
 let azLast=null, azSide=null, azXtfHtml='', azXtfSide=null;   // azXtfSide: null=auto, 'long', 'short'
-let azRec=null;   // the currently-shown recommended trade, for the "Track this setup" button
-async function trackSetup(ev){ if(ev) ev.stopPropagation();
-  if(!azRec){ return; }
-  const q=new URLSearchParams({symbol:azRec.symbol||'', side:azRec.side||'long',
-    entry:azRec.entry, stop:azRec.stop, targets:(azRec.targets||[]).join(','), tf:azRec.tf||''});
-  const m=document.getElementById('trackmsg'); if(m) m.textContent='…';
+let azRec=null;   // the currently-shown MAIN recommended trade
+// Track ANY setup — the main card or any of the cross-timeframe plans. Each card
+// passes its own entry/stop/targets so you choose exactly which setup to track.
+async function trackTrade(sym, side, entry, stop, targetsCsv, tf, msgId){
+  const m=msgId?document.getElementById(msgId):null;
+  if(!sym||entry==null||stop==null||!targetsCsv){ if(m) m.textContent='✗ missing levels'; return; }
+  const q=new URLSearchParams({symbol:sym, side:side||'long', entry:entry, stop:stop, targets:targetsCsv, tf:tf||''});
+  if(m) m.textContent='…';
   try{ const r=await fetch('/track?'+q.toString(),{cache:'no-store'}); const d=await r.json();
-    if(m) m.textContent = d.ok? '✓ Tracking — see 📌 My calls' : '✗ Could not track (check entry sits between stop & target)';
+    if(m) m.textContent = d.ok? '✓ Tracking — see 📌 My calls' : '✗ Could not track (entry must sit between stop & target)';
     if(d.ok){ try{ const rr=await fetch('/data',{cache:'no-store'}); lastData=await rr.json(); renderPerf(); renderCalls(); }catch(e){} }
   }catch(e){ if(m) m.textContent='✗ Failed'; }
+}
+function trackSetup(ev){ if(ev) ev.stopPropagation();
+  if(!azRec) return;
+  trackTrade(azRec.symbol, azRec.side, azRec.entry, azRec.stop, (azRec.targets||[]).join(','), azRec.tf, 'trackmsg');
+}
+// Track a specific cross-TF plan card (b = the xtf trade). Builds its own TP ladder.
+function trackXtf(i, ev){ if(ev) ev.stopPropagation();
+  const b=(azXtfTop||[])[i]; if(!b||!b.be||!b.rec){ return; }
+  const tps=(scaleOutRows(b.be.rt)||[]).map(r=>r.t&&r.t.lvl).filter(x=>x!=null);
+  const tgts=tps.length?tps:[b.rec.lvl];
+  trackTrade((azLast&&azLast.symbol)||'', b.side, b.be.level, (b.be.rs&&b.be.rs.level),
+             tgts.join(','), b.tf, 'xtftrackmsg'+i);
 }
 let azXtfTop=null, azXtfOpen={};   // cached top-3 candidates + which alternatives are expanded
 function toggleXtfTrade(i){ azXtfOpen[i]=!azXtfOpen[i]; if(azXtfTop){ azXtfHtml=xtfRender(azXtfTop); renderAz(); } }
@@ -2452,7 +2469,8 @@ function xtfTradeBody(b,i){
       <span class="vgrade" data-tip="Plan quality (A+→C), blending reward:risk with how reachable the target is. A+ needs a strong R:R and a ≥55% chance of reaching target.">Grade ${b.gr}</span>
       <span class="xtftf" data-tip="The timeframe whose plan graded highest for this trade — the individual levels below can each come from a different chart.">${tfN} chart</span>
       ${i>0?`<button class="wlbtn xtfexp" onclick="toggleXtfTrade(${i})">${detailed?'− collapse':'+ expand'}</button>`:''}
-      ${b.tf!==azTf?`<button class="wlbtn" onclick="setAzTf('${b.tf}')">View on ${tfN} ↗</button>`:`<span class="xtfcur">— viewing this timeframe</span>`}</div>
+      ${b.tf!==azTf?`<button class="wlbtn" onclick="setAzTf('${b.tf}')">View on ${tfN} ↗</button>`:`<span class="xtfcur">— viewing this timeframe</span>`}
+      <button class="wlbtn xtftrackbtn" onclick="trackXtf(${i},event)" data-tip="Track THIS ${tfN} plan (its entry, stop & TP ladder) in 📌 My calls — scale-out aware, graded in R.">📌 Track</button><span class="trackmsg" id="xtftrackmsg${i}"></span></div>
     <div class="xtfrow">
       <span class="xtfi" data-tip="Entry ${fmtNum(be.level)} — the recommended fill: the best value-area pullback that maximises reward:risk while still being a level price is likely to reach. From the ${eTf} chart. Why: ${esc(be.basis||'best value-area level')}."><i>Entry</i>${fmtNum(be.level)}${chip(eTf)}</span>
       <span class="xtfi" data-tip="Stop ${fmtNum(stop.level)} — the level that invalidates the trade, just beyond real structure and clear of the wick/noise range. From the ${sTf} chart. Why: ${esc(stop.basis||'—')}."><i>Stop</i>${fmtNum(stop.level)}${chip(sTf)}</span>
@@ -2638,15 +2656,28 @@ function planGradeOf(rr,p){ if(rr==null||p==null) return '—';
 // stop to break-even. Default management: bank a first tranche at the nearest solid
 // target and de-risk to break-even (trade can no longer lose), hold the core to the
 // base target, leave a runner for the stretch / breakout target.
+// Adaptive scale-out weights — take MORE off the more-reachable (lower-R) near
+// targets, leave a runner on the far high-R ones. Weight ∝ 1/(1+0.5·R), normalised,
+// so the split reflects THIS setup's target spacing (never a fixed 40/35/25). Matches
+// the backend performance tracker exactly.
+function scaleWeights(rrs){
+  const raw=(rrs||[]).map(r=>1/(1+0.5*Math.max(r||1,0.1)));
+  const tot=raw.reduce((a,b)=>a+b,0)||1;
+  return raw.map(x=>x/tot);
+}
 function scaleOutRows(rtg){
   if(!rtg||!rtg.primary) return [];
   const base=rtg.primary, sec=rtg.secure, str=rtg.stretch;
   const distinct=(a,b)=> a&&b&&Math.abs(a.lvl-b.lvl)/(b.lvl||1)>0.004;
   const hasSec=distinct(sec,base), hasStr=distinct(str,base)&&(!sec||distinct(str,sec));
-  if(hasSec&&hasStr) return [{pct:'40%',t:sec,icon:'🔒',be:true},{pct:'35%',t:base,icon:'⭐'},{pct:'25%',t:str,icon:'🚀',runner:true}];
-  if(hasSec)         return [{pct:'50%',t:sec,icon:'🔒',be:true},{pct:'50%',t:base,icon:'⭐'}];
-  if(hasStr)         return [{pct:'60%',t:base,icon:'⭐',be:true},{pct:'40%',t:str,icon:'🚀',runner:true}];
-  return [{pct:'100%',t:base,icon:'⭐'}];
+  let tgs;
+  if(hasSec&&hasStr) tgs=[{t:sec,icon:'🔒',be:true},{t:base,icon:'⭐'},{t:str,icon:'🚀',runner:true}];
+  else if(hasSec)    tgs=[{t:sec,icon:'🔒',be:true},{t:base,icon:'⭐'}];
+  else if(hasStr)    tgs=[{t:base,icon:'⭐',be:true},{t:str,icon:'🚀',runner:true}];
+  else               tgs=[{t:base,icon:'⭐'}];
+  const w=scaleWeights(tgs.map(x=>x.t&&x.t.rr));
+  tgs.forEach((x,i)=>{ x.pct=Math.round(w[i]*100)+'%'; });
+  return tgs;
 }
 function scaleOutHtml(rtg, entry, compact){
   const rows=scaleOutRows(rtg); if(!rows.length) return '';
@@ -3496,7 +3527,7 @@ function toggleRowPlan(key, ev){ if(ev){ ev.stopPropagation(); }
 // A clean, readable trade-plan panel: entry (with the timeframe + why), stop (with
 // its basis + % risk), a target ladder where every TP shows its %move, R:R and WHICH
 // level/timeframe it's from, and a concrete scale-out plan.
-function planPanelHtml(p, side, cmp){
+function planPanelHtml(p, side, cmp, sym){
   if(!p || p.entry==null) return '<div class="planpanel">No tradeable plan on this side right now.</div>';
   const long = side!=='short';
   const riskPct = Math.abs((p.entry-p.stop)/p.entry*100);
@@ -3521,10 +3552,12 @@ function planPanelHtml(p, side, cmp){
          + `<span class="prr">R ${t.rr!=null?(+t.rr).toFixed(1):'—'}</span>`
          + `<span class="pbasis">${esc(t.basis||'')}</span></div>`;
   }).join('');
-  const nT=(p.tps||[]).length;
-  const scale = nT>=3
-    ? `Sell 40% at TP1 → move stop to break-even (${fmtNum(p.entry)}), 35% at TP2, hold 25% runner to TP3 (trail the stop).`
-    : `Sell 60% at TP1 → stop to break-even, hold the 40% runner to TP2.`;
+  const _pw=scaleWeights((p.tps||[]).map(t=>t.rr)).map(x=>Math.round(x*100)+'%');
+  const scale = _pw.length>=2
+    ? `Sell ${_pw[0]} at TP1 → move stop to break-even (${fmtNum(p.entry)})`
+      + _pw.slice(1).map((pc,i)=>`, ${pc} at TP${i+2}`).join('')
+      + ` (trail the stop up on the runner).`
+    : `Sell 100% at TP1.`;
   const entryLine = p.entry_break!=null
     ? `<b>${fmtNum(p.entry)}</b> <span class="pbasis">limit / retest</span> &nbsp;·&nbsp; <b>${fmtNum(p.entry_break)}</b> <span class="pbasis">break-confirm</span>`
     : `<b>${fmtNum(p.entry)}</b>`;
@@ -3535,6 +3568,7 @@ function planPanelHtml(p, side, cmp){
      <div class="pline"><span class="plab">Stop</span><b>${fmtNum(p.stop)}</b> <span class="pmv risk">${riskPct.toFixed(1)}% risk</span> ${tfChip(p.stop_tf)}<span class="pbasis">${esc(p.stop_basis||'')}</span></div>
      <div class="ptps"><div class="ptpsh">Targets — take profit in stages</div>${tps}</div>
      <div class="pscale">📤 Scale-out: ${scale}</div>
+     ${sym?`<div class="trackrow" style="margin-top:8px"><button class="trackbtn" onclick="trackTrade('${sym}','${side}',${p.entry},${p.stop},'${(p.tps||[]).map(t=>t.lvl).join(',')}','${p.entry_tf||''}','pptrk_${esc(sym)}_${side}',event)" data-tip="Track this exact ${long?'long':'short'} plan in 📌 My calls — scale-out aware, graded in R.">📌 Track this</button><span class="trackmsg" id="pptrk_${esc(sym)}_${side}"></span></div>`:''}
    </div>`;
 }
 function renderBoard(side){
@@ -3573,7 +3607,7 @@ function renderBoard(side){
     tb.appendChild(tr);
     if(open){
       const dr=document.createElement('tr'); dr.className='planrow';
-      dr.innerHTML=`<td colspan="11">${planPanelHtml(h, side, P)}</td>`;
+      dr.innerHTML=`<td colspan="11">${planPanelHtml(h, side, P, h.symbol)}</td>`;
       tb.appendChild(dr);
     }
   }
@@ -3617,8 +3651,8 @@ function renderCoil(){
       const dr=document.createElement('tr'); dr.className='planrow';
       const recFirst = h.rec_side==='short';
       const both = recFirst
-        ? planPanelHtml(h.plan_short,'short',P)+planPanelHtml(h.plan_long,'long',P)
-        : planPanelHtml(h.plan_long,'long',P)+planPanelHtml(h.plan_short,'short',P);
+        ? planPanelHtml(h.plan_short,'short',P,h.symbol)+planPanelHtml(h.plan_long,'long',P,h.symbol)
+        : planPanelHtml(h.plan_long,'long',P,h.symbol)+planPanelHtml(h.plan_short,'short',P,h.symbol);
       const recNote = h.rec_side==='either'
         ? 'Neutral lean — trade whichever way it breaks; both plans shown.'
         : `Recommended side: <b>${h.rec_side==='long'?'LONG ▲':'SHORT ▼'}</b> (matches the coil\\'s lean) — shown first.`;
@@ -3673,7 +3707,7 @@ function renderScalp(){
     tb.appendChild(tr);
     if(open){
       const dr=document.createElement('tr'); dr.className='planrow';
-      dr.innerHTML=`<td colspan="11">${planPanelHtml(h, side, P)}</td>`;
+      dr.innerHTML=`<td colspan="11">${planPanelHtml(h, side, P, h.symbol)}</td>`;
       tb.appendChild(dr);
     }
   }
@@ -3789,9 +3823,11 @@ function coilSetupCell(h, side){
   const tps = p.tps;
   const tpTxt = tps.map((t,i)=> `TP${i+1} ${fmtNum(t.lvl)}${t.rr!=null?` (R ${t.rr.toFixed(1)})`:''}`).join(' · ');
   // Scale-out: bank the first tranche + move stop to break-even, hold to TP2, runner to TP3.
-  const scale = tps.length>=3
-    ? `Scale-out: sell 40% at TP1 → move stop to break-even (${fmtNum(p.entry)}), 35% at TP2, hold 25% runner to TP3 (trail the stop up).`
-    : `Scale-out: sell 60% at TP1 → stop to break-even, hold 40% runner to TP2.`;
+  const _cw=scaleWeights(tps.map(t=>t.rr)).map(x=>Math.round(x*100)+'%');
+  const scale = _cw.length>=2
+    ? `Scale-out: sell ${_cw[0]} at TP1 → move stop to break-even (${fmtNum(p.entry)})`
+      + _cw.slice(1).map((pc,i)=>`, ${pc} at TP${i+2}`).join('') + ` (trail the runner).`
+    : `Scale-out: sell 100% at TP1.`;
   const maxR = p.rr!=null? p.rr : (tps[tps.length-1].rr);
   const tip = `${side==='long'?'LONG break-up':'SHORT break-down'} plan. `
             + `Entries (limit): ${fmtNum(p.entry)} on the ${word} retest`

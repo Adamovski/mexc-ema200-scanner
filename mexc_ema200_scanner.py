@@ -3417,7 +3417,10 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
         notes.append(f"RSI(14) is {r14} ({state}).")
     if rsi_div:
         _di = "✅" if rsi_div["dir"] == "bullish" else "⚠"
-        notes.append(f"{_di} {rsi_div['label']} — {rsi_div['note']}")
+        notes.append(f"{_di} {rsi_div['label']} — {rsi_div['note']} (factored into the directional lean below.)")
+    else:
+        notes.append(f"No RSI divergence between the last two swings on the {interval} — "
+                     f"momentum is confirming price rather than diverging from it.")
     if squeeze_pct is not None and squeeze_pct >= 70:
         notes.append(f"🚀 Volatility squeeze — the Bollinger bands are tighter than {squeeze_pct}% of "
                      f"their recent range on the {interval} (a narrow, coiled range). Compressed markets "
