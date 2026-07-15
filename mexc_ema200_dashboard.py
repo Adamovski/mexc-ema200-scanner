@@ -80,6 +80,11 @@ def send_telegram(cfg: dict, text: str) -> None:
 # the live price feed, from the moment it was flagged. Gives real win-rate + average
 # R per board. Persists to a JSON file, and to Upstash Redis if configured (durable
 # across redeploys): set UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN.
+# The "epoch" the tracker is recording under. Bump this whenever the recommendation
+# logic changes meaningfully — the headline win-rate resets to the new version (a clean
+# slate for the new logic), while every past version's results are kept and shown in the
+# "site version" breakdown so you can compare how each iteration actually performed.
+APP_VERSION = "v2 · quality gate + decorrelation"
 # ----------------------------------------------------------------------------
 class Tracker:
     def __init__(self):
@@ -136,6 +141,12 @@ class Tracker:
                 self.open = d.get("open", {})
                 self.closed = d.get("closed", [])
                 self.cooldowns = d.get("cooldowns", {})
+                # Anything recorded before versioning belongs to the previous epoch —
+                # tag it v1 so the current version's headline starts fresh but the old
+                # results are kept and shown in the site-version breakdown.
+                for t in list(self.open.values()) + self.closed:
+                    if not t.get("ver"):
+                        t["ver"] = "v1 · pre-gate"
             except Exception:
                 pass
 
@@ -158,7 +169,7 @@ class Tracker:
 
     @staticmethod
     def _mk(board, sym, side, entry, stop, tps, px, now, tf="", note="", state="pending",
-            regime=""):
+            regime="", ver=APP_VERSION):
         """Build a two-phase, scale-out-aware trade. Phase 1 = wait for the recommended
         ENTRY to fill (measured fairly from the fill, not from when it was flagged).
         Phase 2 = a full TP ladder with a stop that RATCHETS UP as targets bank (→ break-
@@ -185,7 +196,7 @@ class Tracker:
                 "tps": clean, "weights": w, "phase": 0, "realized": 0.0,
                 "cur_stop": stop, "cur_stop_r": -1.0, "px0": px, "ts": now,
                 "tf": tf, "note": note, "tps_hit": [], "rr": (clean[0]["rr"] if clean else None),
-                "regime": regime,
+                "regime": regime, "ver": ver,
                 "state": state, "fill_up": (entry > px), "filled_ts": (now if state == "active" else None)}
 
     def register(self, board, setups):
@@ -220,6 +231,7 @@ class Tracker:
                         and cd.get("entry") and abs(float(entry) - cd["entry"]) / float(entry) < 0.004:
                     continue
                 self.open[k] = self._mk(board, sym, side, entry, stop, tps, px, now,
+                                        tf=(s.get("tf") or s.get("entry_tf") or ""),
                                         regime=s.get("regime", ""))
                 changed = True
         if changed:
@@ -347,7 +359,10 @@ class Tracker:
 
     def stats(self):
         with self.lock:
-            res = [t for t in self.closed if t.get("status") in ("win", "loss", "be")]
+            res_all = [t for t in self.closed if t.get("status") in ("win", "loss", "be")]
+            # Headline + boards show only the CURRENT version (a clean slate for the new
+            # logic). Past versions are kept and surfaced separately in by_version.
+            res = [t for t in res_all if t.get("ver", "v1 · pre-gate") == APP_VERSION]
 
             def agg(rows):
                 n = len(rows)
@@ -378,35 +393,50 @@ class Tracker:
                         "tp_rates": tp_rates, "allout": allout_exp}
             _cf = ("board", "symbol", "side", "entry", "stop", "tps", "rr", "status",
                    "r", "ts", "closed_ts", "tf", "note", "px0", "tps_hit", "state",
-                   "phase", "filled_ts", "regime")
+                   "phase", "filled_ts", "regime", "ver")
             _pk = lambda t: {c: t.get(c) for c in _cf}
             _active = sum(1 for t in self.open.values() if t.get("state") == "active")
             _pending = sum(1 for t in self.open.values() if t.get("state") == "pending")
             _missed = sum(1 for t in self.closed if t.get("status") == "missed")
             _open_all = list(self.open.values())
+            # Current-version open + closed only, so the board tables reflect the new epoch.
+            _open_cur = [t for t in _open_all if t.get("ver", "v1 · pre-gate") == APP_VERSION]
             _closed_rev = list(reversed(self.closed))
+            _closed_cur = [t for t in _closed_rev if t.get("ver", "v1 · pre-gate") == APP_VERSION]
             # Per-board trade lists so each board row on the Performance tab can EXPAND
             # to show its own open (live + waiting) and resolved setups. Capped per board.
             board_rows = {}
             for b in ("long", "short", "coil", "scalp"):
                 board_rows[b] = {
-                    "open": [_pk(t) for t in _open_all if t.get("board") == b][:60],
-                    "closed": [_pk(t) for t in _closed_rev if t.get("board") == b][:60],
+                    "open": [_pk(t) for t in _open_cur if t.get("board") == b][:60],
+                    "closed": [_pk(t) for t in _closed_cur if t.get("board") == b][:60],
                 }
             # Learning signal: win-rate WITH the market regime vs AGAINST it. If
             # against-regime setups bleed (as they should), this proves it in numbers.
             auto = [t for t in res if t.get("board") in ("long", "short", "coil", "scalp")]
             by_regime = {r: agg([t for t in auto if (t.get("regime") or "neutral") == r])
                          for r in ("with", "against", "neutral")}
-            return {"overall": agg(res),
+            # Per-site-version scoreboard (auto boards only) — compare how each iteration
+            # of the recommendation logic actually performed. Newest version first.
+            _auto_all = [t for t in res_all if t.get("board") in ("long", "short", "coil", "scalp")]
+            _vers, _seen = [], set()
+            for t in reversed(self.closed):
+                v = t.get("ver", "v1 · pre-gate")
+                if v not in _seen:
+                    _seen.add(v); _vers.append(v)
+            by_version = [{"ver": v, "current": v == APP_VERSION,
+                           **agg([t for t in _auto_all if t.get("ver", "v1 · pre-gate") == v])}
+                          for v in _vers]
+            return {"overall": agg(res), "version": APP_VERSION,
                     "by_board": {b: agg([t for t in res if t["board"] == b])
                                  for b in ("long", "short", "coil", "scalp", "call")},
                     "by_regime": by_regime,
+                    "by_version": by_version,
                     "board_rows": board_rows,
                     "open": len(self.open), "active": _active, "pending": _pending,
                     "missed": _missed,
                     "upstash": bool(self._up()),
-                    "recent": [_pk(t) for t in _closed_rev[:80]],
+                    "recent": [_pk(t) for t in _closed_cur[:80]],
                     "calls_open": [_pk(t) for t in _open_all if t.get("board") == "call"],
                     "calls_closed": [_pk(t) for t in _closed_rev
                                      if t.get("board") == "call"][:60]}
@@ -858,10 +888,19 @@ def run_one_scan(state: State) -> None:
 
     def _apply_regime(board, side):
         for d in board:
+            bc = d.get("btc_corr")
+            # A coin decorrelated from BTC trades on its own — BTC's regime doesn't apply,
+            # so we DON'T penalise it (a great setup isn't dismissed just because BTC is soft).
+            decor = bc is not None and abs(bc) < 0.4
             favor = _reg if side == "long" else -_reg   # >0 = regime favours this side
             align = "with" if favor >= 0.20 else ("against" if favor <= -0.20 else "neutral")
-            # Down-rank against-regime setups so fewer reach the top 25; nudge with-regime up.
-            fac = 1.15 if align == "with" else (0.55 if align == "against" else 1.0)
+            if decor:
+                align = "neutral"
+                d["decor"] = True
+                fac = 1.0
+            else:
+                # Down-rank (not exclude) against-regime; nudge with-regime up.
+                fac = 1.15 if align == "with" else (0.85 if align == "against" else 1.0)
             d["regime"] = align
             d["regime_score"] = round(_reg, 3)
             d["score"] = d.get("score", 0) * fac
@@ -890,8 +929,11 @@ def run_one_scan(state: State) -> None:
             if conv < CONV_FLOOR:
                 d["gate"] = "low conviction"
                 continue
-            if reg == "against":
-                d["gate"] = "against regime"
+            # Don't auto-exclude against-regime setups — a strong one can still be worth it,
+            # and decorrelated coins aren't judged by BTC at all. Just ask for MORE
+            # conviction when a correlated coin fights the tape.
+            if reg == "against" and not d.get("decor") and conv < CONV_FLOOR + 12:
+                d["gate"] = "against regime (needs more conviction)"
                 continue
             if side == "long" and pv is not None and pv > 30:
                 d["gate"] = "over-extended"
@@ -914,12 +956,12 @@ def run_one_scan(state: State) -> None:
             rs = d.get("rec_side")
             pl = d.get("plan_long") if rs == "long" else d.get("plan_short") if rs == "short" else None
             rr = (pl or {}).get("rr")
-            reg = _align_for(rs) if rs else "neutral"
-            if not rs or not pl or rr is None or rr < 1.8 or (d.get("score", 0) or 0) < 55:
+            bc = d.get("btc_corr")
+            decor = bc is not None and abs(bc) < 0.4
+            reg = "neutral" if decor else (_align_for(rs) if rs else "neutral")
+            floor = 55 if not (reg == "against") else 68     # ask more of counter-regime coils
+            if not rs or not pl or rr is None or rr < 1.8 or (d.get("score", 0) or 0) < floor:
                 d["gate"] = "no clear coil"
-                continue
-            if reg == "against":
-                d["gate"] = "against regime"
                 continue
             d["gate"] = "pass"
             kept.append(d)
@@ -978,11 +1020,9 @@ def run_one_scan(state: State) -> None:
             rr = d.get("rr")
             rsi = d.get("rsi")
             long = d.get("side") != "short"
-            if rr is None or rr < 1.4 or (d.get("score", 0) or 0) < 55:
+            against = d.get("regime") == "against" and not d.get("decor")
+            if rr is None or rr < 1.4 or (d.get("score", 0) or 0) < (55 if not against else 66):
                 d["gate"] = "weak scalp"
-                continue
-            if d.get("regime") == "against":
-                d["gate"] = "against regime"
                 continue
             if rsi is not None and ((long and rsi > 75) or ((not long) and rsi < 25)):
                 d["gate"] = "RSI exhausted"
@@ -1005,6 +1045,7 @@ def run_one_scan(state: State) -> None:
             _coil_regs.append({"symbol": _d["symbol"], "side": _rs, "entry": _pl["entry"],
                                "stop": _pl["stop"], "tps": _pl.get("tps"),
                                "rr": _pl.get("rr"), "price": _d.get("price"),
+                               "tf": _pl.get("entry_tf") or "4h",
                                "regime": _align_for(_rs) if _rs else "neutral"})
     TRACKER.register("coil", _coil_regs)
 
@@ -2232,6 +2273,11 @@ PAGE = """<!doctype html>
   <table id="perfregtbl"><thead><tr>
       <th>Alignment</th><th>Trades</th><th>Win rate</th><th>Expectancy</th>
     </tr></thead><tbody id="perfregrows"></tbody></table>
+  <div class="perfsub">By site version — how each iteration of the logic performed</div>
+  <div class="histnote">The headline above resets to the <b>current version</b> so each change to the recommendation logic gets a clean scorecard. Every past version's results are kept here so you can see whether each iteration actually improved things.</div>
+  <table id="perfvertbl"><thead><tr>
+      <th>Version</th><th>Trades</th><th>Win rate</th><th>Expectancy</th><th>Total R</th>
+    </tr></thead><tbody id="perfverrows"></tbody></table>
   <div class="perfsub">Recent resolved trades</div>
   <table id="perftrtbl"><thead><tr>
       <th>Closed</th><th>Board</th><th>Symbol</th><th>Side</th>
@@ -4248,7 +4294,7 @@ function renderPerf(){
   const o=(perf&&perf.overall)||{};
   const hasData=(o.n||0)>0;
   if(emp) emp.style.display=hasData?'none':'block';
-  if(meta) meta.textContent=`${(perf&&perf.active)||0} live · ${(perf&&perf.pending)||0} waiting for entry · ${(perf&&perf.missed)||0} missed · ${o.n||0} resolved${perf&&perf.upstash?' · durable storage on':' · in-memory (add Upstash to persist)'}`;
+  if(meta) meta.textContent=`${(perf&&perf.version)?('['+perf.version+'] · '):''}${(perf&&perf.active)||0} live · ${(perf&&perf.pending)||0} waiting for entry · ${(perf&&perf.missed)||0} missed · ${o.n||0} resolved this version${perf&&perf.upstash?' · durable storage on':' · in-memory (add Upstash to persist)'}`;
   const wr=o.winrate, exp=o.exp, tot=o.sumR;
   cards.innerHTML=
      perfCard('Win rate', wr==null?'—':wr+'%', wr==null?'':(wr>=50?'pcg':wr>=40?'':'pcb'))
@@ -4317,6 +4363,21 @@ function renderPerf(){
       regrows.appendChild(tr);
     }
     if(!any) regrows.innerHTML='<tr><td colspan="4" class="rr">No regime-tagged trades resolved yet — this fills in over the next scans.</td></tr>';
+  }
+  const verrows=document.getElementById('perfverrows');
+  if(verrows){ verrows.innerHTML='';
+    const vers=(perf&&perf.by_version)||[];
+    for(const a of vers){
+      const wcls=a.winrate==null?'':(a.winrate>=50?'pf-good':a.winrate>=40?'':'pf-bad');
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td>${a.current?'★ ':''}${a.ver}${a.current?' <span class="rr">(current)</span>':''}</td>`
+        +`<td>${a.n||0}</td>`
+        +`<td class="${wcls}">${a.winrate==null?'—':a.winrate+'%'}</td>`
+        +`<td class="${a.exp>0?'pf-good':a.exp<0?'pf-bad':''}">${a.exp==null?'—':(a.exp>0?'+':'')+a.exp+'R'}</td>`
+        +`<td class="${a.sumR>0?'pf-good':a.sumR<0?'pf-bad':''}">${a.sumR==null?'—':(a.sumR>0?'+':'')+a.sumR+'R'}</td>`;
+      verrows.appendChild(tr);
+    }
+    if(!vers.length) verrows.innerHTML='<tr><td colspan="5" class="rr">No resolved trades yet.</td></tr>';
   }
   if(trrows){ trrows.innerHTML='';
     for(const t of ((perf&&perf.recent)||[])){

@@ -3183,9 +3183,15 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
     long_setup, short_setup = leaderboard_setups(
         symbol, highs, lows, closes, vols, _ema_now, _tfb, _bias, _ms,
         ksup, kres, rv, _dets)
+    # Attach BTC correlation so the boards can tell a coin that just follows BTC from one
+    # trading on its own — a decorrelated coin's setup shouldn't be judged by BTC's regime.
+    _bc = round(_corr, 2) if _corr is not None else None
+    long_setup["btc_corr"] = short_setup["btc_corr"] = _bc
     coil_setup = squeeze_setup(symbol, highs, lows, closes, _tfb, _bias,
                                (round(atr(highs, lows, closes) / closes[-1] * 100, 2)
                                 if closes[-1] else None), ksup, kres)
+    if coil_setup:
+        coil_setup["btc_corr"] = _bc
     if _stale:
         long_setup["data_stale"] = short_setup["data_stale"] = True
         if coil_setup:
