@@ -51,7 +51,7 @@ try:
         list_symbols, scan_symbol_multi, get_session, EMA_PERIOD,
         analyze_symbol, normalize_symbol, fetch_candles, pct_returns, CORR_WINDOW,
         bias_on_tf, enrich_1h, best_pattern, coil_tfs_finer, scalp_setup,
-        compute_market_context,
+        compute_market_context, fetch_deriv_series,
     )
 except ImportError:
     sys.exit("Could not import mexc_ema200_scanner.py — keep both files in the "
@@ -373,6 +373,173 @@ class Tracker:
 
 
 TRACKER = Tracker()
+
+
+# Coins whose derivatives (OI / funding / price) we keep a rolling history for.
+# Small, liquid set so the per-scan Coinalyze cost stays bounded (~4 calls each).
+HIST_COINS = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK"]
+
+
+class History:
+    """Rolling historical context for Apex so it can reason about how things CHANGE
+    over time, not just the current snapshot. Four series, all persisted to Upstash
+    (durable across deploys) with a local-file fallback:
+
+      • market   — the Market-tab read each scan (BTC score/verdict, day/week scores,
+                    alt breadth %). Lets us see regime flips ('BTC turned bullish',
+                    'breadth improving vs a week ago').
+      • boards   — how many setups each board produced each scan (activity over time).
+      • signals  — the top long/short leaders each scan (which coins keep ranking).
+      • coins    — per-coin OI / funding / price time-series (from Coinalyze), backloaded
+                   with ~7 days of history on first run, appended every scan after.
+    """
+
+    MAXP = 3000      # market/boards points (~20 days at 10-min scans)
+    MAXSIG = 600     # signal snapshots
+    MAXCP = 500      # per-coin series points
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.market: list[dict] = []
+        self.boards: list[dict] = []
+        self.signals: list[dict] = []
+        self.coins: dict[str, dict] = {}   # sym -> {"oi":[[t,c]],"funding":[[t,c]],"price":[[t,c]]}
+        self._coins_backloaded = False
+        try:
+            self.path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "apex_hist.json")
+        except Exception:
+            self.path = "apex_hist.json"
+        self._load()
+
+    def _up(self):
+        u = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip()
+        t = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
+        return (u, t) if (u and t) else None
+
+    def _load(self):
+        raw = None
+        up = self._up()
+        if up:
+            try:
+                import requests
+                r = requests.post(up[0], json=["GET", "apex_hist"],
+                                  headers={"Authorization": f"Bearer {up[1]}"}, timeout=8)
+                if r.status_code == 200:
+                    raw = r.json().get("result")
+            except Exception:
+                raw = None
+        if raw is None:
+            try:
+                with open(self.path) as f:
+                    raw = f.read()
+            except Exception:
+                raw = None
+        if raw:
+            try:
+                d = json.loads(raw)
+                self.market = d.get("market", [])
+                self.boards = d.get("boards", [])
+                self.signals = d.get("signals", [])
+                self.coins = d.get("coins", {})
+                self._coins_backloaded = bool(self.coins)
+            except Exception:
+                pass
+
+    def _save(self):
+        blob = json.dumps({"market": self.market[-self.MAXP:],
+                           "boards": self.boards[-self.MAXP:],
+                           "signals": self.signals[-self.MAXSIG:],
+                           "coins": self.coins})
+        try:
+            with open(self.path, "w") as f:
+                f.write(blob)
+        except Exception:
+            pass
+        up = self._up()
+        if up:
+            try:
+                import requests
+                requests.post(up[0], json=["SET", "apex_hist", blob],
+                              headers={"Authorization": f"Bearer {up[1]}"}, timeout=8)
+            except Exception:
+                pass
+
+    def record_scan(self, market_context, boards_summary, signals):
+        """Append one point to the market/boards/signals series from a finished scan."""
+        now = int(time.time())
+        with self.lock:
+            mc = market_context or {}
+            btc = mc.get("btc") or {}
+            alts = mc.get("alts") or {}
+            day = mc.get("day") or {}
+            week = mc.get("week") or {}
+            self.market.append({
+                "t": now,
+                "btc": btc.get("score"), "btc_v": btc.get("verdict"),
+                "btc_px": btc.get("price"),
+                "day": (day.get("score")), "day_longs": day.get("longs"),
+                "week": (week.get("score")), "week_longs": week.get("longs"),
+                "alt_above": alts.get("pct_above_200ema"), "alt_v": alts.get("verdict"),
+                "alt_chg": alts.get("avg_chg"),
+            })
+            self.boards.append({"t": now, **(boards_summary or {})})
+            if signals:
+                self.signals.append({"t": now, **signals})
+            self.market = self.market[-self.MAXP:]
+            self.boards = self.boards[-self.MAXP:]
+            self.signals = self.signals[-self.MAXSIG:]
+            self._save()
+
+    def update_coins(self, fetch_series):
+        """Refresh the per-coin OI/funding/price series. On first run backloads ~7 days
+        of hourly history from Coinalyze; afterwards merges only the newest points.
+        `fetch_series(display_symbol, bars)` is injected (scanner.fetch_deriv_series)."""
+        bars = 168 if not self._coins_backloaded else 6
+        got = {}
+        for sym in HIST_COINS:
+            try:
+                s = fetch_series(sym, bars)
+            except Exception:
+                s = None
+            if s:
+                got[sym] = s
+        if not got:
+            return
+        with self.lock:
+            for sym, s in got.items():
+                cur = self.coins.setdefault(sym, {"oi": [], "funding": [], "price": []})
+                for key in ("oi", "funding", "price"):
+                    merged = {int(t): c for t, c in cur.get(key, [])}
+                    for t, c in s.get(key, []):
+                        merged[int(t)] = c
+                    cur[key] = [[t, merged[t]] for t in sorted(merged)][-self.MAXCP:]
+            self._coins_backloaded = True
+            self._save()
+
+    def payload(self):
+        with self.lock:
+            # Compact per-coin summary + full series (series capped already).
+            coins = {}
+            for sym, s in self.coins.items():
+                oi, fr, px = s.get("oi", []), s.get("funding", []), s.get("price", [])
+                summ = {}
+                if len(oi) >= 2 and oi[0][1]:
+                    summ["oi_now"] = oi[-1][1]
+                    summ["oi_chg_7d"] = round((oi[-1][1] / oi[0][1] - 1) * 100, 1)
+                if fr:
+                    summ["funding"] = fr[-1][1]
+                if len(px) >= 2 and px[0][1]:
+                    summ["price"] = px[-1][1]
+                    summ["price_chg_7d"] = round((px[-1][1] / px[0][1] - 1) * 100, 1)
+                coins[sym] = {"summary": summ, "oi": oi, "funding": fr, "price": px}
+            return {"market": self.market[-800:], "boards": self.boards[-800:],
+                    "signals": self.signals[-120:], "coins": coins,
+                    "upstash": bool(self._up()),
+                    "span": [self.market[0]["t"], self.market[-1]["t"]] if self.market else None}
+
+
+HISTORY = History()
 
 
 # ----------------------------------------------------------------------------
@@ -770,6 +937,28 @@ def run_one_scan(state: State) -> None:
         send_telegram(cfg, f"⭐ <b>{s}</b> confluence — now on {len(labels)} "
                            f"scans: {', '.join(labels)}")
 
+    # ---- Historical context: snapshot this scan into the durable time-series ----
+    try:
+        boards_summary = {
+            "n_long": len(long_board), "n_short": len(short_board),
+            "n_coil": len(coil_board), "n_scalp": len(scalp_board),
+            "n_hits": len(hits), "n_flags": len(flags), "n_early": len(earlies),
+            "universe": len(symbols), "n_conf": len(both),
+        }
+        def _top(board, k=8):
+            return [{"s": d["symbol"], "sc": round(d.get("score", 0), 1)}
+                    for d in board[:k]]
+        signals = {"longs": _top(long_board), "shorts": _top(short_board),
+                   "coils": _top(coil_board)}
+        HISTORY.record_scan(state.market_context, boards_summary, signals)
+    except Exception:
+        pass
+    # Per-coin OI/funding/price history (Coinalyze) — backloads on first run.
+    try:
+        HISTORY.update_coins(fetch_deriv_series)
+    except Exception:
+        pass
+
 
 def scan_loop(state: State) -> None:
     every = state.cfg["scan_every"] * 60
@@ -1163,6 +1352,13 @@ PAGE = """<!doctype html>
   #mcbtctbl td,#mcalttbl td{padding:5px 10px;border-bottom:1px solid rgba(139,152,173,.08);font-variant-numeric:tabular-nums}
   #mcbtctbl th,#mcalttbl th{text-align:left;color:var(--dim2);font-size:10px;text-transform:uppercase;letter-spacing:.04em;padding:4px 10px;border-bottom:1px solid var(--line);cursor:help}
   #mcalttbl td.sym a{color:var(--accent);text-decoration:none}
+  .histsvg{width:100%;height:190px;display:block;margin:2px 0 10px;background:rgba(139,152,173,.04);border:1px solid var(--line);border-radius:10px}
+  .histsvg .hz{stroke:var(--dim2);stroke-width:1;stroke-dasharray:3 3;opacity:.6}
+  .histsvg .hg{stroke:var(--line);stroke-width:1}
+  .histsvg .hax{fill:var(--dim);font-size:9px}
+  .histleg{display:flex;gap:16px;margin:4px 0 2px;font-size:11px;color:var(--dim)}
+  .hleg i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:middle}
+  .spark{width:90px;height:22px;vertical-align:middle}
   .tprcell{white-space:normal}
   .tpr{display:inline-block;border-radius:5px;padding:1px 7px;font-size:11px;font-weight:700;margin:2px 4px 2px 0;border:1px solid var(--line);font-variant-numeric:tabular-nums;cursor:help}
   .tpr-hi{background:rgba(63,185,80,.18);color:var(--accent);border-color:rgba(63,185,80,.5)}
@@ -1396,6 +1592,7 @@ PAGE = """<!doctype html>
 <div class="banner" id="banner"></div>
 <div class="tabs">
   <div class="tab" id="tabMarket" onclick="showTab('market')">🧭 Market</div>
+  <div class="tab" id="tabHistory" onclick="showTab('history')">🕘 History</div>
   <div class="tab" id="tabAnalyze" onclick="showTab('analyze')">🔎 Analyze a coin</div>
   <div class="tab active" id="tabBestLong" onclick="showTab('bestlong')">🏆 Best longs</div>
   <div class="tab" id="tabBestShort" onclick="showTab('bestshort')">🩸 Best shorts</div>
@@ -1784,6 +1981,17 @@ PAGE = """<!doctype html>
 <div class="wrap">
   <div id="marketBody"></div>
   <div class="empty" id="marketempty" style="display:none">Market read is being computed on the next scan — check back in a moment.</div>
+</div>
+</div>
+
+<div class="view" id="viewHistory">
+<div class="status">
+  <span>🕘 History — Apex's own <b>memory</b>. Every scan it records the market regime (BTC + alt breadth), how busy each board was, which coins kept topping the leaderboards, and the <b>open-interest / funding / price</b> path of the majors (from Coinalyze). This is the historical context it reasons from — 'breadth improving vs a week ago', 'OI building into this level', 'BTC flipped bullish two days ago'.</span>
+  <span id="histMeta"></span>
+</div>
+<div class="wrap">
+  <div id="histBody"></div>
+  <div class="empty" id="histempty" style="display:none">No history yet — Apex starts recording on its first completed scan. Check back after a scan or two. (Add the Upstash keys in Render → Environment to keep history across restarts.)</div>
 </div>
 </div>
 
@@ -2432,11 +2640,12 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["market","Market"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["coil","Coil"],["scalp","Scalp"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["coil","Coil"],["scalp","Scalp"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
   if(which==="market") renderMarket();
+  if(which==="history") loadHistory();
   if(which==="bestlong") renderBestLong();
   if(which==="bestshort") renderBestShort();
   if(which==="coil") renderCoil();
@@ -3997,6 +4206,121 @@ function mcBar(score){ // score -1..+1 -> a left/right gauge
   return `<div class="mcgauge" data-tip="Aggregate BTC trend score across timeframes (−1 fully bearish → +1 fully bullish)."><div class="mcgauge-fill" style="width:${pct}%;background:${c}"></div><div class="mcgauge-mid"></div></div>`;
 }
 function mcStat(lab,val,cls){ return `<div class="mc-stat"><div class="mc-stat-v ${cls||''}">${val}</div><div class="mc-stat-l">${lab}</div></div>`; }
+
+// ---- History tab ----
+let histData=null, histLastFetch=0;
+async function loadHistory(){
+  const now=Date.now();
+  if(histData && now-histLastFetch<20000){ renderHistory(); return; }
+  try{ const r=await fetch('/history',{cache:'no-store'}); histData=await r.json(); histLastFetch=now; }
+  catch(e){ /* keep old */ }
+  renderHistory();
+}
+// Minimal inline multi-line SVG chart. series=[{name,color,pts:[[t,v]],min,max}], shared x.
+function svgChart(series, opt){
+  opt=opt||{}; const W=opt.w||860, H=opt.h||190, padL=38, padR=12, padT=12, padB=22;
+  const all=[].concat(...series.map(s=>s.pts));
+  if(!all.length) return '<div class="bt-empty">No data yet.</div>';
+  const xs=all.map(p=>p[0]); const xmin=Math.min(...xs), xmax=Math.max(...xs)||xmin+1;
+  const ymin=opt.ymin!=null?opt.ymin:Math.min(...all.map(p=>p[1]));
+  const ymax=opt.ymax!=null?opt.ymax:Math.max(...all.map(p=>p[1]));
+  const yr=(ymax-ymin)||1;
+  const X=t=>padL+(xmax===xmin?0:(t-xmin)/(xmax-xmin))*(W-padL-padR);
+  const Y=v=>padT+(1-(v-ymin)/yr)*(H-padT-padB);
+  let g=`<svg viewBox="0 0 ${W} ${H}" class="histsvg" preserveAspectRatio="none">`;
+  // zero line if range crosses 0
+  if(ymin<0&&ymax>0){ const zy=Y(0); g+=`<line x1="${padL}" y1="${zy}" x2="${W-padR}" y2="${zy}" class="hz"/>`; }
+  // gridlines top/bottom
+  g+=`<line x1="${padL}" y1="${Y(ymax)}" x2="${W-padR}" y2="${Y(ymax)}" class="hg"/>`;
+  g+=`<line x1="${padL}" y1="${Y(ymin)}" x2="${W-padR}" y2="${Y(ymin)}" class="hg"/>`;
+  g+=`<text x="2" y="${Y(ymax)+4}" class="hax">${opt.fmtY?opt.fmtY(ymax):ymax.toFixed(1)}</text>`;
+  g+=`<text x="2" y="${Y(ymin)+4}" class="hax">${opt.fmtY?opt.fmtY(ymin):ymin.toFixed(1)}</text>`;
+  for(const s of series){
+    if(!s.pts.length) continue;
+    const d=s.pts.map((p,i)=>`${i?'L':'M'}${X(p[0]).toFixed(1)} ${Y(p[1]).toFixed(1)}`).join(' ');
+    g+=`<path d="${d}" fill="none" stroke="${s.color}" stroke-width="1.8"/>`;
+  }
+  // x labels: first + last date
+  const df=t=>new Date(t*1000).toLocaleDateString(undefined,{month:'short',day:'numeric'});
+  g+=`<text x="${padL}" y="${H-6}" class="hax">${df(xmin)}</text>`;
+  g+=`<text x="${W-padR}" y="${H-6}" class="hax" text-anchor="end">${df(xmax)}</text>`;
+  g+='</svg>';
+  const leg=series.map(s=>`<span class="hleg"><i style="background:${s.color}"></i>${s.name}</span>`).join('');
+  return `<div class="histleg">${leg}</div>${g}`;
+}
+function renderHistory(){
+  const body=document.getElementById('histBody'); if(!body) return;
+  const h=histData; const emp=document.getElementById('histempty'); const meta=document.getElementById('histMeta');
+  if(!h||!((h.market||[]).length)){ if(emp) emp.style.display='block'; body.innerHTML=''; if(meta) meta.textContent=''; return; }
+  if(emp) emp.style.display='none';
+  const mkt=h.market||[];
+  if(meta){ const span=h.span; meta.textContent=(mkt.length+' snapshots'+(span?' · since '+new Date(span[0]*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit'}):'')+(h.upstash?' · durable':' · in-memory (add Upstash)')); }
+  let out='';
+  // 1) Regime chart: BTC trend score + alt breadth (mapped to -1..1)
+  const btcPts=mkt.filter(p=>p.btc!=null).map(p=>[p.t,p.btc]);
+  const brdPts=mkt.filter(p=>p.alt_above!=null).map(p=>[p.t,(p.alt_above-50)/50]);
+  out+=`<div class="perfsub">Market regime over time — trend & breadth</div>`;
+  out+=svgChart([{name:'BTC trend',color:'#3fb950',pts:btcPts},{name:'Alt breadth',color:'#58a6ff',pts:brdPts}],
+                {ymin:-1,ymax:1,fmtY:v=>v>0?'+'+v.toFixed(1):v.toFixed(1)});
+  // BTC price chart
+  const pxPts=mkt.filter(p=>p.btc_px!=null).map(p=>[p.t,p.btc_px]);
+  if(pxPts.length>1){ out+=`<div class="perfsub">BTC price</div>`+svgChart([{name:'BTC',color:'#f0b429',pts:pxPts}],{fmtY:v=>fmtNum(v)}); }
+  // 2) Recent snapshots table (verdict flips)
+  out+=`<div class="perfsub">Recent market snapshots</div>`;
+  out+=`<table class="bt"><thead><tr><th>When</th><th>BTC</th><th>Day → longs</th><th>Week → longs</th><th>Alt breadth</th><th>Alts 24h</th></tr></thead><tbody>`;
+  const vpill=v=>`<span class="${mcVerdictClass(v)}">${(v||'—')}</span>`;
+  for(const p of mkt.slice().reverse().slice(0,24)){
+    const when=new Date(p.t*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+    out+=`<tr><td class="dim">${when}</td><td>${vpill(p.btc_v)} <span class="rr">${signed(p.btc!=null?+p.btc.toFixed(2):null,'')}</span></td>`
+      +`<td class="${mcVerdictClass(p.day_longs)}">${(p.day_longs||'—').toUpperCase()}</td>`
+      +`<td class="${mcVerdictClass(p.week_longs)}">${(p.week_longs||'—').toUpperCase()}</td>`
+      +`<td>${p.alt_above!=null?p.alt_above+'%':'—'} ${vpill(p.alt_v)}</td>`
+      +`<td class="${(p.alt_chg||0)>=0?'pf-good':'pf-bad'}">${signed(p.alt_chg,'%')}</td></tr>`;
+  }
+  out+=`</tbody></table>`;
+  // 3) Signal leaders — how often each coin topped the boards
+  const sigs=h.signals||[];
+  if(sigs.length){
+    const tally={};
+    for(const s of sigs){ for(const side of ['longs','shorts','coils']){ for(const it of (s[side]||[])){
+      const k=it.s; tally[k]=tally[k]||{s:k,long:0,short:0,coil:0}; tally[k][side.slice(0,-1)]++; } } }
+    const lead=Object.values(tally).map(x=>({...x,tot:x.long+x.short+x.coil})).sort((a,b)=>b.tot-a.tot).slice(0,14);
+    out+=`<div class="perfsub">Signal leaders — most-frequently top-ranked (last ${sigs.length} scans)</div>`;
+    out+=`<table class="bt"><thead><tr><th>Coin</th><th># times as top long</th><th># as top short</th><th># as top coil</th></tr></thead><tbody>`;
+    for(const x of lead){ out+=`<tr><td class="sym"><a href="${tvLink(x.s)}" target="_blank" rel="noopener">${dispSym(x.s)}</a></td>`
+      +`<td class="pf-good">${x.long||'—'}</td><td class="pf-bad">${x.short||'—'}</td><td>${x.coil||'—'}</td></tr>`; }
+    out+=`</tbody></table>`;
+  }
+  // 4) Per-coin derivatives history (Coinalyze)
+  const coins=h.coins||{};
+  const cks=Object.keys(coins);
+  out+=`<div class="perfsub">Open interest, funding & price — majors (from Coinalyze)</div>`;
+  if(!cks.length){
+    out+=`<div class="bt-empty">No derivatives history yet. This lights up once <b>COINALYZE_API_KEY</b> is set in Render → Environment — then Apex backloads ~7 days of OI/funding and keeps appending.</div>`;
+  } else {
+    out+=`<table class="bt"><thead><tr><th>Coin</th><th>OI now</th><th>OI 7d</th><th>Funding</th><th>Price</th><th>Price 7d</th><th>OI trend</th></tr></thead><tbody>`;
+    for(const k of cks){
+      const c=coins[k], s=c.summary||{};
+      const spark=(c.oi||[]).length>2?svgSpark(c.oi.map(p=>p[1]),'#58a6ff'):'—';
+      out+=`<tr><td class="sym"><a href="${tvLink(k+'USDT')}" target="_blank" rel="noopener">${k}</a></td>`
+        +`<td>${s.oi_now!=null?fmtNum(s.oi_now):'—'}</td>`
+        +`<td class="${(s.oi_chg_7d||0)>=0?'pf-good':'pf-bad'}">${signed(s.oi_chg_7d,'%')}</td>`
+        +`<td class="${(s.funding||0)>=0?'pf-good':'pf-bad'}">${s.funding!=null?(s.funding*100).toFixed(3)+'%':'—'}</td>`
+        +`<td>${s.price!=null?fmtNum(s.price):'—'}</td>`
+        +`<td class="${(s.price_chg_7d||0)>=0?'pf-good':'pf-bad'}">${signed(s.price_chg_7d,'%')}</td>`
+        +`<td>${spark}</td></tr>`;
+    }
+    out+=`</tbody></table>`;
+  }
+  body.innerHTML=out;
+}
+// Tiny sparkline for a value array.
+function svgSpark(vals,color){
+  const W=90,H=22,pad=2; const mn=Math.min(...vals),mx=Math.max(...vals),r=(mx-mn)||1;
+  const X=i=>pad+i/(vals.length-1)*(W-2*pad), Y=v=>pad+(1-(v-mn)/r)*(H-2*pad);
+  const d=vals.map((v,i)=>`${i?'L':'M'}${X(i).toFixed(1)} ${Y(v).toFixed(1)}`).join(' ');
+  return `<svg viewBox="0 0 ${W} ${H}" class="spark"><path d="${d}" fill="none" stroke="${color}" stroke-width="1.4"/></svg>`;
+}
 const perfOpenBoards=new Set();
 // Expanded per-board trade lists: waiting-for-entry + live (open), then resolved.
 function boardTradesHtml(bd){
@@ -4130,6 +4454,7 @@ async function poll(){
     slatest=d.short_hits||[]; renderShorts();
     renderBestLong(); renderBestShort(); renderCoil(); renderScalp(); renderPerf(); renderCalls();
     renderMarket(); renderWatch();
+    if(activeTab==="history") loadHistory();
     { const wc=document.getElementById("tabWatch"); if(wc) wc.textContent=`📌 Watchlist${WATCH.size?' ('+WATCH.size+')':''}`; }
     const evs=(d.breakout_events||[]).filter(e=>e.time>seenBreak);
     if(evs.length){ seenBreak=Math.max(seenBreak, ...evs.map(e=>e.time)); if(alertsOn) fireBreakout(evs); }
@@ -4462,6 +4787,9 @@ def make_handler(state: State):
         def do_GET(self):
             if self.path.startswith("/data"):
                 body = json.dumps(state.snapshot()).encode()
+                self._send(200, body, "application/json")
+            elif self.path.startswith("/history"):
+                body = json.dumps(HISTORY.payload()).encode()
                 self._send(200, body, "application/json")
             elif self.path.startswith("/track"):
                 self._track()

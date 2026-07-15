@@ -2264,6 +2264,44 @@ def fetch_derivatives(display_symbol: str, bars: int = 24) -> dict | None:
     return out if len(out) > 1 else None
 
 
+def fetch_deriv_series(display_symbol: str, bars: int = 168) -> dict | None:
+    """Raw derivatives TIME-SERIES for one coin from Coinalyze — hourly open
+    interest, funding rate and price over the last `bars` hours. Used by the
+    History store to backload real historical context on startup and append the
+    newest points thereafter. Returns {'oi':[[t,c],…],'funding':[[t,c],…],
+    'price':[[t,c],…]} (epoch-seconds timestamps) or None without a key/match."""
+    if not COINALYZE_KEY:
+        return None
+    sym = cx_symbol_for(display_symbol)
+    if not sym:
+        return None
+    now = int(time.time())
+    frm = now - (bars + 2) * 3600
+
+    def hist(path):
+        d = _cx_get(path, {"symbols": sym, "interval": "1hour", "from": frm, "to": now})
+        if isinstance(d, list) and d and isinstance(d[0].get("history"), list):
+            return d[0]["history"]
+        return None
+
+    oi = hist("/open-interest-history") or []
+    fr = hist("/funding-rate-history") or []
+    px = hist("/ohlcv-history") or []
+
+    def pairs(rows):
+        out = []
+        for x in rows:
+            t, c = x.get("t"), x.get("c")
+            if t is not None and c is not None:
+                out.append([int(t), float(c)])
+        return out
+
+    o, f, p = pairs(oi), pairs(fr), pairs(px)
+    if not (o or f or p):
+        return None
+    return {"oi": o, "funding": f, "price": p}
+
+
 def fetch_open_interest(sess: requests.Session, symbol: str) -> dict | None:
     """Current open interest for a MEXC perp from the contract ticker.
     Returns {oi, price, oi_usd, chg24} — oi is holdVol (contracts), oi_usd an
