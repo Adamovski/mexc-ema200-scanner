@@ -2602,100 +2602,101 @@ def coil_tfs_finer(sess: requests.Session, symbol: str, market: str) -> dict:
 
 
 def scalp_setup(sess, symbol, market, side, htf_conv, htf_tf_bias):
-    """A LOWER-timeframe (15m) scalp aligned WITH the higher-timeframe direction:
-    a tight entry near a 15m swing level, a tight stop just beyond it, quick 15m
-    target ladder, high R:R. Higher-timeframe trend gives the DIRECTION (only long
-    scalps on an HTF-bullish coin, short on bearish); the 15m gives the precise,
-    tight setup. Second-pass fetch (15m + 5m for context) — top HTF candidates only."""
-    r15 = fetch_candles(sess, symbol, "15m", 400, market)
-    if not r15 or len(r15) < 60:
+    """A MULTI-TIMEFRAME scalp: the higher timeframes set the DIRECTION, and the lower
+    timeframes give the trigger — the 5m provides the precise, TIGHT entry/stop, the
+    15m the structure and the bigger targets. Only taken WITH the higher-timeframe
+    trend, and only when 5m + 15m agree with it. Second-pass fetch (5m + 15m)."""
+    def _series(iv, lim):
+        rr = fetch_candles(sess, symbol, iv, lim, market)
+        if not rr or len(rr) < 40:
+            return None
+        rws = rr[:-1]
+        try:
+            return ([float(x[2]) for x in rws], [float(x[3]) for x in rws],
+                    [float(x[4]) for x in rws], [float(x[5]) for x in rws])
+        except (ValueError, IndexError):
+            return None
+    s5 = _series("5m", 500)
+    s15 = _series("15m", 400)
+    if not s5 and not s15:
         return None
-    rows = r15[:-1]
-    try:
-        H = [float(x[2]) for x in rows]
-        L = [float(x[3]) for x in rows]
-        C = [float(x[4]) for x in rows]
-        Vv = [float(x[5]) for x in rows]
-    except (ValueError, IndexError):
-        return None
+    # Entry timeframe = 5m if we have it (tightest), else fall back to 15m.
+    (H, L, C, Vv), etf = (s5, "5m") if s5 else (s15, "15m")
     price = C[-1]
     if not price:
         return None
     a = atr(H, L, C)
     atrp = round(a / price * 100, 2)
-    ms15 = market_structure(H, L, C)
+    ms_e = market_structure(H, L, C)
     r14 = rsi(C)
     rvv = rel_volume(Vv)
     last = len(L) - 1
-    sups = [s for s in supports_below(L, last, price, max_n=4, min_gap=0.003) if s < price]
-    ress = [r for r in resistances_above(H, last, price, max_n=4, min_gap=0.003) if r > price]
 
-    # 5m bias for extra low-timeframe context (cheap second fetch)
-    def _bias5():
-        rr = fetch_candles(sess, symbol, "5m", 300, market)
-        if not rr or len(rr) < 30:
+    def _bias_of(s):
+        if not s:
             return None
-        rws = rr[:-1]
-        try:
-            m = market_structure([float(x[2]) for x in rws],
-                                 [float(x[3]) for x in rws],
-                                 [float(x[4]) for x in rws])
-        except (ValueError, IndexError):
-            return None
+        m = market_structure(s[0], s[1], s[2])
         return ("bullish" if m["structure"] == "uptrend" or m["choch"] == "bullish"
                 else "bearish" if m["structure"] == "downtrend" or m["choch"] == "bearish"
                 else "neutral")
-    bias5 = _bias5()
-    bias15 = ("bullish" if ms15["structure"] == "uptrend" or ms15["choch"] == "bullish"
-              else "bearish" if ms15["structure"] == "downtrend" or ms15["choch"] == "bearish"
-              else "neutral")
-
+    bias5, bias15 = _bias_of(s5), _bias_of(s15)
     long = side == "long"
+
+    # Fine-TF swing levels for the tight entry/stop; blend in 15m levels for targets.
+    fine_sup = [x for x in supports_below(L, last, price, max_n=4, min_gap=0.002) if x < price]
+    fine_res = [x for x in resistances_above(H, last, price, max_n=4, min_gap=0.002) if x > price]
+    cand_up = [(x, etf) for x in fine_res]
+    cand_dn = [(x, etf) for x in fine_sup]
+    if s15 and etf != "15m":
+        l15 = len(s15[1]) - 1
+        cand_up += [(x, "15m") for x in resistances_above(s15[0], l15, price, max_n=3, min_gap=0.003) if x > price]
+        cand_dn += [(x, "15m") for x in supports_below(s15[1], l15, price, max_n=3, min_gap=0.003) if x < price]
+
     if long:
-        near = sups[0] if sups else price * (1 - 0.006)
-        entry = near if (price - near) / price <= 0.01 else price
-        entry_basis = ("15m swing-low support — buy the dip" if (price - near) / price <= 0.01
-                       else "current price (15m momentum entry)")
-        below = sups[1] if len(sups) > 1 else near * 0.997
-        stop = min(below - 0.3 * a, entry - 0.4 * a)
-        stop_basis = "just below the next 15m swing low (tight)"
+        near = fine_sup[0] if fine_sup else price * (1 - 0.004)
+        entry = near if (price - near) / price <= 0.008 else price
+        entry_basis = (f"{etf} swing-low support — buy the dip" if (price - near) / price <= 0.008
+                       else f"current price ({etf} momentum entry)")
+        below = fine_sup[1] if len(fine_sup) > 1 else near * 0.998
+        stop = min(below - 0.3 * a, entry - 0.35 * a)
+        stop_basis = f"just below the next {etf} swing low (tight)"
         risk = entry - stop
         if risk <= 0:
             return None
+        outs = sorted({round(x, 10): tf for x, tf in cand_up if x > entry * 1.0015}.items())
         tps = []
-        for r in ress:
-            if r > entry * 1.002 and (not tps or r > tps[-1]["lvl"] * 1.002):
-                tps.append({"lvl": round(r, 10), "rr": round((r - entry) / risk, 2),
-                            "basis": "15m swing-high resistance"})
+        for lvl, tf in outs:
+            if not tps or lvl > tps[-1]["lvl"] * 1.0015:
+                tps.append({"lvl": lvl, "rr": round((lvl - entry) / risk, 2),
+                            "basis": f"{tf} swing-high resistance"})
             if len(tps) >= 3:
                 break
         k = 2
         while len(tps) < 2:
-            tps.append({"lvl": round(entry + k * risk, 10), "rr": float(k),
-                        "basis": f"{k}R measured move"})
+            tps.append({"lvl": round(entry + k * risk, 10), "rr": float(k), "basis": f"{k}R measured move"})
             k += 1
     else:
-        near = ress[0] if ress else price * (1 + 0.006)
-        entry = near if (near - price) / price <= 0.01 else price
-        entry_basis = ("15m swing-high resistance — sell the rip" if (near - price) / price <= 0.01
-                       else "current price (15m momentum entry)")
-        above = ress[1] if len(ress) > 1 else near * 1.003
-        stop = max(above + 0.3 * a, entry + 0.4 * a)
-        stop_basis = "just above the next 15m swing high (tight)"
+        near = fine_res[0] if fine_res else price * (1 + 0.004)
+        entry = near if (near - price) / price <= 0.008 else price
+        entry_basis = (f"{etf} swing-high resistance — sell the rip" if (near - price) / price <= 0.008
+                       else f"current price ({etf} momentum entry)")
+        above = fine_res[1] if len(fine_res) > 1 else near * 1.002
+        stop = max(above + 0.3 * a, entry + 0.35 * a)
+        stop_basis = f"just above the next {etf} swing high (tight)"
         risk = stop - entry
         if risk <= 0:
             return None
+        outs = sorted({round(x, 10): tf for x, tf in cand_dn if x < entry * 0.9985}.items(), reverse=True)
         tps = []
-        for s in sups:
-            if s < entry * 0.998 and (not tps or s < tps[-1]["lvl"] * 0.998):
-                tps.append({"lvl": round(s, 10), "rr": round((entry - s) / risk, 2),
-                            "basis": "15m swing-low support"})
+        for lvl, tf in outs:
+            if not tps or lvl < tps[-1]["lvl"] * 0.9985:
+                tps.append({"lvl": lvl, "rr": round((entry - lvl) / risk, 2),
+                            "basis": f"{tf} swing-low support"})
             if len(tps) >= 3:
                 break
         k = 2
         while len(tps) < 2 and entry - k * risk > 0:
-            tps.append({"lvl": round(entry - k * risk, 10), "rr": float(k),
-                        "basis": f"{k}R measured move"})
+            tps.append({"lvl": round(entry - k * risk, 10), "rr": float(k), "basis": f"{k}R measured move"})
             k += 1
 
     risk_frac = risk / entry
@@ -2704,31 +2705,33 @@ def scalp_setup(sess, symbol, market, side, htf_conv, htf_tf_bias):
     rr_base = tps[0]["rr"]
     mult_rr = max(0.4, min(1.3, 0.45 + 0.28 * min(rr_base, 3.0)))
     tight = max(0.0, min(1.0, (0.03 - risk_frac) / 0.025))
-    opp = (long and ms15["structure"] == "downtrend") or (not long and ms15["structure"] == "uptrend")
-    align = 0.6 if opp else 1.0
+    # Alignment: penalise if 5m or 15m is trending AGAINST the HTF direction.
+    want = "bullish" if long else "bearish"
+    opp5 = bias5 is not None and bias5 == ("bearish" if long else "bullish")
+    opp15 = bias15 is not None and bias15 == ("bearish" if long else "bullish")
+    align = 1.0 - (0.25 if opp5 else 0) - (0.25 if opp15 else 0)
+    agree = sum(1 for b in (bias5, bias15) if b == want)
     score = round(max(0.0, min(100.0, (htf_conv or 50) * mult_rr * align * (0.8 + 0.2 * tight))), 1)
 
     _hb = [v for v in (htf_tf_bias or {}).values()]
-    _n_up = sum(1 for v in _hb if v == "bullish")
-    _n_dn = sum(1 for v in _hb if v == "bearish")
-    why = []
-    why.append(f"HTF {'bullish' if long else 'bearish'} — "
-               f"{(_n_up if long else _n_dn)}/{len(_hb) or 1} higher timeframes aligned")
-    why.append(f"15m structure {ms15['structure']}"
-               + (" ⚠ against the HTF" if opp else ""))
-    why.append(f"Tight {risk_frac*100:.1f}% stop (15m structure)")
-    why.append(f"R:R {rr_base} to the first 15m target")
+    _nal = sum(1 for v in _hb if v == want)
+    why = [f"HTF {want} — {_nal}/{len(_hb) or 1} higher timeframes aligned"]
+    why.append(f"LTF trigger: 5m {bias5 or '—'}, 15m {bias15 or '—'}"
+               + (" (both with the trend)" if agree == 2 else " ⚠ (an LTF is against)" if (opp5 or opp15) else ""))
+    why.append(f"Tight {risk_frac*100:.1f}% stop on the {etf}")
+    why.append(f"R:R {rr_base} to the first target")
     if rvv and rvv > 1.3:
-        why.append(f"{rvv:.1f}× 15m relative volume")
+        why.append(f"{rvv:.1f}× {etf} relative volume")
 
     tf_bias = dict(htf_tf_bias or {})
     if bias5:
         tf_bias["5m"] = bias5
-    tf_bias["15m"] = bias15
+    if bias15:
+        tf_bias["15m"] = bias15
 
     return {"symbol": symbol, "side": side, "score": score, "why": why,
             "price": price, "atr_pct": atrp, "tf_bias": tf_bias, "ltf5": bias5, "ltf15": bias15,
-            "entry": round(entry, 10), "entry_basis": entry_basis,
+            "entry_tf": etf, "entry": round(entry, 10), "entry_basis": entry_basis,
             "stop": round(stop, 10), "stop_basis": stop_basis,
             "stop_pct": round(risk_frac * 100, 2),
             "target": tps[0]["lvl"], "rr": rr_base, "rr_max": tps[-1]["rr"], "tps": tps,
