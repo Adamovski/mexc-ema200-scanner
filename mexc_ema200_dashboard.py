@@ -140,11 +140,12 @@ class Tracker:
                 pass
 
     @staticmethod
-    def _mk(board, sym, side, entry, stop, tps, px, now, tf="", note=""):
-        """Build a scale-out-aware trade: a full TP ladder with weights, a stop that
-        RATCHETS UP as targets are banked (→ break-even after TP1, → TP1 after TP2), so
-        once TP1 is reached the trade can no longer be a full loss."""
-        entry, stop = float(entry), float(stop)
+    def _mk(board, sym, side, entry, stop, tps, px, now, tf="", note="", state="pending"):
+        """Build a two-phase, scale-out-aware trade. Phase 1 = wait for the recommended
+        ENTRY to fill (measured fairly from the fill, not from when it was flagged).
+        Phase 2 = a full TP ladder with a stop that RATCHETS UP as targets bank (→ break-
+        even after TP1), so once TP1 is reached it can't become a full loss."""
+        entry, stop, px = float(entry), float(stop), float(px)
         risk = abs(entry - stop) or 1e-9
         clean = []
         for t in (tps or []):
@@ -164,12 +165,14 @@ class Tracker:
         w = [x / tot for x in raw] if n else [1.0]
         return {"board": board, "symbol": sym, "side": side, "entry": entry, "stop": stop,
                 "tps": clean, "weights": w, "phase": 0, "realized": 0.0,
-                "cur_stop": stop, "cur_stop_r": -1.0, "px0": float(px), "ts": now,
-                "tf": tf, "note": note, "tps_hit": [], "rr": (clean[0]["rr"] if clean else None)}
+                "cur_stop": stop, "cur_stop_r": -1.0, "px0": px, "ts": now,
+                "tf": tf, "note": note, "tps_hit": [], "rr": (clean[0]["rr"] if clean else None),
+                "state": state, "fill_up": (entry > px), "filled_ts": (now if state == "active" else None)}
 
     def register(self, board, setups):
-        """Record newly-appeared setups (full TP ladder). Only tracks well-posed ones:
-        the flag price must sit BETWEEN the stop and the first target."""
+        """Record newly-appeared setups (full TP ladder), as PENDING — they'll be
+        measured only once/if the recommended entry actually fills. Geometry must be
+        valid (stop | entry | first target on the correct sides)."""
         now = time.time()
         changed = False
         with self.lock:
@@ -184,9 +187,9 @@ class Tracker:
                 if not (sym and entry and stop and tp1 and px):
                     continue
                 long = side != "short"
-                if long and not (stop < px < tp1):
+                if long and not (stop < entry < tp1):
                     continue
-                if (not long) and not (tp1 < px < stop):
+                if (not long) and not (tp1 < entry < stop):
                     continue
                 k = f"{board}:{sym}:{side}"
                 if k in self.open:
@@ -223,8 +226,10 @@ class Tracker:
             return False
         now = time.time()
         with self.lock:
+            # A manual call = you're taking the trade now, so it starts ACTIVE.
             self.open[f"call:{symbol}:{int(now)}"] = self._mk(
-                "call", symbol, side, entry, stop, tps, entry, now, tf, (note or "")[:120])
+                "call", symbol, side, entry, stop, tps, entry, now, tf, (note or "")[:120],
+                state="active")
             self._save()
         return True
 
@@ -241,12 +246,28 @@ class Tracker:
             for k, t in list(self.open.items()):
                 p = prices.get(t["symbol"])
                 if p is None:
-                    if now - t["ts"] > 5 * 86400:
+                    if now - t["ts"] > 8 * 86400:
                         done.append((k, ("win" if t["realized"] > 0 else "expired"),
                                      round(t["realized"], 3)))
                     continue
                 long = t["side"] != "short"
                 tps = t["tps"]
+                # PHASE 1 — wait for the recommended ENTRY to actually fill. Only then is
+                # the trade measured (fairly, from the fill). If price runs to the first
+                # target without ever filling, it's a MISS (not a loss). Pending expires.
+                if t.get("state") == "pending":
+                    filled = (p >= t["entry"]) if t.get("fill_up") else (p <= t["entry"])
+                    tp1 = tps[0]["lvl"]
+                    hit_tp1 = (p >= tp1) if long else (p <= tp1)
+                    if filled:
+                        t["state"] = "active"
+                        t["filled_ts"] = now
+                    elif hit_tp1:
+                        done.append((k, "missed", 0.0)); continue
+                    elif now - t["ts"] > 3 * 86400:
+                        done.append((k, "expired", 0.0)); continue
+                    else:
+                        continue
                 closed = False
                 while True:
                     hit_stop = (p <= t["cur_stop"]) if long else (p >= t["cur_stop"])
@@ -273,7 +294,7 @@ class Tracker:
                             t["cur_stop_r"] = tps[t["phase"] - 2]["rr"]
                         continue
                     break
-                if not closed and now - t["ts"] > 5 * 86400:
+                if not closed and now - (t.get("filled_ts") or t["ts"]) > 7 * 86400:
                     if t["phase"] >= 1:
                         done.append((k, "win" if t["realized"] > 0 else "be", round(t["realized"], 3)))
                     else:
@@ -309,15 +330,27 @@ class Tracker:
                         tp_hits[i] = tp_hits.get(i, 0) + 1
                 tp_rates = [{"tp": i, "n": tp_hits.get(i, 0), "rate": round(tp_hits.get(i, 0) / n * 100, 1)}
                             for i in range(1, maxtp + 1)]
+                # "R if you took 100% at TPk" — reached TPk → +its R:R, else the −1R stop.
+                allout = {}
+                for t in rows:
+                    mx = max(t.get("tps_hit") or [0])
+                    for i, tp in enumerate(t.get("tps") or []):
+                        allout.setdefault(i + 1, []).append((tp.get("rr") or 0) if mx >= i + 1 else -1.0)
+                allout_exp = [{"tp": kk, "n": len(v), "exp": round(sum(v) / len(v), 2)}
+                              for kk, v in sorted(allout.items())]
                 return {"n": n, "wins": w, "winrate": round(w / n * 100, 1),
                         "exp": round(sum((t.get("r") or 0) for t in rows) / n, 2),
-                        "tp_rates": tp_rates}
+                        "tp_rates": tp_rates, "allout": allout_exp}
             _cf = ("board", "symbol", "side", "entry", "stop", "tps", "rr", "status",
-                   "r", "ts", "closed_ts", "tf", "note", "px0", "tps_hit")
+                   "r", "ts", "closed_ts", "tf", "note", "px0", "tps_hit", "state")
+            _active = sum(1 for t in self.open.values() if t.get("state") == "active")
+            _pending = sum(1 for t in self.open.values() if t.get("state") == "pending")
+            _missed = sum(1 for t in self.closed if t.get("status") == "missed")
             return {"overall": agg(res),
                     "by_board": {b: agg([t for t in res if t["board"] == b])
                                  for b in ("long", "short", "coil", "scalp", "call")},
-                    "open": len(self.open),
+                    "open": len(self.open), "active": _active, "pending": _pending,
+                    "missed": _missed,
                     "upstash": bool(self._up()),
                     "recent": [{c: t.get(c) for c in _cf}
                                for t in list(reversed(self.closed))[:60]],
@@ -1067,6 +1100,13 @@ PAGE = """<!doctype html>
   .pclab{font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--dim);margin-top:6px}
   .perfsub{font-size:11px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;color:var(--dim2);margin:16px 0 6px}
   .pf-good{color:var(--accent)} .pf-bad{color:#f85149}
+  .pf-be{color:#f0b429} .pf-miss{color:var(--dim);font-weight:700;cursor:help;border-bottom:1px dotted var(--line)}
+  .perfhelp{margin:4px 0 14px;border:1px solid var(--line);border-radius:9px;background:var(--panel2,rgba(139,152,173,.05))}
+  .perfhelp>summary{cursor:pointer;padding:9px 12px;font-weight:800;font-size:12px;color:var(--accent);letter-spacing:.02em}
+  .perfhelp[open]>summary{border-bottom:1px solid var(--line)}
+  .perfhelpbody{padding:4px 14px 10px}
+  .perfhelpbody p{margin:9px 0;font-size:12.5px;line-height:1.55;color:var(--dim)}
+  .perfhelpbody b{color:var(--fg,#e6edf3)}
   .tprcell{white-space:normal}
   .tpr{display:inline-block;border-radius:5px;padding:1px 7px;font-size:11px;font-weight:700;margin:2px 4px 2px 0;border:1px solid var(--line);font-variant-numeric:tabular-nums;cursor:help}
   .tpr-hi{background:rgba(63,185,80,.18);color:var(--accent);border-color:rgba(63,185,80,.5)}
@@ -1704,18 +1744,33 @@ PAGE = """<!doctype html>
 
 <div class="view" id="viewPerf">
 <div class="status">
-  <span>📊 Performance — Apex's own <b>forward test</b>. Every setup the boards produce is recorded and then resolved against the live price: did price reach the <b>first target</b> before the <b>stop</b>, from the moment it was flagged? Shows real win-rate and average R (expectancy) per board. A win banks the setup's planned R:R; a loss is −1R.</span>
+  <span>📊 Performance — Apex's own <b>forward test</b>, run honestly like a real trader would.</span>
   <span id="perfMeta"></span>
 </div>
 <div class="wrap">
+  <details class="perfhelp"><summary>What exactly is being tracked here?</summary>
+    <div class="perfhelpbody">
+      <p>Every setup the boards produce is recorded as a <b>two-phase trade</b>, so the numbers reflect what you'd actually get:</p>
+      <p><b>1 · Wait for the entry to fill.</b> A setup isn't a live trade the moment it's flagged — it's a <i>plan</i> with a specific entry price (a pullback for longs, a bounce for shorts, a break for coils). Apex holds it as <b>waiting for entry</b> and only starts the trade when price actually trades to that entry. If price never fills but runs to the first target without you, it's logged as <b>MISSED (no fill)</b> — no fake loss. If it never fills within a few days, it <b>EXPIRES</b> — cancelled, no trade.</p>
+      <p><b>2 · Manage it exactly like the plan.</b> Once filled, Apex banks each target by its scale-out weight and <b>moves the stop to break-even after TP1</b>. So once TP1 hits the trade can no longer be a full loss — worst case it's a <b>break-even</b>. A trade that stops out before any TP is the only <b>−1R loss</b>.</p>
+      <p><b>Win rate</b> = share of filled trades that reached at least TP1. <b>Expectancy</b> = average R across the scaled-out position. <b>Per-TP hit rates</b> = how far price typically runs. The <b>all-out table</b> below answers "what if I'd just taken 100% off at TP1 / TP2 / TP3?" — the simple one-target R for each exit choice.</p>
+      <p><b>The coiled trades</b> track the <b>recommended (lean) side only</b> — not both long and short. Apex picks the direction the squeeze is leaning and forward-tests that single plan, so a coil can't "win" on one side and "lose" on the other.</p>
+    </div>
+  </details>
   <div id="perfCards" class="perfcards"></div>
   <div class="perfsub">By board — win rate, expectancy & per-TP hit rates</div>
   <table id="perftbl"><thead><tr>
-      <th>Board</th><th data-tip="Resolved setups.">Trades</th>
+      <th>Board</th><th data-tip="Filled setups that have resolved.">Trades</th>
       <th data-tip="% that reached at least TP1 (after which the stop moves to break-even, so it can't be a full loss).">Win rate</th>
       <th data-tip="Average R per trade across the scaled-out position. Above 0 = a positive edge.">Expectancy</th>
       <th data-tip="What % of these trades reached each target — TP1, TP2, TP3 … Shows how far price typically runs.">TP hit rates</th>
     </tr></thead><tbody id="perfrows"></tbody></table>
+  <div class="perfsub">If you took 100% off at one target — R per exit choice</div>
+  <table id="perfaotbl"><thead><tr>
+      <th>Board</th><th data-tip="Average R if every trade exited its whole position at TP1.">All-out at TP1</th>
+      <th data-tip="Average R if every trade exited its whole position at TP2 (missing TP2 = −1R).">All-out at TP2</th>
+      <th data-tip="Average R if every trade exited its whole position at TP3 (missing TP3 = −1R).">All-out at TP3</th>
+    </tr></thead><tbody id="perfaorows"></tbody></table>
   <div class="perfsub">Recent resolved trades</div>
   <table id="perftrtbl"><thead><tr>
       <th>Closed</th><th>Board</th><th>Symbol</th><th>Side</th>
@@ -3730,7 +3785,7 @@ function renderPerf(){
   const o=(perf&&perf.overall)||{};
   const hasData=(o.n||0)>0;
   if(emp) emp.style.display=hasData?'none':'block';
-  if(meta) meta.textContent=`${(perf&&perf.open)||0} open · ${o.n||0} resolved${perf&&perf.upstash?' · durable storage on':' · in-memory (add Upstash to persist)'}`;
+  if(meta) meta.textContent=`${(perf&&perf.active)||0} live · ${(perf&&perf.pending)||0} waiting for entry · ${(perf&&perf.missed)||0} missed · ${o.n||0} resolved${perf&&perf.upstash?' · durable storage on':' · in-memory (add Upstash to persist)'}`;
   const wr=o.winrate, exp=o.exp;
   cards.innerHTML=
      perfCard('Win rate', wr==null?'—':wr+'%', wr==null?'':(wr>=50?'pcg':wr>=40?'':'pcb'))
@@ -3751,20 +3806,45 @@ function renderPerf(){
       rows.appendChild(tr);
     }
   }
+  const aorows=document.getElementById('perfaorows');
+  if(aorows){ aorows.innerHTML='';
+    const cell=x=>{ if(!x) return '<td class="rr">—</td>';
+      const c=x.exp>0?'pf-good':'pf-bad';
+      return `<td class="${c}">${(x.exp>0?'+':'')+x.exp}R <span class="rr">(${x.n})</span></td>`; };
+    for(const b of ['long','short','coil','scalp']){
+      const a=((perf&&perf.by_board)||{})[b]||{};
+      const ao=a.allout||[];
+      const byTp=k=>ao.find(z=>z.tp===k);
+      if(!(a.n||0)) continue;
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td>${names[b]}</td>`+cell(byTp(1))+cell(byTp(2))+cell(byTp(3));
+      aorows.appendChild(tr);
+    }
+    if(!aorows.children.length) aorows.innerHTML='<tr><td colspan="4" class="rr">No resolved trades yet.</td></tr>';
+  }
   if(trrows){ trrows.innerHTML='';
     for(const t of ((perf&&perf.recent)||[])){
-      const win=t.status==='win';
+      const tgt=((t.tps||[]).length?fmtNum(t.tps[t.tps.length-1].lvl):'—');
       const when=t.closed_ts?new Date(t.closed_ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
       const tr=document.createElement('tr');
       tr.innerHTML=`<td style="color:var(--dim);white-space:nowrap">${when}</td>`
         +`<td>${({long:'Long',short:'Short',coil:'Coil',scalp:'Scalp'})[t.board]||t.board}</td>`
         +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></div></td>`
         +`<td>${leanPill(t.side==='short'?'bearish':'bullish')}</td>`
-        +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${fmtNum(t.tp1)}</td>`
-        +`<td class="${win?'pf-good':'pf-bad'}"><b>${win?'WIN +'+(t.r!=null?(+t.r).toFixed(1):'')+'R':'LOSS −1R'}</b></td>`;
+        +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${tgt}</td>`
+        +`<td>${perfStatusHtml(t)}</td>`;
       trrows.appendChild(tr);
     }
   }
+}
+function perfStatusHtml(t){
+  const s=t.status, r=(t.r!=null)?(+t.r):null;
+  if(s==='win')   return `<b class="pf-good">WIN ${r!=null?(r>0?'+':'')+r.toFixed(1)+'R':''}</b>`;
+  if(s==='be')    return `<b class="pf-be">BREAK-EVEN ${r!=null?(r>0?'+':'')+r.toFixed(2)+'R':''}</b>`;
+  if(s==='loss')  return `<b class="pf-bad">LOSS −1R</b>`;
+  if(s==='missed')return `<span class="pf-miss" data-tip="Price never filled the recommended entry, then ran to target without us — no trade taken.">MISSED (no fill)</span>`;
+  if(s==='expired')return `<span class="pf-miss" data-tip="Entry never filled in the allotted window — cancelled, counts as no trade.">EXPIRED</span>`;
+  return `<span class="rr">${s||'—'}</span>`;
 }
 function renderCalls(){
   const perf=(lastData&&lastData.perf)||null;
@@ -3782,7 +3862,7 @@ function renderCalls(){
     +perfCard('Resolved', a.n||0, '')
     +perfCard('Open now', opens.length, '')
     +`<div class="perfcard" style="flex:2"><div class="pclab" style="margin:0 0 6px">TP hit rates</div><div class="tprcell">${tpRatesHtml(a.tp_rates)}</div></div>`;
-  const tgts=t=>((t.tps||[]).map(x=>fmtNum(x.lvl)).join(' · '))||fmtNum(t.tp1||t.tp1);
+  const tgts=t=>((t.tps||[]).map(x=>fmtNum(x.lvl)).join(' · ')||'—');
   if(openrows){ openrows.innerHTML='';
     for(const t of opens){
       const when=t.ts?new Date(t.ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
