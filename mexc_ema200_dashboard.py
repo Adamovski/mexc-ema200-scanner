@@ -2781,7 +2781,7 @@ PAGE = """<!doctype html>
 
 <div class="view" id="viewBacktest">
 <div class="status">
-  <span>🧪 Backtest — now testing the <b>trend-aligned mean-reversion</b> strategy: only WITH the higher-timeframe trend (sloping 200-EMA), enter an <b>oversold flush that's snapping back</b> (long) / overbought pop (short), target the nearby <b>20-EMA mean</b> for a quick high-probability bounce, stop beyond the flush extreme. Buy panic in an uptrend, sell euphoria in a downtrend. Apex <b>runs it itself</b> across <b>every timeframe</b> and both sides over the <b>whole universe</b> — no look-ahead, stop-first on ties, <b>net of fees</b>. The matrix is the honest read on whether this actually wins before it ever goes to the live boards. (Refreshes every ~6h.)</span>
+  <span>🧪 Backtest — now testing the <b>trend-aligned mean-reversion</b> strategy: only WITH the higher-timeframe trend (sloping 200-EMA), enter an <b>oversold flush that's snapping back</b> (long) / overbought pop (short), target the nearby <b>20-EMA mean</b> for a quick high-probability bounce, stop beyond the flush extreme. Buy panic in an uptrend, sell euphoria in a downtrend. Apex <b>runs it itself</b> across <b>every timeframe</b> and both sides over the <b>whole universe</b> — no look-ahead, stop-first on ties, <b>net of fees</b>. <b>New:</b> it now <b>won't fight BTC</b> (no longs while BTC breaks down, no shorts while BTC rips), and every trade is sliced by <b>time-of-day, BTC regime & BTC volatility</b> — see "What worked" in each per-timeframe breakdown. The matrix is the honest read on whether this actually wins before it ever goes to the live boards. (Refreshes every ~6h.)</span>
 </div>
 <div class="wrap">
   <div class="btbar">
@@ -4875,6 +4875,7 @@ function btSideCard(label,emoji,s){
     +`<td>${p.n}</td><td class="${p.winrate>=50?'pf-good':'pf-bad'}">${p.winrate}%</td>`
     +`<td class="${p.exp>0?'pf-good':'pf-bad'}">${p.exp>0?'+':''}${p.exp}R</td>`
     +`<td class="${p.sumR>0?'pf-good':'pf-bad'}">${p.sumR>0?'+':''}${p.sumR}R</td>`
+    +`<td data-tip="Average stop distance from entry, as a % of price, for this coin's trades. Wider = more room (and a bigger loss when hit); tighter = smaller risk but easier to stop out.">${p.stopw!=null?p.stopw+'%':'—'}</td>`
     +`<td class="${(p.stp||0)>=35?'pf-bad':''}" data-tip="Share of this coin's losing trades that reached the target AFTER being stopped — high = stops too tight for this coin.">${p.stp!=null?p.stp+'%':'—'}</td></tr>`).join('');
   return `<div class="btcard">
     <div class="btcard-h">${emoji} ${label} <span class="btverdict ${vcls}">${vlabel}</span></div>
@@ -4887,8 +4888,8 @@ function btSideCard(label,emoji,s){
       ${perfCard('Fee drag', '-'+s.fee_drag+'R', s.fee_drag>0?'pcb':'', 'Fees cost per trade on average (gross expectancy '+(s.gross_exp>0?'+':'')+s.gross_exp+'R minus net).')}
     </div>
     <div class="btanalysis">${anl}</div>
-    <div class="perfsub">Per-coin (best first) · last column = stops-too-tight rate</div>
-    <table class="bt"><thead><tr><th>Coin</th><th>Trades</th><th>Win rate</th><th>Expectancy</th><th>Total R</th><th data-tip="Share of losers that hit target after being stopped.">Stop-tight</th></tr></thead><tbody>${rows}</tbody></table>
+    <div class="perfsub">Per-coin (best first) · Stop % = avg stop width · last column = stops-too-tight rate</div>
+    <table class="bt"><thead><tr><th>Coin</th><th>Trades</th><th>Win rate</th><th>Expectancy</th><th>Total R</th><th data-tip="Average stop distance from entry as a % of price.">Stop %</th><th data-tip="Share of losers that hit target after being stopped.">Stop-tight</th></tr></thead><tbody>${rows}</tbody></table>
   </div>`;
 }
 function renderBacktest(){

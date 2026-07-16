@@ -3481,13 +3481,57 @@ def bounce_scalp_setup(sess, symbol, market, side):
             "level": round(level, 10), "touches": touches}
 
 
-def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210):
+def _btc_regime_ctx(rows):
+    """Per-bar BTC BEHAVIOUR keyed by candle open-time (ms): its TREND (up / down / range)
+    from the 200-EMA and the EMA's slope, and its VOLATILITY (hi / lo) from ATR% vs a rolling
+    median. Built once per timeframe from BTC's own candles, then used to tag every backtest
+    trade with what the market leader was doing at that exact moment — so expectancy can be
+    sliced by BTC regime, and the strategy can refuse to fight a strong opposing BTC tape."""
+    try:
+        H = [float(x[2]) for x in rows]
+        L = [float(x[3]) for x in rows]
+        C = [float(x[4]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return {}
+    n = len(C)
+    if n < 60:
+        return {}
+    e200 = ema(C, 200)
+    atrp = [0.0] * n
+    for t in range(n):
+        a = atr(H[max(0, t - 20):t + 1], L[max(0, t - 20):t + 1], C[max(0, t - 20):t + 1])
+        atrp[t] = (a / C[t]) if (a and C[t]) else 0.0
+    ctx = {}
+    for t in range(n):
+        el = e200[t]
+        if el is None:
+            continue
+        prev = e200[t - 20] if t >= 20 else None
+        if C[t] > el and (prev is None or el > prev):
+            trend = "up"
+        elif C[t] < el and (prev is None or el < prev):
+            trend = "down"
+        else:
+            trend = "range"
+        win = sorted(atrp[max(0, t - 100):t + 1])
+        med = win[len(win) // 2] if win else 0.0
+        ctx[int(rows[t][0])] = {"t": trend, "v": ("hi" if atrp[t] > med else "lo")}
+    return ctx
+
+
+def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210, btc_ctx=None):
     """TREND-ALIGNED MEAN REVERSION — the high-win-rate candidate. Only trades WITH the
     higher-timeframe trend (price on the right side of a SLOPING 200-EMA), enters on an
     OVERSOLD (long) / OVERBOUGHT (short) snap-back that has just reversed, and targets the
     nearby mean (20-EMA) for a quick, high-probability bounce. The stop sits beyond the
     flush extreme. In plain terms: buy panic in an uptrend / sell euphoria in a downtrend,
-    and take the snap-back to the mean. No look-ahead; net of fees."""
+    and take the snap-back to the mean. No look-ahead; net of fees.
+
+    OPTIMIZATION — don't fight BTC: when btc_ctx is supplied (per-bar BTC behaviour keyed by
+    candle open-time), skip a LONG while BTC is in a confirmed downtrend and a SHORT while
+    BTC is ripping — the alt's own trend is fragile against a strong opposing BTC tape. Every
+    kept trade is tagged with the time-of-day session and what BTC was doing, so the analysis
+    can slice expectancy by time / BTC regime / BTC volatility."""
     try:
         H = [float(x[2]) for x in rows]
         L = [float(x[3]) for x in rows]
@@ -3516,11 +3560,17 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210):
         if not a or a <= 0:
             t += 1; continue
         prev200 = e200[t - 20] if t >= 20 else None
+        ts = int(rows[t][0]) if rows[t] else 0          # candle open-time → BTC state + time-of-day
+        _bs = btc_ctx.get(ts) if btc_ctx else None
+        btrend = _bs.get("t") if _bs else None
+        bvol = _bs.get("v") if _bs else None
         entry = stop = target = risk = rr = None
         outcome = rbar = None; mfe = 0.0; stp = False
         if long:
             slope_up = (prev200 is None) or (el > prev200)
             if not (price > el and slope_up):           # must be an uptrend
+                t += 1; continue
+            if btrend == "down":                         # don't buy dips while BTC breaks down
                 t += 1; continue
             if rs >= 35:                                 # need an oversold flush
                 t += 1; continue
@@ -3550,6 +3600,8 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210):
             slope_dn = (prev200 is None) or (el < prev200)
             if not (price < el and slope_dn):           # must be a downtrend
                 t += 1; continue
+            if btrend == "up":                           # don't short pops while BTC rips
+                t += 1; continue
             if rs <= 65:                                 # need an overbought pop
                 t += 1; continue
             if C[t] >= C[t - 1]:                         # need the reversal down to have started
@@ -3577,17 +3629,23 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210):
         rr = round(rr, 2)
         fee_R = fee_frac / (risk / entry)
         R = (rr - fee_R) if outcome == "win" else (-1.0 - fee_R)
+        _hour = (ts // 3600000) % 24                      # UTC hour → crypto session
+        _session = "Asia" if _hour < 8 else ("EU" if _hour < 14 else "US")
         trades.append({"r": round(R, 3), "rr": rr, "outcome": outcome,
                        "gross": rr if outcome == "win" else -1.0,
                        "mfe": round(min(mfe, rr), 2), "stop_then_tp": bool(stp),
                        "cmp": False, "bars": rbar - f,
                        "extd": round(abs((entry - el) / el) * 100, 2) if el else 0.0,
-                       "atrp": round(a / entry * 100, 2), "dvol": dvol})
+                       "atrp": round(a / entry * 100, 2), "dvol": dvol,
+                       "stopw": round(risk / entry * 100, 2),   # stop width, % of entry
+                       "session": _session, "btc_trend": btrend, "btc_vol": bvol,
+                       "btc_align": (btrend == ("up" if long else "down")) if btrend else None,
+                       "btc_state": ("BTC " + btrend) if btrend else None})
         t = rbar + 1
     return trades
 
 
-def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="level"):
+def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="level", btc_ctx=None):
     """Replay a strategy's entry/stop/target MECHANICS over one coin's historical candles and
     return a list of resolved trades (net R after fees). WITHOUT look-ahead: every decision at
     bar t uses only candles up to t, and the outcome is whichever of stop/target is reached
@@ -3598,9 +3656,9 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="
     if strategy == "spot":
         # Spot: long-only, cash. Charge realistic spot round-trip fees (default ~20 bps if the
         # caller didn't pass a heavier number) and never short — you can't short on spot.
-        return _bt_revert(rows, "long", fees_bps=max(fees_bps, 20.0), warmup=warmup)
+        return _bt_revert(rows, "long", fees_bps=max(fees_bps, 20.0), warmup=warmup, btc_ctx=btc_ctx)
     if strategy == "revert":
-        return _bt_revert(rows, side, fees_bps=fees_bps, warmup=warmup)
+        return _bt_revert(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx)
     try:
         H = [float(x[2]) for x in rows]
         L = [float(x[3]) for x in rows]
@@ -3766,6 +3824,32 @@ def _bt_findings(trades):
             out.append({"label": label, "a": {"name": aname, "exp": ea, "n": na},
                         "b": {"name": bname, "exp": eb, "n": nb},
                         "better": aname if ea > eb else bname, "gap": round(abs(ea - eb), 2)})
+
+    def add_cat(label, keyfn, minn=20):
+        """Categorical (multi-value) segment: find the single value whose expectancy differs
+        most from the rest, and surface it as best-value-vs-the-field. Used for time-of-day
+        and BTC-regime, where there are more than two buckets."""
+        vals = {}
+        for x in trades:
+            k = keyfn(x)
+            if k is not None:
+                vals.setdefault(k, []).append(x)
+        best = None
+        for k, a in vals.items():
+            if len(a) < minn:
+                continue
+            b = [x for x in trades if keyfn(x) is not None and keyfn(x) != k]
+            if len(b) < minn:
+                continue
+            ea = sum(x["r"] for x in a) / len(a)
+            eb = sum(x["r"] for x in b) / len(b)
+            gap = abs(ea - eb)
+            if gap >= 0.1 and (best is None or gap > best["gap"]):
+                best = {"label": label, "a": {"name": str(k), "exp": round(ea, 3), "n": len(a)},
+                        "b": {"name": "the rest", "exp": round(eb, 3), "n": len(b)},
+                        "better": str(k) if ea > eb else "the rest", "gap": round(gap, 2)}
+        if best:
+            out.append(best)
     add("Entry type", "limit at a level", "market (CMP)", lambda x: not x.get("cmp"))
     add("Distance from 200-EMA", "near (≤5%)", "extended (>5%)", lambda x: (x.get("extd") or 0) <= 5)
     atrs = sorted((x.get("atrp") or 0) for x in trades)
@@ -3780,8 +3864,14 @@ def _bt_findings(trades):
     _fmt = lambda v: (f"${v/1e6:.0f}M" if v >= 1e6 else f"${v/1e3:.0f}K")
     add("Coin liquidity ($vol)", f"liquid (≥{_fmt(dmed)})", f"thin (<{_fmt(dmed)})",
         lambda x: (x.get("dvol") or 0) >= dmed)
+    # NEW dimensions the user asked for: time-of-day, BTC behaviour, BTC alignment & volatility.
+    add_cat("Time of day (UTC)", lambda x: x.get("session"))
+    add_cat("BTC regime", lambda x: x.get("btc_state"))
+    add("BTC alignment", "BTC trending with the trade", "BTC flat / ranging",
+        lambda x: x.get("btc_align") is True, minn=20)
+    add("BTC volatility", "BTC calm", "BTC volatile", lambda x: x.get("btc_vol") == "lo", minn=20)
     out.sort(key=lambda f: f["gap"], reverse=True)
-    return out[:5]
+    return out[:8]
 
 
 # A broad liquid basket the backtester runs over by default (~60 majors + mid-caps).
@@ -3830,11 +3920,13 @@ def _bt_aggregate(results, syms, tf, side, fees_bps):
             m = len(tr); sm = sum(x["r"] for x in tr)
             w = sum(1 for x in tr if x["outcome"] == "win")
             lz = [x for x in tr if x["outcome"] == "loss"]
+            _sw = [x.get("stopw") for x in tr if x.get("stopw") is not None]
             per.append({"symbol": s, "n": m, "winrate": round(w / m * 100, 1),
                         "exp": round(sm / m, 3), "sumR": round(sm, 2),
                         # per-coin diagnostics: stops-too-tight rate + how far losers ran
                         "stp": round(sum(1 for x in lz if x.get("stop_then_tp")) / (len(lz) or 1) * 100),
-                        "cmp": round(sum(1 for x in tr if x.get("cmp")) / m * 100)})
+                        "cmp": round(sum(1 for x in tr if x.get("cmp")) / m * 100),
+                        "stopw": round(sum(_sw) / len(_sw), 2) if _sw else None})
             allt += tr
     n = len(allt)
     if not n:
@@ -3868,14 +3960,24 @@ def backtest_all(sess, market, tfs=("15m", "1h", "4h", "1d"), limit=1000,
     syms = symbols or BACKTEST_BASKET
     out = {}
     for tf in tfs:
-        def _one(sym):
+        # BTC behaviour for THIS timeframe — fetched once, shared across every coin so each
+        # trade can be tagged with (and gated on) what the market leader was doing.
+        btc_ctx = {}
+        try:
+            _brows = fetch_candles(sess, "BTCUSDT", tf, limit, market)
+            if _brows:
+                btc_ctx = _btc_regime_ctx(_brows)
+        except Exception:
+            btc_ctx = {}
+
+        def _one(sym, _bc=btc_ctx):
             try:
                 rows = fetch_candles(sess, sym, tf, limit, market)
             except Exception:
                 return sym, None
             if not rows:
                 return sym, None
-            return sym, {sd: backtest_symbol(rows, sd, fees_bps=fees_bps, strategy=strategy)
+            return sym, {sd: backtest_symbol(rows, sd, fees_bps=fees_bps, strategy=strategy, btc_ctx=_bc)
                          for sd in sides}
         per = {sd: {} for sd in sides}
         with ThreadPoolExecutor(max_workers=12) as ex:
