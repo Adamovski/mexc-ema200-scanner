@@ -386,15 +386,16 @@ class Tracker:
 
     def learn_adjust(self, window=40, min_n=12):
         """LEARN FROM RESULTS. For each board, look at its most recent `window` resolved
-        trades and nudge that board's quality bar by how it's actually performing:
-        a board that's bleeding gets a HIGHER bar (tighten — demand more before
-        recommending); a board that's printing gets a slightly LOWER bar (let more of a
-        working edge through). Uses a rolling window across versions (recency > epoch) so
-        the loop keeps learning instead of resetting every version bump. Returns per-board
-        {n, exp, winrate, conv_delta, rr_delta, note} — deltas ADD to the floors, and the
-        note explains the adjustment so the UI can show WHY the gate moved."""
+        trades FROM THE CURRENT VERSION and nudge that board's quality bar by how the
+        CURRENT logic is actually performing: a board that's bleeding gets a HIGHER bar
+        (tighten); a board that's printing gets a slightly LOWER bar (let a working edge
+        through). Crucially it is scoped to APP_VERSION — a board with no results yet in
+        this version is NOT judged by an older version's (different) logic, so the new
+        logic gets a clean run before the gate reacts. Returns per-board
+        {n, exp, winrate, conv_delta, rr_delta, note} — deltas ADD to the floors."""
         with self.lock:
-            res = [t for t in self.closed if t.get("status") in ("win", "loss", "be")]
+            res = [t for t in self.closed if t.get("status") in ("win", "loss", "be")
+                   and t.get("ver", "v1 · pre-gate") == APP_VERSION]
         out = {}
         for b in ("long", "short", "coil", "scalp"):
             rows = [t for t in res if t.get("board") == b][-window:]
@@ -4514,7 +4515,7 @@ function renderPerf(){
         return `<span class="lchip ${dir}" data-tip="${esc((s.note||'learning')+adj+' · window of recent resolved trades')}">`
               +`<b>${names[b]}</b> ${arrow}${s.exp!=null?` · ${s.exp>0?'+':''}${s.exp}R avg (n=${s.n})`:` · n=${s.n||0}`}</span>`;
       }).join('');
-      glBox.innerHTML=`<div class="learnhd">🧠 Adaptive gate — the bar moves with results: boards that lose get <b>tighter</b>, boards that win get a little <b>looser</b> (rolling window, per board).</div><div class="lchips">${chips}</div>`;
+      glBox.innerHTML=`<div class="learnhd">🧠 Adaptive gate — the bar moves with <b>this version's</b> results: boards that lose get <b>tighter</b>, boards that win get a little <b>looser</b>. A board with no resolved trades yet in this version stays neutral (it's not judged by old logic).</div><div class="lchips">${chips}</div>`;
       glBox.style.display='block';
     }
   }
