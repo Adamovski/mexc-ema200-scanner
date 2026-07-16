@@ -1464,6 +1464,7 @@ def backtest_loop(state: State) -> None:
     time.sleep(120)                                  # let the first scan grab the CPU first
     cfg = state.cfg
     market = cfg.get("market", "futures")
+    tfs = ("15m", "1h", "4h", "1d")
     while True:
         try:
             sess = get_session()
@@ -1471,12 +1472,18 @@ def backtest_loop(state: State) -> None:
                                 futures_only=cfg.get("futures_only", True),
                                 market=market)
             t0 = time.time()
-            data = backtest_all(sess, market, tfs=("15m", "1h", "4h", "1d"),
-                                limit=800, fees_bps=5.0, symbols=syms)
-            with state.lock:
-                state.backtests = {"ts": time.time(), "took": round(time.time() - t0, 1),
-                                   "fees_bps": 5.0, "coins": len(syms), "universe": True,
-                                   "data": data}
+            data = {}
+            # INCREMENTAL: sweep one timeframe at a time and publish after each, so the
+            # matrix fills in progressively instead of showing nothing for an hour.
+            for i, tf in enumerate(tfs):
+                part = backtest_all(sess, market, tfs=(tf,), limit=500,
+                                    fees_bps=5.0, symbols=syms)
+                data.update(part)
+                with state.lock:
+                    state.backtests = {"ts": time.time(), "took": round(time.time() - t0, 1),
+                                       "fees_bps": 5.0, "coins": len(syms), "universe": True,
+                                       "data": dict(data),
+                                       "progress": {"done": i + 1, "total": len(tfs), "last": tf}}
         except Exception as e:
             with state.lock:
                 if not state.backtests:
@@ -4663,7 +4670,8 @@ async function loadBacktest(force){
   catch(e){ btData={error:'Request failed.'}; }
   renderBacktest();
   clearTimeout(window._btPoll);
-  if(btData&&btData.pending){ window._btPoll=setTimeout(()=>loadBacktest(),20000); }  // poll while first sweep runs
+  const incomplete = btData && (btData.pending || (btData.progress && btData.progress.done < btData.progress.total));
+  if(incomplete){ window._btPoll=setTimeout(()=>loadBacktest(),20000); }  // poll while the sweep fills in
 }
 function btVerdict(exp){
   if(exp==null) return ['—',''];
@@ -4716,7 +4724,9 @@ function renderBacktest(){
   if(d.pending){ if(emp){emp.style.display='block'; emp.innerHTML='⏳ Apex is running the first backtest sweep — the <b>whole universe</b> × 4 timeframes × both sides. This is heavy and takes several minutes on a fresh boot; it fills in here automatically and then refreshes every ~6h.';} body.innerHTML=''; if(meta) meta.textContent='running the first sweep…'; return; }
   if(d.error){ if(emp) emp.style.display='none'; body.innerHTML=`<div class="bt-empty">${esc(d.error)}</div>`; if(meta) meta.textContent=''; return; }
   if(emp) emp.style.display='none';
-  if(meta) meta.textContent=`${d.coins} coins · ${d.fees_bps} bps fees · as of ${ago(d.ts)}${d.took?(' · took '+d.took+'s'):''}`;
+  const prog=d.progress;
+  const sweeping=(prog&&prog.done<prog.total)?` · ⏳ sweeping ${prog.done}/${prog.total} timeframes (rest fills in)`:'';
+  if(meta) meta.textContent=`${d.coins} coins · ${d.fees_bps} bps fees · as of ${ago(d.ts)}${d.took?(' · '+d.took+'s'):''}${sweeping}`;
   const tfs=['15m','1h','4h','1d'];
   let m=`<div class="perfsub">Edge matrix — net expectancy · win-rate · (trades) per timeframe & side</div>`;
   m+=`<table class="bt btmatrix"><thead><tr><th>Timeframe</th><th>🏆 Longs</th><th>🔻 Shorts</th></tr></thead><tbody>`;
