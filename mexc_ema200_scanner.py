@@ -2386,29 +2386,52 @@ def fetch_derivatives(display_symbol: str, bars: int = 24) -> dict | None:
         if p_now and p_then:
             out["price_chg_pct"] = round((p_now / p_then - 1) * 100, 1)
 
-    pc, oc = out.get("price_chg_pct"), out.get("oi_chg_pct")
-    if pc is not None and oc is not None:
+    def _div_label(pc, oc):
+        """Classify a price-vs-OI divergence from a % price change and % OI change."""
+        if pc is None or oc is None:
+            return (None, None)
         pu, pd = pc > 0.7, pc < -0.7
         ou, od = oc > 2, oc < -2
         if pu and ou:
-            out["divergence"] = "real_up"
-            out["divergence_note"] = ("price and open interest both rising — new money "
-                                      "behind the move (real, conviction up-move)")
-        elif pu and od:
-            out["divergence"] = "fake_up"
-            out["divergence_note"] = ("price up but open interest FALLING — short-covering / "
-                                      "a thin rally that can fade (fake-pump risk, confirm before chasing)")
-        elif pd and ou:
-            out["divergence"] = "real_down"
-            out["divergence_note"] = ("price down with open interest rising — fresh shorts, "
-                                      "conviction selling (real down-move)")
-        elif pd and od:
-            out["divergence"] = "exhaust_down"
-            out["divergence_note"] = ("price and open interest both falling — longs unwinding, "
-                                      "the selloff may be exhausting (watch for a bounce)")
-        else:
-            out["divergence"] = "neutral"
-            out["divergence_note"] = "open interest roughly flat vs price — no clear divergence"
+            return ("real_up", "price and open interest both rising — new money behind the "
+                    "move (real, conviction up-move)")
+        if pu and od:
+            return ("fake_up", "price up but open interest FALLING — short-covering / a thin "
+                    "rally that can fade (fake-pump risk, confirm before chasing)")
+        if pd and ou:
+            return ("real_down", "price down with open interest rising — fresh shorts, "
+                    "conviction selling (real down-move)")
+        if pd and od:
+            return ("exhaust_down", "price and open interest both falling — longs unwinding, "
+                    "the selloff may be exhausting (watch for a bounce)")
+        return ("neutral", "open interest roughly flat vs price — no clear divergence")
+
+    pc, oc = out.get("price_chg_pct"), out.get("oi_chg_pct")
+    dv, dn = _div_label(pc, oc)
+    if dv:
+        out["divergence"], out["divergence_note"] = dv, dn
+
+    # PER-TIMEFRAME derivatives read — the same OI/price divergence over several windows
+    # (1h / 4h / 12h / 24h) computed from the hourly series (no extra API calls), so you
+    # can see whether the OI story agrees with the timeframe you're actually trading.
+    def _chg(series, hrs, key):
+        if not series or len(series) < 2:
+            return None
+        a = series[-1].get(key)
+        b = series[max(0, len(series) - 1 - hrs)].get(key)
+        return round((a / b - 1) * 100, 1) if (a and b) else None
+
+    oi_tf = []
+    for hrs, lab in ((1, "1h"), (4, "4h"), (12, "12h"), (24, "24h")):
+        _oc = _chg(oi, hrs, "c")
+        if _oc is None:
+            continue
+        _pc = _chg(ohlcv, hrs, "c")
+        _dv, _dn = _div_label(_pc, _oc)
+        oi_tf.append({"tf": lab, "oi_chg": _oc, "price_chg": _pc,
+                      "divergence": _dv, "divergence_note": _dn})
+    if oi_tf:
+        out["oi_tf"] = oi_tf
     return out if len(out) > 1 else None
 
 
