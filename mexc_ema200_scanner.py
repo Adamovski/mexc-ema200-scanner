@@ -3179,6 +3179,192 @@ def scalp_setup(sess, symbol, market, side, htf_conv, htf_tf_bias):
             "rsi": r14}
 
 
+def bounce_scalp_setup(sess, symbol, market, side):
+    """A COUNTER-TREND (or with-trend) BOUNCE scalp: a quick trade off a STRONG, tested
+    lower-timeframe level — buy a wash-out into multi-touch support (long), or fade a
+    pop into multi-touch resistance (short). Unlike scalp_setup this does NOT require
+    higher-timeframe alignment: the edge is the level + an oversold/overbought snap-back,
+    not the trend. Graded on how strong the level is (touches), how stretched RSI is,
+    how tight the stop can sit, and whether price is actually snapping back. This is what
+    keeps a good scalp on the board even when there's no clean trend setup: 'there is
+    always a bounce off strong support/resistance somewhere.' Second-pass fetch (5m+15m)."""
+    def _series(iv, lim):
+        rr = fetch_candles(sess, symbol, iv, lim, market)
+        if not rr or len(rr) < 40:
+            return None
+        rws = rr[:-1]
+        try:
+            return ([float(x[2]) for x in rws], [float(x[3]) for x in rws],
+                    [float(x[4]) for x in rws], [float(x[5]) for x in rws])
+        except (ValueError, IndexError):
+            return None
+    s5 = _series("5m", 500)
+    s15 = _series("15m", 400)
+    if not s5 and not s15:
+        return None
+    (H, L, C, Vv), etf = (s5, "5m") if s5 else (s15, "15m")
+    price = C[-1]
+    if not price or len(C) < 30:
+        return None
+    a = atr(H, L, C)
+    if not a or a <= 0:
+        return None
+    atrp = round(a / price * 100, 2)
+    r5 = rsi(C)
+    rvv = rel_volume(Vv)
+    last = len(L) - 1
+    long = side == "long"
+    tol = max(0.35 * a, price * 0.0015)          # "at the level" tolerance
+
+    def _touches(level, arr):
+        return sum(1 for x in arr if abs(x - level) <= tol)
+
+    def _bias_of(s):
+        if not s:
+            return None
+        m = market_structure(s[0], s[1], s[2])
+        return ("bullish" if m["structure"] == "uptrend" or m["choch"] == "bullish"
+                else "bearish" if m["structure"] == "downtrend" or m["choch"] == "bearish"
+                else "neutral")
+    bias5, bias15 = _bias_of(s5), _bias_of(s15)
+
+    if long:
+        sups = [x for x in supports_below(L, last, price, max_n=4, min_gap=0.0015) if x < price]
+        if not sups:
+            return None
+        level = sups[0]                          # nearest support below
+        dist = (price - level) / price
+        if dist > min(0.02, max(0.010, 1.3 * a / price)):   # price must be NEAR support (cap 2%)
+            return None
+        touches = _touches(level, L)
+        # Snap-back confirmation: a green tick off the low, or a clear lower wick that held.
+        rng = max(H[-1] - L[-1], 1e-9)
+        wick = (C[-1] - L[-1]) / rng
+        reversal = (C[-1] >= C[-2]) or (wick >= 0.45 and L[-1] <= level * 1.0015)
+        oversold = r5 is not None and r5 < 45
+        if not (reversal or oversold):
+            return None
+        if touches < 2 and not (oversold and reversal):
+            return None                          # weak level AND no clear snap = skip
+        entry = price if dist <= 0.006 else round(level * 1.002, 10)
+        entry_basis = (f"bounce underway off {etf} support — enter at market (CMP)"
+                       if dist <= 0.006 else f"limit at {etf} support {level:.6g} ({touches}× tested)")
+        stop = level - max(0.5 * a, level * 0.004)
+        stop_basis = f"just below the {etf} support that's holding (tight)"
+        risk = entry - stop
+        if risk <= 0:
+            return None
+        res = [x for x in resistances_above(H, last, price, max_n=4, min_gap=0.002) if x > entry * 1.0015]
+        if s15 and etf != "15m":
+            l15 = len(s15[0]) - 1
+            res += [x for x in resistances_above(s15[0], l15, price, max_n=3, min_gap=0.003) if x > entry * 1.0015]
+        res = sorted(set(round(x, 10) for x in res))
+        mean_t = round((max(H[-40:]) + min(L[-40:])) / 2, 10)   # snap-back-to-mean target
+        if mean_t > entry * 1.002:
+            res.append(mean_t)
+        res = sorted(set(res))
+        tps = []
+        for lvl in res:
+            if lvl > entry and (not tps or lvl > tps[-1]["lvl"] * 1.002):
+                tps.append({"lvl": lvl, "rr": round((lvl - entry) / risk, 2),
+                            "basis": "snap-back to mean" if abs(lvl - mean_t) < 1e-9 else f"{etf} resistance"})
+            if len(tps) >= 2:
+                break
+    else:
+        ress = [x for x in resistances_above(H, last, price, max_n=4, min_gap=0.0015) if x > price]
+        if not ress:
+            return None
+        level = ress[0]
+        dist = (level - price) / price
+        if dist > min(0.02, max(0.010, 1.3 * a / price)):
+            return None
+        touches = _touches(level, H)
+        rng = max(H[-1] - L[-1], 1e-9)
+        wick = (H[-1] - C[-1]) / rng
+        reversal = (C[-1] <= C[-2]) or (wick >= 0.45 and H[-1] >= level * 0.9985)
+        overbought = r5 is not None and r5 > 55
+        if not (reversal or overbought):
+            return None
+        if touches < 2 and not (overbought and reversal):
+            return None
+        entry = price if dist <= 0.006 else round(level * 0.998, 10)
+        entry_basis = (f"rejection underway off {etf} resistance — enter at market (CMP)"
+                       if dist <= 0.006 else f"limit at {etf} resistance {level:.6g} ({touches}× tested)")
+        stop = level + max(0.5 * a, level * 0.004)
+        stop_basis = f"just above the {etf} resistance that's holding (tight)"
+        risk = stop - entry
+        if risk <= 0:
+            return None
+        sup = [x for x in supports_below(L, last, price, max_n=4, min_gap=0.002) if x < entry * 0.9985]
+        if s15 and etf != "15m":
+            l15 = len(s15[1]) - 1
+            sup += [x for x in supports_below(s15[1], l15, price, max_n=3, min_gap=0.003) if x < entry * 0.9985]
+        sup = sorted(set(round(x, 10) for x in sup), reverse=True)
+        mean_t = round((max(H[-40:]) + min(L[-40:])) / 2, 10)
+        if mean_t < entry * 0.998:
+            sup.append(mean_t); sup.sort(reverse=True)
+        tps = []
+        for lvl in sup:
+            if lvl < entry and (not tps or lvl < tps[-1]["lvl"] * 0.998):
+                tps.append({"lvl": lvl, "rr": round((entry - lvl) / risk, 2),
+                            "basis": "snap-back to mean" if abs(lvl - mean_t) < 1e-9 else f"{etf} support"})
+            if len(tps) >= 2:
+                break
+
+    if not tps:
+        return None
+    # One clean target + a runner only if it's meaningfully further (≥1.6× reward & ≥0.8%).
+    _prim = tps[0]
+    _runner = next((t for t in tps[1:]
+                    if (t.get("rr") or 0) >= (_prim.get("rr") or 0) * 1.6
+                    and abs(t["lvl"] - _prim["lvl"]) / entry >= 0.008), None)
+    tps = [_prim] + ([_runner] if _runner else [])
+    rr_base = tps[0]["rr"]
+    risk_frac = risk / entry
+    if risk_frac > 0.05 or rr_base < 1.2:        # too wide, or not enough room to the level
+        return None
+
+    # Grade on the merits of a bounce: level strength, RSI stretch, R:R, tightness, snap.
+    q_touch = min(1.0, touches / 4.0)
+    q_rsi = (max(0.0, (45 - r5) / 25.0) if long else max(0.0, (r5 - 55) / 25.0)) if r5 is not None else 0.3
+    q_rsi = min(1.0, q_rsi)
+    q_rr = min(1.0, rr_base / 2.5)
+    q_tight = max(0.0, min(1.0, (0.045 - risk_frac) / 0.035))
+    q_rev = 1.0 if reversal else 0.5
+    q_vol = min(1.0, (rvv or 1.0) / 2.0)
+    raw = 0.28 * q_touch + 0.24 * q_rsi + 0.20 * q_rr + 0.12 * q_tight + 0.10 * q_rev + 0.06 * q_vol
+    score = round(max(0.0, min(100.0, 100.0 * raw)), 1)
+
+    want = "bullish" if long else "bearish"
+    against = "bearish" if long else "bullish"
+    counter = (bias15 == against) or (bias5 == against and bias15 in (None, "neutral"))
+    why = [(f"↩ Counter-trend bounce — {etf} at strong {'support' if long else 'resistance'} "
+            f"{level:.6g} ({touches}× tested), fading a {bias15 or bias5 or 'weak'} LTF trend")
+           if counter else
+           (f"Bounce off {etf} {'support' if long else 'resistance'} {level:.6g} ({touches}× tested)")]
+    if r5 is not None:
+        why.append(f"RSI {r5:.0f} — {'oversold snap-back' if long else 'overbought rejection'}")
+    why.append(f"{'Green tick off the low' if (long and reversal) else 'Rejection candle' if reversal else 'Level reaction'} confirms the turn")
+    why.append(f"Tight {risk_frac*100:.1f}% stop just {'below' if long else 'above'} the level")
+    why.append(f"R:R {rr_base} to the {'mean/resistance' if long else 'mean/support'}")
+    if rvv and rvv > 1.3:
+        why.append(f"{rvv:.1f}× {etf} relative volume")
+
+    tf_bias = {}
+    if bias5:
+        tf_bias["5m"] = bias5
+    if bias15:
+        tf_bias["15m"] = bias15
+    return {"symbol": symbol, "side": side, "score": score, "why": why,
+            "price": price, "atr_pct": atrp, "tf_bias": tf_bias, "ltf5": bias5, "ltf15": bias15,
+            "entry_tf": etf, "entry": round(entry, 10), "entry_basis": entry_basis,
+            "stop": round(stop, 10), "stop_basis": stop_basis,
+            "stop_pct": round(risk_frac * 100, 2),
+            "target": tps[0]["lvl"], "rr": rr_base, "rr_max": tps[-1]["rr"], "tps": tps,
+            "rsi": r5, "kind": "bounce", "counter_trend": bool(counter),
+            "level": round(level, 10), "touches": touches}
+
+
 def scan_symbol(sess: requests.Session, symbol: str, interval: str,
                 cfg: dict) -> dict | None:
     return scan_symbol_multi(sess, symbol, interval, cfg)[0]

@@ -51,6 +51,7 @@ try:
         list_symbols, scan_symbol_multi, get_session, EMA_PERIOD,
         analyze_symbol, normalize_symbol, fetch_candles, pct_returns, CORR_WINDOW,
         bias_on_tf, enrich_1h, best_pattern, coil_tfs_finer, scalp_setup,
+        bounce_scalp_setup,
         compute_market_context, fetch_deriv_series, backfill_market_history,
     )
 except ImportError:
@@ -1077,6 +1078,35 @@ def run_one_scan(state: State) -> None:
                     scalp_board.append(_sc)
         scalp_board.sort(key=lambda d: d["score"], reverse=True)
 
+    # Counter-trend / bounce scalps — a quick trade off a STRONG, tested lower-timeframe
+    # level even when no clean HTF trend scalp exists. Long bounces come from the
+    # support-bounce + supertrend-bounce hits (already-strong support); short fades from
+    # bearish hits that may be popping into LTF resistance. bounce_scalp_setup self-
+    # qualifies (must be at the level, with an oversold/overbought snap), so weak ones
+    # drop out. This keeps the scalp tab from going empty: there's always a bounce.
+    _have = {d["symbol"] for d in scalp_board}
+    _bounce_src = {}
+    for _r in (bounces + st_bounces):
+        _s = _r["symbol"]
+        if _s not in _have:
+            _bounce_src[_s] = "long"
+    for _r in shorts:
+        _s = _r["symbol"]
+        if _s not in _have and _s not in _bounce_src:
+            _bounce_src[_s] = "short"
+    if _bounce_src:
+        with ThreadPoolExecutor(max_workers=8) as _ex:
+            _bf = {_ex.submit(bounce_scalp_setup, sess, sym, _mkt, sd): sym
+                   for sym, sd in _bounce_src.items()}
+            for _f in as_completed(_bf):
+                try:
+                    _bc = _f.result()
+                except Exception:
+                    _bc = None
+                if _bc:
+                    scalp_board.append(_bc)
+        scalp_board.sort(key=lambda d: d["score"], reverse=True)
+
     for _d in scalp_board:
         _d["regime"] = _align_for(_d.get("side", "long"))
         _d["regime_score"] = round(_reg, 3)
@@ -1090,6 +1120,16 @@ def run_one_scan(state: State) -> None:
             rsi = d.get("rsi")
             long = d.get("side") != "short"
             against = d.get("regime") == "against" and not d.get("decor")
+            # Counter-trend BOUNCE scalps are judged on the level's strength + the snap-back,
+            # NOT on HTF/regime alignment (they're deliberately against the trend). Lower the
+            # R:R floor and skip the against-regime penalty for them.
+            if d.get("kind") == "bounce":
+                if rr is None or rr < 1.2 or (d.get("score", 0) or 0) < 50:
+                    d["gate"] = "weak bounce"
+                    continue
+                d["gate"] = "pass"
+                kept.append(d)
+                continue
             if rr is None or rr < 1.4 or (d.get("score", 0) or 0) < (55 if not against else 66):
                 d["gate"] = "weak scalp"
                 continue
@@ -1573,6 +1613,8 @@ PAGE = """<!doctype html>
   .expander{display:inline-block;color:var(--accent);font-weight:800;width:12px;cursor:pointer;transition:transform .1s}
   tr.rowsel{background:rgba(63,185,80,.06)}
   .rmax{color:var(--dim2);font-size:11px;font-weight:600}
+  .cbadge{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:5px;font-size:10px;font-weight:700;letter-spacing:.02em;background:rgba(88,166,255,.14);color:#79b8ff;border:1px solid rgba(88,166,255,.35);cursor:help;vertical-align:middle}
+  .cbadge.cbounce{background:rgba(210,153,34,.16);color:#e3b341;border-color:rgba(210,153,34,.4)}
   .planrow>td{background:var(--bg2);padding:0 14px 12px 40px;border-top:0}
   .planpair{display:flex;gap:16px;flex-wrap:wrap}
   .planpanel{flex:1;min-width:320px;margin-top:10px;padding:12px 15px;border:1px solid var(--line2);border-radius:12px;background:var(--panel);font-family:"Inter",sans-serif}
@@ -2220,7 +2262,7 @@ PAGE = """<!doctype html>
 
 <div class="view" id="viewScalp">
 <div class="status">
-  <span>⚡ Best scalps — quick <b>lower-timeframe</b> trades taken <b>with</b> the higher-timeframe trend. The 4h/Daily/Weekly context sets the direction; the <b>15m</b> gives a precise entry near a swing level with a <b>tight stop</b> just beyond it (so the risk % is small and the R:R high). Only setups aligned with the HTF are listed. Click a row for the full plan (entries, tight stop, 15m target ladder, scale-out).</span>
+  <span>⚡ Best scalps — quick <b>lower-timeframe</b> trades with a <b>tight stop</b> and high R:R. Two kinds: <b>trend scalps</b> (5m/15m entry taken <b>with</b> the 4h/Daily/Weekly direction) and <b>↩ counter-trend bounces</b> — a snap-back off a <b>strong, multi-tested support/resistance</b> even when there's no clean trend setup (oversold wash into support = long bounce; overbought pop into resistance = short fade). So there's almost always a good scalp on the board. Counter-trend rows are badged; the edge is the level + the snap, not the trend. Click a row for the full plan.</span>
   <span id="scalpCount"></span>
 </div>
 <div class="wrap">
@@ -2240,7 +2282,7 @@ PAGE = """<!doctype html>
     </tr></thead>
     <tbody id="scalprows"></tbody>
   </table>
-  <div class="empty" id="scalpempty" style="display:none">🚫 No scalps clear the quality bar right now — scalps are only taken WITH the higher-timeframe direction and regime, so when there's no clean HTF setup, Apex sits out. Come back next scan.</div>
+  <div class="empty" id="scalpempty" style="display:none">🚫 Nothing clears the bar this scan — no clean trend scalp AND no coin sitting on a strong enough support/resistance with a real snap-back. Rare, but Apex won't invent one. Come back next scan.</div>
 </div>
 </div>
 
@@ -4327,13 +4369,15 @@ function renderScalp(){
   const tb=document.getElementById('scalprows'); if(!tb) return; tb.innerHTML="";
   const emp=document.getElementById('scalpempty'); if(emp) emp.style.display=rows.length?'none':'block';
   const cnt=document.getElementById('scalpCount');
-  if(cnt) cnt.textContent=`${rows.length} tight LTF setups aligned with the higher-timeframe trend`;
+  const nB=rows.filter(h=>h.kind==='bounce').length, nT=rows.length-nB;
+  if(cnt) cnt.textContent=`${nT} trend scalp${nT===1?'':'s'} + ${nB} counter-trend bounce${nB===1?'':'s'} off strong levels`;
   let rank=0;
   for(const h of rows){
     rank++;
     const P=h.live!=null?h.live:h.price;
     const side=h.side||'long';
     const why=(h.why||[]); const shortWhy=why.slice(0,2).join(' · ')||'—';
+    const bounceBadge=(h.kind==='bounce')?`<span class="cbadge${h.counter_trend?' cbounce':''}" data-tip="${esc((h.counter_trend?'Counter-trend ':'')+'bounce scalp — a quick trade off a strong, '+(h.touches||'')+'×-tested '+(side==='long'?'support':'resistance')+' level ('+(h.entry_tf||'LTF')+'). Not HTF-aligned by design; the edge is the level + the snap-back.')}">${h.counter_trend?'↩ counter':'⤴ bounce'}</span>`:'';
     const rr=(h.rr!=null&&isFinite(h.rr));
     const rrCls=!rr?'':(h.rr>=2?'rrg':h.rr>=1.5?'rry':'rrd');
     const rrTxt=rr?('<b>'+h.rr.toFixed(2)+'</b>'+(h.rr_max!=null&&h.rr_max>h.rr+0.2?` <span class="rmax">→${(+h.rr_max).toFixed(1)}</span>`:'')):'—';
@@ -4344,7 +4388,7 @@ function renderScalp(){
       `<td class="rnk"><span class="expander">${open?'▾':'▸'}</span> ${rank}</td>`+
       `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${dispSym(h.symbol)}</a>${analyzeSideBtn(h.symbol,side)}</div></td>`+
       `<td>${scoreBadge(h.score)}</td>`+
-      `<td>${leanPill(side==='long'?'bullish':'bearish')}</td>`+
+      `<td>${leanPill(side==='long'?'bullish':'bearish')}${bounceBadge}</td>`+
       `<td class="tfstripcell">${tfBiasStrip(h.tf_bias)}</td>`+
       `<td>${fmtNum(P)}</td>`+
       `<td data-tip="${esc(h.entry_basis||'15m entry')}">${h.entry!=null?fmtNum(h.entry):'—'}</td>`+
