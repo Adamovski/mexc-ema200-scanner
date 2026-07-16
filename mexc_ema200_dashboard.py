@@ -85,7 +85,7 @@ def send_telegram(cfg: dict, text: str) -> None:
 # logic changes meaningfully — the headline win-rate resets to the new version (a clean
 # slate for the new logic), while every past version's results are kept and shown in the
 # "site version" breakdown so you can compare how each iteration actually performed.
-APP_VERSION = "v3 · real targets + ATR stops + reach"
+APP_VERSION = "v4 · noise-clearing scalp stops + adaptive gate"
 # One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
 # every call (open + resolved) on the next boot and start the calls scorecard fresh —
 # auto-board trades and their version history are untouched.
@@ -2791,7 +2791,7 @@ function fmtNum(n){ if(n===null||n===undefined) return "—";
   const a=Math.abs(n);
   if(a!==0 && a<1){   // small prices: plain decimals, never scientific notation
     const decimals=Math.min(12, Math.max(2, 3 - Math.floor(Math.log10(a))));
-    return n.toFixed(decimals).replace(/0+$/,'').replace(/\.$/,'');
+    return n.toFixed(decimals).replace(/0+$/,'').replace(/\\.$/,'');
   }
   return n.toLocaleString(undefined,{maximumFractionDigits:a>=1000?2:4}); }
 function ago(ts){ if(!ts) return "—"; const s=Math.max(0,Math.floor(Date.now()/1000-ts));

@@ -3129,8 +3129,11 @@ def scalp_setup(sess, symbol, market, side, htf_conv, htf_tf_bias):
         entry_basis = (f"{etf} swing-low support — buy the dip" if (price - near) / price <= 0.008
                        else f"current price ({etf} momentum entry)")
         below = fine_sup[1] if len(fine_sup) > 1 else near * 0.998
-        stop = min(below - 0.3 * a, entry - 0.35 * a)
-        stop_basis = f"just below the next {etf} swing low (tight)"
+        # Stop must clear ordinary 5m noise — a 0.3×ATR stop gets wicked out before the
+        # target ever prints. Floor it at max(1.2×ATR, 1.0%) beyond the entry.
+        _sfloor = max(1.2 * a, entry * 0.010)
+        stop = min(below - 0.4 * a, entry - _sfloor)
+        stop_basis = f"below the next {etf} swing low, ≥1.2×ATR to clear 5m noise"
         risk = entry - stop
         if risk <= 0:
             return None
@@ -3152,8 +3155,10 @@ def scalp_setup(sess, symbol, market, side, htf_conv, htf_tf_bias):
         entry_basis = (f"{etf} swing-high resistance — sell the rip" if (near - price) / price <= 0.008
                        else f"current price ({etf} momentum entry)")
         above = fine_res[1] if len(fine_res) > 1 else near * 1.002
-        stop = max(above + 0.3 * a, entry + 0.35 * a)
-        stop_basis = f"just above the next {etf} swing high (tight)"
+        # Same noise floor for shorts — a 0.3×ATR stop is inside normal 5m chop.
+        _sfloor = max(1.2 * a, entry * 0.010)
+        stop = max(above + 0.4 * a, entry + _sfloor)
+        stop_basis = f"above the next {etf} swing high, ≥1.2×ATR to clear 5m noise"
         risk = stop - entry
         if risk <= 0:
             return None
@@ -3286,11 +3291,16 @@ def bounce_scalp_setup(sess, symbol, market, side):
             return None
         if touches < 2 and not (oversold and reversal):
             return None                          # weak level AND no clear snap = skip
-        entry = price if dist <= 0.006 else round(level * 1.002, 10)
+        # Prefer entering at MARKET when the snap-back is already underway (a limit at the
+        # level just sits there and goes MISSED as price lifts off). CMP if we're close OR
+        # a reversal candle has already confirmed within a wider band.
+        use_cmp = dist <= 0.008 or (reversal and dist <= 0.013)
+        entry = price if use_cmp else round(level * 1.002, 10)
         entry_basis = (f"bounce underway off {etf} support — enter at market (CMP)"
-                       if dist <= 0.006 else f"limit at {etf} support {level:.6g} ({touches}× tested)")
-        stop = level - max(0.5 * a, level * 0.004)
-        stop_basis = f"just below the {etf} support that's holding (tight)"
+                       if use_cmp else f"limit at {etf} support {level:.6g} ({touches}× tested)")
+        # Stop must sit BELOW the level far enough to clear noise, not hug it: ≥1.2×ATR / 1%.
+        stop = level - max(1.2 * a, level * 0.010)
+        stop_basis = f"below the {etf} support that's holding, ≥1.2×ATR to clear noise"
         risk = entry - stop
         if risk <= 0:
             return None
@@ -3327,11 +3337,12 @@ def bounce_scalp_setup(sess, symbol, market, side):
             return None
         if touches < 2 and not (overbought and reversal):
             return None
-        entry = price if dist <= 0.006 else round(level * 0.998, 10)
+        use_cmp = dist <= 0.008 or (reversal and dist <= 0.013)
+        entry = price if use_cmp else round(level * 0.998, 10)
         entry_basis = (f"rejection underway off {etf} resistance — enter at market (CMP)"
-                       if dist <= 0.006 else f"limit at {etf} resistance {level:.6g} ({touches}× tested)")
-        stop = level + max(0.5 * a, level * 0.004)
-        stop_basis = f"just above the {etf} resistance that's holding (tight)"
+                       if use_cmp else f"limit at {etf} resistance {level:.6g} ({touches}× tested)")
+        stop = level + max(1.2 * a, level * 0.010)
+        stop_basis = f"above the {etf} resistance that's holding, ≥1.2×ATR to clear noise"
         risk = stop - entry
         if risk <= 0:
             return None
