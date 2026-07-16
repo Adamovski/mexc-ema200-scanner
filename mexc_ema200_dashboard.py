@@ -843,6 +843,30 @@ class State:
                     out.append(d)
                 return out
 
+            def edge_map():
+                """A COMPACT read of the latest backtest edge — expectancy / win-rate / trade-count
+                per timeframe & side (plus the spot sweep) — so the LIVE boards can badge every
+                proposal with the measured edge of its timeframe/side. 'Only propose winners' made
+                visible: a setup on a timeframe the sweep proves NEGATIVE gets a ❌; a proven one ✅."""
+                bt = self.backtests
+                if not bt or not isinstance(bt, dict):
+                    return None
+                def cell(a):
+                    a = a or {}
+                    return {"exp": a.get("exp"), "n": a.get("n"), "wr": a.get("winrate")} if a.get("n") else None
+                fut = {}
+                for tf, sides in (bt.get("data") or {}).items():
+                    c = {sd: cell((sides or {}).get(sd)) for sd in ("long", "short")}
+                    c = {k: v for k, v in c.items() if v}
+                    if c:
+                        fut[tf] = c
+                spot = {}
+                for tf, sides in (bt.get("spot") or {}).items():
+                    v = cell((sides or {}).get("long"))
+                    if v:
+                        spot[tf] = v
+                return {"fut": fut, "spot": spot} if (fut or spot) else None
+
             return {
                 "hits": withlive(self.hits),
                 "last_scan": self.last_scan,
@@ -872,6 +896,7 @@ class State:
                 "spot_board": withlive(self.spot_board),
                 "market_context": self.market_context,
                 "gate_learn": self.gate_learn,
+                "bt_edge": edge_map(),
                 "perf": TRACKER.stats(lp),
                 "both_symbols": list(self.both_symbols),
                 "breakout_events": list(self.breakout_events),
@@ -4605,6 +4630,24 @@ function planPanelHtml(p, side, cmp, sym){
      ${sym?`<div class="trackrow" style="margin-top:8px"><button class="trackbtn" onclick="trackTrade('${sym}','${side}',${p.entry},${p.stop},'${(p.tps||[]).map(t=>t.lvl).join(',')}','${p.entry_tf||''}','pptrk_${esc(sym)}_${side}',event)" data-tip="Track this exact ${long?'long':'short'} plan in 📌 My calls — scale-out aware, graded in R.">📌 Track this</button><span class="trackmsg" id="pptrk_${esc(sym)}_${side}"></span></div>`:''}
    </div>`;
 }
+// Map a setup's timeframe label to a backtest sweep timeframe, and pull its measured edge.
+function btEdgeFor(tf, side, spot){
+  const e=lastData&&lastData.bt_edge; if(!e) return null;
+  const map={'4h':'4h','1d':'1d','Daily':'1d','1D':'1d','15m':'15m','1h':'1h','5m':'15m','Weekly':null,'1W':null};
+  const k=map[tf!=null?tf:'']; if(k===undefined||k===null) return null;
+  if(spot){ return (e.spot&&e.spot[k])||null; }
+  const cell=e.fut&&e.fut[k]; if(!cell) return null;
+  return cell[side]||null;
+}
+// A small badge showing the backtest-measured edge for this proposal's timeframe/side.
+// ✅ proven-positive · 🟡 thin · ❌ negative — 'only propose winners' made visible.
+function edgeBadge(tf, side, spot){
+  const c=btEdgeFor(tf, side, spot); if(!c||c.exp==null) return '';
+  const x=+c.exp; const cls=x>=0.15?'rrg':x>0?'rry':'rrd';
+  const lab=x>=0.15?'✅':x>0?'🟡':'❌';
+  const tfk={'Daily':'1d','1D':'1d','5m':'15m'}[tf]||tf||'?';
+  return ` <span class="rr ${cls}" data-tip="Backtest edge for ${tfk} ${spot?'spot ':''}${side}s over the whole universe: expectancy ${x>0?'+':''}${x}R across ${c.n} trades (win ${c.wr!=null?c.wr+'%':'—'}). ${x>=0.15?'The sweep proves this timeframe/side actually wins.':x>0?'Only a thin edge here — size down.':'The sweep says this timeframe/side does NOT win — treat with caution.'}">${lab}${x>0?'+':''}${x}R</span>`;
+}
 function renderBoard(side){
   const isLong = side==='long';
   const rows = (lastData && (isLong?lastData.long_board:lastData.short_board)) || [];
@@ -4631,7 +4674,7 @@ function renderBoard(side){
     tr.innerHTML =
       `<td class="rnk"><span class="expander">${open?'▾':'▸'}</span> ${rank}</td>`+
       `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${dispSym(h.symbol)}</a>${confBadge}${analyzeSideBtn(h.symbol,side)}</div></td>`+
-      `<td>${scoreBadge(h.score)}</td>`+
+      `<td>${scoreBadge(h.score)}${edgeBadge(h.entry_tf||'4h', side)}</td>`+
       `<td>${fmtNum(P)}</td>`+
       `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
       `<td class="tfstripcell">${tfBiasStrip(h.tf_bias)}</td>`+
@@ -4733,7 +4776,7 @@ function renderScalp(){
     tr.innerHTML=
       `<td class="rnk"><span class="expander">${open?'▾':'▸'}</span> ${rank}</td>`+
       `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${dispSym(h.symbol)}</a>${analyzeSideBtn(h.symbol,side)}</div></td>`+
-      `<td>${scoreBadge(h.score)}</td>`+
+      `<td>${scoreBadge(h.score)}${edgeBadge(h.entry_tf||'15m', side)}</td>`+
       `<td>${leanPill(side==='long'?'bullish':'bearish')}${bounceBadge}</td>`+
       `<td class="tfstripcell">${tfBiasStrip(h.tf_bias)}</td>`+
       `<td>${fmtNum(P)}</td>`+
@@ -4774,7 +4817,7 @@ function renderSpot(){
     tr.innerHTML=
       `<td class="rnk"><span class="expander">${open?'▾':'▸'}</span> ${rank}</td>`+
       `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${dispSym(h.symbol)}</a>${analyzeSideBtn(h.symbol,'long')}</div></td>`+
-      `<td>${scoreBadge(h.spot_score!=null?h.spot_score:h.score)}</td>`+
+      `<td>${scoreBadge(h.spot_score!=null?h.spot_score:h.score)}${edgeBadge(h.entry_tf||'4h','long',true)}</td>`+
       `<td class="${extCls}" data-tip="${esc(h.note_spot||'')}">${ext!=null?(ext>0?'+':'')+ext.toFixed(1)+'%':'—'}</td>`+
       `<td>${fmtNum(P)}</td>`+
       `<td data-tip="${esc(h.entry_basis||'limit into support')}">${h.entry!=null?fmtNum(h.entry):'—'}</td>`+
