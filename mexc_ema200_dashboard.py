@@ -51,7 +51,7 @@ try:
         list_symbols, scan_symbol_multi, get_session, EMA_PERIOD,
         analyze_symbol, normalize_symbol, fetch_candles, pct_returns, CORR_WINDOW,
         bias_on_tf, enrich_1h, best_pattern, coil_tfs_finer, scalp_setup,
-        bounce_scalp_setup,
+        bounce_scalp_setup, backtest_board,
         compute_market_context, fetch_deriv_series, backfill_market_history,
     )
 except ImportError:
@@ -581,6 +581,7 @@ class Tracker:
 
 
 TRACKER = Tracker()
+_BT_CACHE: dict = {}          # (tf, fees) -> (ts, result) for the on-demand backtester
 
 
 # Coins whose derivatives (OI / funding / price) we keep a rolling history for.
@@ -1021,6 +1022,9 @@ def run_one_scan(state: State) -> None:
     _alts = _mc.get("alts") or {}
     _breadth = (((_alts.get("pct_above_200ema") or 50) - 50) / 50.0)
     _reg = 0.45 * (_day or 0.0) + 0.35 * (_week or 0.0) + 0.20 * _breadth
+    # Volatility regime tilt: in COMPRESSION (chop) mean-reversion bounces work and
+    # breakouts fake out; in EXPANSION momentum/breakouts follow through. Small nudges.
+    _volstate = ((_mc.get("vol_regime") or {}).get("state"))
 
     def _align_for(side):
         favor = _reg if side == "long" else -_reg
@@ -1085,6 +1089,12 @@ def run_one_scan(state: State) -> None:
             rr = d.get("rr")
             reg = d.get("regime", "neutral")
             pv = d.get("pct_vs_ema")
+            # Vol-regime tilt: a BREAKOUT entry gets more room in expansion (breakouts
+            # follow through) and a tougher bar in compression (they fake out in chop).
+            if d.get("breakout") and _volstate == "expansion":
+                conv += 5
+            elif d.get("breakout") and _volstate == "compression":
+                conv -= 5
             if rr is None or rr < rr_floor:
                 d["gate"] = "low R:R"
                 continue
@@ -1212,6 +1222,10 @@ def run_one_scan(state: State) -> None:
         _sl = _learn.get("scalp", {})               # results → scalp gate adjustment
         _s_rr = _sl.get("rr_delta") or 0.0
         _s_sc = _sl.get("conv_delta") or 0.0        # applied to the score floor
+        # Vol-regime tilt: compression rewards mean-reversion BOUNCES (lower their bar,
+        # raise the trend bar); expansion rewards TREND scalps (and vice-versa).
+        _vr_bounce = -5.0 if _volstate == "compression" else (5.0 if _volstate == "expansion" else 0.0)
+        _vr_trend = -5.0 if _volstate == "expansion" else (5.0 if _volstate == "compression" else 0.0)
         kept = []
         for d in board:
             rr = d.get("rr")
@@ -1222,13 +1236,13 @@ def run_one_scan(state: State) -> None:
             # NOT on HTF/regime alignment (they're deliberately against the trend). Lower the
             # R:R floor and skip the against-regime penalty for them.
             if d.get("kind") == "bounce":
-                if rr is None or rr < 1.2 + _s_rr or (d.get("score", 0) or 0) < 50 + _s_sc:
+                if rr is None or rr < 1.2 + _s_rr or (d.get("score", 0) or 0) < 50 + _s_sc + _vr_bounce:
                     d["gate"] = "weak bounce"
                     continue
                 d["gate"] = "pass"
                 kept.append(d)
                 continue
-            if rr is None or rr < 1.4 + _s_rr or (d.get("score", 0) or 0) < (55 if not against else 66) + _s_sc:
+            if rr is None or rr < 1.4 + _s_rr or (d.get("score", 0) or 0) < (55 if not against else 66) + _s_sc + _vr_trend:
                 d["gate"] = "weak scalp"
                 continue
             if rsi is not None and ((long and rsi > 75) or ((not long) and rsi < 25)):
@@ -1245,6 +1259,37 @@ def run_one_scan(state: State) -> None:
     short_board = [d for d in short_board if not TRACKER.cooling("short", d["symbol"], "short")]
     scalp_board = [d for d in scalp_board if not TRACKER.cooling("scalp", d["symbol"], d.get("side", "long"))]
     coil_board = [d for d in coil_board if not TRACKER.cooling("coil", d["symbol"], d.get("rec_side") or "long")]
+
+    # --- CROSS-BOARD CONFLUENCE: how many independent signals line up on a recommended
+    # coin. A top long that's ALSO a bull flag, a support bounce and a supertrend reclaim
+    # is far higher-probability than one signal alone. Attach the count + the list, and
+    # give confluent setups a modest rank boost so they surface to the top. ---
+    _bull_sets = {
+        "200-EMA reclaim": {h["symbol"] for h in hits},
+        "Bull flag": {h["symbol"] for h in flags},
+        "Narrow CPR": {h["symbol"] for h in cprs},
+        "Support bounce": {h["symbol"] for h in bounces},
+        "Supertrend bounce": {h["symbol"] for h in st_bounces},
+        "Falling wedge": {h["symbol"] for h in wedges},
+        "Early mover": {h["symbol"] for h in earlies},
+    }
+    _bear_sets = {"Breakdown / short setup": {s["symbol"] for s in shorts}}
+
+    def _attach_conf(board, base_label, sets):
+        for d in board:
+            sym = d["symbol"]
+            sigs = [base_label] + [lab for lab, members in sets.items() if sym in members]
+            tb = d.get("tf_bias") or {}
+            want = "bullish" if base_label == "Top long" else "bearish"
+            if isinstance(tb, dict) and sum(1 for v in tb.values() if v == want) >= 3:
+                sigs.append(f"Multi-TF {want}")
+            n = len(sigs)
+            d["confluence"] = {"n": n, "signals": sigs}
+            if n >= 2:                                   # boost rank by up to ~+12% for 4 signals
+                d["score"] = round((d.get("score", 0) or 0) * (1 + 0.04 * min(3, n - 1)), 1)
+        board.sort(key=lambda x: x.get("score", 0), reverse=True)
+    _attach_conf(long_board, "Top long", _bull_sets)
+    _attach_conf(short_board, "Top short", _bear_sets)
 
     # Drought clock: record whether each board produced anything this scan (drives the
     # auto-loosen next scan if a board stays empty for hours).
@@ -1719,8 +1764,24 @@ PAGE = """<!doctype html>
   .expander{display:inline-block;color:var(--accent);font-weight:800;width:12px;cursor:pointer;transition:transform .1s}
   tr.rowsel{background:rgba(63,185,80,.06)}
   .rmax{color:var(--dim2);font-size:11px;font-weight:600}
+  .confb{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:5px;font-size:10.5px;font-weight:800;cursor:help;vertical-align:middle;border:1px solid rgba(210,153,34,.45);background:rgba(210,153,34,.14);color:#e3b341}
+  .confb.cf3{border-color:rgba(63,185,80,.5);background:rgba(63,185,80,.16);color:#8ddf9c}
+  .confb.cf4{border-color:rgba(63,185,80,.7);background:rgba(63,185,80,.24);color:#adf7bd}
   .cbadge{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:5px;font-size:10px;font-weight:700;letter-spacing:.02em;background:rgba(88,166,255,.14);color:#79b8ff;border:1px solid rgba(88,166,255,.35);cursor:help;vertical-align:middle}
   .cbadge.cbounce{background:rgba(210,153,34,.16);color:#e3b341;border-color:rgba(210,153,34,.4)}
+  .btbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:10px 0 14px;font-size:13px;color:var(--dim)}
+  .btseg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .btopt{padding:5px 12px;cursor:pointer;font-size:12.5px;font-weight:600;color:var(--dim)}
+  .btopt.btsel{background:var(--accent);color:#04110a}
+  .btfees{width:64px;background:var(--bg2);border:1px solid var(--line);border-radius:7px;color:var(--fg);padding:5px 8px;font-size:12.5px}
+  .btrun{background:var(--accent);color:#04110a;border:0;border-radius:8px;padding:7px 16px;font-weight:800;cursor:pointer;font-size:13px}
+  .btrun:disabled{opacity:.6;cursor:default}
+  .btmeta{color:var(--dim2);font-size:12px}
+  .btgrid{display:flex;gap:16px;flex-wrap:wrap}
+  .btcard{flex:1;min-width:420px;border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:rgba(139,152,173,.03)}
+  .btcard-h{font-size:14px;font-weight:800;margin-bottom:10px;display:flex;align-items:center;gap:10px}
+  .btverdict{font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px;border:1px solid var(--line)}
+  .btnote,.btcard .histnote{color:var(--dim)}
   .learnbox{margin:10px 0 4px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg2)}
   .learnhd{font-size:12px;color:var(--dim);margin-bottom:8px}
   .lchips{display:flex;flex-wrap:wrap;gap:6px}
@@ -1746,6 +1807,8 @@ PAGE = """<!doctype html>
   .ptpsh{font-size:10.5px;font-weight:800;letter-spacing:.05em;color:var(--dim2);text-transform:uppercase;margin-bottom:4px}
   .ptp .plab{min-width:36px;color:var(--accent)}
   .pscale{margin-top:8px;font-size:12.5px;color:#c3ccd8}
+  .psize{margin-top:6px;font-size:12.5px;color:#c3ccd8;cursor:help;border-top:1px dashed var(--line);padding-top:6px}
+  .psize b{color:var(--fg);font-weight:700}
   .coilnote{margin:10px 0 0;font-size:12.5px;color:var(--dim)}
   .perfcards{display:flex;gap:12px;flex-wrap:wrap;margin:6px 0 14px}
   .perfcard{flex:1;min-width:150px;padding:16px 18px;border:1px solid var(--line2);border-radius:14px;background:var(--panel)}
@@ -2068,6 +2131,7 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabStb" onclick="showTab('stb')">Supertrend support bounce</div>
   <div class="tab" id="tabShorts" onclick="showTab('shorts')">Shorts</div>
   <div class="tab" id="tabPerf" onclick="showTab('perf')">📊 Performance</div>
+  <div class="tab" id="tabBacktest" onclick="showTab('backtest')">🧪 Backtest</div>
   <div class="tab" id="tabCalls" onclick="showTab('calls')">📌 My calls</div>
   <div class="tab" id="tabInfo" onclick="showTab('info')">Info</div>
 </div>
@@ -2552,6 +2616,28 @@ PAGE = """<!doctype html>
 </div>
 </div>
 
+<div class="view" id="viewBacktest">
+<div class="status">
+  <span>🧪 Backtest — does the edge actually exist? Replays the core <b>entry / stop / target mechanics</b> (trend pullback-or-CMP long, rip-or-CMP short, ATR-floored stop, target at the next structural level) over <b>real historical candles</b> for a liquid basket — no look-ahead, the limit must fill, stop-hit assumed first on a tie, and <b>net of fees</b>. This is the offline read on whether the logic has positive expectancy, instead of waiting days for the live forward-test.</span>
+</div>
+<div class="wrap">
+  <div class="btbar">
+    <span>Timeframe:</span>
+    <span class="btseg" id="btTf">
+      <span class="btopt" data-tf="15m" onclick="setBtTf('15m')">15m</span>
+      <span class="btopt btsel" data-tf="4h" onclick="setBtTf('4h')">4h</span>
+      <span class="btopt" data-tf="1d" onclick="setBtTf('1d')">1D</span>
+    </span>
+    <span style="margin-left:14px">Fees (bps round-trip):</span>
+    <input id="btFees" type="number" value="4" min="0" max="50" step="1" class="btfees">
+    <button id="btRun" class="btrun" onclick="runBacktest()">▶ Run backtest</button>
+    <span id="btMeta" class="btmeta"></span>
+  </div>
+  <div id="btBody"></div>
+  <div class="empty" id="btempty">Pick a timeframe and hit <b>Run backtest</b>. It replays ~1000 candles across a 16-coin liquid basket — takes a few seconds. Results are cached for 15 minutes.</div>
+</div>
+</div>
+
 <div class="view" id="viewInfo">
 <div class="wrap"><div class="info">
   <h2>What this scanner looks for</h2>
@@ -2977,7 +3063,7 @@ function sortWatch(key){
 }
 function setWatchArrows(){
   document.querySelectorAll('#wltbl thead th[data-wk]').forEach(th=>{
-    const base=th.getAttribute('data-label')||th.textContent.replace(/[▲▼]\s*$/,'').trim();
+    const base=th.getAttribute('data-label')||th.textContent.replace(/[▲▼]\\s*$/,'').trim();
     th.setAttribute('data-label', base);
     const arrow=(th.dataset.wk===watchSort.key)?(watchSort.dir<0?' ▼':' ▲'):'';
     th.childNodes[0].nodeValue = base + arrow;
@@ -3117,7 +3203,7 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["coil","Coil"],["scalp","Scalp"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["coil","Coil"],["scalp","Scalp"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
@@ -4383,6 +4469,7 @@ function planPanelHtml(p, side, cmp, sym){
      <div class="pline"><span class="plab">Stop</span><b>${fmtNum(p.stop)}</b> <span class="pmv risk">${riskPct.toFixed(1)}% risk</span> ${tfChip(p.stop_tf)}<span class="pbasis">${esc(p.stop_basis||'')}</span></div>
      <div class="ptps"><div class="ptpsh">Targets — take profit in stages</div>${tps}</div>
      <div class="pscale">📤 Scale-out: ${scale}</div>
+     ${(()=>{const rf=riskPct/100; if(!(rf>0)) return ''; const sizePct=Math.round(1/rf); const lev=Math.max(1,Math.ceil(sizePct/100)); const safeLev=Math.max(1,Math.min(25,Math.floor(0.5/rf))); return `<div class="psize" data-tip="Risking 1% of your account on this trade. Stop is ${riskPct.toFixed(1)}% from entry, so position notional ≈ ${sizePct}% of account (loss if stopped ≈ 1%). It needs ≥${lev}× leverage just to hold that notional; keeping leverage at ≤${safeLev}× (isolated) leaves the liquidation price well beyond the stop. Adjust for your own risk-per-trade %.">💰 Sizing (1% risk): size ≈ <b>${sizePct}%</b> of account · needs ≥${lev}× · keep ≤<b>${safeLev}×</b> lev</div>`;})()}
      ${sym?`<div class="trackrow" style="margin-top:8px"><button class="trackbtn" onclick="trackTrade('${sym}','${side}',${p.entry},${p.stop},'${(p.tps||[]).map(t=>t.lvl).join(',')}','${p.entry_tf||''}','pptrk_${esc(sym)}_${side}',event)" data-tip="Track this exact ${long?'long':'short'} plan in 📌 My calls — scale-out aware, graded in R.">📌 Track this</button><span class="trackmsg" id="pptrk_${esc(sym)}_${side}"></span></div>`:''}
    </div>`;
 }
@@ -4405,11 +4492,13 @@ function renderBoard(side){
     const rrCls = !rr? '' : (h.rr>=2?'rrg':h.rr>=1.5?'rry':'rrd');
     const key=side+':'+h.symbol, open=!!rowOpen[key];
     const rrTxt = rr? ('<b>'+h.rr.toFixed(2)+'</b>'+(h.rr_max!=null&&h.rr_max>h.rr+0.2?` <span class="rmax">→${(+h.rr_max).toFixed(1)}</span>`:'')) : '—';
+    const cf=h.confluence||null;
+    const confBadge=(cf&&cf.n>=2)?`<span class="confb cf${Math.min(4,cf.n)}" data-tip="${esc('Confluence '+cf.n+'× — this coin lines up on '+cf.n+' independent signals: '+(cf.signals||[]).join(', ')+'. More stacked signals = higher-probability; these are boosted up the ranking.')}">⚑${cf.n}</span>`:'';
     const tr=document.createElement('tr'); tr.className=rowClass(h)+(open?' rowsel':''); tr.style.cursor='pointer';
     tr.setAttribute('onclick',`toggleRowPlan('${key}')`);
     tr.innerHTML =
       `<td class="rnk"><span class="expander">${open?'▾':'▸'}</span> ${rank}</td>`+
-      `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${dispSym(h.symbol)}</a>${analyzeSideBtn(h.symbol,side)}</div></td>`+
+      `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${dispSym(h.symbol)}</a>${confBadge}${analyzeSideBtn(h.symbol,side)}</div></td>`+
       `<td>${scoreBadge(h.score)}</td>`+
       `<td>${fmtNum(P)}</td>`+
       `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
@@ -4529,8 +4618,61 @@ function renderScalp(){
     }
   }
 }
-function perfCard(label,val,cls){
-  return `<div class="perfcard ${cls}"><div class="pcval">${val}</div><div class="pclab">${label}</div></div>`;
+// ---- Backtest tab ----
+let btTf='4h', btData=null, btRunning=false;
+function setBtTf(tf){ btTf=tf; document.querySelectorAll('#btTf .btopt').forEach(x=>x.classList.toggle('btsel',x.dataset.tf===tf)); }
+async function runBacktest(){
+  if(btRunning) return; btRunning=true;
+  const btn=document.getElementById('btRun'), meta=document.getElementById('btMeta'), emp=document.getElementById('btempty');
+  const fees=Math.max(0,Math.min(50, +(document.getElementById('btFees').value||4)));
+  if(btn){ btn.disabled=true; btn.textContent='⏳ Running…'; }
+  if(meta) meta.textContent='replaying ~1000 candles × 16 coins…';
+  try{
+    const r=await fetch(`/backtest?tf=${btTf}&fees=${fees}`,{cache:'no-store'});
+    btData=await r.json();
+  }catch(e){ btData={error:'Request failed — try again.'}; }
+  if(btn){ btn.disabled=false; btn.textContent='▶ Run backtest'; }
+  if(emp) emp.style.display='none';
+  btRunning=false; renderBacktest();
+}
+function btVerdict(exp){
+  if(exp==null) return ['—',''];
+  if(exp>=0.15) return ['✅ positive edge','pcg'];
+  if(exp>0) return ['🟡 thin edge',''];
+  return ['❌ negative edge','pcb'];
+}
+function btSideCard(label,emoji,s){
+  if(!s||!s.n){ return `<div class="btcard"><div class="btcard-h">${emoji} ${label}</div><div class="btnote">No qualifying trades in the sample.</div></div>`; }
+  const [vlabel,vcls]=btVerdict(s.exp);
+  const rows=(s.per_symbol||[]).map(p=>`<tr><td class="sym"><a href="${tvLink(p.symbol)}" target="_blank" rel="noopener">${dispSym(p.symbol)}</a></td>`
+    +`<td>${p.n}</td><td class="${p.winrate>=50?'pf-good':'pf-bad'}">${p.winrate}%</td>`
+    +`<td class="${p.exp>0?'pf-good':'pf-bad'}">${p.exp>0?'+':''}${p.exp}R</td>`
+    +`<td class="${p.sumR>0?'pf-good':'pf-bad'}">${p.sumR>0?'+':''}${p.sumR}R</td></tr>`).join('');
+  return `<div class="btcard">
+    <div class="btcard-h">${emoji} ${label} <span class="btverdict ${vcls}">${vlabel}</span></div>
+    <div class="perfcards">
+      ${perfCard('Trades', s.n, '')}
+      ${perfCard('Win rate', s.winrate+'%', s.winrate>=50?'pcg':s.winrate>=40?'':'pcb')}
+      ${perfCard('Expectancy (net)', (s.exp>0?'+':'')+s.exp+'R', s.exp>0?'pcg':'pcb', 'Average R per trade AFTER fees. This is the number that matters — positive = the mechanics have an edge.')}
+      ${perfCard('Total R (net)', (s.sumR>0?'+':'')+s.sumR+'R', s.sumR>0?'pcg':'pcb')}
+      ${perfCard('Avg win / loss', (s.avg_win!=null?('+'+s.avg_win):'—')+' / '+(s.avg_loss!=null?s.avg_loss:'—')+'R', '')}
+      ${perfCard('Fee drag', '-'+s.fee_drag+'R', s.fee_drag>0?'pcb':'', 'How much fees cost per trade on average (gross expectancy '+ (s.gross_exp>0?'+':'')+s.gross_exp+'R minus net).')}
+    </div>
+    <div class="perfsub">Per-coin (best first)</div>
+    <table class="bt"><thead><tr><th>Coin</th><th>Trades</th><th>Win rate</th><th>Expectancy</th><th>Total R</th></tr></thead><tbody>${rows}</tbody></table>
+  </div>`;
+}
+function renderBacktest(){
+  const body=document.getElementById('btBody'), meta=document.getElementById('btMeta'); if(!body) return;
+  const d=btData; if(!d){ return; }
+  if(d.error){ body.innerHTML=`<div class="bt-empty">${esc(d.error)}</div>`; if(meta) meta.textContent=''; return; }
+  if(meta) meta.textContent=`${d.tf} · ${d.fees_bps} bps fees · as of ${ago(d.ts)}`;
+  body.innerHTML=`<div class="btgrid">${btSideCard('Longs (trend pullback)','🏆',d.long)}${btSideCard('Shorts (rip to resistance)','🔻',d.short)}</div>`
+    +`<div class="histnote">⚠ This tests a <b>simplified</b> version of the entry/stop/target geometry (not every detector), on a 16-coin basket. It's a directional read on whether the core mechanics have an edge — not a promise of live results. A negative expectancy here is a strong signal the stops/targets need work; a positive one says the geometry is sound and the live gate just needs to pick the right moments.</div>`;
+}
+function perfCard(label,val,cls,tip){
+  const t=tip?` data-tip="${esc(tip)}" style="cursor:help"`:'';
+  return `<div class="perfcard ${cls}"${t}><div class="pcval">${val}</div><div class="pclab">${label}</div></div>`;
 }
 function tpRatesHtml(tp_rates){
   if(!tp_rates||!tp_rates.length) return '<span style="color:var(--dim2)">—</span>';
@@ -4721,6 +4863,12 @@ function renderMarket(){
     const nc=rnow.lean==='long'?'mc-bull':rnow.lean==='short'?'mc-bear':'mc-mid';
     const nt=rnow.lean==='long'?'lean LONG':rnow.lean==='short'?'lean SHORT':'no clear lean';
     h+=`<div class="mc-now ${nc}" data-tip="A fast 'right now' lean from the quickest reads — BTC 15m/1h trend blended with 4h alt breadth. Shorter-horizon than the Today card; use it to time intraday entries.">⏱️ Right now — <b>${nt}</b> · ${rnow.note||''}</div>`;
+  }
+  const vr=mc.vol_regime||null;
+  if(vr&&vr.state){
+    const vc=vr.state==='expansion'?'mc-bull':vr.state==='compression'?'mc-mid':'';
+    const vi=vr.state==='expansion'?'📈':vr.state==='compression'?'🪤':'➖';
+    h+=`<div class="mc-now ${vc}" data-tip="${esc(vr.note||'')} Apex tilts the boards accordingly — favouring bounces in compression and breakouts/trend in expansion.">${vi} Volatility — <b>${vr.state.toUpperCase()}</b> · BTC 4h ATR at the ${vr.atr_pctile}th percentile (${vr.atr_pct}%)</div>`;
   }
   // BTC section
   h+=`<div class="perfsub">₿ Bitcoin — multi-timeframe trend</div>`;
@@ -5485,6 +5633,8 @@ def make_handler(state: State):
                     _hp["coinalyze"] = False
                 body = json.dumps(_hp).encode()
                 self._send(200, body, "application/json")
+            elif self.path.startswith("/backtest"):
+                self._backtest()
             elif self.path.startswith("/track"):
                 self._track()
             elif self.path.startswith("/analyze"):
@@ -5493,6 +5643,35 @@ def make_handler(state: State):
                 self._send(200, PAGE.encode(), "text/html; charset=utf-8")
             else:
                 self._send(404, b"not found", "text/plain")
+
+        def _backtest(self):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            g = lambda k, d: (q.get(k) or [d])[0]
+            tf = g("tf", "4h")
+            if tf not in ("15m", "1h", "4h", "1d"):
+                tf = "4h"
+            try:
+                fees = max(0.0, min(50.0, float(g("fees", "4"))))
+            except ValueError:
+                fees = 4.0
+            key = (tf, round(fees, 1))
+            now = time.time()
+            cached = _BT_CACHE.get(key)
+            if cached and now - cached[0] < 900:        # 15-min cache (backtests are heavy)
+                self._send(200, json.dumps(cached[1]).encode(), "application/json")
+                return
+            try:
+                sess = get_session()
+                mkt = state.cfg.get("market", "futures")
+                out = {"long": backtest_board(sess, "long", mkt, tf=tf, fees_bps=fees),
+                       "short": backtest_board(sess, "short", mkt, tf=tf, fees_bps=fees),
+                       "tf": tf, "fees_bps": fees, "ts": now}
+            except Exception as e:
+                out = {"error": f"Backtest failed: {e}"}
+            if "error" not in out:
+                _BT_CACHE[key] = (now, out)
+            self._send(200, json.dumps(out).encode(), "application/json")
 
         def _track(self):
             from urllib.parse import urlparse, parse_qs

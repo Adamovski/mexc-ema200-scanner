@@ -2104,6 +2104,38 @@ def compute_market_context(sess: requests.Session, market: str) -> dict:
         return {"score": round(c, 3), "longs": longs, "shorts": shorts, "headline": head}
     out["day"] = _combine(day_s, "day", breadth_4h)
     out["week"] = _combine(week_s, "week", breadth_s)
+
+    # --- Volatility regime (BTC 4h): compression/chop vs expansion. Drives which KIND of
+    # trade the tape rewards: in compression, mean-reversion bounces off levels work and
+    # breakouts fake out; in expansion, momentum/trend & breakouts follow through. ---
+    vol_regime = None
+    try:
+        braw = fetch_candles(sess, "BTCUSDT", "4h", 300, market)
+        if braw and len(braw) > 60:
+            bh = [float(x[2]) for x in braw[:-1]]
+            bl = [float(x[3]) for x in braw[:-1]]
+            bc = [float(x[4]) for x in braw[:-1]]
+            trs = [max(bh[i] - bl[i], abs(bh[i] - bc[i - 1]), abs(bl[i] - bc[i - 1]))
+                   for i in range(1, len(bc))]
+            win = 14
+            atrs = [sum(trs[i - win:i]) / win for i in range(win, len(trs) + 1)]
+            if atrs:
+                cur = atrs[-1]
+                look = atrs[-120:] if len(atrs) >= 120 else atrs
+                pct = round(sum(1 for x in look if x <= cur) / len(look) * 100)
+                if pct >= 70:
+                    st, note = "expansion", ("BTC volatility is EXPANDING — momentum, trend "
+                        "and breakouts tend to follow through; counter-trend fades are riskier.")
+                elif pct <= 30:
+                    st, note = "compression", ("BTC volatility is COMPRESSED (chop) — bounces "
+                        "off strong levels work best; breakouts often fail/fake until it expands.")
+                else:
+                    st, note = "normal", "BTC volatility is around normal — no strong tilt either way."
+                vol_regime = {"state": st, "atr_pctile": pct,
+                              "atr_pct": round(cur / bc[-1] * 100, 2), "note": note}
+    except Exception:
+        vol_regime = None
+    out["vol_regime"] = vol_regime
     return out
 
 
@@ -3440,6 +3472,168 @@ def bounce_scalp_setup(sess, symbol, market, side):
             "target": tps[0]["lvl"], "rr": rr_base, "rr_max": tps[-1]["rr"], "tps": tps,
             "rsi": r5, "kind": "bounce", "counter_trend": bool(counter),
             "level": round(level, 10), "touches": touches}
+
+
+def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210):
+    """Replay the core entry/stop/target MECHANICS over one coin's historical candles and
+    return a list of resolved trades (net R after fees). This validates the geometry that
+    matters for expectancy — a trend pullback to support (long) / rip to resistance (short),
+    an ATR-floored stop, and a target at the next structural level — WITHOUT look-ahead:
+    every decision at bar t uses only candles up to t, the limit must actually fill, and the
+    outcome is whichever of stop/target price reaches first (stop assumed first on a tie)."""
+    try:
+        H = [float(x[2]) for x in rows]
+        L = [float(x[3]) for x in rows]
+        C = [float(x[4]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return []
+    n = len(C)
+    if n < warmup + horizon + 5:
+        return []
+    e200 = ema(C, 200)
+    long = side == "long"
+    W = 120
+    fee_frac = fees_bps / 10000.0
+    trades = []
+    t = warmup
+    while t < n - horizon - 1:
+        el = e200[t]
+        if el is None:
+            t += 1; continue
+        price = C[t]
+        lo = max(0, t - W)
+        Hw, Lw, Cw = H[lo:t + 1], L[lo:t + 1], C[lo:t + 1]
+        a = atr(H[max(0, t - 20):t + 1], L[max(0, t - 20):t + 1], C[max(0, t - 20):t + 1])
+        if not a or a <= 0:
+            t += 1; continue
+        ms = market_structure(Hw, Lw, Cw)
+        up = ms["structure"] == "uptrend" or ms["choch"] == "bullish"
+        dn = ms["structure"] == "downtrend" or ms["choch"] == "bearish"
+        last = len(Lw) - 1
+        entry = stop = tp = risk = rr = None
+        prox = max(0.02, 1.5 * a / price)              # "near a level" band for a limit entry
+        if long:
+            if not (price > el and up):
+                t += 1; continue
+            sup = [s for s in supports_below(Lw, last, price, max_n=3, min_gap=0.004) if s < price]
+            near = sup[0] if sup else None
+            is_cmp = near is None or (price - near) / price > prox
+            entry = price if is_cmp else near           # CMP momentum entry, or limit at support
+            _min = max(0.008, 1.4 * a / entry)
+            below = (sup[1] if len(sup) > 1 else (near * 0.996 if near else entry * 0.985))
+            stop = min((below - 0.4 * a) if (near and not is_cmp) else entry * (1 - _min),
+                       entry * (1 - _min))
+            risk = entry - stop
+            if risk <= 0:
+                t += 1; continue
+            res = [r for r in resistances_above(Hw, last, price, max_n=3, min_gap=0.005) if r > entry * 1.01]
+            tp = res[0] if res else entry + 2 * risk
+            rr = (tp - entry) / risk
+            if rr < 1.3:
+                t += 1; continue
+            if is_cmp:
+                f = t + 1
+            else:
+                f = next((j for j in range(t + 1, min(n, t + 9)) if L[j] <= entry), None)
+                if f is None:
+                    t += 1; continue
+            outcome = rbar = None
+            for j in range(f, min(n, f + horizon + 1)):
+                if L[j] <= stop:
+                    outcome, rbar = "loss", j; break
+                if H[j] >= tp:
+                    outcome, rbar = "win", j; break
+            if outcome is None:
+                t = f + 1; continue
+        else:
+            if not (price < el and dn):
+                t += 1; continue
+            res = [r for r in resistances_above(Hw, last, price, max_n=3, min_gap=0.004) if r > price]
+            near = res[0] if res else None
+            is_cmp = near is None or (near - price) / price > prox
+            entry = price if is_cmp else near
+            _min = max(0.008, 1.4 * a / entry)
+            above = (res[1] if len(res) > 1 else (near * 1.004 if near else entry * 1.015))
+            stop = max((above + 0.4 * a) if (near and not is_cmp) else entry * (1 + _min),
+                       entry * (1 + _min))
+            risk = stop - entry
+            if risk <= 0:
+                t += 1; continue
+            sup = [s for s in supports_below(Lw, last, price, max_n=3, min_gap=0.005) if s < entry * 0.99]
+            tp = sup[0] if sup else entry - 2 * risk
+            if tp <= 0:
+                t += 1; continue
+            rr = (entry - tp) / risk
+            if rr < 1.3:
+                t += 1; continue
+            if is_cmp:
+                f = t + 1
+            else:
+                f = next((j for j in range(t + 1, min(n, t + 9)) if H[j] >= entry), None)
+                if f is None:
+                    t += 1; continue
+            outcome = rbar = None
+            for j in range(f, min(n, f + horizon + 1)):
+                if H[j] >= stop:
+                    outcome, rbar = "loss", j; break
+                if L[j] <= tp:
+                    outcome, rbar = "win", j; break
+            if outcome is None:
+                t = f + 1; continue
+        rr = round(rr, 2)
+        fee_R = fee_frac / (risk / entry)
+        R = (rr - fee_R) if outcome == "win" else (-1.0 - fee_R)
+        trades.append({"r": round(R, 3), "rr": rr, "outcome": outcome,
+                       "gross": rr if outcome == "win" else -1.0})
+        t = rbar + 1
+    return trades
+
+
+# A small liquid basket the backtester runs over (bounded cost for the free instance).
+BACKTEST_BASKET = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK",
+                   "SUI", "APT", "ARB", "OP", "LTC", "NEAR", "INJ"]
+
+
+def backtest_board(sess, side, market, tf="4h", limit=1000, fees_bps=4.0, symbols=None):
+    """Run backtest_symbol across a liquid basket and aggregate — win-rate, expectancy
+    (net of fees), gross vs net, avg win/loss and a per-symbol breakdown. This is the
+    offline read on whether the mechanics have a real edge, instead of waiting days for the
+    live forward-test to fill in."""
+    syms = symbols or BACKTEST_BASKET
+    rows_by = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {ex.submit(fetch_candles, sess, s + "USDT", tf, limit, market): s for s in syms}
+        for f in as_completed(futs):
+            try:
+                rows_by[futs[f]] = f.result()
+            except Exception:
+                rows_by[futs[f]] = None
+    allt, per = [], []
+    for s in syms:
+        rows = rows_by.get(s)
+        if not rows:
+            continue
+        tr = backtest_symbol(rows, side, fees_bps=fees_bps)
+        if tr:
+            m = len(tr); sm = sum(x["r"] for x in tr)
+            w = sum(1 for x in tr if x["outcome"] == "win")
+            per.append({"symbol": s + "USDT", "n": m, "winrate": round(w / m * 100, 1),
+                        "exp": round(sm / m, 3), "sumR": round(sm, 2)})
+            allt += tr
+    n = len(allt)
+    if not n:
+        return {"n": 0, "tf": tf, "side": side, "fees_bps": fees_bps}
+    w = sum(1 for x in allt if x["outcome"] == "win")
+    sm = sum(x["r"] for x in allt); gsm = sum(x["gross"] for x in allt)
+    wins = [x["r"] for x in allt if x["outcome"] == "win"]
+    losses = [x["r"] for x in allt if x["outcome"] == "loss"]
+    return {"n": n, "winrate": round(w / n * 100, 1), "exp": round(sm / n, 3),
+            "sumR": round(sm, 2), "gross_exp": round(gsm / n, 3),
+            "fee_drag": round((gsm - sm) / n, 3),
+            "avg_win": round(sum(wins) / len(wins), 2) if wins else None,
+            "avg_loss": round(sum(losses) / len(losses), 2) if losses else None,
+            "per_symbol": sorted(per, key=lambda p: p["exp"], reverse=True),
+            "tf": tf, "fees_bps": fees_bps, "side": side, "coins": len(per)}
 
 
 def scan_symbol(sess: requests.Session, symbol: str, interval: str,
