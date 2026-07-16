@@ -2642,10 +2642,10 @@ def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
     _rng = max(_hi - _lo, price * 0.005, 1e-9)
 
     def _smart_tps(long, entry, risk):
-        """A SMARTER target ladder: blend real structure (swing highs/lows per TF) with
-        Fibonacci extensions of the recent swing, measured moves, round numbers and the
-        leverage-liquidation magnets — deduped, sorted, each labelled with its 'why'. So
-        targets aren't just 'the next swing high' but the levels price is actually pulled to."""
+        """Target ladder built from REAL levels price is actually pulled toward: multi-TF
+        swing highs/lows, Fibonacci extensions of the recent swing, leverage-liquidation
+        magnets and round numbers — each labelled with its 'why'. Arbitrary 'R measured
+        moves' are a LAST-RESORT fallback only (added later if fewer than 2 real levels)."""
         cands = []
         if long:
             for r in sorted([x for x in ress if x > entry * 1.005]):
@@ -2655,8 +2655,6 @@ def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
                 lv = _hi + k * _rng
                 if lv > entry * 1.01:
                     cands.append((lv, f"{lab}× Fib extension of the swing"))
-            for m in (2.0, 3.5):
-                cands.append((entry + m * risk, f"{m:g}R measured move"))
             rn = _round_number(entry, True)
             if rn and rn > entry * 1.01:
                 cands.append((rn, "round-number magnet"))
@@ -2673,10 +2671,6 @@ def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
                 lv = _lo - k * _rng
                 if 0 < lv < entry * 0.99:
                     cands.append((lv, f"{lab}× Fib extension of the swing"))
-            for m in (2.0, 3.5):
-                lv = entry - m * risk
-                if lv > 0:
-                    cands.append((lv, f"{m:g}R measured move"))
             rn = _round_number(entry, False)
             if rn and 0 < rn < entry * 0.99:
                 cands.append((rn, "round-number magnet"))
@@ -2732,15 +2726,28 @@ def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
             else:
                 entry = near if near is not None else price
                 entry_tf = _tf_of(entry, _sup_map)
-                entry_basis = (f"{entry_tf} swing-low support — buy the pullback"
-                               if entry_tf else "current price (nearest support is too far to wait for)")
+                if entry > price * 1.001:
+                    # Price has already fallen BELOW this support → not a pullback but a
+                    # RECLAIM (a buy-stop above the current price; only a long once reclaimed).
+                    entry_basis = (f"reclaim of the {entry_tf} level — buy-stop ABOVE price"
+                                   if entry_tf else "reclaim entry — buy-stop above price")
+                else:
+                    entry_basis = (f"{entry_tf} swing-low support — buy the pullback"
+                                   if entry_tf else "current price (nearest support is too far to wait for)")
                 below = [s for s in ins if s < entry * 0.999]
-                stop = below[0] if below else round(entry * (1 - buf), 10)
-                if (entry - stop) < entry * 0.005:
+                # Stop sized to THIS coin's volatility — ~1.4×ATR below the support with a
+                # small 0.8% floor so a 4h swing isn't wicked out, but the distance stays
+                # individual (a quiet coin gets a tighter stop than a volatile one).
+                _min = max(0.008, 1.4 * atr_frac)
+                if below:
+                    stop = round(min(below[0] - 0.25 * atr_val, entry * (1 - _min)), 10)
+                    stop_tf = _tf_of(below[0], _sup_map)
+                    stop_basis = (f"below the {stop_tf} swing low (ATR-buffered)" if stop_tf
+                                  else "below support, ATR-buffered")
+                else:
                     stop = round(entry * (1 - buf), 10)
-                stop_tf = _tf_of(stop, _sup_map)
-                stop_basis = (f"below the {stop_tf} swing low" if stop_tf
-                              else "≈1.2×ATR below entry (volatility stop)")
+                    stop_tf = None
+                    stop_basis = "≈1.2×ATR below entry (volatility stop)"
             risk = entry - stop
             if risk <= 0:
                 return {}
@@ -2778,12 +2785,17 @@ def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
             entry_basis = (f"{entry_tf} swing-high resistance — sell into strength"
                            if entry_tf else "current price (nearest resistance is too far to wait for)")
             above = [r for r in ins if r > entry * 1.001]
-            stop = above[0] if above else round(entry * (1 + buf), 10)
-            if (stop - entry) < entry * 0.005:
+            # Stop sized to THIS coin's volatility — ~1.4×ATR above the resistance, 0.8% floor.
+            _min = max(0.008, 1.4 * atr_frac)
+            if above:
+                stop = round(max(above[0] + 0.25 * atr_val, entry * (1 + _min)), 10)
+                stop_tf = _tf_of(above[0], _res_map)
+                stop_basis = (f"above the {stop_tf} swing high (ATR-buffered)" if stop_tf
+                              else "above resistance, ATR-buffered")
+            else:
                 stop = round(entry * (1 + buf), 10)
-            stop_tf = _tf_of(stop, _res_map)
-            stop_basis = (f"above the {stop_tf} swing high" if stop_tf
-                          else "≈1.2×ATR above entry (volatility stop)")
+                stop_tf = None
+                stop_basis = "≈1.2×ATR above entry (volatility stop)"
         risk = stop - entry
         if risk <= 0:
             return {}
@@ -2804,7 +2816,12 @@ def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
         if rr is None:
             mult = 0.45
         else:
-            mult = max(0.40, min(1.30, 0.45 + 0.28 * min(rr, 3.0)))
+            # Reward a solid first target AND real ROOM TO RUN (a distant runner) — an
+            # amazing trade has both a clean R:R and space to a far structural target, so
+            # tight scalp-range coins sink and coins with real move potential rise.
+            rmax = plan.get("rr_max") or rr
+            eff = 0.7 * rr + 0.3 * min(rmax, 6.0)
+            mult = max(0.40, min(1.45, 0.45 + 0.26 * min(eff, 3.6)))
         return round(max(0.0, min(100.0, conv * mult)), 1)
 
     base = {"symbol": symbol, "price": price, "atr_pct": atr_pct, "rvol": rv,

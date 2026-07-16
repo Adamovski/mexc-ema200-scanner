@@ -234,6 +234,8 @@ class Tracker:
                 self.open[k] = self._mk(board, sym, side, entry, stop, tps, px, now,
                                         tf=(s.get("tf") or s.get("entry_tf") or ""),
                                         regime=s.get("regime", ""))
+                self.open[k]["entry_tf"] = s.get("entry_tf") or ""
+                self.open[k]["stop_tf"] = s.get("stop_tf") or ""
                 changed = True
         if changed:
             with self.lock:
@@ -271,6 +273,12 @@ class Tracker:
                 state="active")
             self._save()
         return True
+
+    def cooling(self, board, sym, side):
+        """True if this exact setup was recently STOPPED OUT (in its loss cooldown) — used
+        to hide a just-failed idea from the recommendation boards, not only the tracker."""
+        cd = self.cooldowns.get(f"{board}:{sym}:{side}")
+        return bool(cd and time.time() < cd.get("until", 0))
 
     def resolve(self, prices):
         """Scale-out-aware resolution. Bank each TP by its weight as price reaches it,
@@ -346,11 +354,13 @@ class Tracker:
                 t["r"] = round(r, 2)
                 t["closed_ts"] = now
                 self.closed.append(t)
-                # Start a timeframe-scaled cooldown for this exact setup so it isn't
-                # re-taken next scan — a failed 5m scalp rests ~1h, a 4h setup ~2 days.
-                self.cooldowns[f"{t['board']}:{t['symbol']}:{t['side']}"] = {
-                    "entry": t.get("entry"), "stop": t.get("stop"), "ts": now,
-                    "until": now + self._cooldown_secs(t.get("tf"))}
+                # Cooldown ONLY when the idea PLAYED OUT and failed/broke even (stopped) —
+                # don't re-recommend a just-stopped setup. A MISSED/EXPIRED setup never
+                # filled, so it's still a valid pending pullback: no cooldown, keep watching.
+                if outcome in ("loss", "be"):
+                    self.cooldowns[f"{t['board']}:{t['symbol']}:{t['side']}"] = {
+                        "entry": t.get("entry"), "stop": t.get("stop"), "ts": now,
+                        "until": now + self._cooldown_secs(t.get("tf")), "status": outcome}
             # Forget expired cooldowns so genuinely new setups can register again.
             self.cooldowns = {kk: v for kk, v in self.cooldowns.items()
                               if now < v.get("until", v.get("ts", 0) + 12 * 3600)}
@@ -358,7 +368,23 @@ class Tracker:
             if done:
                 self._save()
 
-    def stats(self):
+    def stats(self, prices=None):
+        prices = prices or {}
+
+        def _cur_r(t):
+            """Live mark-to-market R for an OPEN, filled trade: banked R plus the open
+            remainder marked at the current price (up or down). None if not filled/priced."""
+            if t.get("state") != "active":
+                return None
+            p = prices.get(t.get("symbol"))
+            if not p:
+                return None
+            long = t.get("side") != "short"
+            risk = abs((t.get("entry") or 0) - (t.get("stop") or 0)) or 1e-9
+            openr = (p - t["entry"]) / risk if long else (t["entry"] - p) / risk
+            rem = sum(t.get("weights", [1.0])[t.get("phase", 0):]) or 0.0
+            return round((t.get("realized") or 0) + rem * openr, 2)
+
         with self.lock:
             res_all = [t for t in self.closed if t.get("status") in ("win", "loss", "be")]
             # Headline + boards show only the CURRENT version (a clean slate for the new
@@ -394,8 +420,9 @@ class Tracker:
                         "tp_rates": tp_rates, "allout": allout_exp}
             _cf = ("board", "symbol", "side", "entry", "stop", "tps", "rr", "status",
                    "r", "ts", "closed_ts", "tf", "note", "px0", "tps_hit", "state",
-                   "phase", "filled_ts", "regime", "ver")
-            _pk = lambda t: {c: t.get(c) for c in _cf}
+                   "phase", "filled_ts", "regime", "ver", "realized", "cur_stop_r",
+                   "entry_tf", "stop_tf")
+            _pk = lambda t: {**{c: t.get(c) for c in _cf}, "cur_r": _cur_r(t)}
             _active = sum(1 for t in self.open.values() if t.get("state") == "active")
             _pending = sum(1 for t in self.open.values() if t.get("state") == "pending")
             _missed = sum(1 for t in self.closed if t.get("status") == "missed")
@@ -430,7 +457,23 @@ class Tracker:
             by_version = [{"ver": v, "current": v == APP_VERSION,
                            **agg([t for t in _auto_all if t.get("ver", "v1 · pre-gate") == v])}
                           for v in _vers]
+            # LIVE winners: open trades (this version) already past TP1 — risk-free and
+            # running. Their banked R lets you see how the (mostly-open) book is doing
+            # without waiting for everything to resolve. Combined R = resolved + banked.
+            _livewin = [t for t in _open_cur if t.get("tps_hit")]
+            _livewin.sort(key=lambda t: max(t.get("tps_hit") or [0]), reverse=True)
+            live_realized = round(sum((t.get("realized") or 0) for t in _open_cur), 2)
+            _res_sumR = agg(res).get("sumR") or 0
+            # Mark-to-market: current unrealized R across ALL filled open trades (up/down).
+            _active_cur = [t for t in _open_cur if t.get("state") == "active"]
+            open_unreal = round(sum((_cur_r(t) or 0) for t in _active_cur), 2)
+            _mtm_n = sum(1 for t in _active_cur if _cur_r(t) is not None)
             return {"overall": agg(res), "version": APP_VERSION,
+                    "live_winners": [_pk(t) for t in _livewin][:80],
+                    "live_realized": live_realized,
+                    "live_count": len(_open_cur),
+                    "open_unreal_R": open_unreal, "mtm_n": _mtm_n,
+                    "combined_R": round(_res_sumR + open_unreal, 2),
                     "by_board": {b: agg([t for t in res if t["board"] == b])
                                  for b in ("long", "short", "coil", "scalp", "call")},
                     "by_regime": by_regime,
@@ -731,7 +774,7 @@ class State:
                 "coil_board": withlive(self.coil_board),
                 "scalp_board": withlive(self.scalp_board),
                 "market_context": self.market_context,
-                "perf": TRACKER.stats(),
+                "perf": TRACKER.stats(lp),
                 "both_symbols": list(self.both_symbols),
                 "breakout_events": list(self.breakout_events),
                 "error": self.error,
@@ -1034,6 +1077,13 @@ def run_one_scan(state: State) -> None:
             kept.append(d)
         return kept
     scalp_board = _scalp_keep(scalp_board)[:25]
+
+    # Hide setups that JUST got stopped out (in their loss cooldown) from the boards —
+    # a failed idea shouldn't keep being recommended. Missed/never-filled ones stay.
+    long_board = [d for d in long_board if not TRACKER.cooling("long", d["symbol"], "long")]
+    short_board = [d for d in short_board if not TRACKER.cooling("short", d["symbol"], "short")]
+    scalp_board = [d for d in scalp_board if not TRACKER.cooling("scalp", d["symbol"], d.get("side", "long"))]
+    coil_board = [d for d in coil_board if not TRACKER.cooling("coil", d["symbol"], d.get("rec_side") or "long")]
 
     # Performance tracking — register each board's fresh setups (resolved later against
     # the live price feed). Coil registers the recommended side's breakout plan.
@@ -2257,6 +2307,10 @@ PAGE = """<!doctype html>
     </div>
   </details>
   <div id="perfCards" class="perfcards"></div>
+  <div class="perfsub" id="liveWinSub" style="display:none">🟢 Live winners — open trades already past TP1 (stop at break-even, running)</div>
+  <table id="livewintbl" style="display:none"><thead><tr>
+      <th>Added</th><th>Board</th><th>Symbol</th><th>Side</th><th>TF</th><th>Entry</th><th data-tip="Current mark-to-market R right now (banked TPs + open remainder at live price).">Now (R)</th><th>Progress</th>
+    </tr></thead><tbody id="livewinrows"></tbody></table>
   <div class="perfsub">By board — win rate, expectancy & per-TP hit rates</div>
   <table id="perftbl"><thead><tr>
       <th>Board</th><th data-tip="Filled setups that have resolved.">Trades</th>
@@ -4303,12 +4357,34 @@ function renderPerf(){
   if(emp) emp.style.display=hasData?'none':'block';
   if(meta) meta.textContent=`${(perf&&perf.version)?('['+perf.version+'] · '):''}${(perf&&perf.active)||0} live · ${(perf&&perf.pending)||0} waiting for entry · ${(perf&&perf.missed)||0} missed · ${o.n||0} resolved this version${perf&&perf.upstash?' · durable storage on':' · in-memory (add Upstash to persist)'}`;
   const wr=o.winrate, exp=o.exp, tot=o.sumR;
+  const unreal=(perf&&perf.open_unreal_R)||0, comb=(perf&&perf.combined_R), mtmN=(perf&&perf.mtm_n)||0;
   cards.innerHTML=
      perfCard('Win rate', wr==null?'—':wr+'%', wr==null?'':(wr>=50?'pcg':wr>=40?'':'pcb'))
     +perfCard('Expectancy', exp==null?'—':(exp>0?'+':'')+exp+'R', exp==null?'':(exp>0?'pcg':'pcb'))
-    +perfCard('Total R', tot==null?'—':(tot>0?'+':'')+tot+'R', tot==null?'':(tot>0?'pcg':tot<0?'pcb':''))
-    +perfCard('Resolved', (o.n||0), '')
+    +perfCard('Total R (resolved)', tot==null?'—':(tot>0?'+':'')+tot+'R', tot==null?'':(tot>0?'pcg':tot<0?'pcb':''))
+    +perfCard('Open — unrealized', (unreal>0?'+':'')+unreal+'R', unreal>0?'pcg':unreal<0?'pcb':'', `Live mark-to-market of all ${mtmN} filled open trades right now (banked TPs + the open remainder at the current price). Updates every few seconds.`)
+    +perfCard('Net (all, live)', comb==null?'—':(comb>0?'+':'')+comb+'R', comb>0?'pcg':comb<0?'pcb':'', 'Resolved Total R + the live unrealized R of open trades — the whole book, marked to market right now.')
     +perfCard('Open now', (perf&&perf.open)||0, '');
+  // Live winners — open trades already past TP1 (risk-free, running), with current MTM R.
+  const lw=(perf&&perf.live_winners)||[];
+  const lwSub=document.getElementById('liveWinSub'), lwTbl=document.getElementById('livewintbl'), lwRows=document.getElementById('livewinrows');
+  if(lwRows){ lwRows.innerHTML='';
+    if(lw.length){ if(lwSub)lwSub.style.display=''; if(lwTbl)lwTbl.style.display='';
+      for(const t of lw){
+        const hi=(t.tps_hit&&t.tps_hit.length)?Math.max.apply(null,t.tps_hit):0;
+        const when=t.ts?new Date(t.ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
+        const cr=(t.cur_r!=null)?((t.cur_r>0?'+':'')+t.cur_r+'R'):'—';
+        const tr=document.createElement('tr');
+        tr.innerHTML=`<td class="dim" style="white-space:nowrap">${when}</td>`
+          +`<td>${({long:'Long',short:'Short',coil:'Coil',scalp:'Scalp'})[t.board]||t.board}</td>`
+          +`<td class="sym"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></td>`
+          +`<td>${sideLabel(t)}</td><td>${t.tf||'—'}</td><td>${fmtNum(t.entry)}</td>`
+          +`<td class="${t.cur_r>0?'pf-good':t.cur_r<0?'pf-bad':''}"><b>${cr}</b></td>`
+          +`<td class="pf-good">TP${hi} hit → stop at break-even+</td>`;
+        lwRows.appendChild(tr);
+      }
+    } else { if(lwSub)lwSub.style.display='none'; if(lwTbl)lwTbl.style.display='none'; }
+  }
   const names={long:'🏆 Best longs',short:'🩸 Best shorts',coil:'🚀 Coiled',scalp:'⚡ Scalps'};
   const brows=(perf&&perf.board_rows)||{};
   if(rows){ rows.innerHTML='';
