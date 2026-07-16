@@ -84,13 +84,18 @@ def send_telegram(cfg: dict, text: str) -> None:
 # logic changes meaningfully — the headline win-rate resets to the new version (a clean
 # slate for the new logic), while every past version's results are kept and shown in the
 # "site version" breakdown so you can compare how each iteration actually performed.
-APP_VERSION = "v2 · quality gate + decorrelation"
+APP_VERSION = "v3 · real targets + ATR stops + reach"
+# One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
+# every call (open + resolved) on the next boot and start the calls scorecard fresh —
+# auto-board trades and their version history are untouched.
+CALLS_RESET = "2026-07-16"
 # ----------------------------------------------------------------------------
 class Tracker:
     def __init__(self):
         self.lock = threading.Lock()
         self.open: dict[str, dict] = {}
         self.closed: list[dict] = []
+        self.calls_reset = ""
         # After a setup resolves, don't re-track the SAME idea (same board:sym:side at
         # ~the same entry) for a cooldown window — otherwise a setup that keeps appearing
         # on the board gets re-taken and re-stopped every scan (compounding one loss).
@@ -141,18 +146,28 @@ class Tracker:
                 self.open = d.get("open", {})
                 self.closed = d.get("closed", [])
                 self.cooldowns = d.get("cooldowns", {})
+                self.calls_reset = d.get("calls_reset", "")
                 # Anything recorded before versioning belongs to the previous epoch —
                 # tag it v1 so the current version's headline starts fresh but the old
                 # results are kept and shown in the site-version breakdown.
                 for t in list(self.open.values()) + self.closed:
                     if not t.get("ver"):
                         t["ver"] = "v1 · pre-gate"
+                # One-time "My calls" wipe: if the stored marker is stale, drop every
+                # call (open + resolved) so the calls scorecard starts clean. Auto boards
+                # are left completely intact.
+                if self.calls_reset != CALLS_RESET:
+                    self.open = {k: t for k, t in self.open.items()
+                                 if t.get("board") != "call"}
+                    self.closed = [t for t in self.closed if t.get("board") != "call"]
+                    self.calls_reset = CALLS_RESET
+                    self._save()
             except Exception:
                 pass
 
     def _save(self):
         blob = json.dumps({"open": self.open, "closed": self.closed[-1000:],
-                           "cooldowns": self.cooldowns})
+                           "cooldowns": self.cooldowns, "calls_reset": self.calls_reset})
         try:
             with open(self.path, "w") as f:
                 f.write(blob)
@@ -423,22 +438,27 @@ class Tracker:
                    "phase", "filled_ts", "regime", "ver", "realized", "cur_stop_r",
                    "entry_tf", "stop_tf")
             _pk = lambda t: {**{c: t.get(c) for c in _cf}, "cur_r": _cur_r(t)}
-            _active = sum(1 for t in self.open.values() if t.get("state") == "active")
-            _pending = sum(1 for t in self.open.values() if t.get("state") == "pending")
-            _missed = sum(1 for t in self.closed if t.get("status") == "missed")
             _open_all = list(self.open.values())
-            # Current-version open + closed only, so the board tables reflect the new epoch.
+            # Current-version open only. Old-version open trades keep resolving quietly in
+            # the background (so they still score under their own version in by_version),
+            # but they are HIDDEN from every live display — boards, counts, winners, MTM.
             _open_cur = [t for t in _open_all if t.get("ver", "v1 · pre-gate") == APP_VERSION]
+            # User calls are the trader's own picks — never version-scoped, always live.
+            _calls_all = [t for t in _open_all if t.get("board") == "call"]
+            _active = sum(1 for t in _open_cur if t.get("state") == "active")
+            _pending = sum(1 for t in _open_cur if t.get("state") == "pending")
+            _missed = sum(1 for t in self.closed if t.get("status") == "missed"
+                          and t.get("ver", "v1 · pre-gate") == APP_VERSION)
             _closed_rev = list(reversed(self.closed))
             _closed_cur = [t for t in _closed_rev if t.get("ver", "v1 · pre-gate") == APP_VERSION]
             # Per-board trade lists so each board row on the Performance tab can EXPAND
             # to show its own open (live + waiting) and resolved setups. Capped per board.
-            # Expansion shows ALL live/waiting trades (operationally relevant regardless of
-            # version) plus this version's resolved ones — so you can always drill in.
+            # Current version only: this version's live/waiting trades plus its resolved
+            # ones. Old-version open trades are hidden (they score in by_version instead).
             board_rows = {}
             for b in ("long", "short", "coil", "scalp"):
                 board_rows[b] = {
-                    "open": [_pk(t) for t in _open_all if t.get("board") == b][:80],
+                    "open": [_pk(t) for t in _open_cur if t.get("board") == b][:80],
                     "closed": [_pk(t) for t in _closed_cur if t.get("board") == b][:60],
                 }
             # Learning signal: win-rate WITH the market regime vs AGAINST it. If
@@ -457,14 +477,14 @@ class Tracker:
             by_version = [{"ver": v, "current": v == APP_VERSION,
                            **agg([t for t in _auto_all if t.get("ver", "v1 · pre-gate") == v])}
                           for v in _vers]
-            # LIVE winners: open trades (this version) already past TP1 — risk-free and
-            # running. Their banked R lets you see how the (mostly-open) book is doing
-            # without waiting for everything to resolve. Combined R = resolved + banked.
+            # LIVE winners: current-version open trades already past TP1 — risk-free and
+            # running. Version-scoped like the rest of the live view; old-version open
+            # trades are hidden here even if they're still in profit.
             _livewin = [t for t in _open_cur if t.get("tps_hit")]
             _livewin.sort(key=lambda t: max(t.get("tps_hit") or [0]), reverse=True)
             live_realized = round(sum((t.get("realized") or 0) for t in _open_cur), 2)
             _res_sumR = agg(res).get("sumR") or 0
-            # Mark-to-market: current unrealized R across ALL filled open trades (up/down).
+            # Mark-to-market: current unrealized R across current-version filled open trades.
             _active_cur = [t for t in _open_cur if t.get("state") == "active"]
             open_unreal = round(sum((_cur_r(t) or 0) for t in _active_cur), 2)
             _mtm_n = sum(1 for t in _active_cur if _cur_r(t) is not None)
@@ -474,16 +494,19 @@ class Tracker:
                     "live_count": len(_open_cur),
                     "open_unreal_R": open_unreal, "mtm_n": _mtm_n,
                     "combined_R": round(_res_sumR + open_unreal, 2),
-                    "by_board": {b: agg([t for t in res if t["board"] == b])
-                                 for b in ("long", "short", "coil", "scalp", "call")},
+                    # Auto boards are version-scoped (fresh scorecard per version); the
+                    # user's own CALLS are never version-scoped — they span every version.
+                    "by_board": {**{b: agg([t for t in res if t["board"] == b])
+                                    for b in ("long", "short", "coil", "scalp")},
+                                 "call": agg([t for t in res_all if t.get("board") == "call"])},
                     "by_regime": by_regime,
                     "by_version": by_version,
                     "board_rows": board_rows,
-                    "open": len(self.open), "active": _active, "pending": _pending,
+                    "open": len(_open_cur), "active": _active, "pending": _pending,
                     "missed": _missed,
                     "upstash": bool(self._up()),
                     "recent": [_pk(t) for t in _closed_cur[:80]],
-                    "calls_open": [_pk(t) for t in _open_all if t.get("board") == "call"],
+                    "calls_open": [_pk(t) for t in _calls_all],
                     "calls_closed": [_pk(t) for t in _closed_rev
                                      if t.get("board") == "call"][:60]}
 
@@ -4825,7 +4848,9 @@ function renderCalls(){
   if(openrows){ openrows.innerHTML='';
     for(const t of opens){
       const when=t.ts?new Date(t.ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
-      const prog=(t.tps_hit&&t.tps_hit.length)?`TP${Math.max.apply(null,t.tps_hit)} hit → stop at ${t.phase>=1?'break-even+':'—'}`:'watching…';
+      const st=(t.state==='pending')?'⏳ waiting for entry':((t.tps_hit&&t.tps_hit.length)?`TP${Math.max.apply(null,t.tps_hit)} hit → stop at ${t.phase>=1?'break-even+':'—'}`:'● live · watching');
+      const liveR=(t.cur_r!=null)?` · <b style="color:${t.cur_r>=0?'var(--up,#3fb950)':'var(--down,#f85149)'}">${t.cur_r>=0?'+':''}${t.cur_r}R</b>`:'';
+      const prog=st+liveR;
       const tr=document.createElement('tr');
       tr.innerHTML=`<td style="color:var(--dim);white-space:nowrap">${when}</td>`
         +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></div></td>`
