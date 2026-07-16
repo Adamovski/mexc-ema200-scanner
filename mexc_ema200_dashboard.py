@@ -1728,6 +1728,15 @@ PAGE = """<!doctype html>
   .bt-wait{color:#f0b429;font-weight:700;cursor:help} .bt-live{color:var(--accent);font-weight:700}
   .mc-bull{color:var(--accent)} .mc-bear{color:#f85149} .mc-mid{color:#f0b429}
   .mc-heads{display:flex;gap:14px;flex-wrap:wrap;margin:6px 0 4px}
+  .mc-now{margin:8px 0 2px;padding:8px 12px;border-radius:9px;border:1px solid var(--line);background:rgba(139,152,173,.05);font-size:13px;cursor:help}
+  .mc-now.mc-bull{border-color:rgba(63,185,80,.45);background:rgba(63,185,80,.07)}
+  .mc-now.mc-bear{border-color:rgba(248,81,73,.45);background:rgba(248,81,73,.07)}
+  .mc-now b{font-weight:800}
+  .histtypes{display:flex;flex-direction:column;gap:6px;margin:8px 0}
+  .histtype>summary{cursor:pointer;padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg2);font-size:12.5px;font-weight:600;list-style:none}
+  .histtype>summary::-webkit-details-marker{display:none}
+  .histtype[open]>summary{border-bottom-left-radius:0;border-bottom-right-radius:0}
+  .histtype .rnk{color:var(--dim2);width:26px}
   .mc-head{flex:1;min-width:280px;border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:rgba(139,152,173,.04)}
   .mc-head.mc-bull{border-color:rgba(63,185,80,.5);background:rgba(63,185,80,.08)}
   .mc-head.mc-bear{border-color:rgba(248,81,73,.45);background:rgba(248,81,73,.08)}
@@ -4657,6 +4666,13 @@ function renderMarket(){
       </div></div>`;
   };
   let h=`<div class="mc-heads">${headCard('📅 Today',day)}${headCard('🗓️ This week',week)}</div>`;
+  // Intraday "right now" lean — the fastest read (BTC 15m/1h + 4h alt breadth).
+  const rnow=mc.now||{};
+  if(rnow.lean){
+    const nc=rnow.lean==='long'?'mc-bull':rnow.lean==='short'?'mc-bear':'mc-mid';
+    const nt=rnow.lean==='long'?'lean LONG':rnow.lean==='short'?'lean SHORT':'no clear lean';
+    h+=`<div class="mc-now ${nc}" data-tip="A fast 'right now' lean from the quickest reads — BTC 15m/1h trend blended with 4h alt breadth. Shorter-horizon than the Today card; use it to time intraday entries.">⏱️ Right now — <b>${nt}</b> · ${rnow.note||''}</div>`;
+  }
   // BTC section
   h+=`<div class="perfsub">₿ Bitcoin — multi-timeframe trend</div>`;
   h+=`<div class="mc-btcbar"><div>Overall BTC read: <b class="${mcVerdictClass(btc.verdict)}">${(btc.verdict||'—').toUpperCase()}</b>`
@@ -4699,6 +4715,18 @@ function renderMarket(){
         +`<td class="${(r.chg||0)>=0?'pf-good':'pf-bad'}">${signed(r.chg,'%')}</td></tr>`;
     }
     h+=`</tbody></table>`;
+  }
+  // Intraday alt breadth (4h) — how alts are participating in the last few hours.
+  const a4=mc.alts_4h||null;
+  if(a4&&a4.n){
+    h+=`<div class="perfsub">🪙 Alt breadth — intraday (4h)</div>`;
+    h+=`<div class="mc-cards">
+      ${mcStat('Above 200-EMA (4h)', a4.pct_above_200ema+'%', a4.pct_above_200ema>=60?'mc-bull':a4.pct_above_200ema<=40?'mc-bear':'mc-mid')}
+      ${mcStat('Green on the 4h', a4.pct_up+'%', a4.pct_up>=60?'mc-bull':a4.pct_up<=40?'mc-bear':'mc-mid')}
+      ${mcStat('Up / Down (4h)', a4.up+' / '+a4.down, a4.up>a4.down?'mc-bull':a4.up<a4.down?'mc-bear':'mc-mid')}
+      ${mcStat('Avg 4h change', signed(a4.avg_chg,'%'), (a4.avg_chg||0)>=0?'mc-bull':'mc-bear')}
+      ${mcStat('Intraday breadth', (a4.verdict||'—').toUpperCase(), mcVerdictClass(a4.verdict))}
+    </div>`;
   }
   body.innerHTML=h;
 }
@@ -4821,13 +4849,29 @@ function renderHistory(){
     const tally={};
     for(const s of sigs){ for(const side of ['longs','shorts','coils']){ for(const it of (s[side]||[])){
       const k=it.s; tally[k]=tally[k]||{s:k,long:0,short:0,coil:0}; tally[k][side.slice(0,-1)]++; } } }
-    const lead=Object.values(tally).map(x=>({...x,tot:x.long+x.short+x.coil})).sort((a,b)=>b.tot-a.tot).slice(0,14);
+    const all=Object.values(tally);
+    const lead=all.map(x=>({...x,tot:x.long+x.short+x.coil})).sort((a,b)=>b.tot-a.tot).slice(0,14);
     out+=`<div class="perfsub">Signal leaders — coins that keep topping the boards (last ${sigs.length} scans)</div>`;
-    out+=`<div class="histnote">The names that repeatedly rank highest — the ones worth watching. A high long count = persistently strong; high short count = persistently weak.</div>`;
+    out+=`<div class="histnote">The names that repeatedly rank highest — the ones worth watching. A high long count = persistently strong; high short count = persistently weak. Expand a trade type below to rank the leaders for just that board.</div>`;
     out+=`<table class="bt"><thead><tr><th>Coin</th><th># times as top long</th><th># as top short</th><th># as top coil</th></tr></thead><tbody>`;
     for(const x of lead){ out+=`<tr><td class="sym"><a href="${tvLink(x.s)}" target="_blank" rel="noopener">${dispSym(x.s)}</a></td>`
       +`<td class="pf-good">${x.long||'—'}</td><td class="pf-bad">${x.short||'—'}</td><td>${x.coil||'—'}</td></tr>`; }
     out+=`</tbody></table>`;
+    // Expand by trade type — a ranked leaderboard for each board on its own.
+    const typeBlock=(key,label,emoji,cls)=>{
+      const rows=all.filter(x=>x[key]>0).sort((a,b)=>b[key]-a[key]).slice(0,12);
+      if(!rows.length) return '';
+      const body=rows.map((x,i)=>`<tr><td class="rnk">${i+1}</td>`
+        +`<td class="sym"><a href="${tvLink(x.s)}" target="_blank" rel="noopener">${dispSym(x.s)}</a></td>`
+        +`<td class="${cls}">${x[key]}× top ${label.toLowerCase()}</td></tr>`).join('');
+      return `<details class="histtype"><summary>${emoji} ${label} — ${rows.length} coin${rows.length===1?'':'s'} ranked</summary>`
+        +`<table class="bt"><thead><tr><th>#</th><th>Coin</th><th>Times topping this board</th></tr></thead><tbody>${body}</tbody></table></details>`;
+    };
+    out+=`<div class="histtypes">`
+      +typeBlock('long','Longs','🏆','pf-good')
+      +typeBlock('short','Shorts','🔻','pf-bad')
+      +typeBlock('coil','Coiled','🚀','')
+      +`</div>`;
   }
   // 4) Per-coin derivatives history (Coinalyze)
   const coins=h.coins||{};
