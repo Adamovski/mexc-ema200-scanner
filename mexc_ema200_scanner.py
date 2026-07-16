@@ -2048,10 +2048,50 @@ def compute_market_context(sess: requests.Session, market: str) -> dict:
                                   reverse=True)}
     out["alts"] = alts
 
+    # --- Intraday alt breadth (4h) --- a SHORTER-timeframe breadth read so the "day"
+    # verdict reflects how alts are participating RIGHT NOW (last few hours), not just
+    # where they sit on the daily. Same basket, one extra 4h read each (bounded cost).
+    alt4_reads = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {ex.submit(_tf_read, sess, s, "4h", market): s for s in ALT_BASKET}
+        for f in as_completed(futs):
+            try:
+                r = f.result()
+            except Exception:
+                r = None
+            if r:
+                r["symbol"] = futs[f]
+                alt4_reads.append(r)
+    alts_4h = None
+    breadth_4h = 0.0
+    if alt4_reads:
+        n4 = len(alt4_reads)
+        above4 = sum(1 for r in alt4_reads if (r.get("px_vs_ema") or 0) > 0)
+        up4 = sum(1 for r in alt4_reads if (r.get("chg") or 0) > 0)
+        avg_chg4 = sum((r.get("chg") or 0) for r in alt4_reads) / n4
+        pct_above4 = round(above4 / n4 * 100)
+        pct_up4 = round(up4 / n4 * 100)
+        breadth_4h = (above4 / n4 - 0.5) * 2.0
+        # Lean off the freshest thing: how many alts are GREEN on the 4h right now.
+        v4 = "risk-on" if pct_up4 >= 60 else ("risk-off" if pct_up4 <= 40 else "mixed")
+        alts_4h = {"n": n4, "pct_above_200ema": pct_above4, "pct_up": pct_up4,
+                   "up": up4, "down": n4 - up4, "avg_chg": round(avg_chg4, 2),
+                   "verdict": v4}
+    out["alts_4h"] = alts_4h
+
+    # A quick "right now" intraday lean from the fastest reads (BTC 15m/1h + 4h alt breadth).
+    now_s = 0.7 * (day_s or 0.0) + 0.3 * breadth_4h
+    out["now"] = {"score": round(now_s, 3),
+                  "lean": "long" if now_s >= 0.22 else ("short" if now_s <= -0.22 else "neutral"),
+                  "note": ("alts leaning green on the 4h" if breadth_4h > 0.2
+                           else "alts leaning red on the 4h" if breadth_4h < -0.2
+                           else "alts mixed on the 4h")}
+
     # --- Combined day/week verdicts ---
-    def _combine(trend_s, horizon):
-        # Blend BTC trend with alt breadth for a longs/shorts recommendation.
-        c = 0.7 * (trend_s or 0.0) + 0.3 * breadth_s
+    # The DAY read blends BTC intraday trend with the 4h alt breadth (fresh participation);
+    # the WEEK read blends BTC swing trend with the daily alt breadth (structural).
+    def _combine(trend_s, horizon, breadth):
+        c = 0.7 * (trend_s or 0.0) + 0.3 * (breadth or 0.0)
         if c >= 0.28:
             longs, shorts = "favorable", "avoid"
             head = f"Good {horizon} to look for LONGS — BTC is trending up and alt breadth is supportive."
@@ -2062,8 +2102,8 @@ def compute_market_context(sess: requests.Session, market: str) -> dict:
             longs, shorts = "cautious", "cautious"
             head = f"Mixed {horizon} — no clear edge either way; be selective and trade the cleanest setups only."
         return {"score": round(c, 3), "longs": longs, "shorts": shorts, "headline": head}
-    out["day"] = _combine(day_s, "day")
-    out["week"] = _combine(week_s, "week")
+    out["day"] = _combine(day_s, "day", breadth_4h)
+    out["week"] = _combine(week_s, "week", breadth_s)
     return out
 
 

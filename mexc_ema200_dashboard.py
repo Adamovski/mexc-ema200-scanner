@@ -984,25 +984,35 @@ def run_one_scan(state: State) -> None:
     # trades beat 25 forced ones. A setup must have genuine conviction AND R:R, must not
     # fight the regime (unless it's elite), and must not be chasing a stretched extreme.
     # If nothing qualifies, the board is intentionally empty ("no trade").
-    CONV_FLOOR, RR_FLOOR = 60.0, 1.8
+    #
+    # The bar is ASYMMETRIC by regime: when the market read explicitly favours a side
+    # (e.g. a shorts-favourable week), that side gets a little more benefit of the doubt
+    # — a slightly lower conviction/R:R floor — because the tape is already on its side.
+    # The side the regime is fighting keeps the full bar. Base floors are a touch lower
+    # than before so a decent setup isn't held back in a merely-mixed tape.
+    CONV_FLOOR, RR_FLOOR = 57.0, 1.7
 
     def _quality_keep(board, side):
+        favor = _reg if side == "long" else -_reg      # >0 = regime favours this side
+        favored = favor >= 0.20
+        conv_floor = CONV_FLOOR - (5.0 if favored else 0.0)
+        rr_floor = RR_FLOOR - (0.15 if favored else 0.0)
         kept = []
         for d in board:
             conv = d.get("conviction", 0) or 0
             rr = d.get("rr")
             reg = d.get("regime", "neutral")
             pv = d.get("pct_vs_ema")
-            if rr is None or rr < RR_FLOOR:
+            if rr is None or rr < rr_floor:
                 d["gate"] = "low R:R"
                 continue
-            if conv < CONV_FLOOR:
+            if conv < conv_floor:
                 d["gate"] = "low conviction"
                 continue
             # Don't auto-exclude against-regime setups — a strong one can still be worth it,
             # and decorrelated coins aren't judged by BTC at all. Just ask for MORE
             # conviction when a correlated coin fights the tape.
-            if reg == "against" and not d.get("decor") and conv < CONV_FLOOR + 12:
+            if reg == "against" and not d.get("decor") and conv < conv_floor + 12:
                 d["gate"] = "against regime (needs more conviction)"
                 continue
             if side == "long" and pv is not None and pv > 30:
