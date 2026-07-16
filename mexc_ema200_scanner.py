@@ -3481,13 +3481,120 @@ def bounce_scalp_setup(sess, symbol, market, side):
             "level": round(level, 10), "touches": touches}
 
 
-def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210):
-    """Replay the core entry/stop/target MECHANICS over one coin's historical candles and
-    return a list of resolved trades (net R after fees). This validates the geometry that
-    matters for expectancy — a trend pullback to support (long) / rip to resistance (short),
-    an ATR-floored stop, and a target at the next structural level — WITHOUT look-ahead:
-    every decision at bar t uses only candles up to t, the limit must actually fill, and the
-    outcome is whichever of stop/target price reaches first (stop assumed first on a tie)."""
+def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210):
+    """TREND-ALIGNED MEAN REVERSION — the high-win-rate candidate. Only trades WITH the
+    higher-timeframe trend (price on the right side of a SLOPING 200-EMA), enters on an
+    OVERSOLD (long) / OVERBOUGHT (short) snap-back that has just reversed, and targets the
+    nearby mean (20-EMA) for a quick, high-probability bounce. The stop sits beyond the
+    flush extreme. In plain terms: buy panic in an uptrend / sell euphoria in a downtrend,
+    and take the snap-back to the mean. No look-ahead; net of fees."""
+    try:
+        H = [float(x[2]) for x in rows]
+        L = [float(x[3]) for x in rows]
+        C = [float(x[4]) for x in rows]
+        V = [float(x[5]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return []
+    n = len(C)
+    if n < warmup + horizon + 5:
+        return []
+    e200 = ema(C, 200)
+    e20 = ema(C, 20)
+    rsis = rsi_series(C)
+    long = side == "long"
+    fee_frac = fees_bps / 10000.0
+    _dv = sorted(C[i] * V[i] for i in range(len(C)))
+    dvol = _dv[len(_dv) // 2] if _dv else 0.0
+    trades = []
+    t = warmup
+    while t < n - horizon - 1:
+        el = e200[t]; e2 = e20[t]; rs = rsis[t]
+        if el is None or e2 is None or rs is None:
+            t += 1; continue
+        price = C[t]
+        a = atr(H[max(0, t - 20):t + 1], L[max(0, t - 20):t + 1], C[max(0, t - 20):t + 1])
+        if not a or a <= 0:
+            t += 1; continue
+        prev200 = e200[t - 20] if t >= 20 else None
+        entry = stop = target = risk = rr = None
+        outcome = rbar = None; mfe = 0.0; stp = False
+        if long:
+            slope_up = (prev200 is None) or (el > prev200)
+            if not (price > el and slope_up):           # must be an uptrend
+                t += 1; continue
+            if rs >= 35:                                 # need an oversold flush
+                t += 1; continue
+            if C[t] <= C[t - 1]:                         # need the snap-back to have started
+                t += 1; continue
+            entry = price
+            flush_low = min(L[max(0, t - 3):t + 1])
+            stop = flush_low - 0.5 * a
+            risk = entry - stop
+            if risk <= 0:
+                t += 1; continue
+            target = e2 if e2 > entry * 1.003 else entry + 1.3 * risk   # snap to the 20-EMA mean
+            rr = (target - entry) / risk
+            if rr < 0.6:
+                t += 1; continue
+            f = t + 1
+            for j in range(f, min(n, f + horizon + 1)):
+                mfe = max(mfe, (H[j] - entry) / risk)
+                if L[j] <= stop:
+                    outcome, rbar = "loss", j; break
+                if H[j] >= target:
+                    outcome, rbar = "win", j; break
+            if outcome is None:
+                t = f + 1; continue
+            stp = outcome == "loss" and any(H[j] >= target for j in range(rbar, min(n, f + horizon + 1)))
+        else:
+            slope_dn = (prev200 is None) or (el < prev200)
+            if not (price < el and slope_dn):           # must be a downtrend
+                t += 1; continue
+            if rs <= 65:                                 # need an overbought pop
+                t += 1; continue
+            if C[t] >= C[t - 1]:                         # need the reversal down to have started
+                t += 1; continue
+            entry = price
+            flush_high = max(H[max(0, t - 3):t + 1])
+            stop = flush_high + 0.5 * a
+            risk = stop - entry
+            if risk <= 0:
+                t += 1; continue
+            target = e2 if e2 < entry * 0.997 else entry - 1.3 * risk
+            rr = (entry - target) / risk
+            if rr < 0.6:
+                t += 1; continue
+            f = t + 1
+            for j in range(f, min(n, f + horizon + 1)):
+                mfe = max(mfe, (entry - L[j]) / risk)
+                if H[j] >= stop:
+                    outcome, rbar = "loss", j; break
+                if L[j] <= target:
+                    outcome, rbar = "win", j; break
+            if outcome is None:
+                t = f + 1; continue
+            stp = outcome == "loss" and any(L[j] <= target for j in range(rbar, min(n, f + horizon + 1)))
+        rr = round(rr, 2)
+        fee_R = fee_frac / (risk / entry)
+        R = (rr - fee_R) if outcome == "win" else (-1.0 - fee_R)
+        trades.append({"r": round(R, 3), "rr": rr, "outcome": outcome,
+                       "gross": rr if outcome == "win" else -1.0,
+                       "mfe": round(min(mfe, rr), 2), "stop_then_tp": bool(stp),
+                       "cmp": False, "bars": rbar - f,
+                       "extd": round(abs((entry - el) / el) * 100, 2) if el else 0.0,
+                       "atrp": round(a / entry * 100, 2), "dvol": dvol})
+        t = rbar + 1
+    return trades
+
+
+def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="level"):
+    """Replay a strategy's entry/stop/target MECHANICS over one coin's historical candles and
+    return a list of resolved trades (net R after fees). WITHOUT look-ahead: every decision at
+    bar t uses only candles up to t, and the outcome is whichever of stop/target is reached
+    first (stop assumed first on a tie). strategy='level' = pullback/rip to a structural level;
+    'revert' = trend-aligned oversold/overbought snap-back to the mean (the high-win-rate one)."""
+    if strategy == "revert":
+        return _bt_revert(rows, side, fees_bps=fees_bps, warmup=warmup)
     try:
         H = [float(x[2]) for x in rows]
         L = [float(x[3]) for x in rows]
@@ -3761,8 +3868,8 @@ def backtest_all(sess, market, tfs=("15m", "1h", "4h", "1d"), limit=1000,
                 return sym, None, None
             if not rows:
                 return sym, None, None
-            return (sym, backtest_symbol(rows, "long", fees_bps=fees_bps),
-                    backtest_symbol(rows, "short", fees_bps=fees_bps))
+            return (sym, backtest_symbol(rows, "long", fees_bps=fees_bps, strategy="revert"),
+                    backtest_symbol(rows, "short", fees_bps=fees_bps, strategy="revert"))
         longs, shorts = {}, {}
         with ThreadPoolExecutor(max_workers=12) as ex:
             for f in as_completed([ex.submit(_one, s) for s in syms]):

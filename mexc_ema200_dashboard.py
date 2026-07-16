@@ -2679,7 +2679,7 @@ PAGE = """<!doctype html>
 
 <div class="view" id="viewBacktest">
 <div class="status">
-  <span>🧪 Backtest — does the edge actually exist? Apex <b>runs this itself</b> in the background across <b>every timeframe</b> (15m / 1h / 4h / 1D) and both sides, replaying the core <b>limit-at-a-level entry / stop / target mechanics</b> over ~800 real candles for the <b>whole scanned universe</b> — no look-ahead, the limit must fill, stop-hit assumed first on a tie, and <b>net of fees</b>. The matrix below is the offline read on where the mechanics have positive expectancy, so you know which timeframes to trust. (Refreshes every ~6h.)</span>
+  <span>🧪 Backtest — now testing the <b>trend-aligned mean-reversion</b> strategy: only WITH the higher-timeframe trend (sloping 200-EMA), enter an <b>oversold flush that's snapping back</b> (long) / overbought pop (short), target the nearby <b>20-EMA mean</b> for a quick high-probability bounce, stop beyond the flush extreme. Buy panic in an uptrend, sell euphoria in a downtrend. Apex <b>runs it itself</b> across <b>every timeframe</b> and both sides over the <b>whole universe</b> — no look-ahead, stop-first on ties, <b>net of fees</b>. The matrix is the honest read on whether this actually wins before it ever goes to the live boards. (Refreshes every ~6h.)</span>
 </div>
 <div class="wrap">
   <div class="btbar">
