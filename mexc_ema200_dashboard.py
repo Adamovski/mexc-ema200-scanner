@@ -85,7 +85,7 @@ def send_telegram(cfg: dict, text: str) -> None:
 # logic changes meaningfully — the headline win-rate resets to the new version (a clean
 # slate for the new logic), while every past version's results are kept and shown in the
 # "site version" breakdown so you can compare how each iteration actually performed.
-APP_VERSION = "v6 · limit-only entries (no CMP, per backtest)"
+APP_VERSION = "v7 · regime-picks-side + wider stops (per backtest)"
 # One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
 # every call (open + resolved) on the next boot and start the calls scorecard fresh —
 # auto-board trades and their version history are untouched.
@@ -1090,6 +1090,17 @@ def run_one_scan(state: State) -> None:
             rr = d.get("rr")
             reg = d.get("regime", "neutral")
             pv = d.get("pct_vs_ema")
+            # REGIME-CONDITION THE SIDE. The backtest showed the mechanics have no edge
+            # independent of drift — they flip sign with the tape. So take the side the
+            # tape is actually on: don't short a clearly-bullish market or long a clearly-
+            # bearish one (unless the coin is decorrelated from BTC and trades on its own).
+            if not d.get("decor"):
+                if side == "short" and _reg >= 0.15:
+                    d["gate"] = "tape is bullish — not shorting into an up-trend"
+                    continue
+                if side == "long" and _reg <= -0.30:
+                    d["gate"] = "tape is bearish — not longing into a down-trend"
+                    continue
             # Vol-regime tilt: a BREAKOUT entry gets more room in expansion (breakouts
             # follow through) and a tougher bar in compression (they fake out in chop).
             if d.get("breakout") and _volstate == "expansion":

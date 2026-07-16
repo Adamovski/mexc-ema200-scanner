@@ -2833,7 +2833,7 @@ def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
                 # Stop sized to THIS coin's volatility — ~1.4×ATR below the support with a
                 # small 0.8% floor so a 4h swing isn't wicked out, but the distance stays
                 # individual (a quiet coin gets a tighter stop than a volatile one).
-                _min = max(0.008, 1.4 * atr_frac)
+                _min = max(0.011, 1.85 * atr_frac)   # wider stop — backtest: stops too tight
                 if below:
                     stop = round(min(below[0] - 0.25 * atr_val, entry * (1 - _min)), 10)
                     stop_tf = _tf_of(below[0], _sup_map)
@@ -2881,7 +2881,7 @@ def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
                            if entry_tf else "current price (nearest resistance is too far to wait for)")
             above = [r for r in ins if r > entry * 1.001]
             # Stop sized to THIS coin's volatility — ~1.4×ATR above the resistance, 0.8% floor.
-            _min = max(0.008, 1.4 * atr_frac)
+            _min = max(0.011, 1.85 * atr_frac)   # wider stop — backtest: stops too tight
             if above:
                 stop = round(max(above[0] + 0.25 * atr_val, entry * (1 + _min)), 10)
                 stop_tf = _tf_of(above[0], _res_map)
@@ -3492,6 +3492,7 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210):
         H = [float(x[2]) for x in rows]
         L = [float(x[3]) for x in rows]
         C = [float(x[4]) for x in rows]
+        V = [float(x[5]) for x in rows]
     except (ValueError, IndexError, TypeError):
         return []
     n = len(C)
@@ -3500,6 +3501,11 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210):
     e200 = ema(C, 200)
     long = side == "long"
     W = 120
+    # Per-coin liquidity proxy: median USD volume over the window (close × volume). Every
+    # trade on this coin is tagged with it, so the analysis can segment by liquidity TREND
+    # (liquid large-caps vs thin low-caps) rather than by individual coin name.
+    _dv = sorted(C[i] * V[i] for i in range(len(C)))
+    dvol = _dv[len(_dv) // 2] if _dv else 0.0
     fee_frac = fees_bps / 10000.0
     trades = []
     t = warmup
@@ -3528,7 +3534,7 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210):
             if is_cmp:                    # limit-only: backtest proved CMP momentum entries lose
                 t += 1; continue
             entry = near           # CMP momentum entry, or limit at support
-            _min = max(0.008, 1.4 * a / entry)
+            _min = max(0.011, 1.85 * a / entry)   # wider stop (~30%) — backtest: too many losers hit TP after stop
             below = (sup[1] if len(sup) > 1 else (near * 0.996 if near else entry * 0.985))
             stop = min((below - 0.4 * a) if (near and not is_cmp) else entry * (1 - _min),
                        entry * (1 - _min))
@@ -3567,7 +3573,7 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210):
             if is_cmp:                    # limit-only: backtest proved CMP momentum entries lose
                 t += 1; continue
             entry = near
-            _min = max(0.008, 1.4 * a / entry)
+            _min = max(0.011, 1.85 * a / entry)   # wider stop (~30%) — backtest: too many losers hit TP after stop
             above = (res[1] if len(res) > 1 else (near * 1.004 if near else entry * 1.015))
             stop = max((above + 0.4 * a) if (near and not is_cmp) else entry * (1 + _min),
                        entry * (1 + _min))
@@ -3607,7 +3613,7 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210):
                        "mfe": round(min(mfe, rr), 2), "stop_then_tp": bool(stop_then_tp),
                        "cmp": bool(is_cmp), "bars": rbar - f,
                        "extd": round(abs((entry - el) / el) * 100, 2) if el else 0.0,
-                       "atrp": round(a / entry * 100, 2)})
+                       "atrp": round(a / entry * 100, 2), "dvol": dvol})
         t = rbar + 1
     return trades
 
@@ -3654,8 +3660,15 @@ def _bt_findings(trades):
     add("Volatility at entry", f"calmer (≤{med:.1f}% ATR)", f"choppier (>{med:.1f}%)",
         lambda x: (x.get("atrp") or 0) <= med)
     add("Target width", "tighter R:R (<2)", "wider R:R (≥2)", lambda x: (x.get("rr") or 0) < 2)
+    # Coin liquidity (median $volume) — split at the median so the finding reads as a TREND
+    # ("liquid names vs thin"), the coin-character segment the strategy should gate on.
+    dvs = sorted((x.get("dvol") or 0) for x in trades)
+    dmed = dvs[len(dvs) // 2] if dvs else 0
+    _fmt = lambda v: (f"${v/1e6:.0f}M" if v >= 1e6 else f"${v/1e3:.0f}K")
+    add("Coin liquidity ($vol)", f"liquid (≥{_fmt(dmed)})", f"thin (<{_fmt(dmed)})",
+        lambda x: (x.get("dvol") or 0) >= dmed)
     out.sort(key=lambda f: f["gap"], reverse=True)
-    return out[:4]
+    return out[:5]
 
 
 # A broad liquid basket the backtester runs over by default (~60 majors + mid-caps).
