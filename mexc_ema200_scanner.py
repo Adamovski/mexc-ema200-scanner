@@ -1868,6 +1868,60 @@ def fetch_futures_klines(sess: requests.Session, symbol: str, interval: str,
     return None
 
 
+def fetch_futures_klines_deep(sess: requests.Session, symbol: str, interval: str,
+                              target: int) -> list[list] | None:
+    """Deep history via PAGINATION — the contract kline endpoint caps how many candles it
+    returns per call, so to reach 1–2 YEARS of data we walk backward in windows (newest first),
+    stitch them, de-dup by open-time and return the last `target` candles. Used by the backtester
+    so the higher timeframes can be measured over a proper multi-regime span, not a lucky slice."""
+    cs = to_contract(symbol)
+    iv = FUT_INTERVAL.get(interval, "Hour4")
+    secs = _FUT_SECS.get(iv, 14400)
+    win = 1800                                        # candles requested per page (endpoint caps ~2000)
+    end = int(time.time())
+    got = {}
+    for _page in range(8):                            # up to 8 pages back
+        start = end - win * secs
+        ok = False
+        for attempt in range(3):
+            try:
+                r = sess.get(f"{FUTURES_BASE}/api/v1/contract/kline/{cs}",
+                             params={"interval": iv, "start": start, "end": end}, timeout=30)
+                if r.status_code == 429:
+                    time.sleep(1.2 * (attempt + 1)); continue
+                r.raise_for_status()
+                d = r.json().get("data") or {}
+                t = d.get("time") or []
+                if not t:
+                    ok = True; break
+                o, h, l, c, v = d["open"], d["high"], d["low"], d["close"], d["vol"]
+                for i in range(len(t)):
+                    got[t[i]] = [t[i] * 1000, float(o[i]), float(h[i]), float(l[i]),
+                                 float(c[i]), float(v[i]), t[i] * 1000, 0, 0, 0, 0, 0]
+                end = min(t) - secs                   # step the window further back
+                ok = True; break
+            except (requests.RequestException, KeyError, ValueError):
+                time.sleep(0.5 * (attempt + 1))
+        if not ok or len(got) >= target:
+            break
+    if not got:
+        return None
+    rows = [got[k] for k in sorted(got)]
+    return rows[-target:]
+
+
+def fetch_candles_deep(sess: requests.Session, symbol: str, interval: str,
+                       target: int, market: str) -> list[list] | None:
+    """Deep (multi-year) candles for the backtester. Futures paginates for real depth; if that
+    comes back stale/empty, fall back to the normal (capped) fetch so a coin still contributes."""
+    if market == "futures":
+        rows = fetch_futures_klines_deep(sess, symbol, interval, target)
+        if rows and _klines_fresh(rows, interval):
+            return rows
+        return fetch_candles(sess, symbol, interval, min(target, 1000), market)
+    return fetch_klines(sess, symbol, interval, min(target, 1000))
+
+
 def _klines_fresh(rows: list[list] | None, interval: str) -> bool:
     """True if the most recent candle is recent enough (guards against MEXC's
     futures kline REST endpoint serving stale/frozen data for some contracts)."""
@@ -2630,9 +2684,9 @@ def _revert_live(side, closes, highs, lows, ema200_now, atr_val, rsis, e200s, e2
         slope_up = (prev200 is None) or (el > prev200)
         if not (price > el and slope_up):        # must be an uptrend
             return None
-        if btc_trend == "down":                  # don't buy dips while BTC breaks down
+        if _btc_block(True, tf_label or "4h", btc_trend, None):   # smart don't-fight-BTC gate
             return None
-        if rs >= 40:                             # need an oversold flush
+        if rs >= 45:                             # oversold-ish pullback (loosened to catch big caps)
             return None
         if closes[-1] <= closes[-2]:             # snap-back must have started (green tick)
             return None
@@ -2658,9 +2712,9 @@ def _revert_live(side, closes, highs, lows, ema200_now, atr_val, rsis, e200s, e2
         slope_dn = (prev200 is None) or (el < prev200)
         if not (price < el and slope_dn):        # must be a downtrend
             return None
-        if btc_trend == "up":                    # don't short pops while BTC rips
+        if _btc_block(False, tf_label or "4h", btc_trend, None):  # smart don't-fight-BTC gate
             return None
-        if rs <= 60:                             # need an overbought pop
+        if rs <= 55:                             # overbought-ish pop (loosened to catch big caps)
             return None
         if closes[-1] >= closes[-2]:             # roll-over must have started (red tick)
             return None
@@ -3615,7 +3669,22 @@ def _btc_regime_ctx(rows):
     return ctx
 
 
-def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210, btc_ctx=None):
+def _btc_block(long, tf, btrend, bvol):
+    """The SMART don't-fight-BTC gate (replaces the old blunt block that starved longs). On the
+    LOWER timeframes (15m/1h) reversion is noisy, so only trade when the macro tape AGREES —
+    long only in a BTC uptrend, short only in a BTC downtrend. On the HIGHER timeframes we're
+    happy to trade against a calm BTC drift and only step aside for the VOLATILE opposing tape
+    (a BTC dump against a long / a BTC rip against a short). Returns True to SKIP the trade."""
+    if not btrend:
+        return False
+    want = "up" if long else "down"
+    opp = "down" if long else "up"
+    if tf in ("15m", "1h"):
+        return btrend != want
+    return btrend == opp and bvol == "hi"
+
+
+def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210, btc_ctx=None, tf="4h"):
     """TREND-ALIGNED MEAN REVERSION — the high-win-rate candidate. Only trades WITH the
     higher-timeframe trend (price on the right side of a SLOPING 200-EMA), enters on an
     OVERSOLD (long) / OVERBOUGHT (short) snap-back that has just reversed, and targets the
@@ -3666,9 +3735,9 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210, btc_ctx=None):
             slope_up = (prev200 is None) or (el > prev200)
             if not (price > el and slope_up):           # must be an uptrend
                 t += 1; continue
-            if btrend == "down":                         # don't buy dips while BTC breaks down
+            if _btc_block(True, tf, btrend, bvol):       # smart don't-fight-BTC gate
                 t += 1; continue
-            if rs >= 35:                                 # need an oversold flush
+            if rs >= 45:                                 # oversold-ish pullback (loosened to catch big caps)
                 t += 1; continue
             if C[t] <= C[t - 1]:                         # need the snap-back to have started
                 t += 1; continue
@@ -3697,9 +3766,9 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210, btc_ctx=None):
             slope_dn = (prev200 is None) or (el < prev200)
             if not (price < el and slope_dn):           # must be a downtrend
                 t += 1; continue
-            if btrend == "up":                           # don't short pops while BTC rips
+            if _btc_block(False, tf, btrend, bvol):      # smart don't-fight-BTC gate
                 t += 1; continue
-            if rs <= 65:                                 # need an overbought pop
+            if rs <= 55:                                 # overbought-ish pop (loosened to catch big caps)
                 t += 1; continue
             if C[t] >= C[t - 1]:                         # need the reversal down to have started
                 t += 1; continue
@@ -3739,6 +3808,8 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210, btc_ctx=None):
                        "tppct": round(abs(target - entry) / entry * 100, 2),  # target distance, % of entry
                        "mae": round(mae, 2),                     # max drawdown while open, in R
                        "ts": ts,                                 # entry candle time (for the equity curve)
+                       "entry": round(entry, 10), "stop": round(stop, 10),
+                       "target": round(target, 10), "rsi": round(rs, 1),
                        "session": _session, "btc_trend": btrend, "btc_vol": bvol,
                        "btc_align": (btrend == ("up" if long else "down")) if btrend else None,
                        "btc_state": ("BTC " + btrend) if btrend else None})
@@ -3746,7 +3817,7 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210, btc_ctx=None):
     return trades
 
 
-def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="level", btc_ctx=None):
+def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="level", btc_ctx=None, tf="4h"):
     """Replay a strategy's entry/stop/target MECHANICS over one coin's historical candles and
     return a list of resolved trades (net R after fees). WITHOUT look-ahead: every decision at
     bar t uses only candles up to t, and the outcome is whichever of stop/target is reached
@@ -3757,9 +3828,9 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="
     if strategy == "spot":
         # Spot: long-only, cash. Charge realistic spot round-trip fees (default ~20 bps if the
         # caller didn't pass a heavier number) and never short — you can't short on spot.
-        return _bt_revert(rows, "long", fees_bps=max(fees_bps, 20.0), warmup=warmup, btc_ctx=btc_ctx)
+        return _bt_revert(rows, "long", fees_bps=max(fees_bps, 20.0), warmup=warmup, btc_ctx=btc_ctx, tf=tf)
     if strategy == "revert":
-        return _bt_revert(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx)
+        return _bt_revert(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf)
     try:
         H = [float(x[2]) for x in rows]
         L = [float(x[3]) for x in rows]
@@ -4088,8 +4159,27 @@ def _bt_aggregate(results, syms, tf, side, fees_bps):
             "avg_win_mfe": round(sum(_wmfe) / len(_wmfe), 2) if _wmfe else None,
             "insights": _bt_insights(allt), "findings": _bt_findings(allt),
             "portfolio": _bt_portfolio(allt),
+            "sample": _bt_sample(results, syms),
             "per_symbol": sorted(per, key=lambda p: p["exp"], reverse=True),
             "tf": tf, "fees_bps": fees_bps, "side": side, "coins": len(per)}
+
+
+def _bt_sample(results, syms, k=40):
+    """A readable LOG of individual trades — the most recent k across all coins — each carrying
+    its date, the coin, entry/stop/target, net-R result, and the MARKET ENVIRONMENT it was taken
+    in (BTC regime + volatility, time-of-day session) plus the RSI that triggered it, so you can
+    see exactly WHAT was going on and WHY each trade fired, not just the aggregate."""
+    keys = ("ts", "r", "outcome", "rsi", "btc_trend", "btc_vol", "btc_state", "session",
+            "stopw", "tppct", "mae", "entry", "stop", "target", "rr", "bars")
+    rows = []
+    for s in syms:
+        tr = results.get(s)
+        if not tr:
+            continue
+        for x in tr:
+            rows.append({**{kk: x.get(kk) for kk in keys}, "symbol": s})
+    rows.sort(key=lambda z: z.get("ts") or 0, reverse=True)
+    return rows[:k]
 
 
 def backtest_all(sess, market, tfs=("15m", "1h", "4h", "1d"), limit=1000,
@@ -4106,7 +4196,7 @@ def backtest_all(sess, market, tfs=("15m", "1h", "4h", "1d"), limit=1000,
         # trade can be tagged with (and gated on) what the market leader was doing.
         btc_ctx = {}
         try:
-            _brows = fetch_candles(sess, "BTCUSDT", tf, limit, market)
+            _brows = fetch_candles_deep(sess, "BTCUSDT", tf, limit, market)
             if _brows:
                 btc_ctx = _btc_regime_ctx(_brows)
         except Exception:
@@ -4114,12 +4204,12 @@ def backtest_all(sess, market, tfs=("15m", "1h", "4h", "1d"), limit=1000,
 
         def _one(sym, _bc=btc_ctx):
             try:
-                rows = fetch_candles(sess, sym, tf, limit, market)
+                rows = fetch_candles_deep(sess, sym, tf, limit, market)
             except Exception:
                 return sym, None
             if not rows:
                 return sym, None
-            return sym, {sd: backtest_symbol(rows, sd, fees_bps=fees_bps, strategy=strategy, btc_ctx=_bc)
+            return sym, {sd: backtest_symbol(rows, sd, fees_bps=fees_bps, strategy=strategy, btc_ctx=_bc, tf=tf)
                          for sd in sides}
         per = {sd: {} for sd in sides}
         with ThreadPoolExecutor(max_workers=12) as ex:

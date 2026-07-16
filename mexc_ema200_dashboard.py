@@ -1554,10 +1554,10 @@ def backtest_loop(state: State) -> None:
     cfg = state.cfg
     market = cfg.get("market", "futures")
     tfs = ("15m", "1h", "4h", "1d")
-    # Per-TF lookback depth — the HIGHER timeframes (where the edge lives) now cover ~a YEAR:
-    # 4h×2200 ≈ 366 days, 1d×400 ≈ 13 months, 1h×4000 ≈ 5.5 months, 15m×1500 ≈ 15 days
-    # (a full year of 15m would be ~35k candles/coin — infeasible over the whole universe).
-    tf_limit = {"15m": 1500, "1h": 4000, "4h": 2200, "1d": 400}
+    # Per-TF lookback depth — paginated deep fetch reaches ~2 YEARS on the timeframes that matter:
+    # 1d×730 ≈ 2 yrs, 4h×4380 ≈ 2 yrs, 1h×8000 ≈ 11 months, 15m×2600 ≈ 27 days (a full 2 yrs of
+    # 15m would be ~70k candles/coin — infeasible over the whole universe, and 15m is the loser).
+    tf_limit = {"15m": 2600, "1h": 8000, "4h": 4380, "1d": 730}
     while True:
         try:
             sess = get_session()
@@ -1581,7 +1581,7 @@ def backtest_loop(state: State) -> None:
             # Answers "do the spot buys actually work?" on the same honest measurement.
             spot = {}
             for tf in tfs:
-                sp = backtest_all(sess, market, tfs=(tf,), limit=500, fees_bps=20.0,
+                sp = backtest_all(sess, market, tfs=(tf,), limit=tf_limit.get(tf, 1000), fees_bps=20.0,
                                   symbols=syms, strategy="spot", sides=("long",))
                 spot.update(sp)
                 with state.lock:
@@ -2269,26 +2269,28 @@ PAGE = """<!doctype html>
 <div class="bkbanner" id="bkbanner"></div>
 <div class="banner" id="banner"></div>
 <div class="tabs">
-  <div class="tab" id="tabMarket" onclick="showTab('market')">🧭 Market</div>
-  <div class="tab" id="tabHistory" onclick="showTab('history')">🕘 History</div>
+  <!-- LEAN BUILD: only the reversion core is shown. The rest are hidden (not removed) while
+       we build up from the ground up around the backtest-proven reversion logic. -->
   <div class="tab" id="tabAnalyze" onclick="showTab('analyze')">🔎 Analyze a coin</div>
-  <div class="tab active" id="tabBestLong" onclick="showTab('bestlong')">🏆 Best longs</div>
-  <div class="tab" id="tabBestShort" onclick="showTab('bestshort')">🩸 Best shorts</div>
-  <div class="tab" id="tabWatch" onclick="showTab('watch')">📌 Watchlist</div>
-  <div class="tab" id="tabEarly" onclick="showTab('early')">⏳ Early</div>
-  <div class="tab" id="tabCoil" onclick="showTab('coil')">🚀 Coiled</div>
-  <div class="tab" id="tabScalp" onclick="showTab('scalp')">⚡ Best scalps</div>
-  <div class="tab" id="tabSpot" onclick="showTab('spot')">💰 Spot buys</div>
-  <div class="tab" id="tabSetups" onclick="showTab('setups')">200-EMA reclaim</div>
-  <div class="tab" id="tabFlags" onclick="showTab('flags')">Bull flags</div>
-  <div class="tab" id="tabCpr" onclick="showTab('cpr')">Narrow CPR</div>
-  <div class="tab" id="tabBounce" onclick="showTab('bounce')">Support bounce</div>
-  <div class="tab" id="tabStb" onclick="showTab('stb')">Supertrend support bounce</div>
-  <div class="tab" id="tabShorts" onclick="showTab('shorts')">Shorts</div>
+  <div class="tab active" id="tabBestLong" onclick="showTab('bestlong')">🟢 Long</div>
+  <div class="tab" id="tabBestShort" onclick="showTab('bestshort')">🔴 Short</div>
   <div class="tab" id="tabPerf" onclick="showTab('perf')">📊 Performance</div>
   <div class="tab" id="tabBacktest" onclick="showTab('backtest')">🧪 Backtest</div>
-  <div class="tab" id="tabCalls" onclick="showTab('calls')">📌 My calls</div>
-  <div class="tab" id="tabInfo" onclick="showTab('info')">Info</div>
+  <div class="tab" id="tabMarket" onclick="showTab('market')" style="display:none">🧭 Market</div>
+  <div class="tab" id="tabHistory" onclick="showTab('history')" style="display:none">🕘 History</div>
+  <div class="tab" id="tabWatch" onclick="showTab('watch')" style="display:none">📌 Watchlist</div>
+  <div class="tab" id="tabEarly" onclick="showTab('early')" style="display:none">⏳ Early</div>
+  <div class="tab" id="tabCoil" onclick="showTab('coil')" style="display:none">🚀 Coiled</div>
+  <div class="tab" id="tabScalp" onclick="showTab('scalp')" style="display:none">⚡ Best scalps</div>
+  <div class="tab" id="tabSpot" onclick="showTab('spot')" style="display:none">💰 Spot buys</div>
+  <div class="tab" id="tabSetups" onclick="showTab('setups')" style="display:none">200-EMA reclaim</div>
+  <div class="tab" id="tabFlags" onclick="showTab('flags')" style="display:none">Bull flags</div>
+  <div class="tab" id="tabCpr" onclick="showTab('cpr')" style="display:none">Narrow CPR</div>
+  <div class="tab" id="tabBounce" onclick="showTab('bounce')" style="display:none">Support bounce</div>
+  <div class="tab" id="tabStb" onclick="showTab('stb')" style="display:none">Supertrend support bounce</div>
+  <div class="tab" id="tabShorts" onclick="showTab('shorts')" style="display:none">Shorts</div>
+  <div class="tab" id="tabCalls" onclick="showTab('calls')" style="display:none">📌 My calls</div>
+  <div class="tab" id="tabInfo" onclick="showTab('info')" style="display:none">Info</div>
 </div>
 <div class="filterbar" id="filterbar"></div>
 
@@ -2799,7 +2801,7 @@ PAGE = """<!doctype html>
 
 <div class="view" id="viewBacktest">
 <div class="status">
-  <span>🧪 Backtest — now testing the <b>trend-aligned mean-reversion</b> strategy: only WITH the higher-timeframe trend (sloping 200-EMA), enter an <b>oversold flush that's snapping back</b> (long) / overbought pop (short), target the nearby <b>20-EMA mean</b> for a quick high-probability bounce, stop beyond the flush extreme. Buy panic in an uptrend, sell euphoria in a downtrend. Apex <b>runs it itself</b> across <b>every timeframe</b> and both sides over the <b>whole universe</b> — no look-ahead, stop-first on ties, <b>net of fees</b>. <b>New:</b> it now <b>won't fight BTC</b> (no longs while BTC breaks down, no shorts while BTC rips), and every trade is sliced by <b>time-of-day, BTC regime & BTC volatility</b> — see "What worked" in each per-timeframe breakdown. The matrix is the honest read on whether this actually wins before it ever goes to the live boards. (Refreshes every ~6h.)</span>
+  <span>🧪 Backtest — now testing the <b>trend-aligned mean-reversion</b> strategy: only WITH the higher-timeframe trend (sloping 200-EMA), enter an <b>oversold flush that's snapping back</b> (long) / overbought pop (short), target the nearby <b>20-EMA mean</b> for a quick high-probability bounce, stop beyond the flush extreme. Buy panic in an uptrend, sell euphoria in a downtrend. Apex <b>runs it itself</b> across <b>every timeframe</b> and both sides over the <b>whole universe</b> — no look-ahead, stop-first on ties, <b>net of fees</b>. <b>Now over ~2 years</b> (paginated history on the higher TFs), with a <b>looser trigger</b> (RSI 45/55 — so BTC, SOL and the majors actually qualify, not just high-beta alts) and a <b>smarter BTC gate</b>: on 15m/1h it only trades WITH the BTC trend (cuts the noise), on 4h/1d it trades through a calm BTC drift and only steps aside for a volatile opposing tape. Every trade is sliced by <b>time-of-day, BTC regime & BTC volatility</b>, and there's a <b>trade log</b> (date · coin · result · market environment · why) in each breakdown. The matrix is the honest read on whether this actually wins before it ever goes to the live boards. (Refreshes every ~6h.)</span>
 </div>
 <div class="wrap">
   <div class="btbar">
@@ -4930,6 +4932,18 @@ function btSideCard(label,emoji,s){
       <div class="histnote">⚠ Idealised single-stream model — trades run one after another; it does NOT cap how many positions are open at once or model margin limits, so real results with finite capital will differ. Fees ARE included.</div>`;})()}
     <div class="perfsub">Per-coin (best first) · Stop % = avg stop width · MaxDD = avg drawdown · last column = stops-too-tight rate</div>
     <table class="bt"><thead><tr><th>Coin</th><th>Trades</th><th>Win rate</th><th>Expectancy</th><th>Total R</th><th data-tip="Average stop distance from entry as a % of price.">Stop %</th><th data-tip="Average worst drawdown before a trade resolved, in R.">Max DD</th><th data-tip="Share of losers that hit target after being stopped.">Stop-tight</th></tr></thead><tbody>${rows}</tbody></table>
+    ${(()=>{const smp=s.sample||[]; if(!smp.length) return ''; const long=s.side==='long';
+      const fmtd=ts=>{try{const d=new Date(ts);const p=n=>String(n).padStart(2,'0');return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes());}catch(e){return '—';}};
+      const rows2=smp.map(x=>{const win=x.outcome==='win';
+        const why=long?`Oversold flush (RSI ${x.rsi}) snapping back in an uptrend`:`Overbought pop (RSI ${x.rsi}) rolling over in a downtrend`;
+        const env=`BTC ${x.btc_trend||'?'} · ${x.btc_vol==='hi'?'volatile':x.btc_vol==='lo'?'calm':'?'} · ${x.session||'?'}`;
+        return `<tr><td style="white-space:nowrap">${fmtd(x.ts)}</td>`
+          +`<td class="sym"><a href="${tvLink(x.symbol)}" target="_blank" rel="noopener">${dispSym(x.symbol)}</a></td>`
+          +`<td class="${win?'pf-good':'pf-bad'}" data-tip="Entry ${fmtNum(x.entry)} · stop ${fmtNum(x.stop)} (${x.stopw}%) · target ${fmtNum(x.target)} (${x.tppct}%) · R:R ${x.rr} · held ${x.bars} bars · worst drawdown -${x.mae}R">${win?'✓':'✗'} ${x.r>0?'+':''}${x.r}R</td>`
+          +`<td data-tip="What the market leader was doing when this trade fired.">${esc(env)}</td>`
+          +`<td class="whycell">${esc(why)}</td></tr>`;}).join('');
+      return `<div class="perfsub">🧾 Trade log — most recent ${smp.length} trades · date · coin · result · market environment · why it fired</div>
+        <table class="bt"><thead><tr><th>Date (UTC)</th><th>Coin</th><th>Result</th><th>Market environment</th><th>Why the trade was taken</th></tr></thead><tbody>${rows2}</tbody></table>`;})()}
   </div>`;
 }
 function renderBacktest(){
