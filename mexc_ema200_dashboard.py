@@ -384,6 +384,42 @@ class Tracker:
             if done:
                 self._save()
 
+    def learn_adjust(self, window=40, min_n=12):
+        """LEARN FROM RESULTS. For each board, look at its most recent `window` resolved
+        trades and nudge that board's quality bar by how it's actually performing:
+        a board that's bleeding gets a HIGHER bar (tighten — demand more before
+        recommending); a board that's printing gets a slightly LOWER bar (let more of a
+        working edge through). Uses a rolling window across versions (recency > epoch) so
+        the loop keeps learning instead of resetting every version bump. Returns per-board
+        {n, exp, winrate, conv_delta, rr_delta, note} — deltas ADD to the floors, and the
+        note explains the adjustment so the UI can show WHY the gate moved."""
+        with self.lock:
+            res = [t for t in self.closed if t.get("status") in ("win", "loss", "be")]
+        out = {}
+        for b in ("long", "short", "coil", "scalp"):
+            rows = [t for t in res if t.get("board") == b][-window:]
+            n = len(rows)
+            if n < min_n:
+                out[b] = {"n": n, "exp": None, "winrate": None, "conv_delta": 0.0,
+                          "rr_delta": 0.0, "note": f"learning — {n}/{min_n} resolved"}
+                continue
+            exp = sum((t.get("r") or 0) for t in rows) / n
+            wr = round(sum(1 for t in rows if (t.get("r") or 0) > 1e-4) / n * 100, 1)
+            if exp <= -0.20:                        # losing → tighten (up to +8 conv / +0.3 R:R)
+                f = min(1.0, (-exp) / 0.6)
+                cd, rd = round(8.0 * f, 1), round(0.30 * f, 2)
+                note = f"tightened — last {n} avg {exp:+.2f}R"
+            elif exp >= 0.30:                       # winning → relax a touch
+                f = min(1.0, (exp - 0.30) / 0.6)
+                cd, rd = round(-5.0 * f, 1), round(-0.20 * f, 2)
+                note = f"relaxed — last {n} avg {exp:+.2f}R"
+            else:
+                cd, rd = 0.0, 0.0
+                note = f"steady — last {n} avg {exp:+.2f}R"
+            out[b] = {"n": n, "exp": round(exp, 2), "winrate": wr,
+                      "conv_delta": cd, "rr_delta": rd, "note": note}
+        return out
+
     def stats(self, prices=None):
         prices = prices or {}
 
@@ -754,6 +790,7 @@ class State:
         self.progress: tuple[int, int] = (0, 0)  # (done, total)
         self.universe: int = 0
         self.market_context: dict | None = None    # BTC + alts big-picture read
+        self.gate_learn: dict | None = None         # per-board gate adjustment from results
         self.error: str = ""
 
     def snapshot(self) -> dict:
@@ -798,6 +835,7 @@ class State:
                 "coil_board": withlive(self.coil_board),
                 "scalp_board": withlive(self.scalp_board),
                 "market_context": self.market_context,
+                "gate_learn": self.gate_learn,
                 "perf": TRACKER.stats(lp),
                 "both_symbols": list(self.both_symbols),
                 "breakout_events": list(self.breakout_events),
@@ -991,12 +1029,14 @@ def run_one_scan(state: State) -> None:
     # The side the regime is fighting keeps the full bar. Base floors are a touch lower
     # than before so a decent setup isn't held back in a merely-mixed tape.
     CONV_FLOOR, RR_FLOOR = 57.0, 1.7
+    _learn = TRACKER.learn_adjust()                    # results → live gate adjustment
 
     def _quality_keep(board, side):
         favor = _reg if side == "long" else -_reg      # >0 = regime favours this side
         favored = favor >= 0.20
-        conv_floor = CONV_FLOOR - (5.0 if favored else 0.0)
-        rr_floor = RR_FLOOR - (0.15 if favored else 0.0)
+        la = _learn.get(side, {})
+        conv_floor = CONV_FLOOR - (5.0 if favored else 0.0) + (la.get("conv_delta") or 0.0)
+        rr_floor = RR_FLOOR - (0.15 if favored else 0.0) + (la.get("rr_delta") or 0.0)
         kept = []
         for d in board:
             conv = d.get("conviction", 0) or 0
@@ -1031,6 +1071,9 @@ def run_one_scan(state: State) -> None:
     # Coiled: don't force a squeeze that has no clear lean or no room to run. Require a
     # recommended side AND a tradeable R:R on that side's plan, plus a real squeeze score.
     def _coil_keep(board):
+        _cl = _learn.get("coil", {})                # results → coil gate adjustment
+        _c_rr = _cl.get("rr_delta") or 0.0
+        _c_sc = _cl.get("conv_delta") or 0.0
         kept = []
         for d in board:
             rs = d.get("rec_side")
@@ -1039,8 +1082,8 @@ def run_one_scan(state: State) -> None:
             bc = d.get("btc_corr")
             decor = bc is not None and abs(bc) < 0.4
             reg = "neutral" if decor else (_align_for(rs) if rs else "neutral")
-            floor = 55 if not (reg == "against") else 68     # ask more of counter-regime coils
-            if not rs or not pl or rr is None or rr < 1.8 or (d.get("score", 0) or 0) < floor:
+            floor = (55 if not (reg == "against") else 68) + _c_sc   # ask more of counter-regime coils
+            if not rs or not pl or rr is None or rr < 1.8 + _c_rr or (d.get("score", 0) or 0) < floor:
                 d["gate"] = "no clear coil"
                 continue
             d["gate"] = "pass"
@@ -1124,6 +1167,9 @@ def run_one_scan(state: State) -> None:
     # Scalps: don't force. Require a genuine grade, tradeable R:R, alignment with the
     # regime, and no chasing an already-exhausted RSI extreme on the entry timeframe.
     def _scalp_keep(board):
+        _sl = _learn.get("scalp", {})               # results → scalp gate adjustment
+        _s_rr = _sl.get("rr_delta") or 0.0
+        _s_sc = _sl.get("conv_delta") or 0.0        # applied to the score floor
         kept = []
         for d in board:
             rr = d.get("rr")
@@ -1134,13 +1180,13 @@ def run_one_scan(state: State) -> None:
             # NOT on HTF/regime alignment (they're deliberately against the trend). Lower the
             # R:R floor and skip the against-regime penalty for them.
             if d.get("kind") == "bounce":
-                if rr is None or rr < 1.2 or (d.get("score", 0) or 0) < 50:
+                if rr is None or rr < 1.2 + _s_rr or (d.get("score", 0) or 0) < 50 + _s_sc:
                     d["gate"] = "weak bounce"
                     continue
                 d["gate"] = "pass"
                 kept.append(d)
                 continue
-            if rr is None or rr < 1.4 or (d.get("score", 0) or 0) < (55 if not against else 66):
+            if rr is None or rr < 1.4 + _s_rr or (d.get("score", 0) or 0) < (55 if not against else 66) + _s_sc:
                 d["gate"] = "weak scalp"
                 continue
             if rsi is not None and ((long and rsi > 75) or ((not long) and rsi < 25)):
@@ -1251,6 +1297,7 @@ def run_one_scan(state: State) -> None:
         state.short_board = short_board
         state.coil_board = coil_board
         state.scalp_board = scalp_board
+        state.gate_learn = _learn
         state.both_symbols = sorted(both)
 
         # Arm breakout alerts for the current bull flags (their breakout level).
@@ -1625,6 +1672,14 @@ PAGE = """<!doctype html>
   .rmax{color:var(--dim2);font-size:11px;font-weight:600}
   .cbadge{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:5px;font-size:10px;font-weight:700;letter-spacing:.02em;background:rgba(88,166,255,.14);color:#79b8ff;border:1px solid rgba(88,166,255,.35);cursor:help;vertical-align:middle}
   .cbadge.cbounce{background:rgba(210,153,34,.16);color:#e3b341;border-color:rgba(210,153,34,.4)}
+  .learnbox{margin:10px 0 4px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg2)}
+  .learnhd{font-size:12px;color:var(--dim);margin-bottom:8px}
+  .lchips{display:flex;flex-wrap:wrap;gap:6px}
+  .lchip{font-size:11px;padding:3px 9px;border-radius:6px;border:1px solid var(--line);background:var(--bg);cursor:help;font-variant-numeric:tabular-nums}
+  .lchip b{font-weight:700}
+  .lchip.lt{border-color:rgba(248,81,73,.4);color:#f0a5a0}
+  .lchip.lr{border-color:rgba(63,185,80,.4);color:#8ddf9c}
+  .lchip.ls{color:var(--dim)}
   .planrow>td{background:var(--bg2);padding:0 14px 12px 40px;border-top:0}
   .planpair{display:flex;gap:16px;flex-wrap:wrap}
   .planpanel{flex:1;min-width:320px;margin-top:10px;padding:12px 15px;border:1px solid var(--line2);border-radius:12px;background:var(--panel);font-family:"Inter",sans-serif}
@@ -2382,6 +2437,7 @@ PAGE = """<!doctype html>
     </div>
   </details>
   <div id="perfCards" class="perfcards"></div>
+  <div id="gateLearnBox" class="learnbox" style="display:none"></div>
   <div class="perfsub" id="liveWinSub" style="display:none">🟢 Live winners — open trades already past TP1 (stop at break-even, running)</div>
   <table id="livewintbl" style="display:none"><thead><tr>
       <th>Added</th><th>Board</th><th>Symbol</th><th>Side</th><th>TF</th><th>Entry</th><th data-tip="Current mark-to-market R right now (banked TPs + open remainder at live price).">Now (R)</th><th>Progress</th>
@@ -4442,6 +4498,26 @@ function renderPerf(){
     +perfCard('Open — unrealized', (unreal>0?'+':'')+unreal+'R', unreal>0?'pcg':unreal<0?'pcb':'', `Live mark-to-market of all ${mtmN} filled open trades right now (banked TPs + the open remainder at the current price). Updates every few seconds.`)
     +perfCard('Net (all, live)', comb==null?'—':(comb>0?'+':'')+comb+'R', comb>0?'pcg':comb<0?'pcb':'', 'Resolved Total R + the live unrealized R of open trades — the whole book, marked to market right now.')
     +perfCard('Open now', (perf&&perf.open)||0, '');
+  // Adaptive gate — how the quality bar has moved per board off live results.
+  const gl=(lastData&&lastData.gate_learn)||null;
+  const glBox=document.getElementById('gateLearnBox');
+  if(glBox){
+    if(!gl){ glBox.style.display='none'; }
+    else{
+      const names={long:'Best longs',short:'Best shorts',scalp:'Scalps',coil:'Coiled'};
+      const chips=['long','short','scalp','coil'].map(b=>{
+        const s=gl[b]||{}; const cd=s.conv_delta||0, rd=s.rr_delta||0;
+        const moved=(cd||rd);
+        const dir=moved?(cd>0||rd>0?'lt':'lr'):'ls'; // tighter / looser / steady
+        const arrow=moved?(cd>0||rd>0?'▲ tighter':'▼ looser'):'— steady';
+        const adj=moved?` (conv ${cd>0?'+':''}${cd}, R:R ${rd>0?'+':''}${rd})`:'';
+        return `<span class="lchip ${dir}" data-tip="${esc((s.note||'learning')+adj+' · window of recent resolved trades')}">`
+              +`<b>${names[b]}</b> ${arrow}${s.exp!=null?` · ${s.exp>0?'+':''}${s.exp}R avg (n=${s.n})`:` · n=${s.n||0}`}</span>`;
+      }).join('');
+      glBox.innerHTML=`<div class="learnhd">🧠 Adaptive gate — the bar moves with results: boards that lose get <b>tighter</b>, boards that win get a little <b>looser</b> (rolling window, per board).</div><div class="lchips">${chips}</div>`;
+      glBox.style.display='block';
+    }
+  }
   // Live winners — open trades already past TP1 (risk-free, running), with current MTM R.
   const lw=(perf&&perf.live_winners)||[];
   const lwSub=document.getElementById('liveWinSub'), lwTbl=document.getElementById('livewintbl'), lwRows=document.getElementById('livewinrows');
