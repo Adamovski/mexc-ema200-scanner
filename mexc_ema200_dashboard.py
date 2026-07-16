@@ -101,6 +101,9 @@ class Tracker:
         # ~the same entry) for a cooldown window — otherwise a setup that keeps appearing
         # on the board gets re-taken and re-stopped every scan (compounding one loss).
         self.cooldowns: dict[str, dict] = {}
+        # Per-board last-time-a-setup-appeared, for the "drought" auto-loosen: if a board
+        # produces nothing for a couple of hours the gate is probably too tight, so relax it.
+        self.board_seen: dict[str, float] = {}
         try:
             self.path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                      "apex_perf.json")
@@ -147,6 +150,7 @@ class Tracker:
                 self.open = d.get("open", {})
                 self.closed = d.get("closed", [])
                 self.cooldowns = d.get("cooldowns", {})
+                self.board_seen = d.get("board_seen", {})
                 self.calls_reset = d.get("calls_reset", "")
                 # Anything recorded before versioning belongs to the previous epoch —
                 # tag it v1 so the current version's headline starts fresh but the old
@@ -168,7 +172,8 @@ class Tracker:
 
     def _save(self):
         blob = json.dumps({"open": self.open, "closed": self.closed[-1000:],
-                           "cooldowns": self.cooldowns, "calls_reset": self.calls_reset})
+                           "cooldowns": self.cooldowns, "calls_reset": self.calls_reset,
+                           "board_seen": self.board_seen})
         try:
             with open(self.path, "w") as f:
                 f.write(blob)
@@ -420,6 +425,32 @@ class Tracker:
             out[b] = {"n": n, "exp": round(exp, 2), "winrate": wr,
                       "conv_delta": cd, "rr_delta": rd, "note": note}
         return out
+
+    def note_board(self, board, n):
+        """Record whether a board produced any setups this scan. Starts a clock the first
+        time we ever see the board, and resets it whenever the board is non-empty — so the
+        gap since the last non-empty scan is the board's 'drought'."""
+        now = time.time()
+        with self.lock:
+            if board not in self.board_seen:
+                self.board_seen[board] = now
+            if n > 0:
+                self.board_seen[board] = now
+
+    def drought_relax(self, board, grace_h=2.0):
+        """If a board has flagged NOTHING for a while, the gate is probably too tight —
+        so progressively loosen it. Returns (conv_delta, rr_delta, hours) where the deltas
+        are ≤0 (they lower the floors) and grow with the drought past `grace_h`, capped."""
+        last = self.board_seen.get(board)
+        if not last:
+            return (0.0, 0.0, 0.0)
+        h = (time.time() - last) / 3600.0
+        over = h - grace_h
+        if over <= 0:
+            return (0.0, 0.0, round(h, 1))
+        cd = -min(15.0, round(4.0 * over, 1))      # up to −15 conviction
+        rd = -min(0.5, round(0.12 * over, 2))      # up to −0.5 R:R
+        return (cd, rd, round(h, 1))
 
     def stats(self, prices=None):
         prices = prices or {}
@@ -1031,6 +1062,16 @@ def run_one_scan(state: State) -> None:
     # than before so a decent setup isn't held back in a merely-mixed tape.
     CONV_FLOOR, RR_FLOOR = 57.0, 1.7
     _learn = TRACKER.learn_adjust()                    # results → live gate adjustment
+    # DROUGHT auto-loosen: if long/short has flagged nothing for >2h, the bar is too tight,
+    # so relax it progressively (folded into the same per-board deltas the gate applies).
+    for _sd in ("long", "short"):
+        _dcd, _drd, _dh = TRACKER.drought_relax(_sd)
+        if _dcd < 0:
+            _l = _learn.setdefault(_sd, {"n": 0, "exp": None, "conv_delta": 0.0, "rr_delta": 0.0, "note": ""})
+            _l["conv_delta"] = (_l.get("conv_delta") or 0.0) + _dcd
+            _l["rr_delta"] = (_l.get("rr_delta") or 0.0) + _drd
+            _l["drought_h"] = _dh
+            _l["note"] = ((_l.get("note") or "").rstrip() + f" · auto-loosened (no setup {_dh:.1f}h)").lstrip(" ·")
 
     def _quality_keep(board, side):
         favor = _reg if side == "long" else -_reg      # >0 = regime favours this side
@@ -1204,6 +1245,13 @@ def run_one_scan(state: State) -> None:
     short_board = [d for d in short_board if not TRACKER.cooling("short", d["symbol"], "short")]
     scalp_board = [d for d in scalp_board if not TRACKER.cooling("scalp", d["symbol"], d.get("side", "long"))]
     coil_board = [d for d in coil_board if not TRACKER.cooling("coil", d["symbol"], d.get("rec_side") or "long")]
+
+    # Drought clock: record whether each board produced anything this scan (drives the
+    # auto-loosen next scan if a board stays empty for hours).
+    TRACKER.note_board("long", len(long_board))
+    TRACKER.note_board("short", len(short_board))
+    TRACKER.note_board("coil", len(coil_board))
+    TRACKER.note_board("scalp", len(scalp_board))
 
     # Performance tracking — register each board's fresh setups (resolved later against
     # the live price feed). Coil registers the recommended side's breakout plan.
@@ -2337,7 +2385,7 @@ PAGE = """<!doctype html>
 
 <div class="view" id="viewScalp">
 <div class="status">
-  <span>⚡ Best scalps — quick <b>lower-timeframe</b> trades with a <b>tight stop</b> and high R:R. Two kinds: <b>trend scalps</b> (5m/15m entry taken <b>with</b> the 4h/Daily/Weekly direction) and <b>↩ counter-trend bounces</b> — a snap-back off a <b>strong, multi-tested support/resistance</b> even when there's no clean trend setup (oversold wash into support = long bounce; overbought pop into resistance = short fade). So there's almost always a good scalp on the board. Counter-trend rows are badged; the edge is the level + the snap, not the trend. Click a row for the full plan.</span>
+  <span>⚡ Best scalps — quick <b>15-minute</b> trades with a <b>tight-but-breathable</b> stop and high R:R (5m was too noisy for crypto, so the base timeframe is now 15m). Two kinds: <b>trend scalps</b> (15m entry taken <b>with</b> the 4h/Daily/Weekly direction) and <b>↩ counter-trend bounces</b> — a snap-back off a <b>strong, multi-tested support/resistance</b> even when there's no clean trend setup (oversold wash into support = long bounce; overbought pop into resistance = short fade). So there's almost always a good scalp on the board. Counter-trend rows are badged; the edge is the level + the snap, not the trend. Click a row for the full plan.</span>
   <span id="scalpCount"></span>
 </div>
 <div class="wrap">

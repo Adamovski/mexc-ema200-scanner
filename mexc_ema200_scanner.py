@@ -3091,8 +3091,10 @@ def scalp_setup(sess, symbol, market, side, htf_conv, htf_tf_bias):
     s15 = _series("15m", 400)
     if not s5 and not s15:
         return None
-    # Entry timeframe = 5m if we have it (tightest), else fall back to 15m.
-    (H, L, C, Vv), etf = (s5, "5m") if s5 else (s15, "15m")
+    # Entry timeframe = 15m — 5m is too noisy for crypto (stops get wicked out on ordinary
+    # chop). The 15m gives a cleaner structure and a stop that can actually breathe. 5m is
+    # only a fallback if the 15m fetch failed.
+    (H, L, C, Vv), etf = (s15, "15m") if s15 else (s5, "5m")
     price = C[-1]
     if not price:
         return None
@@ -3247,7 +3249,8 @@ def bounce_scalp_setup(sess, symbol, market, side):
     s15 = _series("15m", 400)
     if not s5 and not s15:
         return None
-    (H, L, C, Vv), etf = (s5, "5m") if s5 else (s15, "15m")
+    # 15m base — 5m is too noisy for crypto; the 15m level + snap is a far cleaner bounce.
+    (H, L, C, Vv), etf = (s15, "15m") if s15 else (s5, "5m")
     price = C[-1]
     if not price or len(C) < 30:
         return None
