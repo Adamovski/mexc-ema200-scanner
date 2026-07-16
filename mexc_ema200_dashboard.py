@@ -51,7 +51,7 @@ try:
         list_symbols, scan_symbol_multi, get_session, EMA_PERIOD,
         analyze_symbol, normalize_symbol, fetch_candles, pct_returns, CORR_WINDOW,
         bias_on_tf, enrich_1h, best_pattern, coil_tfs_finer, scalp_setup,
-        bounce_scalp_setup, backtest_board,
+        bounce_scalp_setup, backtest_board, backtest_all,
         compute_market_context, fetch_deriv_series, backfill_market_history,
     )
 except ImportError:
@@ -824,6 +824,7 @@ class State:
         self.universe: int = 0
         self.market_context: dict | None = None    # BTC + alts big-picture read
         self.gate_learn: dict | None = None         # per-board gate adjustment from results
+        self.backtests: dict | None = None          # auto TF × side backtest matrix
         self.error: str = ""
 
     def snapshot(self) -> dict:
@@ -1450,6 +1451,34 @@ def scan_loop(state: State) -> None:
         time.sleep(every)
 
 
+def backtest_loop(state: State) -> None:
+    """Run the full TF × side backtest matrix in the background and refresh it every few
+    hours, so the Backtest tab always shows current results without the user triggering it.
+    Heavy, so it runs on its own slow cadence and after a short startup delay."""
+    time.sleep(90)                                   # let the first scan grab the CPU first
+    market = state.cfg.get("market", "futures")
+    while True:
+        try:
+            sess = get_session()
+            t0 = time.time()
+            data = backtest_all(sess, market, tfs=("15m", "1h", "4h", "1d"),
+                                limit=1000, fees_bps=5.0)
+            with state.lock:
+                state.backtests = {"ts": time.time(), "took": round(time.time() - t0, 1),
+                                   "fees_bps": 5.0, "coins": len(backtest_all_symbols()),
+                                   "data": data}
+        except Exception as e:
+            with state.lock:
+                if not state.backtests:
+                    state.backtests = {"error": str(e)}
+        time.sleep(3 * 3600)                          # refresh every ~3 hours
+
+
+def backtest_all_symbols():
+    import mexc_ema200_scanner as _sc
+    return _sc.BACKTEST_BASKET
+
+
 MEXC_PRICE_URL = "https://api.mexc.com/api/v3/ticker/price"
 MEXC_FUT_TICKER = "https://contract.mexc.com/api/v1/contract/ticker"
 
@@ -1782,6 +1811,15 @@ PAGE = """<!doctype html>
   .btcard-h{font-size:14px;font-weight:800;margin-bottom:10px;display:flex;align-items:center;gap:10px}
   .btverdict{font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px;border:1px solid var(--line)}
   .btnote,.btcard .histnote{color:var(--dim)}
+  .btmatrix td,.btmatrix th{font-size:13.5px}
+  .btmatrix tbody td:first-child{font-family:var(--mono)}
+  .bttf>summary{cursor:pointer;padding:9px 12px;border:1px solid var(--line);border-radius:9px;background:var(--bg2);font-weight:700;font-size:13px;margin-top:8px;list-style:none}
+  .bttf>summary::-webkit-details-marker{display:none}
+  .bttf[open]>summary{border-bottom-left-radius:0;border-bottom-right-radius:0}
+  .btanalysis{margin:10px 0 4px;display:flex;flex-direction:column;gap:5px}
+  .btidea{font-size:12.5px;color:#c3ccd8;padding:6px 10px;border-radius:7px;background:rgba(139,152,173,.06);border:1px solid var(--line)}
+  .btidea.btbad{border-color:rgba(248,81,73,.4);background:rgba(248,81,73,.07)}
+  .btideah{font-size:12px;font-weight:800;letter-spacing:.03em;color:var(--dim);margin-top:6px}
   .learnbox{margin:10px 0 4px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg2)}
   .learnhd{font-size:12px;color:var(--dim);margin-bottom:8px}
   .lchips{display:flex;flex-wrap:wrap;gap:6px}
@@ -2618,23 +2656,15 @@ PAGE = """<!doctype html>
 
 <div class="view" id="viewBacktest">
 <div class="status">
-  <span>🧪 Backtest — does the edge actually exist? Replays the core <b>entry / stop / target mechanics</b> (trend pullback-or-CMP long, rip-or-CMP short, ATR-floored stop, target at the next structural level) over <b>real historical candles</b> for a liquid basket — no look-ahead, the limit must fill, stop-hit assumed first on a tie, and <b>net of fees</b>. This is the offline read on whether the logic has positive expectancy, instead of waiting days for the live forward-test.</span>
+  <span>🧪 Backtest — does the edge actually exist? Apex <b>runs this itself</b> in the background across <b>every timeframe</b> (15m / 1h / 4h / 1D) and both sides, replaying the core <b>entry / stop / target mechanics</b> over ~1000 real candles for a <b>60-coin liquid basket</b> — no look-ahead, the limit must fill, stop-hit assumed first on a tie, and <b>net of fees</b>. The matrix below is the offline read on where the mechanics have positive expectancy, so you know which timeframes to trust.</span>
 </div>
 <div class="wrap">
   <div class="btbar">
-    <span>Timeframe:</span>
-    <span class="btseg" id="btTf">
-      <span class="btopt" data-tf="15m" onclick="setBtTf('15m')">15m</span>
-      <span class="btopt btsel" data-tf="4h" onclick="setBtTf('4h')">4h</span>
-      <span class="btopt" data-tf="1d" onclick="setBtTf('1d')">1D</span>
-    </span>
-    <span style="margin-left:14px">Fees (bps round-trip):</span>
-    <input id="btFees" type="number" value="4" min="0" max="50" step="1" class="btfees">
-    <button id="btRun" class="btrun" onclick="runBacktest()">▶ Run backtest</button>
-    <span id="btMeta" class="btmeta"></span>
+    <span id="btMeta" class="btmeta">Loading the latest backtest…</span>
+    <button id="btRun" class="btrun" onclick="loadBacktest(true)" style="margin-left:auto">↻ Refresh</button>
   </div>
   <div id="btBody"></div>
-  <div class="empty" id="btempty">Pick a timeframe and hit <b>Run backtest</b>. It replays ~1000 candles across a 16-coin liquid basket — takes a few seconds. Results are cached for 15 minutes.</div>
+  <div class="empty" id="btempty" style="display:none"></div>
 </div>
 </div>
 
@@ -3214,6 +3244,7 @@ function showTab(which){
   if(which==="coil") renderCoil();
   if(which==="scalp") renderScalp();
   if(which==="perf") renderPerf();
+  if(which==="backtest") loadBacktest();
   if(which==="calls") renderCalls();
   if(which==="watch"){ renderWatch(); loadWatch(); }
   renderBanner();  // banner follows the active scan tab
@@ -4618,22 +4649,16 @@ function renderScalp(){
     }
   }
 }
-// ---- Backtest tab ----
-let btTf='4h', btData=null, btRunning=false;
-function setBtTf(tf){ btTf=tf; document.querySelectorAll('#btTf .btopt').forEach(x=>x.classList.toggle('btsel',x.dataset.tf===tf)); }
-async function runBacktest(){
-  if(btRunning) return; btRunning=true;
-  const btn=document.getElementById('btRun'), meta=document.getElementById('btMeta'), emp=document.getElementById('btempty');
-  const fees=Math.max(0,Math.min(50, +(document.getElementById('btFees').value||4)));
-  if(btn){ btn.disabled=true; btn.textContent='⏳ Running…'; }
-  if(meta) meta.textContent='replaying ~1000 candles × 16 coins…';
-  try{
-    const r=await fetch(`/backtest?tf=${btTf}&fees=${fees}`,{cache:'no-store'});
-    btData=await r.json();
-  }catch(e){ btData={error:'Request failed — try again.'}; }
-  if(btn){ btn.disabled=false; btn.textContent='▶ Run backtest'; }
-  if(emp) emp.style.display='none';
-  btRunning=false; renderBacktest();
+// ---- Backtest tab (auto TF × side matrix, run in the background) ----
+let btData=null;
+async function loadBacktest(force){
+  const meta=document.getElementById('btMeta');
+  if(force&&meta) meta.textContent='refreshing…';
+  try{ const r=await fetch('/backtest',{cache:'no-store'}); btData=await r.json(); }
+  catch(e){ btData={error:'Request failed.'}; }
+  renderBacktest();
+  clearTimeout(window._btPoll);
+  if(btData&&btData.pending){ window._btPoll=setTimeout(()=>loadBacktest(),20000); }  // poll while first sweep runs
 }
 function btVerdict(exp){
   if(exp==null) return ['—',''];
@@ -4641,34 +4666,64 @@ function btVerdict(exp){
   if(exp>0) return ['🟡 thin edge',''];
   return ['❌ negative edge','pcb'];
 }
+function btCell(s){
+  if(!s||!s.n) return '<span style="color:var(--dim2)">—</span>';
+  const cls=s.exp>=0.15?'pf-good':s.exp>0?'':'pf-bad';
+  return `<span class="${cls}"><b>${s.exp>0?'+':''}${s.exp}R</b></span> · ${s.winrate}% <span class="rr">(${s.n})</span>`;
+}
 function btSideCard(label,emoji,s){
   if(!s||!s.n){ return `<div class="btcard"><div class="btcard-h">${emoji} ${label}</div><div class="btnote">No qualifying trades in the sample.</div></div>`; }
   const [vlabel,vcls]=btVerdict(s.exp);
+  const ins=s.insights||{}, finds=s.findings||[];
+  // Analysis — what worked + where the edge leaks.
+  let anl='';
+  if(s.breakeven_wr!=null){ const ok=s.winrate>=s.breakeven_wr;
+    anl+=`<div class="btidea">🎯 Breakeven win-rate ≈ <b>${s.breakeven_wr}%</b> (from +${s.avg_win}/${s.avg_loss}R). Board wins <b>${s.winrate}%</b> — <span class="${ok?'pf-good':'pf-bad'}">${ok?'above breakeven':'below breakeven — needs a higher hit-rate or bigger winners'}</span>.</div>`; }
+  if(ins.stop_then_tp_pct!=null){ const hot=ins.stop_then_tp_pct>=35;
+    anl+=`<div class="btidea${hot?' btbad':''}">🛑 <b>${ins.stop_then_tp_pct}%</b> of losers hit the target <b>after</b> being stopped${hot?' — stops are too tight; widening ~30% would flip many of these to wins':' — stops look reasonably placed'}. Losers ran +${ins.loser_mfe}R toward target first.</div>`; }
+  if(finds.length){
+    anl+=`<div class="btideah">💡 What worked (segment expectancy)</div>`;
+    anl+=finds.map(f=>`<div class="btidea">${esc(f.label)}: <b class="${f.a.exp>f.b.exp?'pf-good':'pf-bad'}">${esc(f.a.name)} ${f.a.exp>0?'+':''}${f.a.exp}R</b> <span class="rr">(${f.a.n})</span> vs <b class="${f.b.exp>f.a.exp?'pf-good':'pf-bad'}">${esc(f.b.name)} ${f.b.exp>0?'+':''}${f.b.exp}R</b> <span class="rr">(${f.b.n})</span> → favour <b>${esc(f.better)}</b></div>`).join('');
+  }
   const rows=(s.per_symbol||[]).map(p=>`<tr><td class="sym"><a href="${tvLink(p.symbol)}" target="_blank" rel="noopener">${dispSym(p.symbol)}</a></td>`
     +`<td>${p.n}</td><td class="${p.winrate>=50?'pf-good':'pf-bad'}">${p.winrate}%</td>`
     +`<td class="${p.exp>0?'pf-good':'pf-bad'}">${p.exp>0?'+':''}${p.exp}R</td>`
-    +`<td class="${p.sumR>0?'pf-good':'pf-bad'}">${p.sumR>0?'+':''}${p.sumR}R</td></tr>`).join('');
+    +`<td class="${p.sumR>0?'pf-good':'pf-bad'}">${p.sumR>0?'+':''}${p.sumR}R</td>`
+    +`<td class="${(p.stp||0)>=35?'pf-bad':''}" data-tip="Share of this coin's losing trades that reached the target AFTER being stopped — high = stops too tight for this coin.">${p.stp!=null?p.stp+'%':'—'}</td></tr>`).join('');
   return `<div class="btcard">
     <div class="btcard-h">${emoji} ${label} <span class="btverdict ${vcls}">${vlabel}</span></div>
     <div class="perfcards">
       ${perfCard('Trades', s.n, '')}
       ${perfCard('Win rate', s.winrate+'%', s.winrate>=50?'pcg':s.winrate>=40?'':'pcb')}
-      ${perfCard('Expectancy (net)', (s.exp>0?'+':'')+s.exp+'R', s.exp>0?'pcg':'pcb', 'Average R per trade AFTER fees. This is the number that matters — positive = the mechanics have an edge.')}
+      ${perfCard('Expectancy (net)', (s.exp>0?'+':'')+s.exp+'R', s.exp>0?'pcg':'pcb', 'Average R per trade AFTER fees. This is the number that matters.')}
       ${perfCard('Total R (net)', (s.sumR>0?'+':'')+s.sumR+'R', s.sumR>0?'pcg':'pcb')}
       ${perfCard('Avg win / loss', (s.avg_win!=null?('+'+s.avg_win):'—')+' / '+(s.avg_loss!=null?s.avg_loss:'—')+'R', '')}
-      ${perfCard('Fee drag', '-'+s.fee_drag+'R', s.fee_drag>0?'pcb':'', 'How much fees cost per trade on average (gross expectancy '+ (s.gross_exp>0?'+':'')+s.gross_exp+'R minus net).')}
+      ${perfCard('Fee drag', '-'+s.fee_drag+'R', s.fee_drag>0?'pcb':'', 'Fees cost per trade on average (gross expectancy '+(s.gross_exp>0?'+':'')+s.gross_exp+'R minus net).')}
     </div>
-    <div class="perfsub">Per-coin (best first)</div>
-    <table class="bt"><thead><tr><th>Coin</th><th>Trades</th><th>Win rate</th><th>Expectancy</th><th>Total R</th></tr></thead><tbody>${rows}</tbody></table>
+    <div class="btanalysis">${anl}</div>
+    <div class="perfsub">Per-coin (best first) · last column = stops-too-tight rate</div>
+    <table class="bt"><thead><tr><th>Coin</th><th>Trades</th><th>Win rate</th><th>Expectancy</th><th>Total R</th><th data-tip="Share of losers that hit target after being stopped.">Stop-tight</th></tr></thead><tbody>${rows}</tbody></table>
   </div>`;
 }
 function renderBacktest(){
-  const body=document.getElementById('btBody'), meta=document.getElementById('btMeta'); if(!body) return;
-  const d=btData; if(!d){ return; }
-  if(d.error){ body.innerHTML=`<div class="bt-empty">${esc(d.error)}</div>`; if(meta) meta.textContent=''; return; }
-  if(meta) meta.textContent=`${d.tf} · ${d.fees_bps} bps fees · as of ${ago(d.ts)}`;
-  body.innerHTML=`<div class="btgrid">${btSideCard('Longs (trend pullback)','🏆',d.long)}${btSideCard('Shorts (rip to resistance)','🔻',d.short)}</div>`
-    +`<div class="histnote">⚠ This tests a <b>simplified</b> version of the entry/stop/target geometry (not every detector), on a 16-coin basket. It's a directional read on whether the core mechanics have an edge — not a promise of live results. A negative expectancy here is a strong signal the stops/targets need work; a positive one says the geometry is sound and the live gate just needs to pick the right moments.</div>`;
+  const body=document.getElementById('btBody'), meta=document.getElementById('btMeta'), emp=document.getElementById('btempty'); if(!body) return;
+  const d=btData; if(!d) return;
+  if(d.pending){ if(emp){emp.style.display='block'; emp.innerHTML='⏳ Apex is running the first backtest sweep — 60 coins × 4 timeframes × both sides. This takes a few minutes on a fresh boot and refreshes here automatically.';} body.innerHTML=''; if(meta) meta.textContent='running the first sweep…'; return; }
+  if(d.error){ if(emp) emp.style.display='none'; body.innerHTML=`<div class="bt-empty">${esc(d.error)}</div>`; if(meta) meta.textContent=''; return; }
+  if(emp) emp.style.display='none';
+  if(meta) meta.textContent=`${d.coins} coins · ${d.fees_bps} bps fees · as of ${ago(d.ts)}${d.took?(' · took '+d.took+'s'):''}`;
+  const tfs=['15m','1h','4h','1d'];
+  let m=`<div class="perfsub">Edge matrix — net expectancy · win-rate · (trades) per timeframe & side</div>`;
+  m+=`<table class="bt btmatrix"><thead><tr><th>Timeframe</th><th>🏆 Longs</th><th>🔻 Shorts</th></tr></thead><tbody>`;
+  for(const tf of tfs){ const row=(d.data||{})[tf]||{}; m+=`<tr><td><b>${tf}</b></td><td>${btCell(row.long)}</td><td>${btCell(row.short)}</td></tr>`; }
+  m+=`</tbody></table>`;
+  let det='';
+  for(const tf of tfs){ const row=(d.data||{})[tf]||{};
+    if(!(row.long&&row.long.n)&&!(row.short&&row.short.n)) continue;
+    det+=`<details class="bttf"><summary>${tf} — full breakdown (per-coin)</summary><div class="btgrid">${btSideCard('Longs · '+tf,'🏆',row.long)}${btSideCard('Shorts · '+tf,'🔻',row.short)}</div></details>`;
+  }
+  body.innerHTML=m+`<div class="perfsub">Per-timeframe detail (click to expand)</div>`+det
+    +`<div class="histnote">⚠ Simplified mechanics on a 60-coin basket — a directional read, not a promise of live results. Negative across every timeframe = the stops/targets themselves need work; a timeframe that's clearly positive is one to lean on and tune the live gate toward.</div>`;
 }
 function perfCard(label,val,cls,tip){
   const t=tip?` data-tip="${esc(tip)}" style="cursor:help"`:'';
@@ -5645,32 +5700,10 @@ def make_handler(state: State):
                 self._send(404, b"not found", "text/plain")
 
         def _backtest(self):
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            g = lambda k, d: (q.get(k) or [d])[0]
-            tf = g("tf", "4h")
-            if tf not in ("15m", "1h", "4h", "1d"):
-                tf = "4h"
-            try:
-                fees = max(0.0, min(50.0, float(g("fees", "4"))))
-            except ValueError:
-                fees = 4.0
-            key = (tf, round(fees, 1))
-            now = time.time()
-            cached = _BT_CACHE.get(key)
-            if cached and now - cached[0] < 900:        # 15-min cache (backtests are heavy)
-                self._send(200, json.dumps(cached[1]).encode(), "application/json")
-                return
-            try:
-                sess = get_session()
-                mkt = state.cfg.get("market", "futures")
-                out = {"long": backtest_board(sess, "long", mkt, tf=tf, fees_bps=fees),
-                       "short": backtest_board(sess, "short", mkt, tf=tf, fees_bps=fees),
-                       "tf": tf, "fees_bps": fees, "ts": now}
-            except Exception as e:
-                out = {"error": f"Backtest failed: {e}"}
-            if "error" not in out:
-                _BT_CACHE[key] = (now, out)
+            # Served from the background matrix (backtest_loop) — no on-demand compute.
+            with state.lock:
+                bt = state.backtests
+            out = bt if bt else {"pending": True}
             self._send(200, json.dumps(out).encode(), "application/json")
 
         def _track(self):
@@ -5760,6 +5793,7 @@ def main() -> None:
     t = threading.Thread(target=scan_loop, args=(state,), daemon=True)
     t.start()
     threading.Thread(target=breakout_watcher, args=(state,), daemon=True).start()
+    threading.Thread(target=backtest_loop, args=(state,), daemon=True).start()
 
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(state))
     url = f"http://localhost:{args.port}"

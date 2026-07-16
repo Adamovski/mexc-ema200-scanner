@@ -3538,13 +3538,17 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210):
                 if f is None:
                     t += 1; continue
             outcome = rbar = None
+            mfe = 0.0
             for j in range(f, min(n, f + horizon + 1)):
+                mfe = max(mfe, (H[j] - entry) / risk)     # best move toward target so far (R)
                 if L[j] <= stop:
                     outcome, rbar = "loss", j; break
                 if H[j] >= tp:
                     outcome, rbar = "win", j; break
             if outcome is None:
                 t = f + 1; continue
+            stop_then_tp = (outcome == "loss" and
+                            any(H[j] >= tp for j in range(rbar, min(n, f + horizon + 1))))
         else:
             if not (price < el and dn):
                 t += 1; continue
@@ -3573,67 +3577,180 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210):
                 if f is None:
                     t += 1; continue
             outcome = rbar = None
+            mfe = 0.0
             for j in range(f, min(n, f + horizon + 1)):
+                mfe = max(mfe, (entry - L[j]) / risk)
                 if H[j] >= stop:
                     outcome, rbar = "loss", j; break
                 if L[j] <= tp:
                     outcome, rbar = "win", j; break
             if outcome is None:
                 t = f + 1; continue
+            stop_then_tp = (outcome == "loss" and
+                            any(L[j] <= tp for j in range(rbar, min(n, f + horizon + 1))))
         rr = round(rr, 2)
         fee_R = fee_frac / (risk / entry)
         R = (rr - fee_R) if outcome == "win" else (-1.0 - fee_R)
         trades.append({"r": round(R, 3), "rr": rr, "outcome": outcome,
-                       "gross": rr if outcome == "win" else -1.0})
+                       "gross": rr if outcome == "win" else -1.0,
+                       "mfe": round(min(mfe, rr), 2), "stop_then_tp": bool(stop_then_tp),
+                       "cmp": bool(is_cmp), "bars": rbar - f,
+                       "extd": round(abs((entry - el) / el) * 100, 2) if el else 0.0,
+                       "atrp": round(a / entry * 100, 2)})
         t = rbar + 1
     return trades
 
 
-# A small liquid basket the backtester runs over (bounded cost for the free instance).
-BACKTEST_BASKET = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK",
-                   "SUI", "APT", "ARB", "OP", "LTC", "NEAR", "INJ"]
+def _bt_insights(trades):
+    """Diagnostics that turn a backtest into ACTIONABLE ideas. The headline one:
+    'stop_then_tp' = the share of LOSING trades whose target was later reached after the
+    stop was hit — a direct measure of stops being too tight."""
+    n = len(trades)
+    if not n:
+        return {}
+    losers = [x for x in trades if x["outcome"] == "loss"]
+    nl = len(losers) or 1
+    stp = round(sum(1 for x in losers if x.get("stop_then_tp")) / nl * 100, 1)
+    loser_mfe = round(sum(x.get("mfe", 0) for x in losers) / nl, 2)
+    cmp_share = round(sum(1 for x in trades if x.get("cmp")) / n * 100)
+    avg_bars = round(sum(x.get("bars", 0) for x in trades) / n, 1)
+    return {"stop_then_tp_pct": stp, "loser_mfe": loser_mfe,
+            "cmp_share": cmp_share, "avg_bars": avg_bars, "n_losers": len(losers)}
+
+
+def _bt_findings(trades):
+    """Segment the trades by context (entry type, distance-from-EMA, volatility, target
+    width) and surface the splits with the biggest expectancy gap — i.e. WHAT WORKED, so
+    the logic can be biased toward it."""
+    def seg(pred):
+        a = [x for x in trades if pred(x)]
+        b = [x for x in trades if not pred(x)]
+        ma = (round(sum(x["r"] for x in a) / len(a), 3), len(a)) if a else (None, 0)
+        mb = (round(sum(x["r"] for x in b) / len(b), 3), len(b)) if b else (None, 0)
+        return ma, mb
+    out = []
+
+    def add(label, aname, bname, pred, minn=15):
+        (ea, na), (eb, nb) = seg(pred)
+        if na >= minn and nb >= minn and ea is not None and eb is not None and abs(ea - eb) >= 0.1:
+            out.append({"label": label, "a": {"name": aname, "exp": ea, "n": na},
+                        "b": {"name": bname, "exp": eb, "n": nb},
+                        "better": aname if ea > eb else bname, "gap": round(abs(ea - eb), 2)})
+    add("Entry type", "limit at a level", "market (CMP)", lambda x: not x.get("cmp"))
+    add("Distance from 200-EMA", "near (≤5%)", "extended (>5%)", lambda x: (x.get("extd") or 0) <= 5)
+    atrs = sorted((x.get("atrp") or 0) for x in trades)
+    med = atrs[len(atrs) // 2] if atrs else 0
+    add("Volatility at entry", f"calmer (≤{med:.1f}% ATR)", f"choppier (>{med:.1f}%)",
+        lambda x: (x.get("atrp") or 0) <= med)
+    add("Target width", "tighter R:R (<2)", "wider R:R (≥2)", lambda x: (x.get("rr") or 0) < 2)
+    out.sort(key=lambda f: f["gap"], reverse=True)
+    return out[:4]
+
+
+# A broad liquid basket the backtester runs over by default (~60 majors + mid-caps).
+BACKTEST_BASKET = [c + "USDT" for c in (
+    "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK", "SUI", "APT", "ARB",
+    "OP", "LTC", "NEAR", "INJ", "TRX", "DOT", "MATIC", "ATOM", "UNI", "AAVE", "FIL", "ETC",
+    "XLM", "HBAR", "ICP", "IMX", "RUNE", "GRT", "ALGO", "SAND", "MANA", "AXS", "FTM", "EGLD",
+    "THETA", "FLOW", "CHZ", "CRV", "LDO", "SNX", "DYDX", "GMX", "SEI", "TIA", "PYTH", "JTO",
+    "WIF", "PEPE", "BONK", "FLOKI", "ORDI", "STX", "RNDR", "FET", "AR", "KAS", "TON", "WLD")]
 
 
 def backtest_board(sess, side, market, tf="4h", limit=1000, fees_bps=4.0, symbols=None):
-    """Run backtest_symbol across a liquid basket and aggregate — win-rate, expectancy
-    (net of fees), gross vs net, avg win/loss and a per-symbol breakdown. This is the
-    offline read on whether the mechanics have a real edge, instead of waiting days for the
-    live forward-test to fill in."""
+    """Run backtest_symbol across a basket and aggregate — win-rate, expectancy (net of
+    fees), gross vs net, avg win/loss and a per-symbol breakdown. Fetch AND compute are
+    parallelised so a big basket (or the whole universe) stays fast. `symbols` are full
+    pair names (e.g. 'BTCUSDT'); defaults to the broad liquid basket."""
     syms = symbols or BACKTEST_BASKET
-    rows_by = {}
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = {ex.submit(fetch_candles, sess, s + "USDT", tf, limit, market): s for s in syms}
-        for f in as_completed(futs):
+
+    def _one(sym):
+        try:
+            rows = fetch_candles(sess, sym, tf, limit, market)
+        except Exception:
+            return sym, None
+        if not rows:
+            return sym, None
+        return sym, backtest_symbol(rows, side, fees_bps=fees_bps)
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        for f in as_completed([ex.submit(_one, s) for s in syms]):
             try:
-                rows_by[futs[f]] = f.result()
+                sym, tr = f.result()
             except Exception:
-                rows_by[futs[f]] = None
+                sym, tr = None, None
+            if sym:
+                results[sym] = tr
+    return _bt_aggregate(results, syms, tf, side, fees_bps)
+
+
+def _bt_aggregate(results, syms, tf, side, fees_bps):
+    """Aggregate per-symbol trade lists into a board summary + actionable analysis."""
     allt, per = [], []
     for s in syms:
-        rows = rows_by.get(s)
-        if not rows:
-            continue
-        tr = backtest_symbol(rows, side, fees_bps=fees_bps)
+        tr = results.get(s)
         if tr:
             m = len(tr); sm = sum(x["r"] for x in tr)
             w = sum(1 for x in tr if x["outcome"] == "win")
-            per.append({"symbol": s + "USDT", "n": m, "winrate": round(w / m * 100, 1),
-                        "exp": round(sm / m, 3), "sumR": round(sm, 2)})
+            lz = [x for x in tr if x["outcome"] == "loss"]
+            per.append({"symbol": s, "n": m, "winrate": round(w / m * 100, 1),
+                        "exp": round(sm / m, 3), "sumR": round(sm, 2),
+                        # per-coin diagnostics: stops-too-tight rate + how far losers ran
+                        "stp": round(sum(1 for x in lz if x.get("stop_then_tp")) / (len(lz) or 1) * 100),
+                        "cmp": round(sum(1 for x in tr if x.get("cmp")) / m * 100)})
             allt += tr
     n = len(allt)
     if not n:
-        return {"n": 0, "tf": tf, "side": side, "fees_bps": fees_bps}
+        return {"n": 0, "tf": tf, "side": side, "fees_bps": fees_bps, "coins": 0}
     w = sum(1 for x in allt if x["outcome"] == "win")
     sm = sum(x["r"] for x in allt); gsm = sum(x["gross"] for x in allt)
     wins = [x["r"] for x in allt if x["outcome"] == "win"]
     losses = [x["r"] for x in allt if x["outcome"] == "loss"]
+    # Breakeven win-rate given the realised avg win/loss (so a finding can say how far off).
+    aw = (sum(wins) / len(wins)) if wins else 0
+    al = (-sum(losses) / len(losses)) if losses else 1
+    breakeven = round(al / (aw + al) * 100, 1) if (aw + al) else None
     return {"n": n, "winrate": round(w / n * 100, 1), "exp": round(sm / n, 3),
             "sumR": round(sm, 2), "gross_exp": round(gsm / n, 3),
             "fee_drag": round((gsm - sm) / n, 3),
-            "avg_win": round(sum(wins) / len(wins), 2) if wins else None,
-            "avg_loss": round(sum(losses) / len(losses), 2) if losses else None,
+            "avg_win": round(aw, 2) if wins else None,
+            "avg_loss": round(-al, 2) if losses else None,
+            "breakeven_wr": breakeven,
+            "insights": _bt_insights(allt), "findings": _bt_findings(allt),
             "per_symbol": sorted(per, key=lambda p: p["exp"], reverse=True),
             "tf": tf, "fees_bps": fees_bps, "side": side, "coins": len(per)}
+
+
+def backtest_all(sess, market, tfs=("15m", "1h", "4h", "1d"), limit=1000,
+                 fees_bps=5.0, symbols=None):
+    """Sweep the whole basket across EVERY timeframe and BOTH sides in one pass — fetching
+    each coin's candles once per TF and running long + short on them. Returns
+    {tf: {'long': agg, 'short': agg}}. Run in the background so the app shows a full
+    TF × side edge matrix without the user triggering anything."""
+    syms = symbols or BACKTEST_BASKET
+    out = {}
+    for tf in tfs:
+        def _one(sym):
+            try:
+                rows = fetch_candles(sess, sym, tf, limit, market)
+            except Exception:
+                return sym, None, None
+            if not rows:
+                return sym, None, None
+            return (sym, backtest_symbol(rows, "long", fees_bps=fees_bps),
+                    backtest_symbol(rows, "short", fees_bps=fees_bps))
+        longs, shorts = {}, {}
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            for f in as_completed([ex.submit(_one, s) for s in syms]):
+                try:
+                    sym, lt, st = f.result()
+                except Exception:
+                    sym = None
+                if sym:
+                    longs[sym], shorts[sym] = lt, st
+        out[tf] = {"long": _bt_aggregate(longs, syms, tf, "long", fees_bps),
+                   "short": _bt_aggregate(shorts, syms, tf, "short", fees_bps)}
+    return out
 
 
 def scan_symbol(sess: requests.Session, symbol: str, interval: str,
