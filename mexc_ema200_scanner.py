@@ -2922,6 +2922,13 @@ def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
     base = {"symbol": symbol, "price": price, "atr_pct": atr_pct, "rvol": rv,
             "bias": bias, "tf_bias": tfb,
             "pct_vs_ema": (round((price / ema_now - 1) * 100, 2) if ema_now else None)}
+    # Flag CMP / momentum entries (no clean pullback level to limit at). The backtest
+    # proved these lose money vs limit-at-a-level entries, so the gate drops them (except
+    # deliberate breakouts, which are buy/sell-stops by design).
+    for _pl in (lp, sp):
+        if _pl:
+            _pl["entry_cmp"] = (("current price" in (_pl.get("entry_basis") or ""))
+                                and not _pl.get("breakout"))
     long_setup = {**base, "side": "long", "score": _quality(ls, lp), "conviction": ls,
                   "why": lw, "near_level": near_sup, "near_kind": "support", **lp}
     short_setup = {**base, "side": "short", "score": _quality(ss, sp), "conviction": ss,
@@ -3518,7 +3525,9 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210):
             sup = [s for s in supports_below(Lw, last, price, max_n=3, min_gap=0.004) if s < price]
             near = sup[0] if sup else None
             is_cmp = near is None or (price - near) / price > prox
-            entry = price if is_cmp else near           # CMP momentum entry, or limit at support
+            if is_cmp:                    # limit-only: backtest proved CMP momentum entries lose
+                t += 1; continue
+            entry = near           # CMP momentum entry, or limit at support
             _min = max(0.008, 1.4 * a / entry)
             below = (sup[1] if len(sup) > 1 else (near * 0.996 if near else entry * 0.985))
             stop = min((below - 0.4 * a) if (near and not is_cmp) else entry * (1 - _min),
@@ -3555,7 +3564,9 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210):
             res = [r for r in resistances_above(Hw, last, price, max_n=3, min_gap=0.004) if r > price]
             near = res[0] if res else None
             is_cmp = near is None or (near - price) / price > prox
-            entry = price if is_cmp else near
+            if is_cmp:                    # limit-only: backtest proved CMP momentum entries lose
+                t += 1; continue
+            entry = near
             _min = max(0.008, 1.4 * a / entry)
             above = (res[1] if len(res) > 1 else (near * 1.004 if near else entry * 1.015))
             stop = max((above + 0.4 * a) if (near and not is_cmp) else entry * (1 + _min),

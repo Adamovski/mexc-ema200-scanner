@@ -85,7 +85,7 @@ def send_telegram(cfg: dict, text: str) -> None:
 # logic changes meaningfully — the headline win-rate resets to the new version (a clean
 # slate for the new logic), while every past version's results are kept and shown in the
 # "site version" breakdown so you can compare how each iteration actually performed.
-APP_VERSION = "v5 · 15m scalps + drought loosen + per-TF derivs"
+APP_VERSION = "v6 · limit-only entries (no CMP, per backtest)"
 # One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
 # every call (open + resolved) on the next boot and start the calls scorecard fresh —
 # auto-board trades and their version history are untouched.
@@ -1096,6 +1096,12 @@ def run_one_scan(state: State) -> None:
                 conv += 5
             elif d.get("breakout") and _volstate == "compression":
                 conv -= 5
+            # Backtest finding: extended market/CMP entries (no clean pullback level) lose;
+            # only limit-at-a-level entries have positive expectancy. Drop CMP (breakouts,
+            # which are intentional stop-entries, are exempt).
+            if d.get("entry_cmp"):
+                d["gate"] = "no clean pullback (CMP entry — backtest shows these lose)"
+                continue
             if rr is None or rr < rr_floor:
                 d["gate"] = "low R:R"
                 continue
@@ -1452,31 +1458,30 @@ def scan_loop(state: State) -> None:
 
 
 def backtest_loop(state: State) -> None:
-    """Run the full TF × side backtest matrix in the background and refresh it every few
-    hours, so the Backtest tab always shows current results without the user triggering it.
-    Heavy, so it runs on its own slow cadence and after a short startup delay."""
-    time.sleep(90)                                   # let the first scan grab the CPU first
-    market = state.cfg.get("market", "futures")
+    """Run the full TF × side backtest matrix in the background over the WHOLE universe and
+    refresh it every few hours, so the Backtest tab always shows current results without the
+    user triggering it. Heavy, so it runs on its own slow cadence and after a startup delay."""
+    time.sleep(120)                                  # let the first scan grab the CPU first
+    cfg = state.cfg
+    market = cfg.get("market", "futures")
     while True:
         try:
             sess = get_session()
+            syms = list_symbols(sess, cfg["quote"],
+                                futures_only=cfg.get("futures_only", True),
+                                market=market)
             t0 = time.time()
             data = backtest_all(sess, market, tfs=("15m", "1h", "4h", "1d"),
-                                limit=1000, fees_bps=5.0)
+                                limit=800, fees_bps=5.0, symbols=syms)
             with state.lock:
                 state.backtests = {"ts": time.time(), "took": round(time.time() - t0, 1),
-                                   "fees_bps": 5.0, "coins": len(backtest_all_symbols()),
+                                   "fees_bps": 5.0, "coins": len(syms), "universe": True,
                                    "data": data}
         except Exception as e:
             with state.lock:
                 if not state.backtests:
                     state.backtests = {"error": str(e)}
-        time.sleep(3 * 3600)                          # refresh every ~3 hours
-
-
-def backtest_all_symbols():
-    import mexc_ema200_scanner as _sc
-    return _sc.BACKTEST_BASKET
+        time.sleep(6 * 3600)                          # refresh every ~6 hours (whole universe)
 
 
 MEXC_PRICE_URL = "https://api.mexc.com/api/v3/ticker/price"
@@ -2656,7 +2661,7 @@ PAGE = """<!doctype html>
 
 <div class="view" id="viewBacktest">
 <div class="status">
-  <span>🧪 Backtest — does the edge actually exist? Apex <b>runs this itself</b> in the background across <b>every timeframe</b> (15m / 1h / 4h / 1D) and both sides, replaying the core <b>entry / stop / target mechanics</b> over ~1000 real candles for a <b>60-coin liquid basket</b> — no look-ahead, the limit must fill, stop-hit assumed first on a tie, and <b>net of fees</b>. The matrix below is the offline read on where the mechanics have positive expectancy, so you know which timeframes to trust.</span>
+  <span>🧪 Backtest — does the edge actually exist? Apex <b>runs this itself</b> in the background across <b>every timeframe</b> (15m / 1h / 4h / 1D) and both sides, replaying the core <b>limit-at-a-level entry / stop / target mechanics</b> over ~800 real candles for the <b>whole scanned universe</b> — no look-ahead, the limit must fill, stop-hit assumed first on a tie, and <b>net of fees</b>. The matrix below is the offline read on where the mechanics have positive expectancy, so you know which timeframes to trust. (Refreshes every ~6h.)</span>
 </div>
 <div class="wrap">
   <div class="btbar">
@@ -4708,7 +4713,7 @@ function btSideCard(label,emoji,s){
 function renderBacktest(){
   const body=document.getElementById('btBody'), meta=document.getElementById('btMeta'), emp=document.getElementById('btempty'); if(!body) return;
   const d=btData; if(!d) return;
-  if(d.pending){ if(emp){emp.style.display='block'; emp.innerHTML='⏳ Apex is running the first backtest sweep — 60 coins × 4 timeframes × both sides. This takes a few minutes on a fresh boot and refreshes here automatically.';} body.innerHTML=''; if(meta) meta.textContent='running the first sweep…'; return; }
+  if(d.pending){ if(emp){emp.style.display='block'; emp.innerHTML='⏳ Apex is running the first backtest sweep — the <b>whole universe</b> × 4 timeframes × both sides. This is heavy and takes several minutes on a fresh boot; it fills in here automatically and then refreshes every ~6h.';} body.innerHTML=''; if(meta) meta.textContent='running the first sweep…'; return; }
   if(d.error){ if(emp) emp.style.display='none'; body.innerHTML=`<div class="bt-empty">${esc(d.error)}</div>`; if(meta) meta.textContent=''; return; }
   if(emp) emp.style.display='none';
   if(meta) meta.textContent=`${d.coins} coins · ${d.fees_bps} bps fees · as of ${ago(d.ts)}${d.took?(' · took '+d.took+'s'):''}`;
@@ -4723,7 +4728,7 @@ function renderBacktest(){
     det+=`<details class="bttf"><summary>${tf} — full breakdown (per-coin)</summary><div class="btgrid">${btSideCard('Longs · '+tf,'🏆',row.long)}${btSideCard('Shorts · '+tf,'🔻',row.short)}</div></details>`;
   }
   body.innerHTML=m+`<div class="perfsub">Per-timeframe detail (click to expand)</div>`+det
-    +`<div class="histnote">⚠ Simplified mechanics on a 60-coin basket — a directional read, not a promise of live results. Negative across every timeframe = the stops/targets themselves need work; a timeframe that's clearly positive is one to lean on and tune the live gate toward.</div>`;
+    +`<div class="histnote">⚠ Simplified <b>limit-only</b> mechanics across the whole universe — a directional read, not a promise of live results. This is what the live boards now trade (CMP momentum entries were dropped after the backtest showed they lose). A timeframe that's clearly positive is one to lean on.</div>`;
 }
 function perfCard(label,val,cls,tip){
   const t=tip?` data-tip="${esc(tip)}" style="cursor:help"`:'';
