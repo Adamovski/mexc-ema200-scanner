@@ -811,6 +811,7 @@ class State:
         self.short_board: list[dict] = []          # top-25 best shorts (whole universe)
         self.coil_board: list[dict] = []           # top-25 most coiled (imminent big move)
         self.scalp_board: list[dict] = []          # top-25 LTF scalps (tight SL, HTF-aligned)
+        self.spot_board: list[dict] = []           # top-15 spot buys (long-only, 1x, no funding)
         self.both_symbols: list[str] = []          # appear on 2+ scans (confluence)
         self.prev_both: set[str] | None = None     # confluence set from previous scan
         self.watch: dict[str, float] = {}          # symbol -> flag breakout level (armed)
@@ -868,6 +869,7 @@ class State:
                 "short_board": withlive(self.short_board),
                 "coil_board": withlive(self.coil_board),
                 "scalp_board": withlive(self.scalp_board),
+                "spot_board": withlive(self.spot_board),
                 "market_context": self.market_context,
                 "gate_learn": self.gate_learn,
                 "perf": TRACKER.stats(lp),
@@ -1278,6 +1280,42 @@ def run_one_scan(state: State) -> None:
     scalp_board = [d for d in scalp_board if not TRACKER.cooling("scalp", d["symbol"], d.get("side", "long"))]
     coil_board = [d for d in coil_board if not TRACKER.cooling("coil", d["symbol"], d.get("rec_side") or "long")]
 
+    # --- SPOT board: the best longs, reframed for a cash / spot buyer -----------------------
+    # Spot = long-only, 1× (no leverage, so no liquidation) and no funding to bleed while you
+    # hold. The ideal spot buy is therefore a graded uptrend long you can LIMIT-BUY on a dip to
+    # support and calmly hold to the mean/target. Start from the already-vetted long_board and
+    # keep only the spot-appropriate ones: a real pullback level to buy at (not a market chase),
+    # tradeable R:R, and NOT already stretched far above the 200-EMA (don't buy the top). Score
+    # rewards being close to support (buy the dip) and de-rates extension above the mean.
+    spot_board = []
+    for _d in long_board:
+        if _d.get("entry_cmp"):                         # spot buyers place a limit at support, not a chase
+            continue
+        _rr = _d.get("rr") or 0
+        if _rr < 1.2:
+            continue
+        _ext = _d.get("pct_vs_ema")
+        if _ext is not None and _ext > 30:              # >30% above the 200-EMA = chasing; skip for spot
+            continue
+        _s = dict(_d)
+        _s["spot"] = True
+        _q = _d.get("score", 0) or 0
+        _px = _d.get("price"); _nl = _d.get("near_level")
+        _prox = 0.0
+        if _nl and _px:
+            _prox = max(0.0, 12.0 - abs(_px - _nl) / max(_px, 1e-9) * 100 * 2.0)   # nearer support = better
+        _extpen = min(15.0, max(0.0, (_ext or 0) - 8) * 0.5) if _ext is not None else 0.0
+        _liq = min(6.0, (_d.get("rvol") or 1.0) * 2.0)
+        _s["spot_score"] = round(max(0.0, min(100.0, _q + _prox + _liq - _extpen)), 1)
+        _s["hold"] = ("swing (days)" if _d.get("entry_tf") in ("4h", "1d", "Daily", "Weekly")
+                      else "short swing (hours–days)")
+        _s["note_spot"] = ("1× spot — you own the coin, so no funding and no liquidation. "
+                           "Limit-buy the dip into support; the stop is a mental invalidation "
+                           "(a place to trim), not a forced liquidation. Free to hold to target.")
+        spot_board.append(_s)
+    spot_board.sort(key=lambda d: d.get("spot_score", 0), reverse=True)
+    spot_board = spot_board[:15]
+
     # --- CROSS-BOARD CONFLUENCE: how many independent signals line up on a recommended
     # coin. A top long that's ALSO a bull flag, a support bounce and a supertrend reclaim
     # is far higher-probability than one signal alone. Attach the count + the list, and
@@ -1409,6 +1447,7 @@ def run_one_scan(state: State) -> None:
         state.short_board = short_board
         state.coil_board = coil_board
         state.scalp_board = scalp_board
+        state.spot_board = spot_board
         state.gate_learn = _learn
         state.both_symbols = sorted(both)
 
@@ -1495,6 +1534,17 @@ def backtest_loop(state: State) -> None:
                                        "fees_bps": 5.0, "coins": len(syms), "universe": True,
                                        "data": dict(data),
                                        "progress": {"done": i + 1, "total": len(tfs), "last": tf}}
+            # SPOT sweep: long-only trend-aligned reversion with spot fees (no funding, 1×).
+            # Answers "do the spot buys actually work?" on the same honest measurement.
+            spot = {}
+            for tf in tfs:
+                sp = backtest_all(sess, market, tfs=(tf,), limit=500, fees_bps=20.0,
+                                  symbols=syms, strategy="spot", sides=("long",))
+                spot.update(sp)
+                with state.lock:
+                    if state.backtests:
+                        state.backtests["spot"] = dict(spot)
+                        state.backtests["spot_fees_bps"] = 20.0
         except Exception as e:
             with state.lock:
                 if not state.backtests:
@@ -2185,6 +2235,7 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabEarly" onclick="showTab('early')">⏳ Early</div>
   <div class="tab" id="tabCoil" onclick="showTab('coil')">🚀 Coiled</div>
   <div class="tab" id="tabScalp" onclick="showTab('scalp')">⚡ Best scalps</div>
+  <div class="tab" id="tabSpot" onclick="showTab('spot')">💰 Spot buys</div>
   <div class="tab" id="tabSetups" onclick="showTab('setups')">200-EMA reclaim</div>
   <div class="tab" id="tabFlags" onclick="showTab('flags')">Bull flags</div>
   <div class="tab" id="tabCpr" onclick="showTab('cpr')">Narrow CPR</div>
@@ -2531,6 +2582,32 @@ PAGE = """<!doctype html>
     <tbody id="scalprows"></tbody>
   </table>
   <div class="empty" id="scalpempty" style="display:none">🚫 Nothing clears the bar this scan — no clean trend scalp AND no coin sitting on a strong enough support/resistance with a real snap-back. Rare, but Apex won't invent one. Come back next scan.</div>
+</div>
+</div>
+
+<div class="view" id="viewSpot">
+<div class="status">
+  <span>💰 Spot buys — the best <b>LONG</b> setups reframed for a <b>cash / spot</b> buyer. Spot means <b>1× (no leverage → no liquidation)</b> and <b>no funding</b> to bleed while you hold, so the ideal spot pick is an uptrend long you can <b>limit-buy on a dip into support</b> and calmly hold to the mean/target. These are drawn from the whole-universe Best-longs grade, then filtered for spot: a <b>real pullback level to buy at</b> (no chasing), tradeable R:R, and <b>not stretched far above the 200-EMA</b> (don't buy the top). The stop is a <b>mental invalidation</b> — a place to trim, not a forced liquidation. Click a row for the full plan. <i>(The 🧪 Backtest tab now also runs a spot-only sweep — long reversion, spot fees — so you can see how the approach actually performs.)</i></span>
+  <span id="spotCount"></span>
+</div>
+<div class="wrap">
+  <table id="spottbl">
+    <thead><tr>
+      <th>#</th>
+      <th>Symbol</th>
+      <th data-tip="Spot score (0–100) = the coin's Best-long grade, plus a bonus for sitting CLOSE to support (buy the dip) and liquidity, minus a penalty for being stretched above the 200-EMA. High = a strong uptrend long you can buy on a calm pullback.">Score</th>
+      <th data-tip="How far above the 200-EMA price is. Spot buys avoid heavily-extended coins — buying near the mean, not the top.">vs 200-EMA</th>
+      <th data-tip="Live last-traded price (updates ~every 20s).">Price</th>
+      <th data-tip="Recommended spot BUY — a limit into the nearest support / pullback level. Place the order and wait; don't chase.">🎯 Buy (limit)</th>
+      <th data-tip="Invalidation — a MENTAL stop / place to trim if this level breaks. On spot there's no liquidation; you decide. Shown with its % below the buy.">Invalidation</th>
+      <th data-tip="First target — the nearest level price is pulled toward. The row expands to the full ladder.">Target</th>
+      <th data-tip="Reward:risk to the first target; the arrow shows R:R to the furthest.">R:R</th>
+      <th data-tip="Rough hold horizon based on the setup's timeframe. Spot has no funding, so holding costs nothing.">Hold</th>
+      <th data-tip="Plain-English reasons — trend structure, multi-timeframe agreement, proximity to support.">Why</th>
+    </tr></thead>
+    <tbody id="spotrows"></tbody>
+  </table>
+  <div class="empty" id="spotempty" style="display:none">🚫 No clean spot buys this scan — every top long is either chasing (no pullback level to limit-buy) or stretched too far above the mean. Apex won't tell you to buy a top. Check back next scan.</div>
 </div>
 </div>
 
@@ -3256,7 +3333,7 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["coil","Coil"],["scalp","Scalp"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["coil","Coil"],["scalp","Scalp"],["spot","Spot"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
@@ -3266,6 +3343,7 @@ function showTab(which){
   if(which==="bestshort") renderBestShort();
   if(which==="coil") renderCoil();
   if(which==="scalp") renderScalp();
+  if(which==="spot") renderSpot();
   if(which==="perf") renderPerf();
   if(which==="backtest") loadBacktest();
   if(which==="calls") renderCalls();
@@ -4478,7 +4556,7 @@ function scoreBadge(s){
 // Which leaderboard/coil rows are expanded to show their full plan.
 let rowOpen={};
 function toggleRowPlan(key, ev){ if(ev){ ev.stopPropagation(); }
-  rowOpen[key]=!rowOpen[key]; renderBestLong(); renderBestShort(); renderCoil(); }
+  rowOpen[key]=!rowOpen[key]; renderBestLong(); renderBestShort(); renderCoil(); renderScalp(); renderSpot(); }
 // A clean, readable trade-plan panel: entry (with the timeframe + why), stop (with
 // its basis + % risk), a target ladder where every TP shows its %move, R:R and WHICH
 // level/timeframe it's from, and a concrete scale-out plan.
@@ -4672,6 +4750,47 @@ function renderScalp(){
     }
   }
 }
+// ---- Spot buys tab (best longs reframed for a cash buyer) ----
+function renderSpot(){
+  const rows=(lastData&&lastData.spot_board)||[];
+  const tb=document.getElementById('spotrows'); if(!tb) return; tb.innerHTML="";
+  const emp=document.getElementById('spotempty'); if(emp) emp.style.display=rows.length?'none':'block';
+  const cnt=document.getElementById('spotCount');
+  if(cnt) cnt.textContent=`${rows.length} spot buy${rows.length===1?'':'s'} — 1×, no funding, no liquidation`;
+  let rank=0;
+  for(const h of rows){
+    rank++;
+    const P=h.live!=null?h.live:h.price;
+    const why=(h.why||[]); const shortWhy=why.slice(0,2).join(' · ')||'—';
+    const ext=(h.pct_vs_ema!=null)?h.pct_vs_ema:null;
+    const extCls=ext==null?'':(ext<=8?'rrg':ext<=18?'rry':'rrd');
+    const invPct=(h.entry!=null&&h.stop!=null&&h.entry>0)?((h.entry-h.stop)/h.entry*100):null;
+    const rr=(h.rr!=null&&isFinite(h.rr));
+    const rrCls=!rr?'':(h.rr>=2?'rrg':h.rr>=1.5?'rry':'rrd');
+    const rrTxt=rr?('<b>'+h.rr.toFixed(2)+'</b>'+(h.rr_max!=null&&h.rr_max>h.rr+0.2?` <span class="rmax">→${(+h.rr_max).toFixed(1)}</span>`:'')):'—';
+    const key='spot:'+h.symbol, open=!!rowOpen[key];
+    const tr=document.createElement('tr'); tr.className=rowClass(h)+(open?' rowsel':''); tr.style.cursor='pointer';
+    tr.setAttribute('onclick',`toggleRowPlan('${key}')`);
+    tr.innerHTML=
+      `<td class="rnk"><span class="expander">${open?'▾':'▸'}</span> ${rank}</td>`+
+      `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${dispSym(h.symbol)}</a>${analyzeSideBtn(h.symbol,'long')}</div></td>`+
+      `<td>${scoreBadge(h.spot_score!=null?h.spot_score:h.score)}</td>`+
+      `<td class="${extCls}" data-tip="${esc(h.note_spot||'')}">${ext!=null?(ext>0?'+':'')+ext.toFixed(1)+'%':'—'}</td>`+
+      `<td>${fmtNum(P)}</td>`+
+      `<td data-tip="${esc(h.entry_basis||'limit into support')}">${h.entry!=null?fmtNum(h.entry):'—'}</td>`+
+      `<td data-tip="${esc((h.stop_basis||'mental invalidation')+' — no liquidation on spot; a place to trim.')}">${h.stop!=null?fmtNum(h.stop):'—'} <span class="rr">${invPct!=null?'-'+invPct.toFixed(1)+'%':''}</span></td>`+
+      `<td data-tip="${esc((h.tps&&h.tps[0]&&h.tps[0].basis)||'first target')}">${h.target!=null?fmtNum(h.target):'—'}</td>`+
+      `<td class="${rrCls}">${rrTxt}</td>`+
+      `<td data-tip="Spot has no funding — holding costs nothing.">${esc(h.hold||'swing')}</td>`+
+      `<td class="whycell" data-tip="${esc(why.join(' · '))}">${esc(shortWhy)}</td>`;
+    tb.appendChild(tr);
+    if(open){
+      const dr=document.createElement('tr'); dr.className='planrow';
+      dr.innerHTML=`<td colspan="11">${planPanelHtml(h, 'long', P, h.symbol)}</td>`;
+      tb.appendChild(dr);
+    }
+  }
+}
 // ---- Backtest tab (auto TF × side matrix, run in the background) ----
 let btData=null;
 async function loadBacktest(force){
@@ -4748,8 +4867,29 @@ function renderBacktest(){
     if(!(row.long&&row.long.n)&&!(row.short&&row.short.n)) continue;
     det+=`<details class="bttf"><summary>${tf} — full breakdown (per-coin)</summary><div class="btgrid">${btSideCard('Longs · '+tf,'🏆',row.long)}${btSideCard('Shorts · '+tf,'🔻',row.short)}</div></details>`;
   }
+  // SPOT sweep — long-only reversion with spot fees (no funding, 1×). Shows how the
+  // 💰 Spot buys approach performs on the same honest, whole-universe measurement.
+  let sp='';
+  if(d.spot){
+    const anySpot=tfs.some(tf=>{const r=(d.spot||{})[tf]||{}; return r.long&&r.long.n;});
+    sp=`<div class="perfsub" style="margin-top:18px">💰 Spot sweep — long-only, ${d.spot_fees_bps||20} bps spot fees, no funding (buy the oversold dip in an uptrend, hold to the mean)</div>`;
+    if(anySpot){
+      sp+=`<table class="bt btmatrix"><thead><tr><th>Timeframe</th><th>💰 Spot (long-only)</th></tr></thead><tbody>`;
+      for(const tf of tfs){ const r=(d.spot||{})[tf]||{}; sp+=`<tr><td><b>${tf}</b></td><td>${btCell(r.long)}</td></tr>`; }
+      sp+=`</tbody></table>`;
+      let sdet='';
+      for(const tf of tfs){ const r=(d.spot||{})[tf]||{};
+        if(!(r.long&&r.long.n)) continue;
+        sdet+=`<details class="bttf"><summary>${tf} spot — full breakdown (per-coin)</summary><div class="btgrid">${btSideCard('Spot · '+tf,'💰',r.long)}</div></details>`;
+      }
+      sp+=`<div class="perfsub">Per-timeframe spot detail (click to expand)</div>`+sdet;
+    } else {
+      sp+=`<div class="histnote">⏳ Spot sweep runs after the futures matrix on each refresh — it'll appear here once the first pass completes.</div>`;
+    }
+  }
   body.innerHTML=m+`<div class="perfsub">Per-timeframe detail (click to expand)</div>`+det
-    +`<div class="histnote">⚠ Simplified <b>limit-only</b> mechanics across the whole universe — a directional read, not a promise of live results. This is what the live boards now trade (CMP momentum entries were dropped after the backtest showed they lose). A timeframe that's clearly positive is one to lean on.</div>`;
+    +`<div class="histnote">⚠ Simplified <b>limit-only</b> mechanics across the whole universe — a directional read, not a promise of live results. This is what the live boards now trade (CMP momentum entries were dropped after the backtest showed they lose). A timeframe that's clearly positive is one to lean on.</div>`
+    +sp;
 }
 function perfCard(label,val,cls,tip){
   const t=tip?` data-tip="${esc(tip)}" style="cursor:help"`:'';
@@ -5367,7 +5507,7 @@ async function poll(){
     xlatest=d.stb_hits||[]; renderStb();
     eelatest=d.early_hits||[]; renderEarly();
     slatest=d.short_hits||[]; renderShorts();
-    renderBestLong(); renderBestShort(); renderCoil(); renderScalp(); renderPerf(); renderCalls();
+    renderBestLong(); renderBestShort(); renderCoil(); renderScalp(); renderSpot(); renderPerf(); renderCalls();
     renderMarket(); renderWatch();
     if(activeTab==="history") loadHistory();
     { const wc=document.getElementById("tabWatch"); if(wc) wc.textContent=`📌 Watchlist${WATCH.size?' ('+WATCH.size+')':''}`; }

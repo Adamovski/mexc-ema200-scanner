@@ -3592,7 +3592,13 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="
     return a list of resolved trades (net R after fees). WITHOUT look-ahead: every decision at
     bar t uses only candles up to t, and the outcome is whichever of stop/target is reached
     first (stop assumed first on a tie). strategy='level' = pullback/rip to a structural level;
-    'revert' = trend-aligned oversold/overbought snap-back to the mean (the high-win-rate one)."""
+    'revert' = trend-aligned oversold/overbought snap-back to the mean (the high-win-rate one);
+    'spot' = the SAME trend-aligned reversion but LONG-ONLY and with spot fees (no funding, no
+    leverage) — i.e. buy an oversold dip in an uptrend and hold to the mean, as a cash buyer."""
+    if strategy == "spot":
+        # Spot: long-only, cash. Charge realistic spot round-trip fees (default ~20 bps if the
+        # caller didn't pass a heavier number) and never short — you can't short on spot.
+        return _bt_revert(rows, "long", fees_bps=max(fees_bps, 20.0), warmup=warmup)
     if strategy == "revert":
         return _bt_revert(rows, side, fees_bps=fees_bps, warmup=warmup)
     try:
@@ -3853,11 +3859,12 @@ def _bt_aggregate(results, syms, tf, side, fees_bps):
 
 
 def backtest_all(sess, market, tfs=("15m", "1h", "4h", "1d"), limit=1000,
-                 fees_bps=5.0, symbols=None):
-    """Sweep the whole basket across EVERY timeframe and BOTH sides in one pass — fetching
-    each coin's candles once per TF and running long + short on them. Returns
-    {tf: {'long': agg, 'short': agg}}. Run in the background so the app shows a full
-    TF × side edge matrix without the user triggering anything."""
+                 fees_bps=5.0, symbols=None, strategy="revert", sides=("long", "short")):
+    """Sweep the whole basket across EVERY timeframe and the requested SIDES in one pass —
+    fetching each coin's candles once per TF and running the given strategy on them. Returns
+    {tf: {side: agg, ...}}. Run in the background so the app shows a full TF × side edge
+    matrix without the user triggering anything. Pass strategy='spot', sides=('long',) for the
+    cash/spot sweep (long-only reversion, spot fees)."""
     syms = symbols or BACKTEST_BASKET
     out = {}
     for tf in tfs:
@@ -3865,22 +3872,22 @@ def backtest_all(sess, market, tfs=("15m", "1h", "4h", "1d"), limit=1000,
             try:
                 rows = fetch_candles(sess, sym, tf, limit, market)
             except Exception:
-                return sym, None, None
+                return sym, None
             if not rows:
-                return sym, None, None
-            return (sym, backtest_symbol(rows, "long", fees_bps=fees_bps, strategy="revert"),
-                    backtest_symbol(rows, "short", fees_bps=fees_bps, strategy="revert"))
-        longs, shorts = {}, {}
+                return sym, None
+            return sym, {sd: backtest_symbol(rows, sd, fees_bps=fees_bps, strategy=strategy)
+                         for sd in sides}
+        per = {sd: {} for sd in sides}
         with ThreadPoolExecutor(max_workers=12) as ex:
             for f in as_completed([ex.submit(_one, s) for s in syms]):
                 try:
-                    sym, lt, st = f.result()
+                    sym, res = f.result()
                 except Exception:
-                    sym = None
-                if sym:
-                    longs[sym], shorts[sym] = lt, st
-        out[tf] = {"long": _bt_aggregate(longs, syms, tf, "long", fees_bps),
-                   "short": _bt_aggregate(shorts, syms, tf, "short", fees_bps)}
+                    sym, res = None, None
+                if sym and res:
+                    for sd in sides:
+                        per[sd][sym] = res.get(sd)
+        out[tf] = {sd: _bt_aggregate(per[sd], syms, tf, sd, fees_bps) for sd in sides}
     return out
 
 
