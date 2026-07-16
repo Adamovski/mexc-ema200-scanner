@@ -2607,8 +2607,85 @@ def _round_number(price, above):
     return lv if lv > 0 else None
 
 
+def _revert_live(side, closes, highs, lows, ema200_now, atr_val, rsis, e200s, e20s,
+                 tf_label, btc_trend):
+    """The LIVE version of the backtested trend-aligned reversion edge, evaluated on the
+    CURRENT bar. Long = an oversold flush that's snapping back inside an uptrend; short = an
+    overbought pop rolling over inside a downtrend; target the 20-EMA mean; stop beyond the
+    flush extreme. Refuses to fight BTC (no long while BTC is in a downtrend, no short while
+    BTC rips). Returns a ready-to-trade plan dict (same shape the boards expect) or None.
+    This is what the whole-universe backtest proved wins on the higher timeframes."""
+    n = len(closes)
+    if n < 210 or not atr_val or atr_val <= 0:
+        return None
+    price = closes[-1]
+    rs = rsis[-1] if rsis else None
+    el = ema200_now
+    e2 = e20s[-1] if e20s else None
+    if rs is None or el is None or e2 is None or price <= 0:
+        return None
+    prev200 = e200s[-21] if (len(e200s) > 21 and e200s[-21] is not None) else None
+    long = side == "long"
+    if long:
+        slope_up = (prev200 is None) or (el > prev200)
+        if not (price > el and slope_up):        # must be an uptrend
+            return None
+        if btc_trend == "down":                  # don't buy dips while BTC breaks down
+            return None
+        if rs >= 40:                             # need an oversold flush
+            return None
+        if closes[-1] <= closes[-2]:             # snap-back must have started (green tick)
+            return None
+        flush_low = min(lows[-4:])
+        stop = flush_low - 0.5 * atr_val
+        entry = price
+        risk = entry - stop
+        if risk <= 0:
+            return None
+        target = e2 if e2 > entry * 1.003 else entry + 1.3 * risk
+        rr = (target - entry) / risk
+        if rr < 0.6:
+            return None
+        tp2 = entry + 2.0 * risk
+        tps = [{"lvl": round(target, 10), "rr": round(rr, 2), "basis": "20-EMA mean — reversion target"},
+               {"lvl": round(tp2, 10), "rr": 2.0, "basis": "2R extension if momentum carries"}]
+        return {"entry": round(entry, 10), "entry_basis": "oversold snap-back off the flush (reversion)",
+                "entry_tf": tf_label, "stop": round(stop, 10),
+                "stop_basis": "below the flush low + ATR buffer", "stop_tf": tf_label,
+                "target": round(target, 10), "rr": round(rr, 2), "rr_max": 2.0, "tps": tps,
+                "revert": True}
+    else:
+        slope_dn = (prev200 is None) or (el < prev200)
+        if not (price < el and slope_dn):        # must be a downtrend
+            return None
+        if btc_trend == "up":                    # don't short pops while BTC rips
+            return None
+        if rs <= 60:                             # need an overbought pop
+            return None
+        if closes[-1] >= closes[-2]:             # roll-over must have started (red tick)
+            return None
+        flush_high = max(highs[-4:])
+        stop = flush_high + 0.5 * atr_val
+        entry = price
+        risk = stop - entry
+        if risk <= 0:
+            return None
+        target = e2 if e2 < entry * 0.997 else entry - 1.3 * risk
+        rr = (entry - target) / risk
+        if rr < 0.6:
+            return None
+        tp2 = entry - 2.0 * risk
+        tps = [{"lvl": round(target, 10), "rr": round(rr, 2), "basis": "20-EMA mean — reversion target"},
+               {"lvl": round(tp2, 10), "rr": 2.0, "basis": "2R extension if momentum carries"}]
+        return {"entry": round(entry, 10), "entry_basis": "overbought snap-back off the pop (reversion)",
+                "entry_tf": tf_label, "stop": round(stop, 10),
+                "stop_basis": "above the pop high + ATR buffer", "stop_tf": tf_label,
+                "target": round(target, 10), "rr": round(rr, 2), "rr_max": 2.0, "tps": tps,
+                "revert": True}
+
+
 def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
-                       ms, ksup, kres, rv, detectors) -> tuple:
+                       ms, ksup, kres, rv, detectors, btc_trend=None, tf_label=None) -> tuple:
     """Grade the BEST LONG and BEST SHORT for this coin from data already computed
     in the scan (no extra API calls). Returns (long_setup, short_setup) — each a
     0-100 composite with a plain-English `why`, so the Top-setups tabs can rank the
@@ -2902,6 +2979,25 @@ def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
                 "rr_max": (tps[-1]["rr"] if tps else None), "tps": tps}
 
     lp, sp = _plan(True), _plan(False)
+
+    # ---- PROVEN EDGE: trend-aligned reversion (from the whole-universe backtest) ----------
+    # If the CURRENT bar is a BTC-aligned oversold snap-back in an uptrend (long) / overbought
+    # roll-over in a downtrend (short), REPLACE the generic level plan with the reversion plan
+    # and boost the grade — this is the mechanic the backtest proved wins, so it should lead
+    # the board. Non-reversion setups still appear (graded normally) so the board never empties.
+    _e200s = ema(closes, 200)
+    _e20s = ema(closes, 20)
+    _rsis = rsi_series(closes)
+    _rl = _revert_live("long", closes, highs, lows, ema_now, atr_val, _rsis, _e200s, _e20s, tf_label, btc_trend)
+    _rs = _revert_live("short", closes, highs, lows, ema_now, atr_val, _rsis, _e200s, _e20s, tf_label, btc_trend)
+    if _rl:
+        lp = _rl
+        ls = round(min(100.0, ls + 22), 1)
+        lw.insert(0, "Trend-aligned reversion — oversold snap-back in an uptrend (backtest-proven edge)")
+    if _rs:
+        sp = _rs
+        ss = round(min(100.0, ss + 22), 1)
+        sw.insert(0, "Trend-aligned reversion — overbought roll-over in a downtrend (backtest-proven edge)")
 
     # A great setup needs BOTH conviction AND a tradeable reward:risk. A strong trend
     # with no room to run (target already at resistance → poor R:R) is NOT a top setup.
@@ -3565,7 +3661,7 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210, btc_ctx=None):
         btrend = _bs.get("t") if _bs else None
         bvol = _bs.get("v") if _bs else None
         entry = stop = target = risk = rr = None
-        outcome = rbar = None; mfe = 0.0; stp = False
+        outcome = rbar = None; mfe = 0.0; mae = 0.0; stp = False
         if long:
             slope_up = (prev200 is None) or (el > prev200)
             if not (price > el and slope_up):           # must be an uptrend
@@ -3589,6 +3685,7 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210, btc_ctx=None):
             f = t + 1
             for j in range(f, min(n, f + horizon + 1)):
                 mfe = max(mfe, (H[j] - entry) / risk)
+                mae = max(mae, (entry - L[j]) / risk)      # worst drawdown while open (in R)
                 if L[j] <= stop:
                     outcome, rbar = "loss", j; break
                 if H[j] >= target:
@@ -3619,6 +3716,7 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210, btc_ctx=None):
             f = t + 1
             for j in range(f, min(n, f + horizon + 1)):
                 mfe = max(mfe, (entry - L[j]) / risk)
+                mae = max(mae, (H[j] - entry) / risk)      # worst drawdown while open (in R)
                 if H[j] >= stop:
                     outcome, rbar = "loss", j; break
                 if L[j] <= target:
@@ -3638,6 +3736,9 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210, btc_ctx=None):
                        "extd": round(abs((entry - el) / el) * 100, 2) if el else 0.0,
                        "atrp": round(a / entry * 100, 2), "dvol": dvol,
                        "stopw": round(risk / entry * 100, 2),   # stop width, % of entry
+                       "tppct": round(abs(target - entry) / entry * 100, 2),  # target distance, % of entry
+                       "mae": round(mae, 2),                     # max drawdown while open, in R
+                       "ts": ts,                                 # entry candle time (for the equity curve)
                        "session": _session, "btc_trend": btrend, "btc_vol": bvol,
                        "btc_align": (btrend == ("up" if long else "down")) if btrend else None,
                        "btc_state": ("BTC " + btrend) if btrend else None})
@@ -3911,6 +4012,36 @@ def backtest_board(sess, side, market, tf="4h", limit=1000, fees_bps=4.0, symbol
     return _bt_aggregate(results, syms, tf, side, fees_bps)
 
 
+def _bt_portfolio(trades, start=10000.0, notional_frac=0.10):
+    """Turn the net-R trade stream into a PORTFOLIO curve so growth is concrete: $10k start,
+    1% margin at 10× = ~10% notional per trade, so a trade's P&L in $ = net-R × (notional ×
+    stop-width%). Runs the trades in time order and reports two sizing scenarios —
+    COMPOUNDING (size off the current, growing equity) and FIXED (always size off the original
+    $10k) — plus the worst peak-to-trough equity drawdown of each. Idealised: it's a single
+    sequential stream (doesn't cap concurrent positions or model margin limits), so treat it as
+    a directional estimate of the edge's shape, not a promise."""
+    seq = sorted((x for x in trades if x.get("ts") is not None and x.get("stopw") is not None),
+                 key=lambda x: x["ts"])
+    if not seq:
+        return None
+
+    def run(compound):
+        eq = start; peak = start; maxdd = 0.0
+        for x in seq:
+            stopw = (x.get("stopw") or 0.0) / 100.0
+            base = eq if compound else start
+            eq += (x.get("r") or 0.0) * base * notional_frac * stopw
+            if eq < 0:
+                eq = 0.0
+            peak = max(peak, eq)
+            if peak > 0:
+                maxdd = max(maxdd, (peak - eq) / peak)
+        return {"end": round(eq), "ret_pct": round((eq / start - 1) * 100, 1),
+                "max_dd_pct": round(maxdd * 100, 1)}
+    return {"start": round(start), "n": len(seq), "notional_pct": round(notional_frac * 100),
+            "compound": run(True), "fixed": run(False)}
+
+
 def _bt_aggregate(results, syms, tf, side, fees_bps):
     """Aggregate per-symbol trade lists into a board summary + actionable analysis."""
     allt, per = [], []
@@ -3921,12 +4052,14 @@ def _bt_aggregate(results, syms, tf, side, fees_bps):
             w = sum(1 for x in tr if x["outcome"] == "win")
             lz = [x for x in tr if x["outcome"] == "loss"]
             _sw = [x.get("stopw") for x in tr if x.get("stopw") is not None]
+            _md = [x.get("mae") for x in tr if x.get("mae") is not None]
             per.append({"symbol": s, "n": m, "winrate": round(w / m * 100, 1),
                         "exp": round(sm / m, 3), "sumR": round(sm, 2),
                         # per-coin diagnostics: stops-too-tight rate + how far losers ran
                         "stp": round(sum(1 for x in lz if x.get("stop_then_tp")) / (len(lz) or 1) * 100),
                         "cmp": round(sum(1 for x in tr if x.get("cmp")) / m * 100),
-                        "stopw": round(sum(_sw) / len(_sw), 2) if _sw else None})
+                        "stopw": round(sum(_sw) / len(_sw), 2) if _sw else None,
+                        "mae": round(sum(_md) / len(_md), 2) if _md else None})
             allt += tr
     n = len(allt)
     if not n:
@@ -3939,13 +4072,22 @@ def _bt_aggregate(results, syms, tf, side, fees_bps):
     aw = (sum(wins) / len(wins)) if wins else 0
     al = (-sum(losses) / len(losses)) if losses else 1
     breakeven = round(al / (aw + al) * 100, 1) if (aw + al) else None
+    _mae = [x.get("mae") for x in allt if x.get("mae") is not None]
+    _tpp = [x.get("tppct") for x in allt if x.get("tppct") is not None]
+    _wmfe = [x.get("mfe") for x in allt if x["outcome"] == "win" and x.get("mfe") is not None]
     return {"n": n, "winrate": round(w / n * 100, 1), "exp": round(sm / n, 3),
             "sumR": round(sm, 2), "gross_exp": round(gsm / n, 3),
             "fee_drag": round((gsm - sm) / n, 3),
             "avg_win": round(aw, 2) if wins else None,
             "avg_loss": round(-al, 2) if losses else None,
             "breakeven_wr": breakeven,
+            # avg max drawdown per trade (R), avg take-profit distance (%), and how far
+            # winners RAN past TP1 (R) — the last one shows whether a runner/ladder would pay.
+            "avg_mae": round(sum(_mae) / len(_mae), 2) if _mae else None,
+            "avg_tp_pct": round(sum(_tpp) / len(_tpp), 2) if _tpp else None,
+            "avg_win_mfe": round(sum(_wmfe) / len(_wmfe), 2) if _wmfe else None,
             "insights": _bt_insights(allt), "findings": _bt_findings(allt),
+            "portfolio": _bt_portfolio(allt),
             "per_symbol": sorted(per, key=lambda p: p["exp"], reverse=True),
             "tf": tf, "fees_bps": fees_bps, "side": side, "coins": len(per)}
 
@@ -4164,7 +4306,7 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
              "early": early_hit}
     long_setup, short_setup = leaderboard_setups(
         symbol, highs, lows, closes, vols, _ema_now, _tfb, _bias, _ms,
-        ksup, kres, rv, _dets)
+        ksup, kres, rv, _dets, btc_trend=cfg.get("btc_trend"), tf_label=interval)
     # Attach BTC correlation so the boards can tell a coin that just follows BTC from one
     # trading on its own — a decorrelated coin's setup shouldn't be judged by BTC's regime.
     _bc = round(_corr, 2) if _corr is not None else None

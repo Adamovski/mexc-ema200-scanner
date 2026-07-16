@@ -52,7 +52,7 @@ try:
         analyze_symbol, normalize_symbol, fetch_candles, pct_returns, CORR_WINDOW,
         bias_on_tf, enrich_1h, best_pattern, coil_tfs_finer, scalp_setup,
         bounce_scalp_setup, backtest_board, backtest_all,
-        compute_market_context, fetch_deriv_series, backfill_market_history,
+        compute_market_context, fetch_deriv_series, backfill_market_history, ema,
     )
 except ImportError:
     sys.exit("Could not import mexc_ema200_scanner.py — keep both files in the "
@@ -957,6 +957,20 @@ def run_one_scan(state: State) -> None:
         if _braw and len(_braw) > 2:
             _bcl = [float(x[4]) for x in _braw[:-1]]
             scan_cfg["btc_returns"] = pct_returns(_bcl)[-CORR_WINDOW:]
+            # BTC trend on the scan timeframe — keeps live reversion setups from fighting BTC
+            # (mirrors the backtest's don't-fight-BTC filter). up / down / range.
+            try:
+                _be = ema(_bcl, 200)
+                if _be and _be[-1] is not None:
+                    _bp = _be[-21] if (len(_be) > 21 and _be[-21] is not None) else None
+                    if _bcl[-1] > _be[-1] and (_bp is None or _be[-1] > _bp):
+                        scan_cfg["btc_trend"] = "up"
+                    elif _bcl[-1] < _be[-1] and (_bp is None or _be[-1] < _bp):
+                        scan_cfg["btc_trend"] = "down"
+                    else:
+                        scan_cfg["btc_trend"] = "range"
+            except Exception:
+                pass
     except Exception:
         pass
     # Big-picture market read (BTC multi-TF + alt breadth) — good day/week for longs?
@@ -1540,6 +1554,10 @@ def backtest_loop(state: State) -> None:
     cfg = state.cfg
     market = cfg.get("market", "futures")
     tfs = ("15m", "1h", "4h", "1d")
+    # Per-TF lookback depth — the HIGHER timeframes (where the edge lives) now cover ~a YEAR:
+    # 4h×2200 ≈ 366 days, 1d×400 ≈ 13 months, 1h×4000 ≈ 5.5 months, 15m×1500 ≈ 15 days
+    # (a full year of 15m would be ~35k candles/coin — infeasible over the whole universe).
+    tf_limit = {"15m": 1500, "1h": 4000, "4h": 2200, "1d": 400}
     while True:
         try:
             sess = get_session()
@@ -1551,7 +1569,7 @@ def backtest_loop(state: State) -> None:
             # INCREMENTAL: sweep one timeframe at a time and publish after each, so the
             # matrix fills in progressively instead of showing nothing for an hour.
             for i, tf in enumerate(tfs):
-                part = backtest_all(sess, market, tfs=(tf,), limit=500,
+                part = backtest_all(sess, market, tfs=(tf,), limit=tf_limit.get(tf, 1000),
                                     fees_bps=5.0, symbols=syms)
                 data.update(part)
                 with state.lock:
@@ -4648,6 +4666,11 @@ function edgeBadge(tf, side, spot){
   const tfk={'Daily':'1d','1D':'1d','5m':'15m'}[tf]||tf||'?';
   return ` <span class="rr ${cls}" data-tip="Backtest edge for ${tfk} ${spot?'spot ':''}${side}s over the whole universe: expectancy ${x>0?'+':''}${x}R across ${c.n} trades (win ${c.wr!=null?c.wr+'%':'—'}). ${x>=0.15?'The sweep proves this timeframe/side actually wins.':x>0?'Only a thin edge here — size down.':'The sweep says this timeframe/side does NOT win — treat with caution.'}">${lab}${x>0?'+':''}${x}R</span>`;
 }
+// Badge for a setup driven by the backtest-proven trend-aligned reversion mechanic.
+function revBadge(h){
+  if(!h||!h.revert) return '';
+  return ` <span class="cbadge cbounce" data-tip="Trend-aligned reversion — this setup is an oversold snap-back in an uptrend / overbought roll-over in a downtrend, BTC-aligned. It's the exact mechanic the whole-universe backtest proved wins (best on 1h+), so it leads the board.">↩ reversion</span>`;
+}
 function renderBoard(side){
   const isLong = side==='long';
   const rows = (lastData && (isLong?lastData.long_board:lastData.short_board)) || [];
@@ -4674,7 +4697,7 @@ function renderBoard(side){
     tr.innerHTML =
       `<td class="rnk"><span class="expander">${open?'▾':'▸'}</span> ${rank}</td>`+
       `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${dispSym(h.symbol)}</a>${confBadge}${analyzeSideBtn(h.symbol,side)}</div></td>`+
-      `<td>${scoreBadge(h.score)}${edgeBadge(h.entry_tf||'4h', side)}</td>`+
+      `<td>${scoreBadge(h.score)}${revBadge(h)}${edgeBadge(h.entry_tf||'4h', side)}</td>`+
       `<td>${fmtNum(P)}</td>`+
       `<td><span class="biaspill2 b-${(h.bias||'').toLowerCase().replace(/[^a-z]/g,'')}">${h.bias||'—'}</span></td>`+
       `<td class="tfstripcell">${tfBiasStrip(h.tf_bias)}</td>`+
@@ -4776,7 +4799,7 @@ function renderScalp(){
     tr.innerHTML=
       `<td class="rnk"><span class="expander">${open?'▾':'▸'}</span> ${rank}</td>`+
       `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${dispSym(h.symbol)}</a>${analyzeSideBtn(h.symbol,side)}</div></td>`+
-      `<td>${scoreBadge(h.score)}${edgeBadge(h.entry_tf||'15m', side)}</td>`+
+      `<td>${scoreBadge(h.score)}${revBadge(h)}${edgeBadge(h.entry_tf||'15m', side)}</td>`+
       `<td>${leanPill(side==='long'?'bullish':'bearish')}${bounceBadge}</td>`+
       `<td class="tfstripcell">${tfBiasStrip(h.tf_bias)}</td>`+
       `<td>${fmtNum(P)}</td>`+
@@ -4817,7 +4840,7 @@ function renderSpot(){
     tr.innerHTML=
       `<td class="rnk"><span class="expander">${open?'▾':'▸'}</span> ${rank}</td>`+
       `<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${dispSym(h.symbol)}</a>${analyzeSideBtn(h.symbol,'long')}</div></td>`+
-      `<td>${scoreBadge(h.spot_score!=null?h.spot_score:h.score)}${edgeBadge(h.entry_tf||'4h','long',true)}</td>`+
+      `<td>${scoreBadge(h.spot_score!=null?h.spot_score:h.score)}${revBadge(h)}${edgeBadge(h.entry_tf||'4h','long',true)}</td>`+
       `<td class="${extCls}" data-tip="${esc(h.note_spot||'')}">${ext!=null?(ext>0?'+':'')+ext.toFixed(1)+'%':'—'}</td>`+
       `<td>${fmtNum(P)}</td>`+
       `<td data-tip="${esc(h.entry_basis||'limit into support')}">${h.entry!=null?fmtNum(h.entry):'—'}</td>`+
@@ -4867,6 +4890,9 @@ function btSideCard(label,emoji,s){
     anl+=`<div class="btidea">🎯 Breakeven win-rate ≈ <b>${s.breakeven_wr}%</b> (from +${s.avg_win}/${s.avg_loss}R). Board wins <b>${s.winrate}%</b> — <span class="${ok?'pf-good':'pf-bad'}">${ok?'above breakeven':'below breakeven — needs a higher hit-rate or bigger winners'}</span>.</div>`; }
   if(ins.stop_then_tp_pct!=null){ const hot=ins.stop_then_tp_pct>=35;
     anl+=`<div class="btidea${hot?' btbad':''}">🛑 <b>${ins.stop_then_tp_pct}%</b> of losers hit the target <b>after</b> being stopped${hot?' — stops are too tight; widening ~30% would flip many of these to wins':' — stops look reasonably placed'}. Losers ran +${ins.loser_mfe}R toward target first.</div>`; }
+  if(s.avg_win_mfe!=null&&s.avg_win!=null){ const extra=+(s.avg_win_mfe-s.avg_win).toFixed(2); const worth=extra>=0.4;
+    anl+=`<div class="btidea${worth?' btgood':''}">🏃 Single TP at the mean — winners banked <b>+${s.avg_win}R</b> but ran to <b>+${s.avg_win_mfe}R</b> at best${worth?` — leaving ~${extra}R on the table; a runner/ladder would likely add expectancy`:' — little extra run, so a single mean-reversion TP is right'}. (Backtest resolves on this one TP, not a ladder.)</div>`; }
+  if(s.avg_mae!=null){ anl+=`<div class="btidea">📉 Avg <b>max drawdown</b> before resolving: <b>-${s.avg_mae}R</b> · avg <b>TP distance</b>: <b>${s.avg_tp_pct!=null?s.avg_tp_pct+'%':'—'}</b> from entry.</div>`; }
   if(finds.length){
     anl+=`<div class="btideah">💡 What worked (segment expectancy)</div>`;
     anl+=finds.map(f=>`<div class="btidea">${esc(f.label)}: <b class="${f.a.exp>f.b.exp?'pf-good':'pf-bad'}">${esc(f.a.name)} ${f.a.exp>0?'+':''}${f.a.exp}R</b> <span class="rr">(${f.a.n})</span> vs <b class="${f.b.exp>f.a.exp?'pf-good':'pf-bad'}">${esc(f.b.name)} ${f.b.exp>0?'+':''}${f.b.exp}R</b> <span class="rr">(${f.b.n})</span> → favour <b>${esc(f.better)}</b></div>`).join('');
@@ -4876,6 +4902,7 @@ function btSideCard(label,emoji,s){
     +`<td class="${p.exp>0?'pf-good':'pf-bad'}">${p.exp>0?'+':''}${p.exp}R</td>`
     +`<td class="${p.sumR>0?'pf-good':'pf-bad'}">${p.sumR>0?'+':''}${p.sumR}R</td>`
     +`<td data-tip="Average stop distance from entry, as a % of price, for this coin's trades. Wider = more room (and a bigger loss when hit); tighter = smaller risk but easier to stop out.">${p.stopw!=null?p.stopw+'%':'—'}</td>`
+    +`<td class="${(p.mae||0)>=0.85?'pf-bad':''}" data-tip="Average worst drawdown before the trade resolved, in R (max adverse excursion). ~1R = trades routinely sat near the stop before working.">${p.mae!=null?'-'+p.mae+'R':'—'}</td>`
     +`<td class="${(p.stp||0)>=35?'pf-bad':''}" data-tip="Share of this coin's losing trades that reached the target AFTER being stopped — high = stops too tight for this coin.">${p.stp!=null?p.stp+'%':'—'}</td></tr>`).join('');
   return `<div class="btcard">
     <div class="btcard-h">${emoji} ${label} <span class="btverdict ${vcls}">${vlabel}</span></div>
@@ -4885,11 +4912,24 @@ function btSideCard(label,emoji,s){
       ${perfCard('Expectancy (net)', (s.exp>0?'+':'')+s.exp+'R', s.exp>0?'pcg':'pcb', 'Average R per trade AFTER fees. This is the number that matters.')}
       ${perfCard('Total R (net)', (s.sumR>0?'+':'')+s.sumR+'R', s.sumR>0?'pcg':'pcb')}
       ${perfCard('Avg win / loss', (s.avg_win!=null?('+'+s.avg_win):'—')+' / '+(s.avg_loss!=null?s.avg_loss:'—')+'R', '')}
+      ${perfCard('Avg TP distance', s.avg_tp_pct!=null?s.avg_tp_pct+'%':'—', '', 'Average distance from entry to the take-profit (the 20-EMA mean target), as a % of price. This is how far price has to travel to bank a win.')}
+      ${perfCard('Avg max drawdown', s.avg_mae!=null?'-'+s.avg_mae+'R':'—', s.avg_mae!=null&&s.avg_mae>=0.8?'pcb':'', 'Average worst drawdown per trade before it resolved, in R (max adverse excursion). ~1R means trades typically dipped close to the stop before working; low means they went green quickly.')}
       ${perfCard('Fee drag', '-'+s.fee_drag+'R', s.fee_drag>0?'pcb':'', 'Fees cost per trade on average (gross expectancy '+(s.gross_exp>0?'+':'')+s.gross_exp+'R minus net).')}
     </div>
     <div class="btanalysis">${anl}</div>
-    <div class="perfsub">Per-coin (best first) · Stop % = avg stop width · last column = stops-too-tight rate</div>
-    <table class="bt"><thead><tr><th>Coin</th><th>Trades</th><th>Win rate</th><th>Expectancy</th><th>Total R</th><th data-tip="Average stop distance from entry as a % of price.">Stop %</th><th data-tip="Share of losers that hit target after being stopped.">Stop-tight</th></tr></thead><tbody>${rows}</tbody></table>
+    ${(()=>{const pf=s.portfolio; if(!pf) return ''; const c=pf.compound,f=pf.fixed; const money=v=>'$'+Math.round(v).toLocaleString();
+      return `<div class="perfsub">💰 Portfolio sim — ${money(pf.start)} start · 1% margin · 10× (≈${pf.notional_pct}% notional/trade) · ${pf.n} trades in time order · net of fees</div>
+      <div class="perfcards">
+        ${perfCard('Compounding → end', money(c.end), c.end>=pf.start?'pcg':'pcb', 'Each trade sized off the CURRENT (growing) equity — winners get re-invested, so growth is exponential.')}
+        ${perfCard('Compounding return', (c.ret_pct>0?'+':'')+c.ret_pct+'%', c.ret_pct>0?'pcg':'pcb')}
+        ${perfCard('Compounding max DD', '-'+c.max_dd_pct+'%', c.max_dd_pct>=25?'pcb':'', 'Worst peak-to-trough drop of the compounding equity curve.')}
+        ${perfCard('Fixed → end', money(f.end), f.end>=pf.start?'pcg':'pcb', 'Every trade sized off the ORIGINAL $10k (flat stake) — linear, no re-investment.')}
+        ${perfCard('Fixed return', (f.ret_pct>0?'+':'')+f.ret_pct+'%', f.ret_pct>0?'pcg':'pcb')}
+        ${perfCard('Fixed max DD', '-'+f.max_dd_pct+'%', f.max_dd_pct>=25?'pcb':'')}
+      </div>
+      <div class="histnote">⚠ Idealised single-stream model — trades run one after another; it does NOT cap how many positions are open at once or model margin limits, so real results with finite capital will differ. Fees ARE included.</div>`;})()}
+    <div class="perfsub">Per-coin (best first) · Stop % = avg stop width · MaxDD = avg drawdown · last column = stops-too-tight rate</div>
+    <table class="bt"><thead><tr><th>Coin</th><th>Trades</th><th>Win rate</th><th>Expectancy</th><th>Total R</th><th data-tip="Average stop distance from entry as a % of price.">Stop %</th><th data-tip="Average worst drawdown before a trade resolved, in R.">Max DD</th><th data-tip="Share of losers that hit target after being stopped.">Stop-tight</th></tr></thead><tbody>${rows}</tbody></table>
   </div>`;
 }
 function renderBacktest(){
