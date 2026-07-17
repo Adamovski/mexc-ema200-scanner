@@ -89,7 +89,7 @@ APP_VERSION = "v8 · Longs = momentum · Shorts = reversion (2yr-backtested)"
 # One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
 # every call (open + resolved) on the next boot and start the calls scorecard fresh —
 # auto-board trades and their version history are untouched.
-CALLS_RESET = "2026-07-17-v8"
+CALLS_RESET = "2026-07-17-v8b"
 # ----------------------------------------------------------------------------
 class Tracker:
     def __init__(self):
@@ -158,13 +158,14 @@ class Tracker:
                 for t in list(self.open.values()) + self.closed:
                     if not t.get("ver"):
                         t["ver"] = "v1 · pre-gate"
-                # One-time "My calls" wipe: if the stored marker is stale, drop every
-                # call (open + resolved) so the calls scorecard starts clean. Auto boards
-                # are left completely intact.
+                # One-time wipe on a version/reset bump: drop every manual "call" AND the
+                # retired scalp/coil auto-board trades (their tabs are gone in v8), so the
+                # scorecard starts clean on just Long + Short.
+                _drop = {"call", "scalp", "coil"}
                 if self.calls_reset != CALLS_RESET:
                     self.open = {k: t for k, t in self.open.items()
-                                 if t.get("board") != "call"}
-                    self.closed = [t for t in self.closed if t.get("board") != "call"]
+                                 if t.get("board") not in _drop}
+                    self.closed = [t for t in self.closed if t.get("board") not in _drop]
                     self.calls_reset = CALLS_RESET
                     self._save()
             except Exception:
@@ -402,7 +403,7 @@ class Tracker:
             res = [t for t in self.closed if t.get("status") in ("win", "loss", "be")
                    and t.get("ver", "v1 · pre-gate") == APP_VERSION]
         out = {}
-        for b in ("long", "short", "coil", "scalp"):
+        for b in ("long", "short"):
             rows = [t for t in res if t.get("board") == b][-window:]
             n = len(rows)
             if n < min_n:
@@ -525,19 +526,19 @@ class Tracker:
             # Current version only: this version's live/waiting trades plus its resolved
             # ones. Old-version open trades are hidden (they score in by_version instead).
             board_rows = {}
-            for b in ("long", "short", "coil", "scalp"):
+            for b in ("long", "short"):
                 board_rows[b] = {
                     "open": [_pk(t) for t in _open_cur if t.get("board") == b][:80],
                     "closed": [_pk(t) for t in _closed_cur if t.get("board") == b][:60],
                 }
             # Learning signal: win-rate WITH the market regime vs AGAINST it. If
             # against-regime setups bleed (as they should), this proves it in numbers.
-            auto = [t for t in res if t.get("board") in ("long", "short", "coil", "scalp")]
+            auto = [t for t in res if t.get("board") in ("long", "short")]
             by_regime = {r: agg([t for t in auto if (t.get("regime") or "neutral") == r])
                          for r in ("with", "against", "neutral")}
             # Per-site-version scoreboard (auto boards only) — compare how each iteration
             # of the recommendation logic actually performed. Newest version first.
-            _auto_all = [t for t in res_all if t.get("board") in ("long", "short", "coil", "scalp")]
+            _auto_all = [t for t in res_all if t.get("board") in ("long", "short")]
             _vers, _seen = [], set()
             for t in reversed(self.closed):
                 v = t.get("ver", "v1 · pre-gate")
@@ -566,7 +567,7 @@ class Tracker:
                     # Auto boards are version-scoped (fresh scorecard per version); the
                     # user's own CALLS are never version-scoped — they span every version.
                     "by_board": {**{b: agg([t for t in res if t["board"] == b])
-                                    for b in ("long", "short", "coil", "scalp")},
+                                    for b in ("long", "short")},
                                  "call": agg([t for t in res_all if t.get("board") == "call"])},
                     "by_regime": by_regime,
                     "by_version": by_version,
@@ -1390,25 +1391,11 @@ def run_one_scan(state: State) -> None:
     # auto-loosen next scan if a board stays empty for hours).
     TRACKER.note_board("long", len(long_board))
     TRACKER.note_board("short", len(short_board))
-    TRACKER.note_board("coil", len(coil_board))
-    TRACKER.note_board("scalp", len(scalp_board))
 
-    # Performance tracking — register each board's fresh setups (resolved later against
-    # the live price feed). Coil registers the recommended side's breakout plan.
+    # Performance tracking — v8 is a lean two-sided book, so ONLY the Long and Short boards
+    # are tracked. Scalps/Coiled are no longer registered (their tabs are hidden).
     TRACKER.register("long", long_board)
     TRACKER.register("short", short_board)
-    TRACKER.register("scalp", scalp_board)
-    _coil_regs = []
-    for _d in coil_board:
-        _rs = _d.get("rec_side")
-        _pl = _d.get("plan_long") if _rs == "long" else _d.get("plan_short") if _rs == "short" else None
-        if _pl and _pl.get("entry"):
-            _coil_regs.append({"symbol": _d["symbol"], "side": _rs, "entry": _pl["entry"],
-                               "stop": _pl["stop"], "tps": _pl.get("tps"),
-                               "rr": _pl.get("rr"), "price": _d.get("price"),
-                               "tf": _pl.get("entry_tf") or "4h",
-                               "regime": _align_for(_rs) if _rs else "neutral"})
-    TRACKER.register("coil", _coil_regs)
 
     # Enrich ONLY the flagged coins with a 1h read (bias + formation) — a single 1h
     # fetch each, cheap since it's just the few dozen hits (not the ~500 universe).
@@ -5065,8 +5052,8 @@ function renderPerf(){
   if(glBox){
     if(!gl){ glBox.style.display='none'; }
     else{
-      const names={long:'Best longs',short:'Best shorts',scalp:'Scalps',coil:'Coiled'};
-      const chips=['long','short','scalp','coil'].map(b=>{
+      const names={long:'Long',short:'Short'};
+      const chips=['long','short'].map(b=>{
         const s=gl[b]||{}; const cd=s.conv_delta||0, rd=s.rr_delta||0;
         const moved=(cd||rd);
         const dir=moved?(cd>0||rd>0?'lt':'lr'):'ls'; // tighter / looser / steady
@@ -5099,10 +5086,10 @@ function renderPerf(){
       }
     } else { if(lwSub)lwSub.style.display='none'; if(lwTbl)lwTbl.style.display='none'; }
   }
-  const names={long:'🏆 Best longs',short:'🩸 Best shorts',coil:'🚀 Coiled',scalp:'⚡ Scalps'};
+  const names={long:'🟢 Long',short:'🔴 Short'};
   const brows=(perf&&perf.board_rows)||{};
   if(rows){ rows.innerHTML='';
-    for(const b of ['long','short','coil','scalp']){
+    for(const b of ['long','short']){
       const a=((perf&&perf.by_board)||{})[b]||{};
       const wcls=a.winrate==null?'':(a.winrate>=50?'pf-good':a.winrate>=40?'':'pf-bad');
       const ecls=a.exp==null?'':(a.exp>0?'pf-good':'pf-bad');
@@ -5132,7 +5119,7 @@ function renderPerf(){
     const cell=x=>{ if(!x) return '<td class="rr">—</td>';
       const c=x.exp>0?'pf-good':'pf-bad';
       return `<td class="${c}">${(x.exp>0?'+':'')+x.exp}R <span class="rr">(${x.n})</span></td>`; };
-    for(const b of ['long','short','coil','scalp']){
+    for(const b of ['long','short']){
       const a=((perf&&perf.by_board)||{})[b]||{};
       const ao=a.allout||[];
       const byTp=k=>ao.find(z=>z.tp===k);
