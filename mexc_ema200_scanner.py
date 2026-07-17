@@ -1910,10 +1910,58 @@ def fetch_futures_klines_deep(sess: requests.Session, symbol: str, interval: str
     return rows[-target:]
 
 
+# Liquid US stocks for the STOCKS backtest lab (large-caps + high-beta / crypto-proxies).
+STOCK_BASKET = ["AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","AMD","NFLX","AVGO","CRM","ADBE",
+                "INTC","QCOM","ORCL","CSCO","PYPL","SHOP","UBER","COIN","PLTR","SNOW","MU","BA","DIS",
+                "JPM","BAC","GS","XOM","CVX","WMT","HD","NKE","PFE","JNJ","KO","PEP","COST","SMCI",
+                "ARM","MSTR","RIVN","SOFI","DKNG","ROKU","ABNB","MARA","RIOT"]
+
+
+def fetch_stooq_daily(sess: requests.Session, symbol: str, target: int = 1500) -> list[list] | None:
+    """Free daily OHLCV for a US stock from Stooq (no API key). Returns unified rows
+    [openTime_ms, open, high, low, close, volume, closeTime_ms], oldest first, capped to the last
+    `target` sessions. Stooq needs the '.us' suffix; returns None on any failure so the coin just
+    drops out of the sweep gracefully."""
+    sym = symbol.lower()
+    if not sym.endswith(".us"):
+        sym += ".us"
+    url = "https://stooq.com/q/d/l/?s=%s&i=d" % sym
+    try:
+        r = sess.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200 or not r.text:
+            return None
+        lines = r.text.strip().splitlines()
+        if len(lines) < 210 or not lines[0].lower().startswith("date"):
+            return None
+        import datetime as _dt
+        rows = []
+        for ln in lines[1:]:
+            p = ln.split(",")
+            if len(p) < 6:
+                continue
+            try:
+                d = _dt.datetime.strptime(p[0], "%Y-%m-%d").replace(tzinfo=_dt.timezone.utc)
+                ts = int(d.timestamp() * 1000)
+                o, h, l, c = float(p[1]), float(p[2]), float(p[3]), float(p[4])
+                v = float(p[5]) if p[5] not in ("", "N/D") else 0.0
+            except (ValueError, IndexError):
+                continue
+            if o <= 0 or c <= 0:
+                continue
+            rows.append([ts, o, h, l, c, v, ts])
+        if len(rows) < 210:
+            return None
+        return rows[-target:] if len(rows) > target else rows
+    except Exception:
+        return None
+
+
 def fetch_candles_deep(sess: requests.Session, symbol: str, interval: str,
                        target: int, market: str) -> list[list] | None:
     """Deep (multi-year) candles for the backtester. Futures paginates for real depth; if that
     comes back stale/empty, fall back to the normal (capped) fetch so a coin still contributes."""
+    if market == "stocks":
+        return fetch_stooq_daily(sess, symbol, target)
     if market == "futures":
         rows = fetch_futures_klines_deep(sess, symbol, interval, target)
         if rows and _klines_fresh(rows, interval):
@@ -1940,6 +1988,8 @@ def fetch_candles(sess: requests.Session, symbol: str, interval: str,
     """Dispatch to the futures or spot kline endpoint (unified row shape).
     If the futures endpoint returns stale/frozen data (as MEXC sometimes does for
     certain contracts), fall back to the spot klines, which stay current."""
+    if market == "stocks":
+        return fetch_stooq_daily(sess, symbol, limit)
     if market == "futures":
         rows = fetch_futures_klines(sess, symbol, interval, limit)
         if _klines_fresh(rows, interval):
@@ -5231,7 +5281,7 @@ def _bt_sample(results, syms, k=40):
 
 
 def backtest_all(sess, market, tfs=("15m", "1h", "4h", "1d"), limit=1000,
-                 fees_bps=5.0, symbols=None, strategy="revert", sides=("long", "short")):
+                 fees_bps=5.0, symbols=None, strategy="revert", sides=("long", "short"), index_sym="BTCUSDT"):
     """Sweep the whole basket across EVERY timeframe and the requested SIDES in one pass —
     fetching each coin's candles once per TF and running the given strategy on them. Returns
     {tf: {side: agg, ...}}. Run in the background so the app shows a full TF × side edge
@@ -5259,15 +5309,15 @@ def backtest_all(sess, market, tfs=("15m", "1h", "4h", "1d"), limit=1000,
                 if sym and r:
                     rows_by[sym] = r
         # BTC own-regime context (fetch BTC separately if it's not in this basket, e.g. odd baskets)
-        _brows = rows_by.get("BTCUSDT")
+        _brows = rows_by.get(index_sym)
         if not _brows:
             try:
-                _brows = fetch_candles_deep(sess, "BTCUSDT", tf, limit, market)
+                _brows = fetch_candles_deep(sess, index_sym, tf, limit, market)
             except Exception:
                 _brows = None
         btc_ctx = _btc_regime_ctx(_brows) if _brows else {}
         # Market breadth + dominance across the whole basket (per bar) — the environment gate.
-        mkt_ctx = _market_ctx(rows_by, "BTCUSDT")
+        mkt_ctx = _market_ctx(rows_by, index_sym)
 
         # PHASE 2 — run every strategy/side on the pre-fetched candles.
         def _one(sym):
