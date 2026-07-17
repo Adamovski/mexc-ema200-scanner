@@ -4382,6 +4382,173 @@ def _bt_goldencross(rows, side, fees_bps=5.0, horizon=60, warmup=210, btc_ctx=No
     return out
 
 
+def _bt_highwr(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None):
+    """HIGH WIN-RATE mean reversion — engineered for HIT-RATE, not big R. Only trades WITH the
+    higher-timeframe trend (sloping 200-EMA), only in a FAVOURABLE breadth regime (long in risk-on,
+    short in risk-off), only when BTC and the coin are CALM, and only on an oversold/overbought
+    snap that has already turned. The take-profit is placed NEAR (~1.3x ATR, and never past the
+    20-EMA mean) so it is banked frequently; the stop is placed WIDE (~2.0x ATR beyond the flush)
+    so a normal wick does not take you out. Reward:risk is deliberately < 1 (~0.65) — the point is
+    a high win-rate. Breakeven WR at that R:R is ~61%, so it only truly wins if the hit-rate clears
+    that; the lab reports both so you can judge honestly. No look-ahead; net of fees; regime-gated."""
+    try:
+        H = [float(x[2]) for x in rows]; L = [float(x[3]) for x in rows]
+        C = [float(x[4]) for x in rows]; V = [float(x[5]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return []
+    n = len(C)
+    if n < warmup + horizon + 5:
+        return []
+    e200 = ema(C, 200); e20 = ema(C, 20); rsis = rsi_series(C)
+    long = side == "long"; fee_frac = fees_bps / 10000.0
+    _dv = sorted(C[i] * V[i] for i in range(n)); dvol = _dv[len(_dv) // 2] if _dv else 0.0
+    _atrp = [((atr(H[max(0, i - 20):i + 1], L[max(0, i - 20):i + 1], C[max(0, i - 20):i + 1]) or 0.0) / C[i])
+             if C[i] else 0.0 for i in range(n)]
+    _as = sorted(x for x in _atrp if x > 0); _amed = _as[len(_as) // 2] if _as else 0.0
+    out = []; t = warmup
+    while t < n - horizon - 1:
+        el = e200[t]; e2 = e20[t]; rs = rsis[t]
+        if el is None or e2 is None or rs is None:
+            t += 1; continue
+        a = atr(H[max(0, t - 20):t + 1], L[max(0, t - 20):t + 1], C[max(0, t - 20):t + 1])
+        if not a or a <= 0:
+            t += 1; continue
+        prev = e200[t - 20] if t >= 20 else None
+        ts = int(rows[t][0]) if rows[t] else 0
+        _bs = btc_ctx.get(ts) if btc_ctx else None
+        btrend = _bs.get("t") if _bs else None; bvol = _bs.get("v") if _bs else None
+        _ms = mkt_ctx.get(ts) if mkt_ctx else None
+        mbr = _ms.get("br") if _ms else None; mdom = _ms.get("dom") if _ms else None
+        mbpct = _ms.get("bpct") if _ms else None
+        if bvol == "hi":                                   # calm BTC only
+            t += 1; continue
+        if _amed and _atrp[t] > _amed * 1.10:              # calm coin only
+            t += 1; continue
+        price = C[t]; entry = stop = target = None
+        if long:
+            if not (price > el and (prev is None or el > prev)):
+                t += 1; continue
+            if mbr == "risk_off":                          # long only in supportive breadth
+                t += 1; continue
+            if _btc_block(True, tf, btrend, bvol):
+                t += 1; continue
+            if not (38 <= rs <= 55 and C[t] > C[t - 1]):   # oversold-ish snap that has turned up
+                t += 1; continue
+            entry = price
+            flush_low = min(L[max(0, t - 3):t + 1])
+            stop = min(flush_low - 0.2 * a, entry - 1.8 * a)   # WIDE (but not so wide R:R collapses)
+            risk = entry - stop
+            if risk <= 0:
+                t += 1; continue
+            mean_gap = (e2 - entry) if e2 > entry else 1.1 * a
+            target = entry + min(max(1.1 * a, 0.7 * mean_gap), 1.5 * a)   # NEAR — ~0.75 R:R
+        else:
+            if not (price < el and (prev is None or el < prev)):
+                t += 1; continue
+            if mbr == "risk_on":                           # short only in weak breadth
+                t += 1; continue
+            if _btc_block(False, tf, btrend, bvol):
+                t += 1; continue
+            if not (45 <= rs <= 62 and C[t] < C[t - 1]):   # overbought-ish pop rolling over
+                t += 1; continue
+            entry = price
+            flush_high = max(H[max(0, t - 3):t + 1])
+            stop = max(flush_high + 0.2 * a, entry + 1.8 * a)
+            risk = stop - entry
+            if risk <= 0:
+                t += 1; continue
+            mean_gap = (entry - e2) if e2 < entry else 1.1 * a
+            target = entry - min(max(1.1 * a, 0.7 * mean_gap), 1.5 * a)
+        if target is None or abs(target - entry) / entry < 0.0015:
+            t += 1; continue
+        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx,
+                           "highwr", long, t, entry, stop, target, a, rs=rs, mkt_ctx=mkt_ctx)
+        if tr is None:
+            t += 1; continue
+        out.append(tr); t = rbar + 1
+    return out
+
+
+def _bt_pullback20(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None):
+    """20-EMA PULLBACK CONTINUATION — a high-win-rate trend-continuation. In an uptrend (price above
+    a rising 200-EMA, favourable breadth, calm tape) buy the shallow pullback that tags the fast
+    20-EMA and closes back above it; mirror for shorts. The fast mean gets reclaimed often inside a
+    trend, so the hit-rate is high; the target is kept NEAR (a fraction of the swing, ~<=1.3x ATR)
+    and the stop moderately WIDE (below the 20-EMA by ~1.5x ATR). No look-ahead; net of fees; gated."""
+    try:
+        H = [float(x[2]) for x in rows]; L = [float(x[3]) for x in rows]
+        C = [float(x[4]) for x in rows]; V = [float(x[5]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return []
+    n = len(C)
+    if n < warmup + horizon + 5:
+        return []
+    e200 = ema(C, 200); e20 = ema(C, 20); rsis = rsi_series(C)
+    long = side == "long"; fee_frac = fees_bps / 10000.0
+    _dv = sorted(C[i] * V[i] for i in range(n)); dvol = _dv[len(_dv) // 2] if _dv else 0.0
+    _atrp = [((atr(H[max(0, i - 20):i + 1], L[max(0, i - 20):i + 1], C[max(0, i - 20):i + 1]) or 0.0) / C[i])
+             if C[i] else 0.0 for i in range(n)]
+    _as = sorted(x for x in _atrp if x > 0); _amed = _as[len(_as) // 2] if _as else 0.0
+    out = []; t = warmup
+    while t < n - horizon - 1:
+        el = e200[t]; e2 = e20[t]; rs = rsis[t]
+        if el is None or e2 is None:
+            t += 1; continue
+        a = atr(H[max(0, t - 20):t + 1], L[max(0, t - 20):t + 1], C[max(0, t - 20):t + 1])
+        if not a or a <= 0:
+            t += 1; continue
+        prev = e200[t - 20] if t >= 20 else None
+        ts = int(rows[t][0]) if rows[t] else 0
+        _bs = btc_ctx.get(ts) if btc_ctx else None
+        btrend = _bs.get("t") if _bs else None; bvol = _bs.get("v") if _bs else None
+        _ms = mkt_ctx.get(ts) if mkt_ctx else None
+        mbr = _ms.get("br") if _ms else None; mdom = _ms.get("dom") if _ms else None
+        mbpct = _ms.get("bpct") if _ms else None
+        if bvol == "hi" or (_amed and _atrp[t] > _amed * 1.15):
+            t += 1; continue
+        price = C[t]; entry = stop = target = None
+        if long:
+            if not (price > el and (prev is None or el > prev)):
+                t += 1; continue
+            if mbr == "risk_off" or _btc_block(True, tf, btrend, bvol):
+                t += 1; continue
+            tagged = min(L[max(0, t - 2):t + 1]) <= e2 * 1.004        # pullback tagged the fast mean
+            if not (tagged and C[t] > e2 and C[t] > C[t - 1]):        # reclaimed, turning up
+                t += 1; continue
+            entry = price
+            stop = min(min(L[max(0, t - 3):t + 1]) - 0.2 * a, e2 - 1.5 * a)
+            risk = entry - stop
+            if risk <= 0:
+                t += 1; continue
+            prior_high = max(H[max(0, t - 12):t])
+            gap = (prior_high - entry) if prior_high > entry else 1.0 * a
+            target = entry + min(max(0.9 * a, 0.6 * gap), 1.3 * a)
+        else:
+            if not (price < el and (prev is None or el < prev)):
+                t += 1; continue
+            if mbr == "risk_on" or _btc_block(False, tf, btrend, bvol):
+                t += 1; continue
+            tagged = max(H[max(0, t - 2):t + 1]) >= e2 * 0.996
+            if not (tagged and C[t] < e2 and C[t] < C[t - 1]):
+                t += 1; continue
+            entry = price
+            stop = max(max(H[max(0, t - 3):t + 1]) + 0.2 * a, e2 + 1.5 * a)
+            risk = stop - entry
+            if risk <= 0:
+                t += 1; continue
+            prior_low = min(L[max(0, t - 12):t])
+            gap = (entry - prior_low) if prior_low < entry else 1.0 * a
+            target = entry - min(max(0.9 * a, 0.6 * gap), 1.3 * a)
+        if target is None or abs(target - entry) / entry < 0.0015:
+            t += 1; continue
+        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx,
+                           "pullback20", long, t, entry, stop, target, a, rs=rs, mkt_ctx=mkt_ctx)
+        if tr is None:
+            t += 1; continue
+        out.append(tr); t = rbar + 1
+    return out
+
+
 def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="level", btc_ctx=None, tf="4h", mkt_ctx=None):
     """Replay a strategy's entry/stop/target MECHANICS over one coin's historical candles and
     return a list of resolved trades (net R after fees). WITHOUT look-ahead: every decision at
@@ -4406,6 +4573,10 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="
         return _bt_ema200pb(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy == "goldencross":
         return _bt_goldencross(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
+    if strategy == "highwr":
+        return _bt_highwr(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
+    if strategy == "pullback20":
+        return _bt_pullback20(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy == "monday":
         return _bt_btc_monday(rows, side, fees_bps=fees_bps, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     try:
