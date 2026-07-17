@@ -86,7 +86,7 @@ def send_telegram(cfg: dict, text: str) -> None:
 # logic changes meaningfully — the headline win-rate resets to the new version (a clean
 # slate for the new logic), while every past version's results are kept and shown in the
 # "site version" breakdown so you can compare how each iteration actually performed.
-APP_VERSION = "v18 · Fix script-breaking apostrophe; deep market-environment + equity chart live"
+APP_VERSION = "v19 · Stock feed → Yahoo Finance (Stooq blocked servers); stocks lab live"
 # One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
 # every call (open + resolved) on the next boot and start the calls scorecard fresh —
 # auto-board trades and their version history are untouched.

@@ -1917,6 +1917,54 @@ STOCK_BASKET = ["AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","AMD","NFLX","
                 "ARM","MSTR","RIVN","SOFI","DKNG","ROKU","ABNB","MARA","RIOT"]
 
 
+def fetch_yahoo_daily(sess: requests.Session, symbol: str, target: int = 1500) -> list[list] | None:
+    """Free daily OHLCV for a US stock/ETF from Yahoo Finance's chart API (no key). Yahoo serves
+    server/datacenter requests when given a browser User-Agent, unlike Stooq. Returns unified rows
+    [openTime_ms, open, high, low, close, volume, closeTime_ms], oldest first, capped to `target`
+    sessions. Returns None on any failure so the symbol drops out of the sweep gracefully."""
+    hdr = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                         "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        url = "https://%s/v8/finance/chart/%s?range=10y&interval=1d" % (host, symbol)
+        try:
+            r = sess.get(url, timeout=20, headers=hdr)
+            if r.status_code != 200:
+                continue
+            j = r.json()
+            res = (((j or {}).get("chart") or {}).get("result") or [None])[0]
+            if not res:
+                continue
+            ts = res.get("timestamp") or []
+            q = (((res.get("indicators") or {}).get("quote") or [{}])[0]) or {}
+            O, H, L, C, V = q.get("open"), q.get("high"), q.get("low"), q.get("close"), q.get("volume")
+            if not ts or not C:
+                continue
+            rows = []
+            for i in range(len(ts)):
+                try:
+                    o, h, l, c = O[i], H[i], L[i], C[i]
+                    if None in (o, h, l, c) or c <= 0 or o <= 0:
+                        continue
+                    v = V[i] if (V and V[i] is not None) else 0.0
+                    tms = int(ts[i]) * 1000
+                    rows.append([tms, float(o), float(h), float(l), float(c), float(v), tms])
+                except (IndexError, TypeError, ValueError):
+                    continue
+            if len(rows) >= 210:
+                return rows[-target:] if len(rows) > target else rows
+        except Exception:
+            continue
+    return None
+
+
+def fetch_stock_daily(sess: requests.Session, symbol: str, target: int = 1500) -> list[list] | None:
+    """Daily stock candles: Yahoo Finance first (works from servers), Stooq as a fallback."""
+    rows = fetch_yahoo_daily(sess, symbol, target)
+    if rows:
+        return rows
+    return fetch_stooq_daily(sess, symbol, target)
+
+
 def fetch_stooq_daily(sess: requests.Session, symbol: str, target: int = 1500) -> list[list] | None:
     """Free daily OHLCV for a US stock from Stooq (no API key). Returns unified rows
     [openTime_ms, open, high, low, close, volume, closeTime_ms], oldest first, capped to the last
@@ -1961,7 +2009,7 @@ def fetch_candles_deep(sess: requests.Session, symbol: str, interval: str,
     """Deep (multi-year) candles for the backtester. Futures paginates for real depth; if that
     comes back stale/empty, fall back to the normal (capped) fetch so a coin still contributes."""
     if market == "stocks":
-        return fetch_stooq_daily(sess, symbol, target)
+        return fetch_stock_daily(sess, symbol, target)
     if market == "futures":
         rows = fetch_futures_klines_deep(sess, symbol, interval, target)
         if rows and _klines_fresh(rows, interval):
@@ -1989,7 +2037,7 @@ def fetch_candles(sess: requests.Session, symbol: str, interval: str,
     If the futures endpoint returns stale/frozen data (as MEXC sometimes does for
     certain contracts), fall back to the spot klines, which stay current."""
     if market == "stocks":
-        return fetch_stooq_daily(sess, symbol, limit)
+        return fetch_stock_daily(sess, symbol, limit)
     if market == "futures":
         rows = fetch_futures_klines(sess, symbol, interval, limit)
         if _klines_fresh(rows, interval):
