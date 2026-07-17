@@ -85,11 +85,11 @@ def send_telegram(cfg: dict, text: str) -> None:
 # logic changes meaningfully — the headline win-rate resets to the new version (a clean
 # slate for the new logic), while every past version's results are kept and shown in the
 # "site version" breakdown so you can compare how each iteration actually performed.
-APP_VERSION = "v7 · regime-picks-side + wider stops (per backtest)"
+APP_VERSION = "v8 · Longs = momentum · Shorts = reversion (2yr-backtested)"
 # One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
 # every call (open + resolved) on the next boot and start the calls scorecard fresh —
 # auto-board trades and their version history are untouched.
-CALLS_RESET = "2026-07-16"
+CALLS_RESET = "2026-07-17-v8"
 # ----------------------------------------------------------------------------
 class Tracker:
     def __init__(self):
@@ -4882,6 +4882,20 @@ function btCell(s){
   const cls=s.exp>=0.15?'pf-good':s.exp>0?'':'pf-bad';
   return `<span class="${cls}"><b>${s.exp>0?'+':''}${s.exp}R</b></span> · ${s.winrate}% <span class="rr">(${s.n})</span>`;
 }
+// Filter the per-coin table by symbol (BTC, SOL, …) and recompute the visible win-rate / total R.
+function btFilterCoins(inp, key){
+  const v=(inp.value||'').toUpperCase().trim();
+  const tb=document.getElementById('btcoins_'+key); if(!tb) return;
+  let tn=0, tw=0, tsum=0, shown=0;
+  tb.querySelectorAll('tr.btcoin').forEach(function(r){
+    const sym=r.getAttribute('data-sym')||''; const m=!v||sym.indexOf(v)>=0;
+    r.style.display=m?'':'none';
+    const d=r.nextElementSibling; if(d&&d.classList.contains('btdetail')) d.style.display='none';
+    if(m){ shown++; const nn=+r.getAttribute('data-n')||0, wr=+r.getAttribute('data-wr')||0, sr=+r.getAttribute('data-sr')||0; tn+=nn; tw+=nn*wr/100; tsum+=sr; }
+  });
+  const st=document.getElementById('btfstat_'+key);
+  if(st){ st.innerHTML = tn? `${shown} coin${shown===1?'':'s'} · ${tn} trades · win <b>${(tw/tn*100).toFixed(1)}%</b> · total <b class="${tsum>0?'pf-good':'pf-bad'}">${tsum>0?'+':''}${tsum.toFixed(1)}R</b>` : (v?'no matches':''); }
+}
 function btSideCard(label,emoji,s){
   if(!s||!s.n){ return `<div class="btcard"><div class="btcard-h">${emoji} ${label}</div><div class="btnote">No qualifying trades in the sample.</div></div>`; }
   const [vlabel,vcls]=btVerdict(s.exp);
@@ -4894,18 +4908,40 @@ function btSideCard(label,emoji,s){
     anl+=`<div class="btidea${hot?' btbad':''}">🛑 <b>${ins.stop_then_tp_pct}%</b> of losers hit the target <b>after</b> being stopped${hot?' — stops are too tight; widening ~30% would flip many of these to wins':' — stops look reasonably placed'}. Losers ran +${ins.loser_mfe}R toward target first.</div>`; }
   if(s.avg_win_mfe!=null&&s.avg_win!=null){ const extra=+(s.avg_win_mfe-s.avg_win).toFixed(2); const worth=extra>=0.4;
     anl+=`<div class="btidea${worth?' btgood':''}">🏃 Single TP at the mean — winners banked <b>+${s.avg_win}R</b> but ran to <b>+${s.avg_win_mfe}R</b> at best${worth?` — leaving ~${extra}R on the table; a runner/ladder would likely add expectancy`:' — little extra run, so a single mean-reversion TP is right'}. (Backtest resolves on this one TP, not a ladder.)</div>`; }
-  if(s.avg_mae!=null){ anl+=`<div class="btidea">📉 Avg <b>max drawdown</b> before resolving: <b>-${s.avg_mae}R</b> · avg <b>TP distance</b>: <b>${s.avg_tp_pct!=null?s.avg_tp_pct+'%':'—'}</b> from entry.</div>`; }
+  if(s.avg_win_mae!=null){ const clean=s.avg_win_mae<=0.4; const deep=s.avg_win_mae>=0.7;
+    anl+=`<div class="btidea${clean?' btgood':(deep?' btbad':'')}">📉 <b>Winners' avg drawdown: -${s.avg_win_mae}R</b> (losers -${s.avg_loss_mae!=null?s.avg_loss_mae:'—'}R). ${clean?'Winners barely dip before working — entries are clean, and the stop could be tightened to lift R:R.':(deep?'Winners routinely sit deep underwater first — the entry is early/loose; a more patient trigger would raise R:R and cut heat.':'Winners take a moderate dip first — some room to tighten entries.')}</div>`; }
+  else if(s.avg_mae!=null){ anl+=`<div class="btidea">📉 Avg <b>max drawdown</b> before resolving: <b>-${s.avg_mae}R</b> · avg <b>TP distance</b>: <b>${s.avg_tp_pct!=null?s.avg_tp_pct+'%':'—'}</b> from entry.</div>`; }
+  if(s.monthly&&s.monthly.length){
+    const mm=s.monthly; const pos=mm.filter(x=>x.exp>0).length;
+    anl+=`<div class="btideah">🗓️ Win-rate by month (${pos}/${mm.length} months positive)</div>`;
+    anl+=`<div style="overflow-x:auto"><table class="bt" style="min-width:100%"><thead><tr><th>Month</th><th>Trades</th><th>Win rate</th><th>Exp</th><th>Total R</th></tr></thead><tbody>`
+      +mm.map(x=>`<tr><td style="white-space:nowrap">${x.m}</td><td>${x.n}</td><td class="${x.winrate>=50?'pf-good':'pf-bad'}">${x.winrate}%</td><td class="${x.exp>0?'pf-good':'pf-bad'}">${x.exp>0?'+':''}${x.exp}R</td><td class="${x.sumR>0?'pf-good':'pf-bad'}">${x.sumR>0?'+':''}${x.sumR}R</td></tr>`).join('')
+      +`</tbody></table></div>`;
+  }
   if(finds.length){
     anl+=`<div class="btideah">💡 What worked (segment expectancy)</div>`;
     anl+=finds.map(f=>`<div class="btidea">${esc(f.label)}: <b class="${f.a.exp>f.b.exp?'pf-good':'pf-bad'}">${esc(f.a.name)} ${f.a.exp>0?'+':''}${f.a.exp}R</b> <span class="rr">(${f.a.n})</span> vs <b class="${f.b.exp>f.a.exp?'pf-good':'pf-bad'}">${esc(f.b.name)} ${f.b.exp>0?'+':''}${f.b.exp}R</b> <span class="rr">(${f.b.n})</span> → favour <b>${esc(f.better)}</b></div>`).join('');
   }
-  const rows=(s.per_symbol||[]).map(p=>`<tr><td class="sym"><a href="${tvLink(p.symbol)}" target="_blank" rel="noopener">${dispSym(p.symbol)}</a></td>`
-    +`<td>${p.n}</td><td class="${p.winrate>=50?'pf-good':'pf-bad'}">${p.winrate}%</td>`
-    +`<td class="${p.exp>0?'pf-good':'pf-bad'}">${p.exp>0?'+':''}${p.exp}R</td>`
-    +`<td class="${p.sumR>0?'pf-good':'pf-bad'}">${p.sumR>0?'+':''}${p.sumR}R</td>`
-    +`<td data-tip="Average stop distance from entry, as a % of price, for this coin's trades. Wider = more room (and a bigger loss when hit); tighter = smaller risk but easier to stop out.">${p.stopw!=null?p.stopw+'%':'—'}</td>`
-    +`<td class="${(p.mae||0)>=0.85?'pf-bad':''}" data-tip="Average worst drawdown before the trade resolved, in R (max adverse excursion). ~1R = trades routinely sat near the stop before working.">${p.mae!=null?'-'+p.mae+'R':'—'}</td>`
-    +`<td class="${(p.stp||0)>=35?'pf-bad':''}" data-tip="Share of this coin's losing trades that reached the target AFTER being stopped — high = stops too tight for this coin.">${p.stp!=null?p.stp+'%':'—'}</td></tr>`).join('');
+  const ckey=((s.tf||'')+'_'+(s.side||'')).replace(/[^a-z0-9]/gi,'');
+  const fmtd=ts=>{try{const d=new Date(ts);const p=n=>String(n).padStart(2,'0');return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes());}catch(e){return '—';}};
+  const coinRow=(p)=>{
+    const did='btd_'+ckey+'_'+String(p.symbol).replace(/[^A-Za-z0-9]/g,'');
+    const trs=(p.trades||[]).map(x=>{const win=x.outcome==='win';
+      const env=`BTC ${x.btc_trend||'?'} · ${x.btc_vol==='hi'?'volatile':x.btc_vol==='lo'?'calm':'?'} · ${x.session||'?'}`;
+      const why=x.kind==='momentum'?`Breakout / trend-continuation (RSI ${x.rsi})`:`Fade an overbought pop (RSI ${x.rsi})`;
+      return `<tr><td style="white-space:nowrap">${fmtd(x.ts)}</td><td class="${win?'pf-good':'pf-bad'}" data-tip="Entry ${fmtNum(x.entry)} · stop ${fmtNum(x.stop)} (${x.stopw}%) · target ${fmtNum(x.target)} (${x.tppct}%) · R:R ${x.rr} · held ${x.bars} bars · worst drawdown -${x.mae}R">${win?'✓':'✗'} ${x.r>0?'+':''}${x.r}R</td><td>${esc(env)}</td><td class="whycell">${esc(why)}</td></tr>`;}).join('');
+    const detail=`<tr class="btdetail" id="${did}" style="display:none"><td colspan="8"><div class="perfsub">${dispSym(p.symbol)} — recent trades (date · result · environment · why)</div><table class="bt"><thead><tr><th>Date (UTC)</th><th>Result</th><th>Environment</th><th>Setup</th></tr></thead><tbody>${trs||'<tr><td colspan=4>—</td></tr>'}</tbody></table></td></tr>`;
+    return `<tr class="btcoin" data-sym="${String(p.symbol).toUpperCase()}" data-n="${p.n}" data-wr="${p.winrate}" data-sr="${p.sumR}" style="cursor:pointer" onclick="var d=document.getElementById('${did}');if(d)d.style.display=d.style.display==='none'?'':'none';">`
+      +`<td class="sym">▸ ${dispSym(p.symbol)}</td>`
+      +`<td>${p.n}</td><td class="${p.winrate>=50?'pf-good':'pf-bad'}">${p.winrate}%</td>`
+      +`<td class="${p.exp>0?'pf-good':'pf-bad'}">${p.exp>0?'+':''}${p.exp}R</td>`
+      +`<td class="${p.sumR>0?'pf-good':'pf-bad'}">${p.sumR>0?'+':''}${p.sumR}R</td>`
+      +`<td data-tip="Average stop distance from entry, as a % of price.">${p.stopw!=null?p.stopw+'%':'—'}</td>`
+      +`<td class="${(p.mae||0)>=0.85?'pf-bad':''}" data-tip="Average worst drawdown before the trade resolved, in R.">${p.mae!=null?'-'+p.mae+'R':'—'}</td>`
+      +`<td class="${(p.stp||0)>=35?'pf-bad':''}" data-tip="Share of losers that hit target after being stopped.">${p.stp!=null?p.stp+'%':'—'}</td></tr>`
+      +detail;
+  };
+  const rows=(s.per_symbol||[]).map(coinRow).join('');
   return `<div class="btcard">
     <div class="btcard-h">${emoji} ${label} <span class="btverdict ${vcls}">${vlabel}</span></div>
     <div class="perfcards">
@@ -4920,18 +4956,23 @@ function btSideCard(label,emoji,s){
     </div>
     <div class="btanalysis">${anl}</div>
     ${(()=>{const pf=s.portfolio; if(!pf) return ''; const c=pf.compound,f=pf.fixed; const money=v=>'$'+Math.round(v).toLocaleString();
-      return `<div class="perfsub">💰 Portfolio sim — ${money(pf.start)} start · 1% margin · 10× (≈${pf.notional_pct}% notional/trade) · ${pf.n} trades in time order · net of fees</div>
+      return `<div class="perfsub">💰 Portfolio sim — ${money(pf.start)} start · risk 1% of equity as margin but <b>min ${money(pf.min_margin)}</b> at ${pf.lev}× (<b>min ${money(pf.min_notional)}</b> trade) · ${pf.n} trades · net of fees</div>
       <div class="perfcards">
-        ${perfCard('Compounding → end', money(c.end), c.end>=pf.start?'pcg':'pcb', 'Each trade sized off the CURRENT (growing) equity — winners get re-invested, so growth is exponential.')}
+        ${perfCard('Compounding → end', money(c.end), c.end>=pf.start?'pcg':'pcb', 'Margin each trade = max(1% of the CURRENT growing equity, $'+pf.min_margin+'), at '+pf.lev+'×. Winners get re-invested → exponential.')}
         ${perfCard('Compounding return', (c.ret_pct>0?'+':'')+c.ret_pct+'%', c.ret_pct>0?'pcg':'pcb')}
-        ${perfCard('Compounding max DD', '-'+c.max_dd_pct+'%', c.max_dd_pct>=25?'pcb':'', 'Worst peak-to-trough drop of the compounding equity curve.')}
-        ${perfCard('Fixed → end', money(f.end), f.end>=pf.start?'pcg':'pcb', 'Every trade sized off the ORIGINAL $10k (flat stake) — linear, no re-investment.')}
+        ${perfCard('Compounding max DD', '-'+c.max_dd_pct+'% ('+money(c.max_dd_abs)+')', c.max_dd_pct>=25?'pcb':'', 'The deepest the account fell from a prior high, shown as a % and in $. This is the worst losing streak you would have had to sit through — the pain, not the average.')}
+        ${perfCard('Fixed → end', money(f.end), f.end>=pf.start?'pcg':'pcb', 'Every trade uses the minimum $'+pf.min_margin+' margin ($'+pf.min_notional+' notional), flat — linear, no re-investment.')}
         ${perfCard('Fixed return', (f.ret_pct>0?'+':'')+f.ret_pct+'%', f.ret_pct>0?'pcg':'pcb')}
-        ${perfCard('Fixed max DD', '-'+f.max_dd_pct+'%', f.max_dd_pct>=25?'pcb':'')}
+        ${perfCard('Fixed max DD', '-'+f.max_dd_pct+'% ('+money(f.max_dd_abs)+')', f.max_dd_pct>=25?'pcb':'')}
+        ${perfCard('Max open at once', s.max_concurrent!=null?s.max_concurrent:'—', (s.max_concurrent||0)> (Math.floor(pf.start/pf.min_margin))?'pcb':'', 'The most positions that would be open simultaneously if you took every signal. Your $'+pf.start+' holds ~'+Math.floor(pf.start/pf.min_margin)+' margin slots of $'+pf.min_margin+'. If this exceeds that, you could not actually take them all.')}
       </div>
-      <div class="histnote">⚠ Idealised single-stream model — trades run one after another; it does NOT cap how many positions are open at once or model margin limits, so real results with finite capital will differ. Fees ARE included.</div>`;})()}
-    <div class="perfsub">Per-coin (best first) · Stop % = avg stop width · MaxDD = avg drawdown · last column = stops-too-tight rate</div>
-    <table class="bt"><thead><tr><th>Coin</th><th>Trades</th><th>Win rate</th><th>Expectancy</th><th>Total R</th><th data-tip="Average stop distance from entry as a % of price.">Stop %</th><th data-tip="Average worst drawdown before a trade resolved, in R.">Max DD</th><th data-tip="Share of losers that hit target after being stopped.">Stop-tight</th></tr></thead><tbody>${rows}</tbody></table>
+      <div class="histnote">⚠ Idealised single-stream model — trades run one after another. "Max open at once" shows how many would really overlap. Drawdown = worst peak-to-trough dip of the equity curve, in % and $. Fees ARE included.</div>`;})()}
+    <div class="perfsub">Per-coin (best first) · click a coin to expand its trades · Stop % = avg stop width · MaxDD = avg drawdown · last = stops-too-tight rate</div>
+    <div style="display:flex;gap:8px;align-items:center;margin:4px 0 8px;flex-wrap:wrap">
+      <input type="text" placeholder="filter coin — e.g. BTC, SOL…" oninput="btFilterCoins(this,'${ckey}')" style="background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 10px;color:var(--txt);font-size:12px;min-width:180px">
+      <span id="btfstat_${ckey}" style="color:var(--dim);font-size:12px"></span>
+    </div>
+    <table class="bt"><thead><tr><th>Coin</th><th>Trades</th><th>Win rate</th><th>Expectancy</th><th>Total R</th><th data-tip="Average stop distance from entry as a % of price.">Stop %</th><th data-tip="Average worst drawdown before a trade resolved, in R.">Max DD</th><th data-tip="Share of losers that hit target after being stopped.">Stop-tight</th></tr></thead><tbody id="btcoins_${ckey}">${rows}</tbody></table>
     ${(()=>{const smp=s.sample||[]; if(!smp.length) return ''; const long=s.side==='long';
       const fmtd=ts=>{try{const d=new Date(ts);const p=n=>String(n).padStart(2,'0');return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes());}catch(e){return '—';}};
       const rows2=smp.map(x=>{const win=x.outcome==='win';

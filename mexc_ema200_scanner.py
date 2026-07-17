@@ -2686,28 +2686,33 @@ def _revert_live(side, closes, highs, lows, ema200_now, atr_val, rsis, e200s, e2
             return None
         if _btc_block(True, tf_label or "4h", btc_trend, None):   # smart don't-fight-BTC gate
             return None
-        if rs >= 45:                             # oversold-ish pullback (loosened to catch big caps)
+        # MOMENTUM continuation (dip-buying loses in crypto) — ride strength on a fresh breakout.
+        if not (52 <= rs <= 72):                 # strong, not blown off
             return None
-        if closes[-1] <= closes[-2]:             # snap-back must have started (green tick)
+        prior_high = max(highs[-21:-1]) if len(highs) >= 21 else max(highs[:-1] or highs)
+        if closes[-1] <= prior_high:             # need a fresh 20-bar breakout close
             return None
-        flush_low = min(lows[-4:])
-        stop = flush_low - 0.5 * atr_val
         entry = price
+        base_low = min(lows[-20:])
+        swing_low = min(lows[-10:])
+        stop = min(swing_low, entry - 1.4 * atr_val)
         risk = entry - stop
         if risk <= 0:
             return None
-        target = e2 if e2 > entry * 1.003 else entry + 1.3 * risk
+        # Smart, individual target: measured move (height of the base projected up), not a flat 2R.
+        measured = prior_high - base_low
+        target = entry + max(measured, 1.5 * risk)
         rr = (target - entry) / risk
-        if rr < 0.6:
+        if rr < 1.2:
             return None
-        tp2 = entry + 2.0 * risk
-        tps = [{"lvl": round(target, 10), "rr": round(rr, 2), "basis": "20-EMA mean — reversion target"},
-               {"lvl": round(tp2, 10), "rr": 2.0, "basis": "2R extension if momentum carries"}]
-        return {"entry": round(entry, 10), "entry_basis": "oversold snap-back off the flush (reversion)",
+        tp2 = entry + (target - entry) * 1.6
+        tps = [{"lvl": round(target, 10), "rr": round(rr, 2), "basis": "measured move — base height projected up"},
+               {"lvl": round(tp2, 10), "rr": round(rr * 1.6, 2), "basis": "runner — let the trend extend"}]
+        return {"entry": round(entry, 10), "entry_basis": "breakout / trend-continuation (momentum)",
                 "entry_tf": tf_label, "stop": round(stop, 10),
-                "stop_basis": "below the flush low + ATR buffer", "stop_tf": tf_label,
-                "target": round(target, 10), "rr": round(rr, 2), "rr_max": 2.0, "tps": tps,
-                "revert": True}
+                "stop_basis": "below the breakout base / 1.4×ATR", "stop_tf": tf_label,
+                "target": round(target, 10), "rr": round(rr, 2), "rr_max": 3.0, "tps": tps,
+                "revert": True, "kind": "momentum"}
     else:
         slope_dn = (prev200 is None) or (el < prev200)
         if not (price < el and slope_dn):        # must be a downtrend
@@ -2719,23 +2724,27 @@ def _revert_live(side, closes, highs, lows, ema200_now, atr_val, rsis, e200s, e2
         if closes[-1] >= closes[-2]:             # roll-over must have started (red tick)
             return None
         flush_high = max(highs[-4:])
-        stop = flush_high + 0.5 * atr_val
         entry = price
-        risk = stop - entry
+        risk = (flush_high + 0.5 * atr_val - entry) * 1.3   # WIDER stop (~30%) — losers kept hitting target after being stopped
+        stop = entry + risk
         if risk <= 0:
             return None
-        target = e2 if e2 < entry * 0.997 else entry - 1.3 * risk
-        rr = (entry - target) / risk
-        if rr < 0.6:
+        recent_low = min(lows[-20:])
+        struct = min(e2, recent_low) if recent_low < entry * 0.997 else e2
+        target = min(struct, entry - 1.3 * risk)
+        if target <= 0:
             return None
-        tp2 = entry - 2.0 * risk
-        tps = [{"lvl": round(target, 10), "rr": round(rr, 2), "basis": "20-EMA mean — reversion target"},
-               {"lvl": round(tp2, 10), "rr": 2.0, "basis": "2R extension if momentum carries"}]
-        return {"entry": round(entry, 10), "entry_basis": "overbought snap-back off the pop (reversion)",
+        rr = (entry - target) / risk
+        if rr < 0.8:
+            return None
+        tp2 = entry - (entry - target) * 1.6
+        tps = [{"lvl": round(target, 10), "rr": round(rr, 2), "basis": "structure below — 20-EMA mean / recent swing low"},
+               {"lvl": round(tp2, 10), "rr": round(rr * 1.6, 2), "basis": "runner — let the downtrend extend"}]
+        return {"entry": round(entry, 10), "entry_basis": "overbought pop fading in a downtrend (reversion)",
                 "entry_tf": tf_label, "stop": round(stop, 10),
-                "stop_basis": "above the pop high + ATR buffer", "stop_tf": tf_label,
+                "stop_basis": "above the pop high + widened ATR buffer", "stop_tf": tf_label,
                 "target": round(target, 10), "rr": round(rr, 2), "rr_max": 2.0, "tps": tps,
-                "revert": True}
+                "revert": True, "kind": "reversion"}
 
 
 def leaderboard_setups(symbol, highs, lows, closes, vols, ema_now, tfb, bias,
@@ -3684,7 +3693,7 @@ def _btc_block(long, tf, btrend, bvol):
     return btrend == opp and bvol == "hi"
 
 
-def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210, btc_ctx=None, tf="4h"):
+def _bt_revert(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="4h"):
     """TREND-ALIGNED MEAN REVERSION — the high-win-rate candidate. Only trades WITH the
     higher-timeframe trend (price on the right side of a SLOPING 200-EMA), enters on an
     OVERSOLD (long) / OVERBOUGHT (short) snap-back that has just reversed, and targets the
@@ -3737,19 +3746,26 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210, btc_ctx=None, t
                 t += 1; continue
             if _btc_block(True, tf, btrend, bvol):       # smart don't-fight-BTC gate
                 t += 1; continue
-            if rs >= 45:                                 # oversold-ish pullback (loosened to catch big caps)
+            # MOMENTUM continuation — dip-buying LOSES in crypto (2yr backtest), so ride STRENGTH
+            # instead: strong-but-not-blown-off, breaking out of the recent range with the trend.
+            if not (52 <= rs <= 72):                     # strong momentum, not an exhausted blow-off
                 t += 1; continue
-            if C[t] <= C[t - 1]:                         # need the snap-back to have started
+            prior_high = max(H[max(0, t - 20):t])        # highest high of the prior 20 bars
+            if C[t] <= prior_high:                       # need a fresh breakout close
                 t += 1; continue
             entry = price
-            flush_low = min(L[max(0, t - 3):t + 1])
-            stop = flush_low - 0.5 * a
+            base_low = min(L[max(0, t - 20):t + 1])
+            swing_low = min(L[max(0, t - 10):t + 1])
+            stop = min(swing_low, entry - 1.4 * a)       # below the breakout base
             risk = entry - stop
             if risk <= 0:
                 t += 1; continue
-            target = e2 if e2 > entry * 1.003 else entry + 1.3 * risk   # snap to the 20-EMA mean
+            # SMART, individual target: project the base's height up from the breakout (measured
+            # move) — a per-coin structural objective, NOT a fixed R multiple. Let winners run.
+            measured = prior_high - base_low
+            target = entry + max(measured, 1.5 * risk)
             rr = (target - entry) / risk
-            if rr < 0.6:
+            if rr < 1.2:
                 t += 1; continue
             f = t + 1
             for j in range(f, min(n, f + horizon + 1)):
@@ -3774,13 +3790,19 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210, btc_ctx=None, t
                 t += 1; continue
             entry = price
             flush_high = max(H[max(0, t - 3):t + 1])
-            stop = flush_high + 0.5 * a
-            risk = stop - entry
+            risk = (flush_high + 0.5 * a - entry) * 1.3      # WIDER stop (~30%): losers kept hitting target after being stopped
+            stop = entry + risk
             if risk <= 0:
                 t += 1; continue
-            target = e2 if e2 < entry * 0.997 else entry - 1.3 * risk
+            # SMART, individual target: ride the fade toward real structure below (the 20-EMA mean
+            # OR the recent swing low, whichever is further) — not a fixed R cap. Let winners run.
+            recent_low = min(L[max(0, t - 20):t])
+            struct = min(e2, recent_low) if recent_low < entry * 0.997 else e2
+            target = min(struct, entry - 1.3 * risk)
+            if target <= 0:
+                t += 1; continue
             rr = (entry - target) / risk
-            if rr < 0.6:
+            if rr < 0.8:
                 t += 1; continue
             f = t + 1
             for j in range(f, min(n, f + horizon + 1)):
@@ -3810,6 +3832,7 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=16, warmup=210, btc_ctx=None, t
                        "ts": ts,                                 # entry candle time (for the equity curve)
                        "entry": round(entry, 10), "stop": round(stop, 10),
                        "target": round(target, 10), "rsi": round(rs, 1),
+                       "kind": ("momentum" if long else "reversion"),
                        "session": _session, "btc_trend": btrend, "btc_vol": bvol,
                        "btc_align": (btrend == ("up" if long else "down")) if btrend else None,
                        "btc_state": ("BTC " + btrend) if btrend else None})
@@ -4083,34 +4106,83 @@ def backtest_board(sess, side, market, tf="4h", limit=1000, fees_bps=4.0, symbol
     return _bt_aggregate(results, syms, tf, side, fees_bps)
 
 
-def _bt_portfolio(trades, start=10000.0, notional_frac=0.10):
-    """Turn the net-R trade stream into a PORTFOLIO curve so growth is concrete: $10k start,
-    1% margin at 10× = ~10% notional per trade, so a trade's P&L in $ = net-R × (notional ×
-    stop-width%). Runs the trades in time order and reports two sizing scenarios —
-    COMPOUNDING (size off the current, growing equity) and FIXED (always size off the original
-    $10k) — plus the worst peak-to-trough equity drawdown of each. Idealised: it's a single
-    sequential stream (doesn't cap concurrent positions or model margin limits), so treat it as
-    a directional estimate of the edge's shape, not a promise."""
+def _bt_portfolio(trades, start=10000.0, min_margin=100.0, lev=10.0):
+    """Turn the net-R trade stream into a $ PORTFOLIO curve. Sizing rule (your spec): $10k start,
+    risk 1% of equity as margin BUT never less than $100 margin, always at 10× — so the minimum
+    trade is $1,000 notional (the book can hold ~100 such margin slots). A trade's P&L in $ =
+    net-R × (notional × stop-width%). Two scenarios: COMPOUNDING (margin = max(1% of the growing
+    equity, $100)) and FIXED ($100 margin every trade). We report each scenario's end equity,
+    return %, and the worst peak-to-trough drawdown in BOTH % and $. Idealised single sequential
+    stream — see 'max concurrent' for how many positions would actually be open at once."""
     seq = sorted((x for x in trades if x.get("ts") is not None and x.get("stopw") is not None),
                  key=lambda x: x["ts"])
     if not seq:
         return None
 
     def run(compound):
-        eq = start; peak = start; maxdd = 0.0
+        eq = start; peak = start; maxdd = 0.0; maxdd_abs = 0.0
         for x in seq:
             stopw = (x.get("stopw") or 0.0) / 100.0
-            base = eq if compound else start
-            eq += (x.get("r") or 0.0) * base * notional_frac * stopw
+            margin = max(0.01 * eq, min_margin) if compound else min_margin
+            notional = margin * lev
+            eq += (x.get("r") or 0.0) * notional * stopw
             if eq < 0:
                 eq = 0.0
             peak = max(peak, eq)
+            dd = peak - eq
+            if dd > maxdd_abs:
+                maxdd_abs = dd
             if peak > 0:
-                maxdd = max(maxdd, (peak - eq) / peak)
+                maxdd = max(maxdd, dd / peak)
         return {"end": round(eq), "ret_pct": round((eq / start - 1) * 100, 1),
-                "max_dd_pct": round(maxdd * 100, 1)}
-    return {"start": round(start), "n": len(seq), "notional_pct": round(notional_frac * 100),
+                "max_dd_pct": round(maxdd * 100, 1), "max_dd_abs": round(maxdd_abs)}
+    return {"start": round(start), "n": len(seq), "min_margin": round(min_margin), "lev": round(lev),
+            "min_notional": round(min_margin * lev),
             "compound": run(True), "fixed": run(False)}
+
+
+_TF_SECS = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
+
+
+def _bt_monthly(trades):
+    """Win-rate + expectancy per calendar month, so you can see WHEN the edge showed up and
+    whether it's steady or lumpy (e.g. all the short profit came from a couple of dump months)."""
+    by = {}
+    for x in trades:
+        ts = x.get("ts")
+        if not ts:
+            continue
+        import datetime as _dt
+        m = _dt.datetime.utcfromtimestamp(ts / 1000).strftime("%Y-%m")
+        by.setdefault(m, []).append(x)
+    out = []
+    for m in sorted(by):
+        a = by[m]; nn = len(a)
+        wr = round(sum(1 for x in a if x["outcome"] == "win") / nn * 100, 1)
+        ex = round(sum(x["r"] for x in a) / nn, 3)
+        out.append({"m": m, "n": nn, "winrate": wr, "exp": ex, "sumR": round(sum(x["r"] for x in a), 1)})
+    return out
+
+
+def _bt_max_concurrent(trades, tf):
+    """The most positions that would be OPEN AT ONCE if you took every signal — a reality check
+    on the portfolio sim (which runs trades sequentially). High = you'd need lots of margin slots
+    and couldn't actually take them all on a small account."""
+    secs = _TF_SECS.get(tf, 14400) * 1000
+    events = []
+    for x in trades:
+        ts = x.get("ts")
+        if not ts:
+            continue
+        end = ts + (x.get("bars") or 1) * secs
+        events.append((ts, 1)); events.append((end, -1))
+    events.sort()
+    cur = mx = 0
+    for _, d in events:
+        cur += d
+        if cur > mx:
+            mx = cur
+    return mx
 
 
 def _bt_aggregate(results, syms, tf, side, fees_bps):
@@ -4124,13 +4196,18 @@ def _bt_aggregate(results, syms, tf, side, fees_bps):
             lz = [x for x in tr if x["outcome"] == "loss"]
             _sw = [x.get("stopw") for x in tr if x.get("stopw") is not None]
             _md = [x.get("mae") for x in tr if x.get("mae") is not None]
+            _tkeys = ("ts", "r", "outcome", "rsi", "btc_trend", "btc_vol", "session",
+                      "stopw", "tppct", "mae", "entry", "stop", "target", "rr", "bars", "kind")
+            _recent = sorted(tr, key=lambda z: z.get("ts") or 0, reverse=True)[:8]
             per.append({"symbol": s, "n": m, "winrate": round(w / m * 100, 1),
                         "exp": round(sm / m, 3), "sumR": round(sm, 2),
                         # per-coin diagnostics: stops-too-tight rate + how far losers ran
                         "stp": round(sum(1 for x in lz if x.get("stop_then_tp")) / (len(lz) or 1) * 100),
                         "cmp": round(sum(1 for x in tr if x.get("cmp")) / m * 100),
                         "stopw": round(sum(_sw) / len(_sw), 2) if _sw else None,
-                        "mae": round(sum(_md) / len(_md), 2) if _md else None})
+                        "mae": round(sum(_md) / len(_md), 2) if _md else None,
+                        # this coin's most-recent trades (for the expandable row)
+                        "trades": [{k: x.get(k) for k in _tkeys} for x in _recent]})
             allt += tr
     n = len(allt)
     if not n:
@@ -4143,20 +4220,26 @@ def _bt_aggregate(results, syms, tf, side, fees_bps):
     aw = (sum(wins) / len(wins)) if wins else 0
     al = (-sum(losses) / len(losses)) if losses else 1
     breakeven = round(al / (aw + al) * 100, 1) if (aw + al) else None
-    _mae = [x.get("mae") for x in allt if x.get("mae") is not None]
     _tpp = [x.get("tppct") for x in allt if x.get("tppct") is not None]
     _wmfe = [x.get("mfe") for x in allt if x["outcome"] == "win" and x.get("mfe") is not None]
+    # Split max-drawdown-while-open by OUTCOME: winners that barely dipped = clean entries;
+    # winners that went deep underwater first = the entry could be tighter (better RR).
+    _wmae = [x.get("mae") for x in allt if x["outcome"] == "win" and x.get("mae") is not None]
+    _lmae = [x.get("mae") for x in allt if x["outcome"] == "loss" and x.get("mae") is not None]
+    _allmae = [x.get("mae") for x in allt if x.get("mae") is not None]
     return {"n": n, "winrate": round(w / n * 100, 1), "exp": round(sm / n, 3),
             "sumR": round(sm, 2), "gross_exp": round(gsm / n, 3),
             "fee_drag": round((gsm - sm) / n, 3),
             "avg_win": round(aw, 2) if wins else None,
             "avg_loss": round(-al, 2) if losses else None,
             "breakeven_wr": breakeven,
-            # avg max drawdown per trade (R), avg take-profit distance (%), and how far
-            # winners RAN past TP1 (R) — the last one shows whether a runner/ladder would pay.
-            "avg_mae": round(sum(_mae) / len(_mae), 2) if _mae else None,
+            "avg_mae": round(sum(_allmae) / len(_allmae), 2) if _allmae else None,
+            "avg_win_mae": round(sum(_wmae) / len(_wmae), 2) if _wmae else None,   # winners' avg drawdown
+            "avg_loss_mae": round(sum(_lmae) / len(_lmae), 2) if _lmae else None,
             "avg_tp_pct": round(sum(_tpp) / len(_tpp), 2) if _tpp else None,
             "avg_win_mfe": round(sum(_wmfe) / len(_wmfe), 2) if _wmfe else None,
+            "max_concurrent": _bt_max_concurrent(allt, tf),
+            "monthly": _bt_monthly(allt),
             "insights": _bt_insights(allt), "findings": _bt_findings(allt),
             "portfolio": _bt_portfolio(allt),
             "sample": _bt_sample(results, syms),
