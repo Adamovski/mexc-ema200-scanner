@@ -86,7 +86,7 @@ def send_telegram(cfg: dict, text: str) -> None:
 # logic changes meaningfully — the headline win-rate resets to the new version (a clean
 # slate for the new logic), while every past version's results are kept and shown in the
 # "site version" breakdown so you can compare how each iteration actually performed.
-APP_VERSION = "v15 · Stocks lab (Stooq daily, SPY index) + Premium/High-WR on both markets"
+APP_VERSION = "v17 · Deep market-environment: index momentum, breadth direction, monthly-regime correlation"
 # One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
 # every call (open + resolved) on the next boot and start the calls scorecard fresh —
 # auto-board trades and their version history are untouched.
@@ -4901,9 +4901,21 @@ function btSideCard(label,emoji,s){
   else if(s.avg_mae!=null){ anl+=`<div class="btidea">📉 Avg <b>max drawdown</b> before resolving: <b>-${s.avg_mae}R</b> · avg <b>TP distance</b>: <b>${s.avg_tp_pct!=null?s.avg_tp_pct+'%':'—'}</b> from entry.</div>`; }
   if(s.monthly&&s.monthly.length){
     const mm=s.monthly; const pos=mm.filter(x=>x.exp>0).length;
-    anl+=`<div class="btideah">🗓️ Win-rate by month (${pos}/${mm.length} months positive)</div>`;
-    anl+=`<div style="overflow-x:auto"><table class="bt" style="min-width:100%"><thead><tr><th>Month</th><th>Trades</th><th>Win rate</th><th>Exp</th><th>Total R</th></tr></thead><tbody>`
-      +mm.map(x=>`<tr><td style="white-space:nowrap">${x.m}</td><td>${x.n}</td><td class="${x.winrate>=50?'pf-good':'pf-bad'}">${x.winrate}%</td><td class="${x.exp>0?'pf-good':'pf-bad'}">${x.exp>0?'+':''}${x.exp}R</td><td class="${x.sumR>0?'pf-good':'pf-bad'}">${x.sumR>0?'+':''}${x.sumR}R</td></tr>`).join('')
+    // CORRELATION: does this board's monthly P&L track how bearish/bullish the market was that month?
+    const pairs=mm.filter(x=>x.idx!=null).map(x=>[x.idx,x.sumR]);
+    let corrTxt='';
+    if(pairs.length>=6){
+      const n=pairs.length, mx=pairs.reduce((a,p)=>a+p[0],0)/n, my=pairs.reduce((a,p)=>a+p[1],0)/n;
+      let sxy=0,sxx=0,syy=0; pairs.forEach(p=>{const dx=p[0]-mx,dy=p[1]-my;sxy+=dx*dy;sxx+=dx*dx;syy+=dy*dy;});
+      const r=(sxx>0&&syy>0)?sxy/Math.sqrt(sxx*syy):0;
+      const strong=Math.abs(r)>=0.5, dir=r<0;
+      corrTxt=`<div class="btidea ${strong?(dir?'btgood':'btbad'):''}">🔬 <b>Monthly P&L vs market direction:</b> correlation <b>${r.toFixed(2)}</b> — ${dir?'this board makes more when the market is <b>more bearish</b> that month':'this board makes more when the market is <b>more bullish</b>'} ${strong?'(a <b>strong</b> link — the edge is regime-driven, so gate it on market direction)':'(a weak link — this timeframe\'s edge is NOT mainly about market direction)'}.</div>`;
+    }
+    anl+=`<div class="btideah">🗓️ Win-rate by month + market environment (${pos}/${mm.length} months positive)</div>`;
+    anl+=corrTxt;
+    anl+=`<div style="overflow-x:auto"><table class="bt" style="min-width:100%"><thead><tr><th>Month</th><th>Trades</th><th>Win rate</th><th>Exp</th><th>Total R</th><th data-tip="Average alt-breadth that month (% of the basket above its 200-EMA) and how hard the market index was moving. This is the ENVIRONMENT the month played out in.">Market that month</th></tr></thead><tbody>`
+      +mm.map(x=>{const envc=(x.idx!=null)?(x.idx<=-0.5?'pf-good':(x.idx>=0.5?'pf-bad':'')):''; const env=(x.breadth!=null?x.breadth+'% breadth':'')+(x.idxlab?' · '+x.idxlab:'');
+        return `<tr><td style="white-space:nowrap">${x.m}</td><td>${x.n}</td><td class="${x.winrate>=50?'pf-good':'pf-bad'}">${x.winrate}%</td><td class="${x.exp>0?'pf-good':'pf-bad'}">${x.exp>0?'+':''}${x.exp}R</td><td class="${x.sumR>0?'pf-good':'pf-bad'}">${x.sumR>0?'+':''}${x.sumR}R</td><td class="${envc}" style="white-space:nowrap">${env||'—'}</td></tr>`;}).join('')
       +`</tbody></table></div>`;
   }
   if(finds.length){
@@ -4990,6 +5002,33 @@ function btSideCard(label,emoji,s){
         ${perfCard('Fixed max DD', '-'+f.max_dd_pct+'% ('+money(f.max_dd_abs)+')', f.max_dd_pct>=25?'pcb':'')}
         ${perfCard('Max open at once', s.max_concurrent!=null?s.max_concurrent:'—', (s.max_concurrent||0)> (Math.floor(pf.start/pf.min_margin))?'pcb':'', 'The most positions that would be open simultaneously if you took every signal. Your $'+pf.start+' holds ~'+Math.floor(pf.start/pf.min_margin)+' margin slots of $'+pf.min_margin+'. If this exceeds that, you could not actually take them all.')}
       </div>
+      ${(()=>{const series=[];
+        if(pf.risk_flat&&pf.risk_flat.curve) series.push({name:'Flat $100-risk',color:'#3fb950',pts:pf.risk_flat.curve});
+        if(pf.capped&&pf.capped.curve) series.push({name:'Capped ×'+(pf.capped.cap||5),color:'#58a6ff',pts:pf.capped.curve});
+        if(pf.compound&&pf.compound.curve) series.push({name:'Compounding',color:'#d29922',pts:pf.compound.curve});
+        if(!series.length) return '';
+        let tmin=Infinity,tmax=-Infinity,ymin=Infinity,ymax=-Infinity;
+        series.forEach(se=>se.pts.forEach(p=>{tmin=Math.min(tmin,p[0]);tmax=Math.max(tmax,p[0]);ymin=Math.min(ymin,p[1]);ymax=Math.max(ymax,p[1]);}));
+        ymin=Math.min(ymin,pf.start); if(!(ymax>ymin)) ymax=ymin+1;
+        const W=680,H=210,PL=54,PR=12,PT=26,PB=22;
+        const xs=t=>PL+(W-PL-PR)*((t-tmin)/((tmax-tmin)||1));
+        const ys=v=>PT+(H-PT-PB)*(1-((v-ymin)/((ymax-ymin)||1)));
+        const path=se=>se.pts.map((p,i)=>(i?'L':'M')+xs(p[0]).toFixed(1)+' '+ys(p[1]).toFixed(1)).join(' ');
+        const fmtM=v=>'$'+Math.round(v).toLocaleString();
+        const fmtD=t=>{const d=new Date(t);return d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0');};
+        const startY=ys(pf.start);
+        const lines=series.map(se=>`<path d="${path(se)}" fill="none" stroke="${se.color}" stroke-width="1.8" vector-effect="non-scaling-stroke"/>`).join('');
+        const legend=series.map((se,i)=>`<g transform="translate(${PL+i*175},14)"><rect width="11" height="11" y="-9" rx="2" fill="${se.color}"/><text x="16" y="0" fill="var(--dim)" font-size="11">${se.name} → ${fmtM(se.pts[se.pts.length-1][1])}</text></g>`).join('');
+        return `<div class="perfsub">📈 Portfolio size over time — same trades, three sizing rules</div>
+        <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:210px;background:var(--panel2);border:1px solid var(--line);border-radius:10px">
+          <line x1="${PL}" y1="${startY}" x2="${W-PR}" y2="${startY}" stroke="var(--line)" stroke-dasharray="3 3"/>
+          <text x="${PL-6}" y="${startY+3}" text-anchor="end" fill="var(--dim)" font-size="10">${fmtM(pf.start)}</text>
+          <text x="${PL-6}" y="${ys(ymax)+9}" text-anchor="end" fill="var(--dim)" font-size="10">${fmtM(ymax)}</text>
+          <text x="${PL+2}" y="${H-6}" fill="var(--dim)" font-size="10">${fmtD(tmin)}</text>
+          <text x="${W-PR}" y="${H-6}" text-anchor="end" fill="var(--dim)" font-size="10">${fmtD(tmax)}</text>
+          ${lines}${legend}
+        </svg>
+        <div class="histnote">Flat $100-risk (green) risks a fixed $100/trade. Capped ×5 (blue) = same but max 5 open at once. Compounding (amber) sizes by margin (1% of equity at 10×) — it risks far less per trade, so it grows slower but far smoother.</div>`;})()}
       <div class="histnote">⚠ Idealised single-stream model — trades run one after another. "Max open at once" shows how many would really overlap. Drawdown = worst peak-to-trough dip of the equity curve, in % and $. Fees ARE included.</div>`;})()}
     <div class="perfsub">Per-coin (best first) · click a coin to expand its trades · Stop % = avg stop width · MaxDD = avg drawdown · last = stops-too-tight rate</div>
     <div style="display:flex;gap:8px;align-items:center;margin:4px 0 8px;flex-wrap:wrap">

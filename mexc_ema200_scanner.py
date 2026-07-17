@@ -3761,10 +3761,24 @@ def _market_ctx(rows_by, btc_sym="BTCUSDT", lookback=20, min_syms=8):
                     btc_ret[t] = r
                 else:
                     alt_rets.setdefault(t, []).append(r)
+    # INDEX MOMENTUM — z-score the index's own lookback returns so the buckets adapt automatically to
+    # the market's volatility (works for crypto AND stocks, any timeframe). This is the "how hard is
+    # the whole market moving up or down" read the monthly discrepancies hinge on.
+    _vals = list(btc_ret.values())
+    if _vals:
+        _imean = sum(_vals) / len(_vals)
+        _istd = (sum((x - _imean) ** 2 for x in _vals) / len(_vals)) ** 0.5 or 1e-9
+    else:
+        _imean, _istd = 0.0, 1e-9
+    ordered = sorted(above.keys())
+    posn = {t: i for i, t in enumerate(ordered)}
+    bpct_by = {t: (ab / tot if tot else None) for t, (tot, ab) in above.items()}
     ctx = {}
-    for t, (tot, ab) in above.items():
+    for t in ordered:
+        tot, ab = above[t]
         if tot < min_syms:
-            ctx[t] = {"br": None, "bpct": (round(ab / tot * 100) if tot else None), "dom": None}
+            ctx[t] = {"br": None, "bpct": (round(ab / tot * 100) if tot else None),
+                      "dom": None, "im": None, "bdir": None}
             continue
         b = ab / tot
         br = "risk_on" if b >= 0.55 else ("risk_off" if b <= 0.40 else "mixed")
@@ -3774,7 +3788,19 @@ def _market_ctx(rows_by, btc_sym="BTCUSDT", lookback=20, min_syms=8):
             a_sorted = sorted(ar)
             med = a_sorted[len(a_sorted) // 2]
             dom = "alt" if med > btc_ret[t] else "btc"
-        ctx[t] = {"br": br, "bpct": round(b * 100), "dom": dom}
+        im = None
+        if t in btc_ret:
+            z = (btc_ret[t] - _imean) / _istd
+            im = ("strong_up" if z > 1.5 else "up" if z > 0.5 else
+                  "strong_down" if z < -1.5 else "down" if z < -0.5 else "flat")
+        bdir = None
+        i = posn[t]
+        if i >= 20:
+            pb = bpct_by.get(ordered[i - 20])
+            if pb is not None:
+                dlt = (b - pb) * 100
+                bdir = "rising" if dlt > 3 else "falling" if dlt < -3 else "flat"
+        ctx[t] = {"br": br, "bpct": round(b * 100), "dom": dom, "im": im, "bdir": bdir}
     return ctx
 
 
@@ -3873,6 +3899,8 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, t
         mbr = _ms.get("br") if _ms else None
         mdom = _ms.get("dom") if _ms else None
         mbpct = _ms.get("bpct") if _ms else None
+        mim = _ms.get("im") if _ms else None
+        mbdir = _ms.get("bdir") if _ms else None
         # LEARNED GATES (2yr segments): only trade when BTC is CALM and the coin itself is calm.
         if bvol == "hi":                                 # volatile BTC lost heavily on both sides
             t += 1; continue
@@ -3978,7 +4006,7 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, t
                        "session": _session, "btc_trend": btrend, "btc_vol": bvol,
                        "btc_align": (btrend == ("up" if long else "down")) if btrend else None,
                        "btc_state": ("BTC " + btrend) if btrend else None,
-                       "breadth": mbr, "dom": mdom, "bpct": mbpct})
+                       "breadth": mbr, "dom": mdom, "bpct": mbpct, "imom": mim, "bdir": mbdir})
         t = rbar + 1
     return trades
 
@@ -4028,6 +4056,8 @@ def _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, kind, long
     mbr = _ms.get("br") if _ms else None
     mdom = _ms.get("dom") if _ms else None
     mbpct = _ms.get("bpct") if _ms else None
+    mim = _ms.get("im") if _ms else None
+    mbdir = _ms.get("bdir") if _ms else None
     if long and mbr == "risk_off":          # don't buy alts when broad breadth is risk-off
         return None, None
     f = t + 1; outcome = rbar = None; mfe = 0.0; mae = 0.0
@@ -4065,7 +4095,7 @@ def _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, kind, long
           "session": _sess, "btc_trend": btrend, "btc_vol": bvol,
           "btc_align": (btrend == ("up" if long else "down")) if btrend else None,
           "btc_state": ("BTC " + btrend) if btrend else None,
-          "breadth": mbr, "dom": mdom, "bpct": mbpct}
+          "breadth": mbr, "dom": mdom, "bpct": mbpct, "imom": mim, "bdir": mbdir}
     return tr, rbar
 
 
@@ -5036,6 +5066,9 @@ def _bt_findings(trades):
         lambda x: x.get("btc_align") is True, minn=20)
     add("BTC volatility", "BTC calm", "BTC volatile", lambda x: x.get("btc_vol") == "lo", minn=20)
     add_cat("Market breadth", lambda x: x.get("breadth"))
+    add_cat("Index momentum", lambda x: x.get("imom"))
+    add("Breadth direction", "breadth rising", "breadth falling",
+        lambda x: x.get("bdir") == "rising", minn=20)
     add("Dominance", "alts leading (BTC.D falling)", "BTC leading (BTC.D rising)",
         lambda x: x.get("dom") == "alt", minn=20)
     out.sort(key=lambda f: f["gap"], reverse=True)
@@ -5079,6 +5112,22 @@ def backtest_board(sess, side, market, tf="4h", limit=1000, fees_bps=4.0, symbol
     return _bt_aggregate(results, syms, tf, side, fees_bps)
 
 
+def _pf_downsample(pairs, n=90):
+    """Downsample an equity curve [(ts_ms, eq), ...] to ~n points (keeps first & last) for a compact
+    JSON payload the frontend can plot."""
+    if not pairs:
+        return []
+    if len(pairs) <= n:
+        return [[int(t), round(e)] for t, e in pairs]
+    step = len(pairs) / float(n)
+    out = []
+    for i in range(n):
+        t, e = pairs[min(len(pairs) - 1, int(i * step))]
+        out.append([int(t), round(e)])
+    out.append([int(pairs[-1][0]), round(pairs[-1][1])])
+    return out
+
+
 def _bt_portfolio(trades, start=10000.0, min_margin=100.0, lev=10.0, risk_per_trade=100.0, tf=None, cap=5):
     """Turn the net-R trade stream into a $ PORTFOLIO curve. Sizing rule (your spec): $10k start,
     risk 1% of equity as margin BUT never less than $100 margin, always at 10× — so the minimum
@@ -5093,7 +5142,7 @@ def _bt_portfolio(trades, start=10000.0, min_margin=100.0, lev=10.0, risk_per_tr
         return None
 
     def run(compound):
-        eq = start; peak = start; maxdd = 0.0; maxdd_abs = 0.0
+        eq = start; peak = start; maxdd = 0.0; maxdd_abs = 0.0; curve = [(seq[0]["ts"], start)]
         for x in seq:
             stopw = (x.get("stopw") or 0.0) / 100.0
             margin = max(0.01 * eq, min_margin) if compound else min_margin
@@ -5101,6 +5150,7 @@ def _bt_portfolio(trades, start=10000.0, min_margin=100.0, lev=10.0, risk_per_tr
             eq += (x.get("r") or 0.0) * notional * stopw
             if eq < 0:
                 eq = 0.0
+            curve.append((x["ts"], eq))
             peak = max(peak, eq)
             dd = peak - eq
             if dd > maxdd_abs:
@@ -5108,23 +5158,26 @@ def _bt_portfolio(trades, start=10000.0, min_margin=100.0, lev=10.0, risk_per_tr
             if peak > 0:
                 maxdd = max(maxdd, dd / peak)
         return {"end": round(eq), "ret_pct": round((eq / start - 1) * 100, 1),
-                "max_dd_pct": round(maxdd * 100, 1), "max_dd_abs": round(maxdd_abs)}
+                "max_dd_pct": round(maxdd * 100, 1), "max_dd_abs": round(maxdd_abs),
+                "curve": _pf_downsample(curve)}
     def run_risk(rd):
         # FLAT RISK: risk a fixed $rd per trade (1R = $rd). Position auto-sized so a stop-out loses
         # exactly $rd regardless of stop width. $ P&L per trade = net-R x $rd. The cleanest read of
         # "risking $100 a trade" — and what makes total $ = expectancy x trades x $rd.
-        eq = start; peak = start; maxdd = 0.0; maxdd_abs = 0.0
+        eq = start; peak = start; maxdd = 0.0; maxdd_abs = 0.0; curve = [(seq[0]["ts"], start)]
         for x in seq:
             eq += (x.get("r") or 0.0) * rd
             if eq < 0:
                 eq = 0.0
+            curve.append((x["ts"], eq))
             peak = max(peak, eq); dd = peak - eq
             if dd > maxdd_abs:
                 maxdd_abs = dd
             if peak > 0:
                 maxdd = max(maxdd, dd / peak)
         return {"end": round(eq), "ret_pct": round((eq / start - 1) * 100, 1),
-                "max_dd_pct": round(maxdd * 100, 1), "max_dd_abs": round(maxdd_abs)}
+                "max_dd_pct": round(maxdd * 100, 1), "max_dd_abs": round(maxdd_abs),
+                "curve": _pf_downsample(curve)}
     def run_capped(rd, cap):
         # REALISTIC: at most `cap` positions open at once. A signal is SKIPPED when all slots are
         # full (you simply can't take it), so you don't hold 60 correlated shorts into one rally —
@@ -5132,6 +5185,7 @@ def _bt_portfolio(trades, start=10000.0, min_margin=100.0, lev=10.0, risk_per_tr
         secs = _TF_SECS.get(tf, 3600) * 1000
         eq = start; peak = start; maxdd = 0.0; maxdd_abs = 0.0; taken = 0; skipped = 0
         openpos = []  # list of exit-times of currently open trades
+        curve = [(seq[0]["ts"], start)]
         for x in seq:
             et = x.get("ts") or 0
             openpos = [o for o in openpos if o > et]        # free finished slots
@@ -5141,6 +5195,7 @@ def _bt_portfolio(trades, start=10000.0, min_margin=100.0, lev=10.0, risk_per_tr
             eq += (x.get("r") or 0.0) * rd; taken += 1
             if eq < 0:
                 eq = 0.0
+            curve.append((et, eq))
             peak = max(peak, eq); dd = peak - eq
             if dd > maxdd_abs:
                 maxdd_abs = dd
@@ -5148,7 +5203,8 @@ def _bt_portfolio(trades, start=10000.0, min_margin=100.0, lev=10.0, risk_per_tr
                 maxdd = max(maxdd, dd / peak)
         return {"end": round(eq), "ret_pct": round((eq / start - 1) * 100, 1),
                 "max_dd_pct": round(maxdd * 100, 1), "max_dd_abs": round(maxdd_abs),
-                "taken": taken, "skipped": skipped, "cap": cap}
+                "taken": taken, "skipped": skipped, "cap": cap,
+                "curve": _pf_downsample(curve)}
     return {"start": round(start), "n": len(seq), "min_margin": round(min_margin), "lev": round(lev),
             "min_notional": round(min_margin * lev), "risk_per_trade": round(risk_per_trade),
             "compound": run(True), "fixed": run(False), "risk_flat": run_risk(risk_per_trade),
@@ -5169,12 +5225,20 @@ def _bt_monthly(trades):
         import datetime as _dt
         m = _dt.datetime.utcfromtimestamp(ts / 1000).strftime("%Y-%m")
         by.setdefault(m, []).append(x)
+    _imv = {"strong_down": -2, "down": -1, "flat": 0, "up": 1, "strong_up": 2}
+    _iml = {-2: "↓↓ crashing", -1: "↓ down", 0: "→ flat", 1: "↑ up", 2: "↑↑ ripping"}
     out = []
     for m in sorted(by):
         a = by[m]; nn = len(a)
         wr = round(sum(1 for x in a if x["outcome"] == "win") / nn * 100, 1)
         ex = round(sum(x["r"] for x in a) / nn, 3)
-        out.append({"m": m, "n": nn, "winrate": wr, "exp": ex, "sumR": round(sum(x["r"] for x in a), 1)})
+        _bp = [x.get("bpct") for x in a if x.get("bpct") is not None]
+        _iz = [_imv.get(x.get("imom")) for x in a if x.get("imom") in _imv]
+        breadth = round(sum(_bp) / len(_bp)) if _bp else None
+        idxz = (sum(_iz) / len(_iz)) if _iz else None
+        idxlab = _iml.get(round(idxz)) if idxz is not None else None
+        out.append({"m": m, "n": nn, "winrate": wr, "exp": ex, "sumR": round(sum(x["r"] for x in a), 1),
+                    "breadth": breadth, "idx": (round(idxz, 2) if idxz is not None else None), "idxlab": idxlab})
     return out
 
 
