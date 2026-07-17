@@ -85,7 +85,7 @@ def send_telegram(cfg: dict, text: str) -> None:
 # logic changes meaningfully — the headline win-rate resets to the new version (a clean
 # slate for the new logic), while every past version's results are kept and shown in the
 # "site version" breakdown so you can compare how each iteration actually performed.
-APP_VERSION = "v11 · +High-win-rate & 20-EMA-pullback strategies (9 strategies, regime-gated)"
+APP_VERSION = "v12 · High-win-rate only · ~4yr backtest · flat $100-risk P&L"
 # One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
 # every call (open + resolved) on the next boot and start the calls scorecard fresh —
 # auto-board trades and their version history are untouched.
@@ -1543,21 +1543,18 @@ def backtest_loop(state: State) -> None:
     # STRATEGY LAB — sweep several DIFFERENT strategies head-to-head so we can compare edges in
     # their own tabs instead of overwriting one strategy forever. Run on a liquid basket (~60
     # coins) so it actually completes on the free tier; the meaningful TFs only.
-    strategies = [("revert", "200-EMA reversion"), ("supertrend", "Supertrend pullback"),
-                  ("cpr", "Narrow CPR"), ("mix", "Mix — all 3 confluence"),
-                  ("ema200pb", "200-EMA pullback"), ("goldencross", "Golden/Death cross"),
-                  ("highwr", "High win-rate ☑"), ("pullback20", "20-EMA pullback")]
+    strategies = [("highwr", "High win-rate ☑")]     # focused: the high-win-rate strategy only
     lab_tfs = ("1h", "4h", "1d")
-    lab_limit = {"1h": 6000, "4h": 4380, "1d": 730}
-    monday_syms = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
-    strat_meta = [{"key": k, "name": nm} for k, nm in strategies] + [{"key": "monday", "name": "BTC Monday-range"}]
+    # 4-YEAR history where practical: daily & 4h reach ~4y; 1h capped (~1.4y) to fit free-tier memory.
+    lab_limit = {"1h": 12000, "4h": 8760, "1d": 1460}
+    strat_meta = [{"key": k, "name": nm} for k, nm in strategies]
     while True:
         try:
             sess = get_session()
             basket = list(BACKTEST_BASKET)           # ~60 liquid majors/mid-caps — fast + representative
             t0 = time.time()
             lab = {}
-            total = len(strategies) + 1
+            total = len(strategies)
             for si, (skey, sname) in enumerate(strategies):
                 sdata = {}
                 for tf in lab_tfs:
@@ -1570,16 +1567,9 @@ def backtest_loop(state: State) -> None:
                                            "fees_bps": 5.0, "coins": len(basket), "lab": dict(lab),
                                            "strategies": strat_meta,
                                            "progress": {"done": si, "total": total, "last": f"{sname} · {tf}"}}
-            # BTC Monday-range — the weekly opening range, majors only.
-            mon = {}
-            for tf in ("4h", "1d"):
-                part = backtest_all(sess, market, tfs=(tf,), limit=lab_limit.get(tf, 2000),
-                                    fees_bps=5.0, symbols=monday_syms, strategy="monday")
-                mon.update(part)
             with state.lock:
                 if state.backtests and "lab" in state.backtests:
-                    state.backtests["lab"]["monday"] = mon
-                    state.backtests["progress"] = {"done": total, "total": total, "last": "BTC Monday-range"}
+                    state.backtests["progress"] = {"done": total, "total": total, "last": "High win-rate ☑"}
         except Exception as e:
             with state.lock:
                 if not state.backtests:
@@ -4970,7 +4960,14 @@ function btSideCard(label,emoji,s){
     </div>
     <div class="btanalysis">${anl}</div>
     ${(()=>{const pf=s.portfolio; if(!pf) return ''; const c=pf.compound,f=pf.fixed; const money=v=>'$'+Math.round(v).toLocaleString();
-      return `<div class="perfsub">💰 Portfolio sim — ${money(pf.start)} start · risk 1% of equity as margin but <b>min ${money(pf.min_margin)}</b> at ${pf.lev}× (<b>min ${money(pf.min_notional)}</b> trade) · ${pf.n} trades · net of fees</div>
+      return `${pf.risk_flat?`<div class="perfsub">💵 Flat risk — <b>${money(pf.risk_per_trade)} risked per trade</b> (1R = ${money(pf.risk_per_trade)}; position auto-sized so a stop-out loses exactly ${money(pf.risk_per_trade)}). $ P&L = expectancy × ${pf.n} trades × ${money(pf.risk_per_trade)}.</div>
+      <div class="perfcards">
+        ${perfCard('Flat-risk → end', money(pf.risk_flat.end), pf.risk_flat.end>=pf.start?'pcg':'pcb', 'Start '+money(pf.start)+', add net-R×'+money(pf.risk_per_trade)+' each trade. This is the "risking $100 a trade" model.')}
+        ${perfCard('Flat-risk return', (pf.risk_flat.ret_pct>0?'+':'')+pf.risk_flat.ret_pct+'%', pf.risk_flat.ret_pct>0?'pcg':'pcb')}
+        ${perfCard('Flat-risk profit', (pf.risk_flat.end-pf.start>=0?'+':'')+money(pf.risk_flat.end-pf.start), pf.risk_flat.end>=pf.start?'pcg':'pcb', 'Total $ profit at '+money(pf.risk_per_trade)+' risk/trade = net total-R × '+money(pf.risk_per_trade)+'.')}
+        ${perfCard('Flat-risk max DD', '-'+pf.risk_flat.max_dd_pct+'% ('+money(pf.risk_flat.max_dd_abs)+')', pf.risk_flat.max_dd_pct>=25?'pcb':'', 'Deepest peak-to-trough dip of the flat-risk equity curve.')}
+      </div>`:''}
+      <div class="perfsub">💰 Portfolio sim — ${money(pf.start)} start · risk 1% of equity as margin but <b>min ${money(pf.min_margin)}</b> at ${pf.lev}× (<b>min ${money(pf.min_notional)}</b> trade) · ${pf.n} trades · net of fees</div>
       <div class="perfcards">
         ${perfCard('Compounding → end', money(c.end), c.end>=pf.start?'pcg':'pcb', 'Margin each trade = max(1% of the CURRENT growing equity, $'+pf.min_margin+'), at '+pf.lev+'×. Winners get re-invested → exponential.')}
         ${perfCard('Compounding return', (c.ret_pct>0?'+':'')+c.ret_pct+'%', c.ret_pct>0?'pcg':'pcb')}
@@ -5022,7 +5019,7 @@ function renderBacktest(){
     mix:'Confluence: only trade when the 200-EMA trend, the Supertrend, AND the pivot all agree.',
     ema200pb:'Simplest trend trade: buy the pullback that tags a rising 200-EMA / short the rip that tags a falling 200-EMA. Wide stop (~1.8×ATR beyond the line) — only wrong on a decisive close through the mean.',
     goldencross:'Golden Cross (50-EMA crosses ABOVE 200-EMA) = go long / Death Cross (50 below 200) = go short. Classic long-term trend flip, wide stop, ~3R target, run across every timeframe.',
-    highwr:'⭐ Built for WIN-RATE: trend-aligned + regime-gated + calm-only oversold/overbought snap, NEAR take-profit (banked often) + WIDE stop (rarely hit). R:R is <1 by design (~0.65, breakeven ≈61%) — the goal is a high hit-rate. Check expectancy too: high WR only pays if it clears breakeven.',
+    highwr:'⭐ Built for WIN-RATE: trend-aligned + regime-gated + calm-only oversold/overbought snap, NEAR take-profit (banked often) + WIDE stop (rarely hit), R:R ~0.65–0.8 so a 60%+ hit-rate turns a profit. Now the ONLY strategy in the lab, over a DEEP history (daily & 4h ≈ 4 years, 1h ≈ 1.4y). Shorts win in risk-off (bear breadth); longs need risk-on.',
     pullback20:'High win-rate trend-continuation: buy the shallow pullback that tags & reclaims the fast 20-EMA in an uptrend (mirror for shorts). Near target, moderately wide stop. The fast mean reclaims often, so it tends to win frequently.',
     monday:'BTC/majors: fade the weekly Monday opening range — hold the Monday low (long) or reject the Monday high (short).'};
   let sel=`<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">`+

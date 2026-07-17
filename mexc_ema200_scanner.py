@@ -4834,7 +4834,7 @@ def backtest_board(sess, side, market, tf="4h", limit=1000, fees_bps=4.0, symbol
     return _bt_aggregate(results, syms, tf, side, fees_bps)
 
 
-def _bt_portfolio(trades, start=10000.0, min_margin=100.0, lev=10.0):
+def _bt_portfolio(trades, start=10000.0, min_margin=100.0, lev=10.0, risk_per_trade=100.0):
     """Turn the net-R trade stream into a $ PORTFOLIO curve. Sizing rule (your spec): $10k start,
     risk 1% of equity as margin BUT never less than $100 margin, always at 10× — so the minimum
     trade is $1,000 notional (the book can hold ~100 such margin slots). A trade's P&L in $ =
@@ -4864,9 +4864,25 @@ def _bt_portfolio(trades, start=10000.0, min_margin=100.0, lev=10.0):
                 maxdd = max(maxdd, dd / peak)
         return {"end": round(eq), "ret_pct": round((eq / start - 1) * 100, 1),
                 "max_dd_pct": round(maxdd * 100, 1), "max_dd_abs": round(maxdd_abs)}
+    def run_risk(rd):
+        # FLAT RISK: risk a fixed $rd per trade (1R = $rd). Position auto-sized so a stop-out loses
+        # exactly $rd regardless of stop width. $ P&L per trade = net-R x $rd. The cleanest read of
+        # "risking $100 a trade" — and what makes total $ = expectancy x trades x $rd.
+        eq = start; peak = start; maxdd = 0.0; maxdd_abs = 0.0
+        for x in seq:
+            eq += (x.get("r") or 0.0) * rd
+            if eq < 0:
+                eq = 0.0
+            peak = max(peak, eq); dd = peak - eq
+            if dd > maxdd_abs:
+                maxdd_abs = dd
+            if peak > 0:
+                maxdd = max(maxdd, dd / peak)
+        return {"end": round(eq), "ret_pct": round((eq / start - 1) * 100, 1),
+                "max_dd_pct": round(maxdd * 100, 1), "max_dd_abs": round(maxdd_abs)}
     return {"start": round(start), "n": len(seq), "min_margin": round(min_margin), "lev": round(lev),
-            "min_notional": round(min_margin * lev),
-            "compound": run(True), "fixed": run(False)}
+            "min_notional": round(min_margin * lev), "risk_per_trade": round(risk_per_trade),
+            "compound": run(True), "fixed": run(False), "risk_flat": run_risk(risk_per_trade)}
 
 
 _TF_SECS = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
