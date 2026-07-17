@@ -85,7 +85,7 @@ def send_telegram(cfg: dict, text: str) -> None:
 # logic changes meaningfully — the headline win-rate resets to the new version (a clean
 # slate for the new logic), while every past version's results are kept and shown in the
 # "site version" breakdown so you can compare how each iteration actually performed.
-APP_VERSION = "v9 · Market-regime gating — longs limited to risk-on breadth (BTC.D-aware)"
+APP_VERSION = "v10 · +200-EMA pullback & Golden/Death-cross strategies (regime-gated, multi-TF)"
 # One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
 # every call (open + resolved) on the next boot and start the calls scorecard fresh —
 # auto-board trades and their version history are untouched.
@@ -1544,7 +1544,8 @@ def backtest_loop(state: State) -> None:
     # their own tabs instead of overwriting one strategy forever. Run on a liquid basket (~60
     # coins) so it actually completes on the free tier; the meaningful TFs only.
     strategies = [("revert", "200-EMA reversion"), ("supertrend", "Supertrend pullback"),
-                  ("cpr", "Narrow CPR"), ("mix", "Mix — all 3 confluence")]
+                  ("cpr", "Narrow CPR"), ("mix", "Mix — all 3 confluence"),
+                  ("ema200pb", "200-EMA pullback"), ("goldencross", "Golden/Death cross")]
     lab_tfs = ("1h", "4h", "1d")
     lab_limit = {"1h": 6000, "4h": 4380, "1d": 730}
     monday_syms = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
@@ -5018,6 +5019,8 @@ function renderBacktest(){
     supertrend:'Trend-follow: buy the pullback to a rising Supertrend line / sell the pop to a falling one.',
     cpr:'Trade reactions at the rolling Central Pivot Range (pivot / BC / TC).',
     mix:'Confluence: only trade when the 200-EMA trend, the Supertrend, AND the pivot all agree.',
+    ema200pb:'Simplest trend trade: buy the pullback that tags a rising 200-EMA / short the rip that tags a falling 200-EMA. Wide stop (~1.8×ATR beyond the line) — only wrong on a decisive close through the mean.',
+    goldencross:'Golden Cross (50-EMA crosses ABOVE 200-EMA) = go long / Death Cross (50 below 200) = go short. Classic long-term trend flip, wide stop, ~3R target, run across every timeframe.',
     monday:'BTC/majors: fade the weekly Monday opening range — hold the Monday low (long) or reject the Monday high (short).'};
   let sel=`<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">`+
     strats.map(s=>{const on=s.key===labStrat; const has=lab[s.key]; return `<button onclick="setLabStrat('${s.key}')" style="cursor:pointer;border-radius:8px;padding:7px 12px;font-size:12.5px;font-weight:600;border:1px solid ${on?'var(--accent)':'var(--line)'};background:${on?'rgba(63,185,80,.12)':'var(--panel2)'};color:${on?'var(--txt)':'var(--dim)'}">${esc(s.name)}${has?'':' ⏳'}</button>`;}).join('')+`</div>`;

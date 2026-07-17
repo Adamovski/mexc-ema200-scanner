@@ -4236,6 +4236,152 @@ def _bt_btc_monday(rows, side, fees_bps=5.0, horizon=42, warmup=60, btc_ctx=None
     return out
 
 
+def _bt_ema200pb(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None):
+    """200-EMA PULLBACK / RIP — the simplest trend trade, with a DELIBERATELY WIDE stop.
+    LONG: in an uptrend (price above a RISING 200-EMA) buy the pullback that tags the 200-EMA
+    (a wick into it) and closes back above it — the classic 'buy the dip to the mean in an
+    uptrend'. SHORT: in a downtrend (price below a FALLING 200-EMA) sell the rip that tags the
+    200-EMA from below (uses it as resistance) and closes back under it. The stop sits WIDE —
+    ~1.8x ATR beyond the EMA — so a normal wick through the line does not knock you out; the
+    trade is only wrong if price CLOSES decisively through the mean. Target a measured 2R move
+    (capped ~3R). No look-ahead; stop-first on ties; net of fees; regime-tagged/gated via _bt_sim."""
+    try:
+        H = [float(x[2]) for x in rows]
+        L = [float(x[3]) for x in rows]
+        C = [float(x[4]) for x in rows]
+        V = [float(x[5]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return []
+    n = len(C)
+    if n < warmup + horizon + 5:
+        return []
+    e200 = ema(C, 200)
+    long = side == "long"
+    fee_frac = fees_bps / 10000.0
+    _dv = sorted(C[i] * V[i] for i in range(n))
+    dvol = _dv[len(_dv) // 2] if _dv else 0.0
+    out = []
+    t = warmup
+    while t < n - horizon - 1:
+        el = e200[t]
+        if el is None:
+            t += 1; continue
+        prev = e200[t - 20] if t >= 20 else None
+        a = atr(H[max(0, t - 20):t + 1], L[max(0, t - 20):t + 1], C[max(0, t - 20):t + 1])
+        if not a or a <= 0:
+            t += 1; continue
+        price = C[t]
+        entry = stop = target = None
+        if long:
+            slope_up = (prev is None) or (el > prev)
+            if not (price > el and slope_up):                     # uptrend only
+                t += 1; continue
+            tagged = min(L[max(0, t - 3):t + 1]) <= max(el + 0.60 * a, el * 1.012)  # pullback reached the mean band
+            if not tagged:
+                t += 1; continue
+            if not (C[t] > el and C[t] > C[t - 1]):               # closes back above, turning up
+                t += 1; continue
+            entry = price
+            stop = min(el, price) - 1.8 * a                        # WIDE, below the EMA
+            risk = entry - stop
+            if risk <= 0:
+                t += 1; continue
+            prior_high = max(H[max(0, t - 20):t])
+            target = min(max(prior_high, entry + 2.0 * risk), entry + 3.0 * risk)
+        else:
+            slope_dn = (prev is None) or (el < prev)
+            if not (price < el and slope_dn):                     # downtrend only
+                t += 1; continue
+            tagged = max(H[max(0, t - 3):t + 1]) >= min(el - 0.60 * a, el * 0.988)  # rip reached the mean band
+            if not tagged:
+                t += 1; continue
+            if not (C[t] < el and C[t] < C[t - 1]):               # closes back below, turning down
+                t += 1; continue
+            entry = price
+            stop = max(el, price) + 1.8 * a                        # WIDE, above the EMA
+            risk = stop - entry
+            if risk <= 0:
+                t += 1; continue
+            prior_low = min(L[max(0, t - 20):t])
+            target = max(min(prior_low, entry - 2.0 * risk), entry - 3.0 * risk)
+        if abs(target - entry) / entry < 0.002:
+            t += 1; continue
+        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx,
+                           "ema200pb", long, t, entry, stop, target, a, mkt_ctx=mkt_ctx)
+        if tr is None:
+            t += 1; continue
+        out.append(tr); t = rbar + 1
+    return out
+
+
+def _bt_goldencross(rows, side, fees_bps=5.0, horizon=60, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None):
+    """GOLDEN / DEATH CROSS — the classic long-term trend flip. A Golden Cross = the faster 50-EMA
+    crossing ABOVE the slow 200-EMA (long-term uptrend begins); a Death Cross = 50-EMA crossing
+    BELOW the 200-EMA (downtrend begins). LONG on a fresh Golden Cross, SHORT on a fresh Death
+    Cross — entered at the close of the cross bar. Because it's a slow, structural signal it uses a
+    LONGER horizon and a WIDE stop (below/above the 200-EMA by ~2x ATR, or the recent swing) and a
+    larger measured target (~3R), riding the new trend. Trades are rarer per coin but add up across
+    the basket and timeframes. No look-ahead; stop-first on ties; net of fees; regime-tagged."""
+    try:
+        H = [float(x[2]) for x in rows]
+        L = [float(x[3]) for x in rows]
+        C = [float(x[4]) for x in rows]
+        V = [float(x[5]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return []
+    n = len(C)
+    if n < warmup + horizon + 5:
+        return []
+    e50 = ema(C, 50)
+    e200 = ema(C, 200)
+    long = side == "long"
+    fee_frac = fees_bps / 10000.0
+    _dv = sorted(C[i] * V[i] for i in range(n))
+    dvol = _dv[len(_dv) // 2] if _dv else 0.0
+    out = []
+    t = warmup
+    while t < n - horizon - 1:
+        ef, es = e50[t], e200[t]
+        efp, esp = e50[t - 1], e200[t - 1]
+        if None in (ef, es, efp, esp):
+            t += 1; continue
+        a = atr(H[max(0, t - 20):t + 1], L[max(0, t - 20):t + 1], C[max(0, t - 20):t + 1])
+        if not a or a <= 0:
+            t += 1; continue
+        price = C[t]
+        golden = efp <= esp and ef > es          # fresh 50>200 cross this bar
+        death = efp >= esp and ef < es           # fresh 50<200 cross this bar
+        entry = stop = target = None
+        if long:
+            if not golden:
+                t += 1; continue
+            entry = price
+            swing_low = min(L[max(0, t - 20):t + 1])
+            stop = min(swing_low, es - 2.0 * a)   # WIDE — below the 200-EMA / recent swing
+            risk = entry - stop
+            if risk <= 0:
+                t += 1; continue
+            target = entry + 3.0 * risk            # ride the new uptrend (~3R)
+        else:
+            if not death:
+                t += 1; continue
+            entry = price
+            swing_high = max(H[max(0, t - 20):t + 1])
+            stop = max(swing_high, es + 2.0 * a)
+            risk = stop - entry
+            if risk <= 0:
+                t += 1; continue
+            target = entry - 3.0 * risk
+        if abs(target - entry) / entry < 0.002:
+            t += 1; continue
+        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx,
+                           "goldencross", long, t, entry, stop, target, a, mkt_ctx=mkt_ctx)
+        if tr is None:
+            t += 1; continue
+        out.append(tr); t = rbar + 1
+    return out
+
+
 def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="level", btc_ctx=None, tf="4h", mkt_ctx=None):
     """Replay a strategy's entry/stop/target MECHANICS over one coin's historical candles and
     return a list of resolved trades (net R after fees). WITHOUT look-ahead: every decision at
@@ -4256,6 +4402,10 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="
         return _bt_cpr(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy == "mix":
         return _bt_mix(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
+    if strategy == "ema200pb":
+        return _bt_ema200pb(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
+    if strategy == "goldencross":
+        return _bt_goldencross(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy == "monday":
         return _bt_btc_monday(rows, side, fees_bps=fees_bps, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     try:
