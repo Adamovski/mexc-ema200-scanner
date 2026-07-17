@@ -4549,6 +4549,86 @@ def _bt_pullback20(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=Non
     return out
 
 
+def _bt_bullmom(rows, side, fees_bps=5.0, horizon=36, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None):
+    """BULL MOMENTUM — the hunt for a LONG edge in a genuine bull market (and its bear mirror). In
+    crypto, buying STRENGTH beats buying dips, so this only fires when the WHOLE market is risk-on:
+    LONG requires broad breadth >= 60% (most alts already above their 200-EMA), BTC in an uptrend,
+    the coin above a rising 200-EMA, strong-but-not-blown-off momentum (RSI 55-72), and a FRESH
+    breakout above the prior 20-bar high. It then RIDES (~2.5R target) rather than scalping. SHORT
+    mirrors it for a broad risk-off breakdown (breadth <= 40%, BTC down, fresh 20-bar low). Stop
+    below the breakout base (~1.5x ATR). No look-ahead; net of fees; regime-tagged via _bt_sim."""
+    try:
+        H = [float(x[2]) for x in rows]; L = [float(x[3]) for x in rows]
+        C = [float(x[4]) for x in rows]; V = [float(x[5]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return []
+    n = len(C)
+    if n < warmup + horizon + 5:
+        return []
+    e200 = ema(C, 200); rsis = rsi_series(C)
+    long = side == "long"; fee_frac = fees_bps / 10000.0
+    _dv = sorted(C[i] * V[i] for i in range(n)); dvol = _dv[len(_dv) // 2] if _dv else 0.0
+    out = []; t = warmup
+    while t < n - horizon - 1:
+        el = e200[t]; rs = rsis[t]
+        if el is None or rs is None:
+            t += 1; continue
+        a = atr(H[max(0, t - 20):t + 1], L[max(0, t - 20):t + 1], C[max(0, t - 20):t + 1])
+        if not a or a <= 0:
+            t += 1; continue
+        prev = e200[t - 20] if t >= 20 else None
+        ts = int(rows[t][0]) if rows[t] else 0
+        _bs = btc_ctx.get(ts) if btc_ctx else None
+        btrend = _bs.get("t") if _bs else None
+        _ms = mkt_ctx.get(ts) if mkt_ctx else None
+        mbpct = _ms.get("bpct") if _ms else None
+        price = C[t]; entry = stop = target = None
+        if long:
+            if not (price > el and (prev is None or el > prev)):
+                t += 1; continue
+            if mbpct is None or mbpct < 60:                 # STRONG bull breadth only
+                t += 1; continue
+            if btrend and btrend != "up":                   # BTC uptrend
+                t += 1; continue
+            if not (55 <= rs <= 85):     # momentum: ride strength (RSI stays high in a real trend)
+                t += 1; continue
+            prior_high = max(H[max(0, t - 20):t])
+            if C[t] <= prior_high:                          # fresh breakout close
+                t += 1; continue
+            entry = price
+            stop = min(min(L[max(0, t - 10):t + 1]), entry - 1.5 * a)
+            risk = entry - stop
+            if risk <= 0:
+                t += 1; continue
+            target = entry + 2.5 * risk                     # ride the trend
+        else:
+            if not (price < el and (prev is None or el < prev)):
+                t += 1; continue
+            if mbpct is None or mbpct > 40:                 # broad risk-off only
+                t += 1; continue
+            if btrend and btrend != "down":
+                t += 1; continue
+            if not (15 <= rs <= 45):     # momentum breakdown: weakness stays low
+                t += 1; continue
+            prior_low = min(L[max(0, t - 20):t])
+            if C[t] >= prior_low:                           # fresh breakdown close
+                t += 1; continue
+            entry = price
+            stop = max(max(H[max(0, t - 10):t + 1]), entry + 1.5 * a)
+            risk = stop - entry
+            if risk <= 0:
+                t += 1; continue
+            target = entry - 2.5 * risk
+        if target is None or abs(target - entry) / entry < 0.002:
+            t += 1; continue
+        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx,
+                           "bullmom", long, t, entry, stop, target, a, rs=rs, mkt_ctx=mkt_ctx)
+        if tr is None:
+            t += 1; continue
+        out.append(tr); t = rbar + 1
+    return out
+
+
 def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="level", btc_ctx=None, tf="4h", mkt_ctx=None):
     """Replay a strategy's entry/stop/target MECHANICS over one coin's historical candles and
     return a list of resolved trades (net R after fees). WITHOUT look-ahead: every decision at
@@ -4577,6 +4657,8 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="
         return _bt_highwr(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy == "pullback20":
         return _bt_pullback20(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
+    if strategy == "bullmom":
+        return _bt_bullmom(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy == "monday":
         return _bt_btc_monday(rows, side, fees_bps=fees_bps, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     try:
@@ -4834,7 +4916,7 @@ def backtest_board(sess, side, market, tf="4h", limit=1000, fees_bps=4.0, symbol
     return _bt_aggregate(results, syms, tf, side, fees_bps)
 
 
-def _bt_portfolio(trades, start=10000.0, min_margin=100.0, lev=10.0, risk_per_trade=100.0):
+def _bt_portfolio(trades, start=10000.0, min_margin=100.0, lev=10.0, risk_per_trade=100.0, tf=None, cap=5):
     """Turn the net-R trade stream into a $ PORTFOLIO curve. Sizing rule (your spec): $10k start,
     risk 1% of equity as margin BUT never less than $100 margin, always at 10× — so the minimum
     trade is $1,000 notional (the book can hold ~100 such margin slots). A trade's P&L in $ =
@@ -4880,9 +4962,34 @@ def _bt_portfolio(trades, start=10000.0, min_margin=100.0, lev=10.0, risk_per_tr
                 maxdd = max(maxdd, dd / peak)
         return {"end": round(eq), "ret_pct": round((eq / start - 1) * 100, 1),
                 "max_dd_pct": round(maxdd * 100, 1), "max_dd_abs": round(maxdd_abs)}
+    def run_capped(rd, cap):
+        # REALISTIC: at most `cap` positions open at once. A signal is SKIPPED when all slots are
+        # full (you simply can't take it), so you don't hold 60 correlated shorts into one rally —
+        # which is what blows up the drawdown. Exit time is estimated from bars-held x the TF.
+        secs = _TF_SECS.get(tf, 3600) * 1000
+        eq = start; peak = start; maxdd = 0.0; maxdd_abs = 0.0; taken = 0; skipped = 0
+        openpos = []  # list of exit-times of currently open trades
+        for x in seq:
+            et = x.get("ts") or 0
+            openpos = [o for o in openpos if o > et]        # free finished slots
+            if len(openpos) >= cap:
+                skipped += 1; continue
+            openpos.append(et + max(1, (x.get("bars") or 1)) * secs)
+            eq += (x.get("r") or 0.0) * rd; taken += 1
+            if eq < 0:
+                eq = 0.0
+            peak = max(peak, eq); dd = peak - eq
+            if dd > maxdd_abs:
+                maxdd_abs = dd
+            if peak > 0:
+                maxdd = max(maxdd, dd / peak)
+        return {"end": round(eq), "ret_pct": round((eq / start - 1) * 100, 1),
+                "max_dd_pct": round(maxdd * 100, 1), "max_dd_abs": round(maxdd_abs),
+                "taken": taken, "skipped": skipped, "cap": cap}
     return {"start": round(start), "n": len(seq), "min_margin": round(min_margin), "lev": round(lev),
             "min_notional": round(min_margin * lev), "risk_per_trade": round(risk_per_trade),
-            "compound": run(True), "fixed": run(False), "risk_flat": run_risk(risk_per_trade)}
+            "compound": run(True), "fixed": run(False), "risk_flat": run_risk(risk_per_trade),
+            "capped": run_capped(risk_per_trade, cap)}
 
 
 _TF_SECS = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
@@ -4986,7 +5093,7 @@ def _bt_aggregate(results, syms, tf, side, fees_bps):
             "monthly": _bt_monthly(allt),
             "insights": _bt_insights(allt), "findings": _bt_findings(allt),
             "by_breadth": _bt_by_breadth(allt),
-            "portfolio": _bt_portfolio(allt),
+            "portfolio": _bt_portfolio(allt, tf=tf),
             "sample": _bt_sample(results, syms),
             "per_symbol": sorted(per, key=lambda p: p["exp"], reverse=True),
             "tf": tf, "fees_bps": fees_bps, "side": side, "coins": len(per)}

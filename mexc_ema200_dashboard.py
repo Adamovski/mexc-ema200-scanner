@@ -85,7 +85,7 @@ def send_telegram(cfg: dict, text: str) -> None:
 # logic changes meaningfully — the headline win-rate resets to the new version (a clean
 # slate for the new logic), while every past version's results are kept and shown in the
 # "site version" breakdown so you can compare how each iteration actually performed.
-APP_VERSION = "v12 · High-win-rate only · ~4yr backtest · flat $100-risk P&L"
+APP_VERSION = "v13 · +Bull-momentum long hunt · capped-concurrency drawdown"
 # One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
 # every call (open + resolved) on the next boot and start the calls scorecard fresh —
 # auto-board trades and their version history are untouched.
@@ -1543,7 +1543,7 @@ def backtest_loop(state: State) -> None:
     # STRATEGY LAB — sweep several DIFFERENT strategies head-to-head so we can compare edges in
     # their own tabs instead of overwriting one strategy forever. Run on a liquid basket (~60
     # coins) so it actually completes on the free tier; the meaningful TFs only.
-    strategies = [("highwr", "High win-rate ☑")]     # focused: the high-win-rate strategy only
+    strategies = [("highwr", "High win-rate ☑"), ("bullmom", "Bull momentum ↗")]  # WR short + bull-market long hunt
     lab_tfs = ("1h", "4h", "1d")
     # 4-YEAR history where practical: daily & 4h reach ~4y; 1h capped (~1.4y) to fit free-tier memory.
     lab_limit = {"1h": 12000, "4h": 8760, "1d": 1460}
@@ -4965,8 +4965,15 @@ function btSideCard(label,emoji,s){
         ${perfCard('Flat-risk → end', money(pf.risk_flat.end), pf.risk_flat.end>=pf.start?'pcg':'pcb', 'Start '+money(pf.start)+', add net-R×'+money(pf.risk_per_trade)+' each trade. This is the "risking $100 a trade" model.')}
         ${perfCard('Flat-risk return', (pf.risk_flat.ret_pct>0?'+':'')+pf.risk_flat.ret_pct+'%', pf.risk_flat.ret_pct>0?'pcg':'pcb')}
         ${perfCard('Flat-risk profit', (pf.risk_flat.end-pf.start>=0?'+':'')+money(pf.risk_flat.end-pf.start), pf.risk_flat.end>=pf.start?'pcg':'pcb', 'Total $ profit at '+money(pf.risk_per_trade)+' risk/trade = net total-R × '+money(pf.risk_per_trade)+'.')}
-        ${perfCard('Flat-risk max DD', '-'+pf.risk_flat.max_dd_pct+'% ('+money(pf.risk_flat.max_dd_abs)+')', pf.risk_flat.max_dd_pct>=25?'pcb':'', 'Deepest peak-to-trough dip of the flat-risk equity curve.')}
-      </div>`:''}
+        ${perfCard('Flat-risk max DD', '-'+pf.risk_flat.max_dd_pct+'% ('+money(pf.risk_flat.max_dd_abs)+')', pf.risk_flat.max_dd_pct>=25?'pcb':'', 'Deepest peak-to-trough dip of the flat-risk equity curve — taking EVERY signal.')}
+      </div>
+      ${pf.capped?`<div class="perfsub">🧯 Capped concurrency — same $${pf.risk_per_trade}/trade but <b>max ${pf.capped.cap} positions open at once</b> (skip a signal when full). This is the realistic, tradeable version — it stops you piling into 60 correlated trades at once, which is what causes the huge drawdown.</div>
+      <div class="perfcards">
+        ${perfCard('Capped → end', money(pf.capped.end), pf.capped.end>=pf.start?'pcg':'pcb', 'Max '+pf.capped.cap+' concurrent positions, $'+pf.risk_per_trade+' risk each.')}
+        ${perfCard('Capped return', (pf.capped.ret_pct>0?'+':'')+pf.capped.ret_pct+'%', pf.capped.ret_pct>0?'pcg':'pcb')}
+        ${perfCard('Capped max DD', '-'+pf.capped.max_dd_pct+'% ('+money(pf.capped.max_dd_abs)+')', pf.capped.max_dd_pct>=25?'pcb':'pcg', 'Deepest dip when you cap at '+pf.capped.cap+' open positions — compare to the flat-risk DD above; this is the number that matters for surviving it.')}
+        ${perfCard('Signals taken', pf.capped.taken+' / '+(pf.capped.taken+pf.capped.skipped), '', 'How many signals you actually took vs skipped because all '+pf.capped.cap+' slots were full. A high skip rate means the edge clusters — you only need a few slots.')}
+      </div>`:''}`:''}
       <div class="perfsub">💰 Portfolio sim — ${money(pf.start)} start · risk 1% of equity as margin but <b>min ${money(pf.min_margin)}</b> at ${pf.lev}× (<b>min ${money(pf.min_notional)}</b> trade) · ${pf.n} trades · net of fees</div>
       <div class="perfcards">
         ${perfCard('Compounding → end', money(c.end), c.end>=pf.start?'pcg':'pcb', 'Margin each trade = max(1% of the CURRENT growing equity, $'+pf.min_margin+'), at '+pf.lev+'×. Winners get re-invested → exponential.')}
@@ -5021,6 +5028,7 @@ function renderBacktest(){
     goldencross:'Golden Cross (50-EMA crosses ABOVE 200-EMA) = go long / Death Cross (50 below 200) = go short. Classic long-term trend flip, wide stop, ~3R target, run across every timeframe.',
     highwr:'⭐ Built for WIN-RATE: trend-aligned + regime-gated + calm-only oversold/overbought snap, NEAR take-profit (banked often) + WIDE stop (rarely hit), R:R ~0.65–0.8 so a 60%+ hit-rate turns a profit. Now the ONLY strategy in the lab, over a DEEP history (daily & 4h ≈ 4 years, 1h ≈ 1.4y). Shorts win in risk-off (bear breadth); longs need risk-on.',
     pullback20:'High win-rate trend-continuation: buy the shallow pullback that tags & reclaims the fast 20-EMA in an uptrend (mirror for shorts). Near target, moderately wide stop. The fast mean reclaims often, so it tends to win frequently.',
+    bullmom:'↗ The LONG-in-a-BULL hunt: only fires when the WHOLE market is risk-on (breadth ≥60%, BTC up) — buy a FRESH breakout in strong momentum and RIDE it (~2.5R). Mirror shorts a broad risk-off breakdown. Lower win-rate, bigger winners — the opposite trade-off to High win-rate.',
     monday:'BTC/majors: fade the weekly Monday opening range — hold the Monday low (long) or reject the Monday high (short).'};
   let sel=`<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">`+
     strats.map(s=>{const on=s.key===labStrat; const has=lab[s.key]; return `<button onclick="setLabStrat('${s.key}')" style="cursor:pointer;border-radius:8px;padding:7px 12px;font-size:12.5px;font-weight:600;border:1px solid ${on?'var(--accent)':'var(--line)'};background:${on?'rgba(63,185,80,.12)':'var(--panel2)'};color:${on?'var(--txt)':'var(--dim)'}">${esc(s.name)}${has?'':' ⏳'}</button>`;}).join('')+`</div>`;
