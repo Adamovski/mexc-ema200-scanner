@@ -86,7 +86,7 @@ def send_telegram(cfg: dict, text: str) -> None:
 # logic changes meaningfully — the headline win-rate resets to the new version (a clean
 # slate for the new logic), while every past version's results are kept and shown in the
 # "site version" breakdown so you can compare how each iteration actually performed.
-APP_VERSION = "v17 · Deep market-environment: index momentum, breadth direction, monthly-regime correlation"
+APP_VERSION = "v18 · Fix script-breaking apostrophe; deep market-environment + equity chart live"
 # One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
 # every call (open + resolved) on the next boot and start the calls scorecard fresh —
 # auto-board trades and their version history are untouched.
@@ -4909,7 +4909,7 @@ function btSideCard(label,emoji,s){
       let sxy=0,sxx=0,syy=0; pairs.forEach(p=>{const dx=p[0]-mx,dy=p[1]-my;sxy+=dx*dy;sxx+=dx*dx;syy+=dy*dy;});
       const r=(sxx>0&&syy>0)?sxy/Math.sqrt(sxx*syy):0;
       const strong=Math.abs(r)>=0.5, dir=r<0;
-      corrTxt=`<div class="btidea ${strong?(dir?'btgood':'btbad'):''}">🔬 <b>Monthly P&L vs market direction:</b> correlation <b>${r.toFixed(2)}</b> — ${dir?'this board makes more when the market is <b>more bearish</b> that month':'this board makes more when the market is <b>more bullish</b>'} ${strong?'(a <b>strong</b> link — the edge is regime-driven, so gate it on market direction)':'(a weak link — this timeframe\'s edge is NOT mainly about market direction)'}.</div>`;
+      corrTxt=`<div class="btidea ${strong?(dir?'btgood':'btbad'):''}">🔬 <b>Monthly P&L vs market direction:</b> correlation <b>${r.toFixed(2)}</b> — ${dir?'this board makes more when the market is <b>more bearish</b> that month':'this board makes more when the market is <b>more bullish</b>'} ${strong?'(a <b>strong</b> link — the edge is regime-driven, so gate it on market direction)':'(a weak link — the edge here is NOT mainly about market direction)'}.</div>`;
     }
     anl+=`<div class="btideah">🗓️ Win-rate by month + market environment (${pos}/${mm.length} months positive)</div>`;
     anl+=corrTxt;
