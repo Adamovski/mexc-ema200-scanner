@@ -52,7 +52,7 @@ try:
         analyze_symbol, normalize_symbol, fetch_candles, pct_returns, CORR_WINDOW,
         bias_on_tf, enrich_1h, best_pattern, coil_tfs_finer, scalp_setup,
         bounce_scalp_setup, backtest_board, backtest_all,
-        compute_market_context, fetch_deriv_series, backfill_market_history, ema,
+        compute_market_context, fetch_deriv_series, backfill_market_history, ema, BACKTEST_BASKET,
     )
 except ImportError:
     sys.exit("Could not import mexc_ema200_scanner.py — keep both files in the "
@@ -1540,41 +1540,44 @@ def backtest_loop(state: State) -> None:
     time.sleep(120)                                  # let the first scan grab the CPU first
     cfg = state.cfg
     market = cfg.get("market", "futures")
-    tfs = ("15m", "1h", "4h", "1d")
-    # Per-TF lookback depth — paginated deep fetch reaches ~2 YEARS on the timeframes that matter:
-    # 1d×730 ≈ 2 yrs, 4h×4380 ≈ 2 yrs, 1h×8000 ≈ 11 months, 15m×2600 ≈ 27 days (a full 2 yrs of
-    # 15m would be ~70k candles/coin — infeasible over the whole universe, and 15m is the loser).
-    tf_limit = {"15m": 2600, "1h": 8000, "4h": 4380, "1d": 730}
+    # STRATEGY LAB — sweep several DIFFERENT strategies head-to-head so we can compare edges in
+    # their own tabs instead of overwriting one strategy forever. Run on a liquid basket (~60
+    # coins) so it actually completes on the free tier; the meaningful TFs only.
+    strategies = [("revert", "200-EMA reversion"), ("supertrend", "Supertrend pullback"),
+                  ("cpr", "Narrow CPR"), ("mix", "Mix — all 3 confluence")]
+    lab_tfs = ("1h", "4h", "1d")
+    lab_limit = {"1h": 6000, "4h": 4380, "1d": 730}
+    monday_syms = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
+    strat_meta = [{"key": k, "name": nm} for k, nm in strategies] + [{"key": "monday", "name": "BTC Monday-range"}]
     while True:
         try:
             sess = get_session()
-            syms = list_symbols(sess, cfg["quote"],
-                                futures_only=cfg.get("futures_only", True),
-                                market=market)
+            basket = list(BACKTEST_BASKET)           # ~60 liquid majors/mid-caps — fast + representative
             t0 = time.time()
-            data = {}
-            # INCREMENTAL: sweep one timeframe at a time and publish after each, so the
-            # matrix fills in progressively instead of showing nothing for an hour.
-            for i, tf in enumerate(tfs):
-                part = backtest_all(sess, market, tfs=(tf,), limit=tf_limit.get(tf, 1000),
-                                    fees_bps=5.0, symbols=syms)
-                data.update(part)
-                with state.lock:
-                    state.backtests = {"ts": time.time(), "took": round(time.time() - t0, 1),
-                                       "fees_bps": 5.0, "coins": len(syms), "universe": True,
-                                       "data": dict(data),
-                                       "progress": {"done": i + 1, "total": len(tfs), "last": tf}}
-            # SPOT sweep: long-only trend-aligned reversion with spot fees (no funding, 1×).
-            # Answers "do the spot buys actually work?" on the same honest measurement.
-            spot = {}
-            for tf in tfs:
-                sp = backtest_all(sess, market, tfs=(tf,), limit=tf_limit.get(tf, 1000), fees_bps=20.0,
-                                  symbols=syms, strategy="spot", sides=("long",))
-                spot.update(sp)
-                with state.lock:
-                    if state.backtests:
-                        state.backtests["spot"] = dict(spot)
-                        state.backtests["spot_fees_bps"] = 20.0
+            lab = {}
+            total = len(strategies) + 1
+            for si, (skey, sname) in enumerate(strategies):
+                sdata = {}
+                for tf in lab_tfs:
+                    part = backtest_all(sess, market, tfs=(tf,), limit=lab_limit.get(tf, 2000),
+                                        fees_bps=5.0, symbols=basket, strategy=skey)
+                    sdata.update(part)
+                    lab[skey] = dict(sdata)
+                    with state.lock:
+                        state.backtests = {"ts": time.time(), "took": round(time.time() - t0, 1),
+                                           "fees_bps": 5.0, "coins": len(basket), "lab": dict(lab),
+                                           "strategies": strat_meta,
+                                           "progress": {"done": si, "total": total, "last": f"{sname} · {tf}"}}
+            # BTC Monday-range — the weekly opening range, majors only.
+            mon = {}
+            for tf in ("4h", "1d"):
+                part = backtest_all(sess, market, tfs=(tf,), limit=lab_limit.get(tf, 2000),
+                                    fees_bps=5.0, symbols=monday_syms, strategy="monday")
+                mon.update(part)
+            with state.lock:
+                if state.backtests and "lab" in state.backtests:
+                    state.backtests["lab"]["monday"] = mon
+                    state.backtests["progress"] = {"done": total, "total": total, "last": "BTC Monday-range"}
         except Exception as e:
             with state.lock:
                 if not state.backtests:
@@ -4974,48 +4977,45 @@ function btSideCard(label,emoji,s){
         <table class="bt"><thead><tr><th>Date (UTC)</th><th>Coin</th><th>Result</th><th>Market environment</th><th>Why the trade was taken</th></tr></thead><tbody>${rows2}</tbody></table>`;})()}
   </div>`;
 }
+let labStrat=null;
+function setLabStrat(k){ labStrat=k; renderBacktest(); }
 function renderBacktest(){
   const body=document.getElementById('btBody'), meta=document.getElementById('btMeta'), emp=document.getElementById('btempty'); if(!body) return;
   const d=btData; if(!d) return;
-  if(d.pending){ if(emp){emp.style.display='block'; emp.innerHTML='⏳ Apex is running the first backtest sweep — the <b>whole universe</b> × 4 timeframes × both sides. This is heavy and takes several minutes on a fresh boot; it fills in here automatically and then refreshes every ~6h.';} body.innerHTML=''; if(meta) meta.textContent='running the first sweep…'; return; }
+  if(d.pending){ if(emp){emp.style.display='block'; emp.innerHTML='⏳ Apex is running the first <b>Strategy Lab</b> sweep — 200-EMA · Supertrend · CPR · Mix · BTC Monday, each over a liquid basket × timeframes × both sides. Fills in here automatically, then refreshes every ~6h.';} body.innerHTML=''; if(meta) meta.textContent='running the first sweep…'; return; }
   if(d.error){ if(emp) emp.style.display='none'; body.innerHTML=`<div class="bt-empty">${esc(d.error)}</div>`; if(meta) meta.textContent=''; return; }
   if(emp) emp.style.display='none';
+  const lab=d.lab||{};
+  const strats=(d.strategies||[{key:'revert',name:'200-EMA reversion'}]);
+  if(!labStrat||!strats.some(s=>s.key===labStrat)) labStrat=strats[0].key;
   const prog=d.progress;
-  const sweeping=(prog&&prog.done<prog.total)?` · ⏳ sweeping ${prog.done}/${prog.total} timeframes (rest fills in)`:'';
-  if(meta) meta.textContent=`${d.coins} coins · ${d.fees_bps} bps fees · as of ${ago(d.ts)}${d.took?(' · '+d.took+'s'):''}${sweeping}`;
-  const tfs=['15m','1h','4h','1d'];
-  let m=`<div class="perfsub">Edge matrix — net expectancy · win-rate · (trades) per timeframe & side</div>`;
-  m+=`<table class="bt btmatrix"><thead><tr><th>Timeframe</th><th>🏆 Longs</th><th>🔻 Shorts</th></tr></thead><tbody>`;
-  for(const tf of tfs){ const row=(d.data||{})[tf]||{}; m+=`<tr><td><b>${tf}</b></td><td>${btCell(row.long)}</td><td>${btCell(row.short)}</td></tr>`; }
+  const sweeping=(prog&&prog.done<prog.total)?` · ⏳ sweeping ${prog.done}/${prog.total} strategies (last: ${esc(prog.last||'')})`:'';
+  if(meta) meta.textContent=`${d.coins} coins · ${d.fees_bps} bps fees · as of ${ago(d.ts)}${sweeping}`;
+  // Strategy selector — one tab per idea.
+  const desc={revert:'Buy oversold dips / fade overbought pops back to the mean (200-EMA + RSI). Calm-BTC only.',
+    supertrend:'Trend-follow: buy the pullback to a rising Supertrend line / sell the pop to a falling one.',
+    cpr:'Trade reactions at the rolling Central Pivot Range (pivot / BC / TC).',
+    mix:'Confluence: only trade when the 200-EMA trend, the Supertrend, AND the pivot all agree.',
+    monday:'BTC/majors: fade the weekly Monday opening range — hold the Monday low (long) or reject the Monday high (short).'};
+  let sel=`<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">`+
+    strats.map(s=>{const on=s.key===labStrat; const has=lab[s.key]; return `<button onclick="setLabStrat('${s.key}')" style="cursor:pointer;border-radius:8px;padding:7px 12px;font-size:12.5px;font-weight:600;border:1px solid ${on?'var(--accent)':'var(--line)'};background:${on?'rgba(63,185,80,.12)':'var(--panel2)'};color:${on?'var(--txt)':'var(--dim)'}">${esc(s.name)}${has?'':' ⏳'}</button>`;}).join('')+`</div>`;
+  const S=lab[labStrat]||{};
+  const tfs=(labStrat==='monday')?['4h','1d']:['1h','4h','1d'];
+  const sname=(strats.find(s=>s.key===labStrat)||{}).name||labStrat;
+  let m=`<div class="perfsub">🧪 ${esc(sname)} — <span style="color:var(--dim)">${esc(desc[labStrat]||'')}</span></div>`;
+  m+=`<table class="bt btmatrix"><thead><tr><th>Timeframe</th><th>🟢 Longs</th><th>🔴 Shorts</th></tr></thead><tbody>`;
+  let any=false;
+  for(const tf of tfs){ const row=S[tf]||{}; if((row.long&&row.long.n)||(row.short&&row.short.n)) any=true;
+    m+=`<tr><td><b>${tf}</b></td><td>${btCell(row.long)}</td><td>${btCell(row.short)}</td></tr>`; }
   m+=`</tbody></table>`;
   let det='';
-  for(const tf of tfs){ const row=(d.data||{})[tf]||{};
+  for(const tf of tfs){ const row=S[tf]||{};
     if(!(row.long&&row.long.n)&&!(row.short&&row.short.n)) continue;
-    det+=`<details class="bttf"><summary>${tf} — full breakdown (per-coin)</summary><div class="btgrid">${btSideCard('Longs · '+tf,'🏆',row.long)}${btSideCard('Shorts · '+tf,'🔻',row.short)}</div></details>`;
+    det+=`<details class="bttf"><summary>${tf} — full breakdown (per-coin, trade log, portfolio)</summary><div class="btgrid">${btSideCard('Longs · '+tf,'🟢',row.long)}${btSideCard('Shorts · '+tf,'🔴',row.short)}</div></details>`;
   }
-  // SPOT sweep — long-only reversion with spot fees (no funding, 1×). Shows how the
-  // 💰 Spot buys approach performs on the same honest, whole-universe measurement.
-  let sp='';
-  if(d.spot){
-    const anySpot=tfs.some(tf=>{const r=(d.spot||{})[tf]||{}; return r.long&&r.long.n;});
-    sp=`<div class="perfsub" style="margin-top:18px">💰 Spot sweep — long-only, ${d.spot_fees_bps||20} bps spot fees, no funding (buy the oversold dip in an uptrend, hold to the mean)</div>`;
-    if(anySpot){
-      sp+=`<table class="bt btmatrix"><thead><tr><th>Timeframe</th><th>💰 Spot (long-only)</th></tr></thead><tbody>`;
-      for(const tf of tfs){ const r=(d.spot||{})[tf]||{}; sp+=`<tr><td><b>${tf}</b></td><td>${btCell(r.long)}</td></tr>`; }
-      sp+=`</tbody></table>`;
-      let sdet='';
-      for(const tf of tfs){ const r=(d.spot||{})[tf]||{};
-        if(!(r.long&&r.long.n)) continue;
-        sdet+=`<details class="bttf"><summary>${tf} spot — full breakdown (per-coin)</summary><div class="btgrid">${btSideCard('Spot · '+tf,'💰',r.long)}</div></details>`;
-      }
-      sp+=`<div class="perfsub">Per-timeframe spot detail (click to expand)</div>`+sdet;
-    } else {
-      sp+=`<div class="histnote">⏳ Spot sweep runs after the futures matrix on each refresh — it'll appear here once the first pass completes.</div>`;
-    }
-  }
-  body.innerHTML=m+`<div class="perfsub">Per-timeframe detail (click to expand)</div>`+det
-    +`<div class="histnote">⚠ Simplified <b>limit-only</b> mechanics across the whole universe — a directional read, not a promise of live results. This is what the live boards now trade (CMP momentum entries were dropped after the backtest showed they lose). A timeframe that's clearly positive is one to lean on.</div>`
-    +sp;
+  if(!any){ det=`<div class="histnote">⏳ This strategy hasn't finished sweeping yet — it fills in as the lab works through each one.</div>`; }
+  body.innerHTML=sel+m+(any?`<div class="perfsub">Per-timeframe detail (click to expand)</div>`:'')+det
+    +`<div class="histnote">⚠ Each strategy is backtested the same honest way — no look-ahead, stop-first on ties, net of fees, on a ~60-coin liquid basket. Compare the tabs: a strategy that's clearly positive on a timeframe is the one worth wiring live.</div>`;
 }
 function perfCard(label,val,cls,tip){
   const t=tip?` data-tip="${esc(tip)}" style="cursor:help"`:'';

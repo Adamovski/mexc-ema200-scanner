@@ -2699,9 +2699,9 @@ def _revert_live(side, closes, highs, lows, ema200_now, atr_val, rsis, e200s, e2
         risk = entry - stop
         if risk <= 0:
             return None
-        # Smart, individual target: measured move (height of the base projected up), not a flat 2R.
+        # Structural target (measured move) capped tight at ~1.9R — 2yr data: R:R<2 beats ≥2.
         measured = prior_high - base_low
-        target = entry + max(measured, 1.5 * risk)
+        target = min(entry + max(measured, 1.5 * risk), entry + 1.9 * risk)
         rr = (target - entry) / risk
         if rr < 1.2:
             return None
@@ -2731,7 +2731,7 @@ def _revert_live(side, closes, highs, lows, ema200_now, atr_val, rsis, e200s, e2
             return None
         recent_low = min(lows[-20:])
         struct = min(e2, recent_low) if recent_low < entry * 0.997 else e2
-        target = min(struct, entry - 1.3 * risk)
+        target = max(min(struct, entry - 1.3 * risk), entry - 1.9 * risk)   # capped tight (R:R<2 wins)
         if target <= 0:
             return None
         rr = (entry - target) / risk
@@ -3723,6 +3723,12 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, t
     fee_frac = fees_bps / 10000.0
     _dv = sorted(C[i] * V[i] for i in range(len(C)))
     dvol = _dv[len(_dv) // 2] if _dv else 0.0
+    # LEARNED FILTER (from the 2yr segments): calm entries beat choppy ones on both sides. Skip
+    # a bar when the coin's ATR% is above its own median — trade the calm, not the chop.
+    _atrp = [((atr(H[max(0, i - 20):i + 1], L[max(0, i - 20):i + 1], C[max(0, i - 20):i + 1]) or 0.0) / C[i])
+             if C[i] else 0.0 for i in range(n)]
+    _asort = sorted(x for x in _atrp if x > 0)
+    _atrp_med = _asort[len(_asort) // 2] if _asort else 0.0
     trades = []
     t = warmup
     while t < n - horizon - 1:
@@ -3738,6 +3744,11 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, t
         _bs = btc_ctx.get(ts) if btc_ctx else None
         btrend = _bs.get("t") if _bs else None
         bvol = _bs.get("v") if _bs else None
+        # LEARNED GATES (2yr segments): only trade when BTC is CALM and the coin itself is calm.
+        if bvol == "hi":                                 # volatile BTC lost heavily on both sides
+            t += 1; continue
+        if _atrp_med and _atrp[t] > _atrp_med * 1.15:    # choppy entry — skip, calm beats chop
+            t += 1; continue
         entry = stop = target = risk = rr = None
         outcome = rbar = None; mfe = 0.0; mae = 0.0; stp = False
         if long:
@@ -3760,10 +3771,10 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, t
             risk = entry - stop
             if risk <= 0:
                 t += 1; continue
-            # SMART, individual target: project the base's height up from the breakout (measured
-            # move) — a per-coin structural objective, NOT a fixed R multiple. Let winners run.
+            # Individual structural target (measured move) BUT capped tight — the 2yr segments
+            # proved R:R < 2 beats R:R ≥ 2, so we take the structural objective only up to ~1.9R.
             measured = prior_high - base_low
-            target = entry + max(measured, 1.5 * risk)
+            target = min(entry + max(measured, 1.5 * risk), entry + 1.9 * risk)
             rr = (target - entry) / risk
             if rr < 1.2:
                 t += 1; continue
@@ -3794,11 +3805,11 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, t
             stop = entry + risk
             if risk <= 0:
                 t += 1; continue
-            # SMART, individual target: ride the fade toward real structure below (the 20-EMA mean
-            # OR the recent swing low, whichever is further) — not a fixed R cap. Let winners run.
+            # Structural target (20-EMA mean / recent swing low) BUT capped tight at ~1.9R —
+            # the 2yr segments proved tighter R:R (<2) beats wider on the short side too.
             recent_low = min(L[max(0, t - 20):t])
             struct = min(e2, recent_low) if recent_low < entry * 0.997 else e2
-            target = min(struct, entry - 1.3 * risk)
+            target = max(min(struct, entry - 1.3 * risk), entry - 1.9 * risk)
             if target <= 0:
                 t += 1; continue
             rr = (entry - target) / risk
@@ -3840,6 +3851,302 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, t
     return trades
 
 
+def _st_series(H, L, C, period=10, mult=3.0):
+    """Per-bar Supertrend (value, direction) — causal, no look-ahead — for backtesting reactions
+    to the trailing ATR trend line. dir 1 = line is SUPPORT below price; -1 = RESISTANCE above."""
+    n = len(C)
+    st = [None] * n; d = [0] * n
+    if n < period + 2:
+        return st, d
+    tr = [0.0] * n
+    for i in range(1, n):
+        tr[i] = max(H[i] - L[i], abs(H[i] - C[i - 1]), abs(L[i] - C[i - 1]))
+    atr_s = [None] * n
+    atr_s[period] = sum(tr[1:period + 1]) / period
+    for i in range(period + 1, n):
+        atr_s[i] = (atr_s[i - 1] * (period - 1) + tr[i]) / period
+    fu = [0.0] * n; fl = [0.0] * n
+    for i in range(period, n):
+        if atr_s[i] is None:
+            continue
+        hl2 = (H[i] + L[i]) / 2; bu = hl2 + mult * atr_s[i]; bl = hl2 - mult * atr_s[i]
+        if st[i - 1] is None:
+            fu[i], fl[i], st[i], d[i] = bu, bl, bl, 1; continue
+        fu[i] = bu if (bu < fu[i - 1] or C[i - 1] > fu[i - 1]) else fu[i - 1]
+        fl[i] = bl if (bl > fl[i - 1] or C[i - 1] < fl[i - 1]) else fl[i - 1]
+        d[i] = 1 if C[i] > fu[i - 1] else (-1 if C[i] < fl[i - 1] else d[i - 1])
+        st[i] = fl[i] if d[i] == 1 else fu[i]
+    return st, d
+
+
+def _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, kind, long, t, entry, stop, target, a, rs=None):
+    """Shared forward simulator: resolve one trade (stop/target first-touch, stop-first on a tie),
+    net of fees, tagged with the full context every backtest metric needs. Returns (trade, rbar)."""
+    risk = (entry - stop) if long else (stop - entry)
+    if risk <= 0 or entry <= 0:
+        return None, None
+    rr = (((target - entry) if long else (entry - target)) / risk)
+    if rr <= 0:
+        return None, None
+    ts = int(rows[t][0]) if rows[t] else 0
+    _bs = btc_ctx.get(ts) if btc_ctx else None
+    btrend = _bs.get("t") if _bs else None
+    bvol = _bs.get("v") if _bs else None
+    f = t + 1; outcome = rbar = None; mfe = 0.0; mae = 0.0
+    for j in range(f, min(n, f + horizon + 1)):
+        if long:
+            mfe = max(mfe, (H[j] - entry) / risk); mae = max(mae, (entry - L[j]) / risk)
+            if L[j] <= stop:
+                outcome, rbar = "loss", j; break
+            if H[j] >= target:
+                outcome, rbar = "win", j; break
+        else:
+            mfe = max(mfe, (entry - L[j]) / risk); mae = max(mae, (H[j] - entry) / risk)
+            if H[j] >= stop:
+                outcome, rbar = "loss", j; break
+            if L[j] <= target:
+                outcome, rbar = "win", j; break
+    if outcome is None:
+        return None, None
+    if long:
+        stp = outcome == "loss" and any(H[j] >= target for j in range(rbar, min(n, f + horizon + 1)))
+    else:
+        stp = outcome == "loss" and any(L[j] <= target for j in range(rbar, min(n, f + horizon + 1)))
+    rr = round(rr, 2); fee_R = fee_frac / (risk / entry)
+    R = (rr - fee_R) if outcome == "win" else (-1.0 - fee_R)
+    _hr = (ts // 3600000) % 24
+    _sess = "Asia" if _hr < 8 else ("EU" if _hr < 14 else "US")
+    el = e200[t]
+    tr = {"r": round(R, 3), "rr": rr, "outcome": outcome, "gross": rr if outcome == "win" else -1.0,
+          "mfe": round(min(mfe, rr), 2), "mae": round(mae, 2), "stop_then_tp": bool(stp), "cmp": False,
+          "bars": rbar - f, "extd": round(abs((entry - el) / el) * 100, 2) if el else 0.0,
+          "atrp": round(a / entry * 100, 2) if entry else 0.0, "dvol": dvol,
+          "stopw": round(risk / entry * 100, 2), "tppct": round(abs(target - entry) / entry * 100, 2),
+          "ts": ts, "entry": round(entry, 10), "stop": round(stop, 10), "target": round(target, 10),
+          "rsi": round(rs, 1) if rs is not None else None, "kind": kind,
+          "session": _sess, "btc_trend": btrend, "btc_vol": bvol,
+          "btc_align": (btrend == ("up" if long else "down")) if btrend else None,
+          "btc_state": ("BTC " + btrend) if btrend else None}
+    return tr, rbar
+
+
+def _bt_supertrend(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="4h"):
+    """SUPERTREND-PULLBACK — a trend-FOLLOWING engine (different from RSI reversion). In an
+    uptrend (price above the 200-EMA, Supertrend in 'up' mode) buy the PULLBACK that tests the
+    rising Supertrend line and closes back above it; mirror for shorts. Stop just beyond the ST
+    line, tight structural target. Calm-BTC only. This is the fresh idea for the LONG side."""
+    try:
+        H = [float(x[2]) for x in rows]; L = [float(x[3]) for x in rows]; C = [float(x[4]) for x in rows]
+        V = [float(x[5]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return []
+    n = len(C)
+    if n < warmup + horizon + 5:
+        return []
+    e200 = ema(C, 200); st, d = _st_series(H, L, C)
+    _dv = sorted(C[i] * V[i] for i in range(n)); dvol = _dv[len(_dv) // 2] if _dv else 0.0
+    fee_frac = fees_bps / 10000.0; long = side == "long"; out = []; t = warmup
+    while t < n - horizon - 1:
+        el = e200[t]; sv = st[t]
+        if el is None or sv is None:
+            t += 1; continue
+        price = C[t]
+        a = atr(H[max(0, t - 20):t + 1], L[max(0, t - 20):t + 1], C[max(0, t - 20):t + 1])
+        if not a or a <= 0:
+            t += 1; continue
+        _bs = btc_ctx.get(int(rows[t][0])) if btc_ctx else None
+        if _bs and _bs.get("v") == "hi":                 # calm BTC only
+            t += 1; continue
+        if long:
+            # uptrend + ST support, price dipped to the line this bar and closed back above it
+            if not (d[t] == 1 and price > el):
+                t += 1; continue
+            if not (L[t] <= sv * 1.004 and price > sv):
+                t += 1; continue
+            entry = price; stop = sv - 0.6 * a; risk = entry - stop
+            if risk <= 0:
+                t += 1; continue
+            target = entry + min(max(1.4 * risk, (max(H[max(0, t - 20):t]) - entry)), 1.9 * risk)
+        else:
+            if not (d[t] == -1 and price < el):
+                t += 1; continue
+            if not (H[t] >= sv * 0.996 and price < sv):
+                t += 1; continue
+            entry = price; stop = sv + 0.6 * a; risk = stop - entry
+            if risk <= 0:
+                t += 1; continue
+            target = entry - min(max(1.4 * risk, (entry - min(L[max(0, t - 20):t]))), 1.9 * risk)
+        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, "supertrend", long, t, entry, stop, target, a)
+        if tr is None:
+            t += 1; continue
+        out.append(tr); t = rbar + 1
+    return out
+
+
+def _bt_cpr(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="4h"):
+    """CPR / PIVOT REACTION — trade reactions at the rolling Central Pivot Range (pivot, BC, TC
+    from the prior 20 bars). In an uptrend, buy a dip that holds the pivot/BC support and closes
+    back above the pivot; in a downtrend, short a pop rejected at the pivot/TC. Tight target,
+    calm-BTC only. A structurally different, level-based idea to test head-to-head."""
+    try:
+        H = [float(x[2]) for x in rows]; L = [float(x[3]) for x in rows]; C = [float(x[4]) for x in rows]
+        V = [float(x[5]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return []
+    n = len(C)
+    if n < warmup + horizon + 5:
+        return []
+    e200 = ema(C, 200)
+    _dv = sorted(C[i] * V[i] for i in range(n)); dvol = _dv[len(_dv) // 2] if _dv else 0.0
+    fee_frac = fees_bps / 10000.0; long = side == "long"; out = []; t = warmup; pk = 20
+    while t < n - horizon - 1:
+        el = e200[t]
+        if el is None:
+            t += 1; continue
+        price = C[t]
+        a = atr(H[max(0, t - 20):t + 1], L[max(0, t - 20):t + 1], C[max(0, t - 20):t + 1])
+        if not a or a <= 0:
+            t += 1; continue
+        Hp = max(H[t - pk:t]); Lp = min(L[t - pk:t]); Cp = C[t - 1]
+        P = (Hp + Lp + Cp) / 3.0; BC = (Hp + Lp) / 2.0; TC = 2 * P - BC
+        lo_p, hi_p = min(BC, TC), max(BC, TC)
+        _bs = btc_ctx.get(int(rows[t][0])) if btc_ctx else None
+        if _bs and _bs.get("v") == "hi":
+            t += 1; continue
+        if long:
+            if not (price > el):
+                t += 1; continue
+            if not (L[t] <= P * 1.004 and price > lo_p and C[t] > C[t - 1]):
+                t += 1; continue
+            entry = price; stop = min(lo_p, L[t]) - 0.4 * a; risk = entry - stop
+            if risk <= 0:
+                t += 1; continue
+            target = entry + min(max(1.4 * risk, (hi_p - entry)), 1.9 * risk)
+        else:
+            if not (price < el):
+                t += 1; continue
+            if not (H[t] >= P * 0.996 and price < hi_p and C[t] < C[t - 1]):
+                t += 1; continue
+            entry = price; stop = max(hi_p, H[t]) + 0.4 * a; risk = stop - entry
+            if risk <= 0:
+                t += 1; continue
+            target = entry - min(max(1.4 * risk, (entry - lo_p)), 1.9 * risk)
+        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, "cpr", long, t, entry, stop, target, a)
+        if tr is None:
+            t += 1; continue
+        out.append(tr); t = rbar + 1
+    return out
+
+
+def _bt_mix(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="4h"):
+    """MIX / CONFLUENCE — only trade when all three agree: the 200-EMA trend, the Supertrend
+    direction, AND price reacting at the rolling pivot. Stricter = fewer, hopefully higher-quality
+    trades. Tests whether stacking the three edges beats any one alone."""
+    try:
+        H = [float(x[2]) for x in rows]; L = [float(x[3]) for x in rows]; C = [float(x[4]) for x in rows]
+        V = [float(x[5]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return []
+    n = len(C)
+    if n < warmup + horizon + 5:
+        return []
+    e200 = ema(C, 200); st, d = _st_series(H, L, C)
+    _dv = sorted(C[i] * V[i] for i in range(n)); dvol = _dv[len(_dv) // 2] if _dv else 0.0
+    fee_frac = fees_bps / 10000.0; long = side == "long"; out = []; t = warmup; pk = 20
+    while t < n - horizon - 1:
+        el = e200[t]; sv = st[t]
+        if el is None or sv is None:
+            t += 1; continue
+        price = C[t]
+        a = atr(H[max(0, t - 20):t + 1], L[max(0, t - 20):t + 1], C[max(0, t - 20):t + 1])
+        if not a or a <= 0:
+            t += 1; continue
+        _bs = btc_ctx.get(int(rows[t][0])) if btc_ctx else None
+        if _bs and _bs.get("v") == "hi":
+            t += 1; continue
+        Hp = max(H[t - pk:t]); Lp = min(L[t - pk:t]); Cp = C[t - 1]
+        P = (Hp + Lp + Cp) / 3.0
+        if long:
+            if not (price > el and d[t] == 1 and L[t] <= max(sv, P) * 1.004 and price > P and C[t] > C[t - 1]):
+                t += 1; continue
+            entry = price; stop = min(sv, P) - 0.5 * a; risk = entry - stop
+            if risk <= 0:
+                t += 1; continue
+            target = entry + min(max(1.4 * risk, Hp - entry), 1.9 * risk)
+        else:
+            if not (price < el and d[t] == -1 and H[t] >= min(sv, P) * 0.996 and price < P and C[t] < C[t - 1]):
+                t += 1; continue
+            entry = price; stop = max(sv, P) + 0.5 * a; risk = stop - entry
+            if risk <= 0:
+                t += 1; continue
+            target = entry - min(max(1.4 * risk, entry - Lp), 1.9 * risk)
+        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, "mix", long, t, entry, stop, target, a)
+        if tr is None:
+            t += 1; continue
+        out.append(tr); t = rbar + 1
+    return out
+
+
+def _bt_btc_monday(rows, side, fees_bps=5.0, horizon=42, warmup=60, btc_ctx=None, tf="4h"):
+    """BTC MONDAY-RANGE — the weekly opening range. Monday (UTC) prints a high/low; for the rest
+    of the week we fade the edges: LONG a dip that holds the Monday LOW and turns back up (target
+    the Monday high), SHORT a pop rejected at the Monday HIGH (target the Monday low). A structural
+    idea (weekly reference levels traders watch) — run on BTC/majors only."""
+    import datetime as _dt
+    try:
+        H = [float(x[2]) for x in rows]; L = [float(x[3]) for x in rows]; C = [float(x[4]) for x in rows]
+        V = [float(x[5]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return []
+    n = len(C)
+    if n < warmup + horizon + 5:
+        return []
+    e200 = ema(C, 200)
+    _dv = sorted(C[i] * V[i] for i in range(n)); dvol = _dv[len(_dv) // 2] if _dv else 0.0
+    fee_frac = fees_bps / 10000.0; long = side == "long"; out = []
+    wd = [(_dt.datetime.utcfromtimestamp(int(rows[i][0]) / 1000).weekday()) for i in range(n)]
+    t = warmup
+    mHigh = mLow = None; seen_mon = False
+    while t < n - horizon - 1:
+        # (Re)build the Monday range as Monday bars stream in; freeze it for the week after.
+        if wd[t] == 0:
+            if not seen_mon or (wd[t - 1] != 0):
+                mHigh, mLow, seen_mon = H[t], L[t], True
+            else:
+                mHigh = max(mHigh, H[t]); mLow = min(mLow, L[t])
+            t += 1; continue
+        if mHigh is None:
+            t += 1; continue
+        price = C[t]
+        a = atr(H[max(0, t - 20):t + 1], L[max(0, t - 20):t + 1], C[max(0, t - 20):t + 1])
+        if not a or a <= 0:
+            t += 1; continue
+        rng = mHigh - mLow
+        if rng <= 0:
+            t += 1; continue
+        if long:
+            if not (L[t] <= mLow * 1.002 and price > mLow and C[t] > C[t - 1]):
+                t += 1; continue
+            entry = price; stop = mLow - 0.6 * a; risk = entry - stop
+            if risk <= 0:
+                t += 1; continue
+            target = min(mHigh, entry + 2.5 * risk)              # ride toward the Monday high
+        else:
+            if not (H[t] >= mHigh * 0.998 and price < mHigh and C[t] < C[t - 1]):
+                t += 1; continue
+            entry = price; stop = mHigh + 0.6 * a; risk = stop - entry
+            if risk <= 0:
+                t += 1; continue
+            target = max(mLow, entry - 2.5 * risk)               # ride toward the Monday low
+        if abs(target - entry) / entry < 0.002:
+            t += 1; continue
+        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, "monday", long, t, entry, stop, target, a)
+        if tr is None:
+            t += 1; continue
+        out.append(tr); t = rbar + 1
+    return out
+
+
 def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="level", btc_ctx=None, tf="4h"):
     """Replay a strategy's entry/stop/target MECHANICS over one coin's historical candles and
     return a list of resolved trades (net R after fees). WITHOUT look-ahead: every decision at
@@ -3854,6 +4161,14 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="
         return _bt_revert(rows, "long", fees_bps=max(fees_bps, 20.0), warmup=warmup, btc_ctx=btc_ctx, tf=tf)
     if strategy == "revert":
         return _bt_revert(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf)
+    if strategy == "supertrend":
+        return _bt_supertrend(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf)
+    if strategy == "cpr":
+        return _bt_cpr(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf)
+    if strategy == "mix":
+        return _bt_mix(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf)
+    if strategy == "monday":
+        return _bt_btc_monday(rows, side, fees_bps=fees_bps, btc_ctx=btc_ctx, tf=tf)
     try:
         H = [float(x[2]) for x in rows]
         L = [float(x[3]) for x in rows]
