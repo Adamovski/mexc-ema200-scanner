@@ -3678,6 +3678,81 @@ def _btc_regime_ctx(rows):
     return ctx
 
 
+def _market_ctx(rows_by, btc_sym="BTCUSDT", lookback=20, min_syms=8):
+    """Per-bar MARKET BREADTH & DOMINANCE across the whole basket, keyed by candle open-time.
+    breadth = fraction of the basket trading above its OWN 200-EMA at that bar (broad alt
+    participation); dom = who led over the last `lookback` bars, BTC or the median alt — a cheap,
+    self-contained BTC-dominance proxy (no external BTC.D feed needed). Buckets: risk_on (breadth
+    >=55%), risk_off (<=40%), mixed. Used to TAG and GATE every backtest trade with the market
+    ENVIRONMENT, so longs can be limited to risk-on breadth instead of firing into broad alt bleed."""
+    above = {}      # ts -> [total, above_count]
+    btc_ret = {}    # ts -> BTC lookback return
+    alt_rets = {}   # ts -> [alt lookback returns]
+    for sym, rows in rows_by.items():
+        if not rows or len(rows) < 210:
+            continue
+        try:
+            C = [float(x[4]) for x in rows]
+            T = [int(x[0]) for x in rows]
+        except (ValueError, IndexError, TypeError):
+            continue
+        e200 = ema(C, 200)
+        for i in range(len(C)):
+            if e200[i] is None:
+                continue
+            t = T[i]
+            cell = above.setdefault(t, [0, 0])
+            cell[0] += 1
+            if C[i] > e200[i]:
+                cell[1] += 1
+            if i >= lookback and C[i - lookback] > 0:
+                r = C[i] / C[i - lookback] - 1.0
+                if sym == btc_sym:
+                    btc_ret[t] = r
+                else:
+                    alt_rets.setdefault(t, []).append(r)
+    ctx = {}
+    for t, (tot, ab) in above.items():
+        if tot < min_syms:
+            ctx[t] = {"br": None, "bpct": (round(ab / tot * 100) if tot else None), "dom": None}
+            continue
+        b = ab / tot
+        br = "risk_on" if b >= 0.55 else ("risk_off" if b <= 0.40 else "mixed")
+        dom = None
+        ar = alt_rets.get(t)
+        if ar and t in btc_ret:
+            a_sorted = sorted(ar)
+            med = a_sorted[len(a_sorted) // 2]
+            dom = "alt" if med > btc_ret[t] else "btc"
+        ctx[t] = {"br": br, "bpct": round(b * 100), "dom": dom}
+    return ctx
+
+
+def _bt_by_breadth(trades):
+    """Expectancy / win-rate sliced by the market-breadth regime the trade was taken in
+    (risk_on / mixed / risk_off) and by dominance (alts vs BTC leading) — the clean read on
+    WHICH environment this strategy/side actually makes money in."""
+    def blk(pred):
+        a = [x for x in trades if pred(x)]
+        if not a:
+            return None
+        w = sum(1 for x in a if x.get("outcome") == "win")
+        sm = sum(x.get("r") or 0 for x in a)
+        return {"n": len(a), "winrate": round(w / len(a) * 100, 1),
+                "exp": round(sm / len(a), 3), "sumR": round(sm, 1)}
+    out = {"breadth": {}, "dom": {}}
+    for k in ("risk_on", "mixed", "risk_off"):
+        r = blk(lambda x, k=k: x.get("breadth") == k)
+        if r:
+            out["breadth"][k] = r
+    for k in ("alt", "btc"):
+        r = blk(lambda x, k=k: x.get("dom") == k)
+        if r:
+            out["dom"][k] = r
+    return out
+
+
+
 def _btc_block(long, tf, btrend, bvol):
     """The SMART don't-fight-BTC gate (replaces the old blunt block that starved longs). On the
     LOWER timeframes (15m/1h) reversion is noisy, so only trade when the macro tape AGREES —
@@ -3693,7 +3768,7 @@ def _btc_block(long, tf, btrend, bvol):
     return btrend == opp and bvol == "hi"
 
 
-def _bt_revert(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="4h"):
+def _bt_revert(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None):
     """TREND-ALIGNED MEAN REVERSION — the high-win-rate candidate. Only trades WITH the
     higher-timeframe trend (price on the right side of a SLOPING 200-EMA), enters on an
     OVERSOLD (long) / OVERBOUGHT (short) snap-back that has just reversed, and targets the
@@ -3744,6 +3819,10 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, t
         _bs = btc_ctx.get(ts) if btc_ctx else None
         btrend = _bs.get("t") if _bs else None
         bvol = _bs.get("v") if _bs else None
+        _ms = mkt_ctx.get(ts) if mkt_ctx else None
+        mbr = _ms.get("br") if _ms else None
+        mdom = _ms.get("dom") if _ms else None
+        mbpct = _ms.get("bpct") if _ms else None
         # LEARNED GATES (2yr segments): only trade when BTC is CALM and the coin itself is calm.
         if bvol == "hi":                                 # volatile BTC lost heavily on both sides
             t += 1; continue
@@ -3756,6 +3835,8 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, t
             if not (price > el and slope_up):           # must be an uptrend
                 t += 1; continue
             if _btc_block(True, tf, btrend, bvol):       # smart don't-fight-BTC gate
+                t += 1; continue
+            if mbr == "risk_off":                        # broad breadth risk-off — don't long alt bleed
                 t += 1; continue
             # MOMENTUM continuation — dip-buying LOSES in crypto (2yr backtest), so ride STRENGTH
             # instead: strong-but-not-blown-off, breaking out of the recent range with the trend.
@@ -3846,7 +3927,8 @@ def _bt_revert(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, t
                        "kind": ("momentum" if long else "reversion"),
                        "session": _session, "btc_trend": btrend, "btc_vol": bvol,
                        "btc_align": (btrend == ("up" if long else "down")) if btrend else None,
-                       "btc_state": ("BTC " + btrend) if btrend else None})
+                       "btc_state": ("BTC " + btrend) if btrend else None,
+                       "breadth": mbr, "dom": mdom, "bpct": mbpct})
         t = rbar + 1
     return trades
 
@@ -3879,7 +3961,7 @@ def _st_series(H, L, C, period=10, mult=3.0):
     return st, d
 
 
-def _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, kind, long, t, entry, stop, target, a, rs=None):
+def _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, kind, long, t, entry, stop, target, a, rs=None, mkt_ctx=None):
     """Shared forward simulator: resolve one trade (stop/target first-touch, stop-first on a tie),
     net of fees, tagged with the full context every backtest metric needs. Returns (trade, rbar)."""
     risk = (entry - stop) if long else (stop - entry)
@@ -3892,6 +3974,12 @@ def _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, kind, long
     _bs = btc_ctx.get(ts) if btc_ctx else None
     btrend = _bs.get("t") if _bs else None
     bvol = _bs.get("v") if _bs else None
+    _ms = mkt_ctx.get(ts) if mkt_ctx else None
+    mbr = _ms.get("br") if _ms else None
+    mdom = _ms.get("dom") if _ms else None
+    mbpct = _ms.get("bpct") if _ms else None
+    if long and mbr == "risk_off":          # don't buy alts when broad breadth is risk-off
+        return None, None
     f = t + 1; outcome = rbar = None; mfe = 0.0; mae = 0.0
     for j in range(f, min(n, f + horizon + 1)):
         if long:
@@ -3926,11 +4014,12 @@ def _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, kind, long
           "rsi": round(rs, 1) if rs is not None else None, "kind": kind,
           "session": _sess, "btc_trend": btrend, "btc_vol": bvol,
           "btc_align": (btrend == ("up" if long else "down")) if btrend else None,
-          "btc_state": ("BTC " + btrend) if btrend else None}
+          "btc_state": ("BTC " + btrend) if btrend else None,
+          "breadth": mbr, "dom": mdom, "bpct": mbpct}
     return tr, rbar
 
 
-def _bt_supertrend(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="4h"):
+def _bt_supertrend(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None):
     """SUPERTREND-PULLBACK — a trend-FOLLOWING engine (different from RSI reversion). In an
     uptrend (price above the 200-EMA, Supertrend in 'up' mode) buy the PULLBACK that tests the
     rising Supertrend line and closes back above it; mirror for shorts. Stop just beyond the ST
@@ -3976,14 +4065,14 @@ def _bt_supertrend(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=Non
             if risk <= 0:
                 t += 1; continue
             target = entry - min(max(1.4 * risk, (entry - min(L[max(0, t - 20):t]))), 1.9 * risk)
-        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, "supertrend", long, t, entry, stop, target, a)
+        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, "supertrend", long, t, entry, stop, target, a, mkt_ctx=mkt_ctx)
         if tr is None:
             t += 1; continue
         out.append(tr); t = rbar + 1
     return out
 
 
-def _bt_cpr(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="4h"):
+def _bt_cpr(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None):
     """CPR / PIVOT REACTION — trade reactions at the rolling Central Pivot Range (pivot, BC, TC
     from the prior 20 bars). In an uptrend, buy a dip that holds the pivot/BC support and closes
     back above the pivot; in a downtrend, short a pop rejected at the pivot/TC. Tight target,
@@ -4031,14 +4120,14 @@ def _bt_cpr(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="
             if risk <= 0:
                 t += 1; continue
             target = entry - min(max(1.4 * risk, (entry - lo_p)), 1.9 * risk)
-        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, "cpr", long, t, entry, stop, target, a)
+        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, "cpr", long, t, entry, stop, target, a, mkt_ctx=mkt_ctx)
         if tr is None:
             t += 1; continue
         out.append(tr); t = rbar + 1
     return out
 
 
-def _bt_mix(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="4h"):
+def _bt_mix(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None):
     """MIX / CONFLUENCE — only trade when all three agree: the 200-EMA trend, the Supertrend
     direction, AND price reacting at the rolling pivot. Stricter = fewer, hopefully higher-quality
     trades. Tests whether stacking the three edges beats any one alone."""
@@ -4080,14 +4169,14 @@ def _bt_mix(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="
             if risk <= 0:
                 t += 1; continue
             target = entry - min(max(1.4 * risk, entry - Lp), 1.9 * risk)
-        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, "mix", long, t, entry, stop, target, a)
+        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, "mix", long, t, entry, stop, target, a, mkt_ctx=mkt_ctx)
         if tr is None:
             t += 1; continue
         out.append(tr); t = rbar + 1
     return out
 
 
-def _bt_btc_monday(rows, side, fees_bps=5.0, horizon=42, warmup=60, btc_ctx=None, tf="4h"):
+def _bt_btc_monday(rows, side, fees_bps=5.0, horizon=42, warmup=60, btc_ctx=None, tf="4h", mkt_ctx=None):
     """BTC MONDAY-RANGE — the weekly opening range. Monday (UTC) prints a high/low; for the rest
     of the week we fade the edges: LONG a dip that holds the Monday LOW and turns back up (target
     the Monday high), SHORT a pop rejected at the Monday HIGH (target the Monday low). A structural
@@ -4140,14 +4229,14 @@ def _bt_btc_monday(rows, side, fees_bps=5.0, horizon=42, warmup=60, btc_ctx=None
             target = max(mLow, entry - 2.5 * risk)               # ride toward the Monday low
         if abs(target - entry) / entry < 0.002:
             t += 1; continue
-        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, "monday", long, t, entry, stop, target, a)
+        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, "monday", long, t, entry, stop, target, a, mkt_ctx=mkt_ctx)
         if tr is None:
             t += 1; continue
         out.append(tr); t = rbar + 1
     return out
 
 
-def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="level", btc_ctx=None, tf="4h"):
+def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="level", btc_ctx=None, tf="4h", mkt_ctx=None):
     """Replay a strategy's entry/stop/target MECHANICS over one coin's historical candles and
     return a list of resolved trades (net R after fees). WITHOUT look-ahead: every decision at
     bar t uses only candles up to t, and the outcome is whichever of stop/target is reached
@@ -4158,17 +4247,17 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="
     if strategy == "spot":
         # Spot: long-only, cash. Charge realistic spot round-trip fees (default ~20 bps if the
         # caller didn't pass a heavier number) and never short — you can't short on spot.
-        return _bt_revert(rows, "long", fees_bps=max(fees_bps, 20.0), warmup=warmup, btc_ctx=btc_ctx, tf=tf)
+        return _bt_revert(rows, "long", fees_bps=max(fees_bps, 20.0), warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy == "revert":
-        return _bt_revert(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf)
+        return _bt_revert(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy == "supertrend":
-        return _bt_supertrend(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf)
+        return _bt_supertrend(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy == "cpr":
-        return _bt_cpr(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf)
+        return _bt_cpr(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy == "mix":
-        return _bt_mix(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf)
+        return _bt_mix(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy == "monday":
-        return _bt_btc_monday(rows, side, fees_bps=fees_bps, btc_ctx=btc_ctx, tf=tf)
+        return _bt_btc_monday(rows, side, fees_bps=fees_bps, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     try:
         H = [float(x[2]) for x in rows]
         L = [float(x[3]) for x in rows]
@@ -4380,6 +4469,9 @@ def _bt_findings(trades):
     add("BTC alignment", "BTC trending with the trade", "BTC flat / ranging",
         lambda x: x.get("btc_align") is True, minn=20)
     add("BTC volatility", "BTC calm", "BTC volatile", lambda x: x.get("btc_vol") == "lo", minn=20)
+    add_cat("Market breadth", lambda x: x.get("breadth"))
+    add("Dominance", "alts leading (BTC.D falling)", "BTC leading (BTC.D rising)",
+        lambda x: x.get("dom") == "alt", minn=20)
     out.sort(key=lambda f: f["gap"], reverse=True)
     return out[:8]
 
@@ -4556,6 +4648,7 @@ def _bt_aggregate(results, syms, tf, side, fees_bps):
             "max_concurrent": _bt_max_concurrent(allt, tf),
             "monthly": _bt_monthly(allt),
             "insights": _bt_insights(allt), "findings": _bt_findings(allt),
+            "by_breadth": _bt_by_breadth(allt),
             "portfolio": _bt_portfolio(allt),
             "sample": _bt_sample(results, syms),
             "per_symbol": sorted(per, key=lambda p: p["exp"], reverse=True),
@@ -4592,28 +4685,46 @@ def backtest_all(sess, market, tfs=("15m", "1h", "4h", "1d"), limit=1000,
     for tf in tfs:
         # BTC behaviour for THIS timeframe — fetched once, shared across every coin so each
         # trade can be tagged with (and gated on) what the market leader was doing.
-        btc_ctx = {}
-        try:
-            _brows = fetch_candles_deep(sess, "BTCUSDT", tf, limit, market)
-            if _brows:
-                btc_ctx = _btc_regime_ctx(_brows)
-        except Exception:
-            btc_ctx = {}
-
-        def _one(sym, _bc=btc_ctx):
+        # PHASE 1 — fetch every coin's candles ONCE (parallel), keep them so we can build a
+        # market-wide breadth/dominance context before running any strategy.
+        rows_by = {}
+        def _fetch(sym):
             try:
-                rows = fetch_candles_deep(sess, sym, tf, limit, market)
+                return sym, fetch_candles_deep(sess, sym, tf, limit, market)
             except Exception:
                 return sym, None
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            for fut in as_completed([ex.submit(_fetch, s) for s in syms]):
+                try:
+                    sym, r = fut.result()
+                except Exception:
+                    sym, r = None, None
+                if sym and r:
+                    rows_by[sym] = r
+        # BTC own-regime context (fetch BTC separately if it's not in this basket, e.g. odd baskets)
+        _brows = rows_by.get("BTCUSDT")
+        if not _brows:
+            try:
+                _brows = fetch_candles_deep(sess, "BTCUSDT", tf, limit, market)
+            except Exception:
+                _brows = None
+        btc_ctx = _btc_regime_ctx(_brows) if _brows else {}
+        # Market breadth + dominance across the whole basket (per bar) — the environment gate.
+        mkt_ctx = _market_ctx(rows_by, "BTCUSDT")
+
+        # PHASE 2 — run every strategy/side on the pre-fetched candles.
+        def _one(sym):
+            rows = rows_by.get(sym)
             if not rows:
                 return sym, None
-            return sym, {sd: backtest_symbol(rows, sd, fees_bps=fees_bps, strategy=strategy, btc_ctx=_bc, tf=tf)
+            return sym, {sd: backtest_symbol(rows, sd, fees_bps=fees_bps, strategy=strategy,
+                                             btc_ctx=btc_ctx, mkt_ctx=mkt_ctx, tf=tf)
                          for sd in sides}
         per = {sd: {} for sd in sides}
         with ThreadPoolExecutor(max_workers=12) as ex:
-            for f in as_completed([ex.submit(_one, s) for s in syms]):
+            for fut in as_completed([ex.submit(_one, s) for s in syms]):
                 try:
-                    sym, res = f.result()
+                    sym, res = fut.result()
                 except Exception:
                     sym, res = None, None
                 if sym and res:

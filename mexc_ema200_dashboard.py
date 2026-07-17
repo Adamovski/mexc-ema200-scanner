@@ -85,7 +85,7 @@ def send_telegram(cfg: dict, text: str) -> None:
 # logic changes meaningfully — the headline win-rate resets to the new version (a clean
 # slate for the new logic), while every past version's results are kept and shown in the
 # "site version" breakdown so you can compare how each iteration actually performed.
-APP_VERSION = "v8 · Longs = momentum · Shorts = reversion (2yr-backtested)"
+APP_VERSION = "v9 · Market-regime gating — longs limited to risk-on breadth (BTC.D-aware)"
 # One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
 # every call (open + resolved) on the next boot and start the calls scorecard fresh —
 # auto-board trades and their version history are untouched.
@@ -4911,6 +4911,28 @@ function btSideCard(label,emoji,s){
   if(finds.length){
     anl+=`<div class="btideah">💡 What worked (segment expectancy)</div>`;
     anl+=finds.map(f=>`<div class="btidea">${esc(f.label)}: <b class="${f.a.exp>f.b.exp?'pf-good':'pf-bad'}">${esc(f.a.name)} ${f.a.exp>0?'+':''}${f.a.exp}R</b> <span class="rr">(${f.a.n})</span> vs <b class="${f.b.exp>f.a.exp?'pf-good':'pf-bad'}">${esc(f.b.name)} ${f.b.exp>0?'+':''}${f.b.exp}R</b> <span class="rr">(${f.b.n})</span> → favour <b>${esc(f.better)}</b></div>`).join('');
+  }
+  // MARKET REGIME panel — how this strategy/side does by broad breadth (risk-on / mixed / risk-off)
+  // and by dominance (alts vs BTC leading). This is the "market environment for longs" read.
+  const bb=s.by_breadth||{}; const isLong=(s.side==='long');
+  if(bb.breadth && Object.keys(bb.breadth).length){
+    const order=['risk_on','mixed','risk_off'];
+    const lbl={risk_on:'Risk-on (breadth ≥55%)',mixed:'Mixed (40–55%)',risk_off:'Risk-off (≤40%)'};
+    const tip={risk_on:'Most of the basket is above its 200-EMA — broad alt participation.',mixed:'Split market — no clear breadth.',risk_off:'Most alts below their 200-EMA — broad bleed.'};
+    anl+=`<div class="btideah">🌐 By market regime — where this ${isLong?'LONG':'SHORT'} edge lives</div>`;
+    anl+=`<div style="overflow-x:auto"><table class="bt" style="min-width:100%"><thead><tr><th>Breadth regime</th><th>Trades</th><th>Win rate</th><th>Expectancy</th><th>Total R</th></tr></thead><tbody>`
+      +order.filter(k=>bb.breadth[k]).map(k=>{const r=bb.breadth[k];
+        return `<tr><td style="white-space:nowrap" data-tip="${tip[k]}">${lbl[k]}</td><td>${r.n}</td><td class="${r.winrate>=50?'pf-good':'pf-bad'}">${r.winrate}%</td><td class="${r.exp>0?'pf-good':'pf-bad'}">${r.exp>0?'+':''}${r.exp}R</td><td class="${r.sumR>0?'pf-good':'pf-bad'}">${r.sumR>0?'+':''}${r.sumR}R</td></tr>`;}).join('')
+      +`</tbody></table></div>`;
+    // recommendation line
+    const best=order.filter(k=>bb.breadth[k]&&bb.breadth[k].n>=20).sort((a,b)=>bb.breadth[b].exp-bb.breadth[a].exp)[0];
+    if(best){ const r=bb.breadth[best]; const good=r.exp>0;
+      anl+=`<div class="btidea${good?' btgood':' btbad'}">➡️ Best in <b>${lbl[best].split(' (')[0]}</b> (${r.exp>0?'+':''}${r.exp}R over ${r.n}). ${good?`This ${isLong?'long':'short'} side should be gated to that regime — take it when breadth agrees, stand aside otherwise.`:'Even its best regime is negative — this side/timeframe has no edge worth trading.'}</div>`; }
+  }
+  if(bb.dom && (bb.dom.alt||bb.dom.btc)){
+    const a=bb.dom.alt,b=bb.dom.btc;
+    const cell=(r)=> r?`<b class="${r.exp>0?'pf-good':'pf-bad'}">${r.exp>0?'+':''}${r.exp}R</b> <span class="rr">(${r.n})</span>`:'—';
+    anl+=`<div class="btidea" data-tip="Dominance proxy: over the prior 20 bars, did the median alt outrun BTC (alts leading / BTC.D falling) or lag it (BTC leading / BTC.D rising)?">🧭 Dominance — alts leading: ${cell(a)} vs BTC leading: ${cell(b)}${(a&&b)?` → favour <b>${a.exp>b.exp?'alt-led tape':'BTC-led tape'}</b>`:''}</div>`;
   }
   const ckey=((s.tf||'')+'_'+(s.side||'')).replace(/[^a-z0-9]/gi,'');
   const fmtd=ts=>{try{const d=new Date(ts);const p=n=>String(n).padStart(2,'0');return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes());}catch(e){return '—';}};
