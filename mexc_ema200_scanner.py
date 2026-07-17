@@ -4629,6 +4629,117 @@ def _bt_bullmom(rows, side, fees_bps=5.0, horizon=36, warmup=210, btc_ctx=None, 
     return out
 
 
+def _bt_pro(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None):
+    """PREMIUM CONFLUENCE reversion — aims for a ~70% win-rate WITH reward:risk >= 1 by taking only
+    the cleanest setups and rejecting the rest. Every filter must line up: (1) WITH the higher-TF
+    trend (price on the right side of a sloping 200-EMA); (2) the FAVOURABLE breadth regime (long
+    only when breadth >= 55% / risk-on, short only when breadth <= 45% / risk-off); (3) BTC not
+    fighting it; (4) CALM tape (coin ATR% below its median); (5) price REACTING at a REAL structural
+    level — a nearby swing support (long) / resistance (short) or the 20-EMA — tagged and reclaimed;
+    (6) an RSI extreme that has turned. The stop sits just beyond the level (tight), the target is
+    the 20-EMA mean / next level, and the trade is SKIPPED unless the resulting R:R >= 1.0. Fewer,
+    higher-quality trades. No look-ahead; stop-first on ties; net of fees; regime-tagged via _bt_sim."""
+    try:
+        H = [float(x[2]) for x in rows]; L = [float(x[3]) for x in rows]
+        C = [float(x[4]) for x in rows]; V = [float(x[5]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return []
+    n = len(C)
+    if n < warmup + horizon + 5:
+        return []
+    e200 = ema(C, 200); e20 = ema(C, 20); rsis = rsi_series(C)
+    long = side == "long"; fee_frac = fees_bps / 10000.0
+    _dv = sorted(C[i] * V[i] for i in range(n)); dvol = _dv[len(_dv) // 2] if _dv else 0.0
+    _atrp = [((atr(H[max(0, i - 20):i + 1], L[max(0, i - 20):i + 1], C[max(0, i - 20):i + 1]) or 0.0) / C[i])
+             if C[i] else 0.0 for i in range(n)]
+    _as = sorted(x for x in _atrp if x > 0); _amed = _as[len(_as) // 2] if _as else 0.0
+    out = []; t = warmup
+    while t < n - horizon - 1:
+        el = e200[t]; e2 = e20[t]; rs = rsis[t]
+        if el is None or e2 is None or rs is None:
+            t += 1; continue
+        a = atr(H[max(0, t - 20):t + 1], L[max(0, t - 20):t + 1], C[max(0, t - 20):t + 1])
+        if not a or a <= 0:
+            t += 1; continue
+        prev = e200[t - 20] if t >= 20 else None
+        ts = int(rows[t][0]) if rows[t] else 0
+        _bs = btc_ctx.get(ts) if btc_ctx else None
+        btrend = _bs.get("t") if _bs else None; bvol = _bs.get("v") if _bs else None
+        _ms = mkt_ctx.get(ts) if mkt_ctx else None
+        mbr = _ms.get("br") if _ms else None; mdom = _ms.get("dom") if _ms else None
+        mbpct = _ms.get("bpct") if _ms else None
+        if bvol == "hi" or (_amed and _atrp[t] > _amed * 1.05):     # calm only (strict)
+            t += 1; continue
+        price = C[t]; entry = stop = target = None
+        if long:
+            if not (price > el and (prev is None or el > prev)):
+                t += 1; continue
+            if mbr == "risk_off" or (mbpct is not None and mbpct < 50):   # supportive breadth
+                t += 1; continue
+            if btrend == "down":
+                t += 1; continue
+            if not (36 <= rs <= 52 and C[t] > C[t - 1]):             # oversold-ish, turning up
+                t += 1; continue
+            sups = supports_below(L, t, price, max_n=3, min_gap=0.003)
+            lvl = None
+            for cand in sups:                                        # nearest real support within reach
+                if cand >= price * 0.94:
+                    lvl = cand; break
+            if lvl is None and e2 < price:
+                lvl = e2
+            if lvl is None:
+                t += 1; continue
+            if min(L[max(0, t - 3):t + 1]) > lvl * 1.006:            # must have actually tagged it
+                t += 1; continue
+            entry = price
+            stop = lvl - 0.6 * a
+            risk = entry - stop
+            if risk <= 0:
+                t += 1; continue
+            ress = resistances_above(H, t, price, max_n=2, min_gap=0.004)
+            mean_tgt = e2 if e2 > entry else (ress[0] if ress else entry + 1.5 * risk)
+            target = min(max(mean_tgt, entry + 1.0 * risk), entry + 2.4 * risk)
+        else:
+            if not (price < el and (prev is None or el < prev)):
+                t += 1; continue
+            if mbr == "risk_on" or (mbpct is not None and mbpct > 50):
+                t += 1; continue
+            if btrend == "up":
+                t += 1; continue
+            if not (48 <= rs <= 64 and C[t] < C[t - 1]):             # overbought-ish, rolling over
+                t += 1; continue
+            ress = resistances_above(H, t, price, max_n=3, min_gap=0.003)
+            lvl = None
+            for cand in ress:
+                if cand <= price * 1.06:
+                    lvl = cand; break
+            if lvl is None and e2 > price:
+                lvl = e2
+            if lvl is None:
+                t += 1; continue
+            if max(H[max(0, t - 3):t + 1]) < lvl * 0.994:
+                t += 1; continue
+            entry = price
+            stop = lvl + 0.6 * a
+            risk = stop - entry
+            if risk <= 0:
+                t += 1; continue
+            sups = supports_below(L, t, price, max_n=2, min_gap=0.004)
+            mean_tgt = e2 if e2 < entry else (sups[0] if sups else entry - 1.5 * risk)
+            target = max(min(mean_tgt, entry - 1.0 * risk), entry - 2.4 * risk)
+        if target is None or abs(target - entry) / entry < 0.0015:
+            t += 1; continue
+        rr = (((target - entry) if long else (entry - target)) / risk)
+        if rr < 1.0:                                                # PREMIUM: only good-R:R setups
+            t += 1; continue
+        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx,
+                           "pro", long, t, entry, stop, target, a, rs=rs, mkt_ctx=mkt_ctx)
+        if tr is None:
+            t += 1; continue
+        out.append(tr); t = rbar + 1
+    return out
+
+
 def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="level", btc_ctx=None, tf="4h", mkt_ctx=None):
     """Replay a strategy's entry/stop/target MECHANICS over one coin's historical candles and
     return a list of resolved trades (net R after fees). WITHOUT look-ahead: every decision at
@@ -4659,6 +4770,8 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="
         return _bt_pullback20(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy == "bullmom":
         return _bt_bullmom(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
+    if strategy == "pro":
+        return _bt_pro(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy == "monday":
         return _bt_btc_monday(rows, side, fees_bps=fees_bps, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     try:

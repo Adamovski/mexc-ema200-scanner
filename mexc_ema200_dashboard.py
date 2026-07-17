@@ -85,7 +85,7 @@ def send_telegram(cfg: dict, text: str) -> None:
 # logic changes meaningfully — the headline win-rate resets to the new version (a clean
 # slate for the new logic), while every past version's results are kept and shown in the
 # "site version" breakdown so you can compare how each iteration actually performed.
-APP_VERSION = "v13 · +Bull-momentum long hunt · capped-concurrency drawdown"
+APP_VERSION = "v14 · Premium confluence ★ — 70% WR aim, R:R≥1, both sides"
 # One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
 # every call (open + resolved) on the next boot and start the calls scorecard fresh —
 # auto-board trades and their version history are untouched.
@@ -1543,7 +1543,7 @@ def backtest_loop(state: State) -> None:
     # STRATEGY LAB — sweep several DIFFERENT strategies head-to-head so we can compare edges in
     # their own tabs instead of overwriting one strategy forever. Run on a liquid basket (~60
     # coins) so it actually completes on the free tier; the meaningful TFs only.
-    strategies = [("highwr", "High win-rate ☑"), ("bullmom", "Bull momentum ↗")]  # WR short + bull-market long hunt
+    strategies = [("pro", "Premium ★ (70% WR aim)"), ("highwr", "High win-rate ☑")]  # premium confluence both sides + WR reference
     lab_tfs = ("1h", "4h", "1d")
     # 4-YEAR history where practical: daily & 4h reach ~4y; 1h capped (~1.4y) to fit free-tier memory.
     lab_limit = {"1h": 12000, "4h": 8760, "1d": 1460}
@@ -5029,6 +5029,7 @@ function renderBacktest(){
     highwr:'⭐ Built for WIN-RATE: trend-aligned + regime-gated + calm-only oversold/overbought snap, NEAR take-profit (banked often) + WIDE stop (rarely hit), R:R ~0.65–0.8 so a 60%+ hit-rate turns a profit. Now the ONLY strategy in the lab, over a DEEP history (daily & 4h ≈ 4 years, 1h ≈ 1.4y). Shorts win in risk-off (bear breadth); longs need risk-on.',
     pullback20:'High win-rate trend-continuation: buy the shallow pullback that tags & reclaims the fast 20-EMA in an uptrend (mirror for shorts). Near target, moderately wide stop. The fast mean reclaims often, so it tends to win frequently.',
     bullmom:'↗ The LONG-in-a-BULL hunt: only fires when the WHOLE market is risk-on (breadth ≥60%, BTC up) — buy a FRESH breakout in strong momentum and RIDE it (~2.5R). Mirror shorts a broad risk-off breakdown. Lower win-rate, bigger winners — the opposite trade-off to High win-rate.',
+    pro:'★ PREMIUM confluence — the cleanest-only setups, aiming for ~70% win-rate WITH R:R ≥ 1. Every filter must align: with-trend + favourable breadth + BTC not fighting + calm tape + price reacting at a REAL support/resistance (or 20-EMA) + a turned RSI extreme, and the trade is skipped unless reward:risk ≥ 1. Long = buy held support in a bull; Short = fade a rejected resistance in a bear. Fewer, higher-quality trades.',
     monday:'BTC/majors: fade the weekly Monday opening range — hold the Monday low (long) or reject the Monday high (short).'};
   let sel=`<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">`+
     strats.map(s=>{const on=s.key===labStrat; const has=lab[s.key]; return `<button onclick="setLabStrat('${s.key}')" style="cursor:pointer;border-radius:8px;padding:7px 12px;font-size:12.5px;font-weight:600;border:1px solid ${on?'var(--accent)':'var(--line)'};background:${on?'rgba(63,185,80,.12)':'var(--panel2)'};color:${on?'var(--txt)':'var(--dim)'}">${esc(s.name)}${has?'':' ⏳'}</button>`;}).join('')+`</div>`;
