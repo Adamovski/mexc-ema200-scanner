@@ -86,7 +86,8 @@ def send_telegram(cfg: dict, text: str) -> None:
 # logic changes meaningfully — the headline win-rate resets to the new version (a clean
 # slate for the new logic), while every past version's results are kept and shown in the
 # "site version" breakdown so you can compare how each iteration actually performed.
-APP_VERSION = "v19 · Stock feed → Yahoo Finance (Stooq blocked servers); stocks lab live"
+APP_MODE = os.environ.get("APP_MODE", "crypto").strip().lower()   # "crypto" (default) or "stocks" — lets the SAME app run as two independent Render services
+APP_VERSION = ("v21 · STOCKS site (Yahoo daily)" if APP_MODE == "stocks" else "v21 · crypto site") + " — mode-split, separate services"
 # One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
 # every call (open + resolved) on the next boot and start the calls scorecard fresh —
 # auto-board trades and their version history are untouched.
@@ -1547,12 +1548,15 @@ def backtest_loop(state: State) -> None:
     # STRATEGY LAB jobs: (tabKey, displayName, strategyFn, market, indexSym, basket, timeframes).
     # Runs the premium + high-win-rate strategies on BOTH crypto (MEXC futures, BTC index) and
     # US stocks (Stooq daily, SPY index) so the two markets sit side-by-side in their own tabs.
-    lab_jobs = [
-        ("pro",        "Premium ★ · crypto",  "pro",    "futures", "BTCUSDT", list(BACKTEST_BASKET), ("1h", "4h", "1d")),
-        ("highwr",     "High win-rate · crypto", "highwr", "futures", "BTCUSDT", list(BACKTEST_BASKET), ("1h", "4h", "1d")),
-        ("pro_stk",    "Premium ★ · stocks",  "pro",    "stocks",  "SPY",     list(STOCK_BASKET),    ("1d",)),
-        ("highwr_stk", "High win-rate · stocks", "highwr", "stocks",  "SPY",     list(STOCK_BASKET),    ("1d",)),
+    CRYPTO_JOBS = [
+        ("pro",    "Premium ★",     "pro",    "futures", "BTCUSDT", list(BACKTEST_BASKET), ("1h", "4h", "1d")),
+        ("highwr", "High win-rate", "highwr", "futures", "BTCUSDT", list(BACKTEST_BASKET), ("1h", "4h", "1d")),
     ]
+    STOCK_JOBS = [
+        ("pro",    "Premium ★",     "pro",    "stocks", "SPY", list(STOCK_BASKET), ("1d",)),
+        ("highwr", "High win-rate", "highwr", "stocks", "SPY", list(STOCK_BASKET), ("1d",)),
+    ]
+    lab_jobs = STOCK_JOBS if APP_MODE == "stocks" else CRYPTO_JOBS
     lab_limit = {"1h": 12000, "4h": 8760, "1d": 1460}
     strat_meta = [{"key": j[0], "name": j[1]} for j in lab_jobs]
     while True:
@@ -5081,7 +5085,10 @@ function renderBacktest(){
   let sel=`<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">`+
     strats.map(s=>{const on=s.key===labStrat; const has=lab[s.key]; return `<button onclick="setLabStrat('${s.key}')" style="cursor:pointer;border-radius:8px;padding:7px 12px;font-size:12.5px;font-weight:600;border:1px solid ${on?'var(--accent)':'var(--line)'};background:${on?'rgba(63,185,80,.12)':'var(--panel2)'};color:${on?'var(--txt)':'var(--dim)'}">${esc(s.name)}${has?'':' ⏳'}</button>`;}).join('')+`</div>`;
   const S=lab[labStrat]||{};
-  const tfs=(labStrat==='monday')?['4h','1d']:(labStrat.endsWith('_stk')?['1d']:['1h','4h','1d']);
+  // Data-driven: show exactly the timeframes this board actually has (crypto = 1h/4h/1d, stocks = 1d).
+  const _tford=['5m','15m','1h','4h','1d','1wk'];
+  let tfs=_tford.filter(tf=>S[tf]&&(S[tf].long||S[tf].short));
+  if(!tfs.length) tfs=(labStrat==='monday')?['4h','1d']:['1h','4h','1d'];
   const sname=(strats.find(s=>s.key===labStrat)||{}).name||labStrat;
   let m=`<div class="perfsub">🧪 ${esc(sname)} — <span style="color:var(--dim)">${esc(desc[labStrat]||'')}</span></div>`;
   m+=`<table class="bt btmatrix"><thead><tr><th>Timeframe</th><th>🟢 Longs</th><th>🔴 Shorts</th></tr></thead><tbody>`;
@@ -6163,9 +6170,9 @@ def main() -> None:
     else:
         print("  Telegram alerts: off (set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)")
 
-    t = threading.Thread(target=scan_loop, args=(state,), daemon=True)
-    t.start()
-    threading.Thread(target=breakout_watcher, args=(state,), daemon=True).start()
+    if APP_MODE != "stocks":
+        threading.Thread(target=scan_loop, args=(state,), daemon=True).start()
+        threading.Thread(target=breakout_watcher, args=(state,), daemon=True).start()
     threading.Thread(target=backtest_loop, args=(state,), daemon=True).start()
 
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(state))
