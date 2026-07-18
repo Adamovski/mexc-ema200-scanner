@@ -4556,8 +4556,11 @@ def _bt_highwr(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, t
         if long:
             if not (price > el and (prev is None or el > prev)):
                 t += 1; continue
-            if mbr == "risk_off":                          # long only in supportive breadth
-                t += 1; continue
+            if (mbr != "risk_on" or (mbpct is not None and mbpct < 58)          # STRONG breadth
+                    or (_ms and _ms.get("bdir") == "falling")                     # participation rising
+                    or mdom == "btc"                                              # alts leading (BTC.D falling)
+                    or (btrend is not None and btrend != "up")):                  # BTC uptrend
+                t += 1; continue           # LONG only in a CONFIRMED alt-season
             if _btc_block(True, tf, btrend, bvol):
                 t += 1; continue
             if not (38 <= rs <= 55 and C[t] > C[t - 1]):   # oversold-ish snap that has turned up
@@ -4575,6 +4578,8 @@ def _bt_highwr(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, t
                 t += 1; continue
             if mbr == "risk_on":                           # short only in weak breadth
                 t += 1; continue
+            if tf in ("4h", "1d") and _ms and _ms.get("im") not in ("down", "strong_down"):
+                t += 1; continue           # higher-TF short: only fade genuinely WEAK tape (edge is bearish-tilted)
             if _btc_block(False, tf, btrend, bvol):
                 t += 1; continue
             if not (45 <= rs <= 62 and C[t] < C[t - 1]):   # overbought-ish pop rolling over
@@ -4802,10 +4807,10 @@ def _bt_pro(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="
         if long:
             if not (price > el and (prev is None or el > prev)):
                 t += 1; continue
-            if mbr == "risk_off" or (mbpct is not None and mbpct < 50):   # supportive breadth
-                t += 1; continue
-            if btrend == "down":
-                t += 1; continue
+            if (mbr != "risk_on" or (mbpct is not None and mbpct < 58)
+                    or (_ms and _ms.get("bdir") == "falling")
+                    or mdom == "btc" or (btrend is not None and btrend != "up")):
+                t += 1; continue           # LONG only in a CONFIRMED alt-season
             if not (36 <= rs <= 52 and C[t] > C[t - 1]):             # oversold-ish, turning up
                 t += 1; continue
             sups = supports_below(L, t, price, max_n=3, min_gap=0.003)
@@ -4834,6 +4839,8 @@ def _bt_pro(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="
                 t += 1; continue
             if btrend == "up":
                 t += 1; continue
+            if tf in ("4h", "1d") and _ms and _ms.get("im") not in ("down", "strong_down"):
+                t += 1; continue           # higher-TF short: only fade genuinely WEAK tape
             if not (48 <= rs <= 64 and C[t] < C[t - 1]):             # overbought-ish, rolling over
                 t += 1; continue
             ress = resistances_above(H, t, price, max_n=3, min_gap=0.003)

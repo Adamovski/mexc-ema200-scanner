@@ -87,7 +87,7 @@ def send_telegram(cfg: dict, text: str) -> None:
 # slate for the new logic), while every past version's results are kept and shown in the
 # "site version" breakdown so you can compare how each iteration actually performed.
 APP_MODE = os.environ.get("APP_MODE", "crypto").strip().lower()   # "crypto" (default) or "stocks" — lets the SAME app run as two independent Render services
-APP_VERSION = ("v21 · STOCKS site (Yahoo daily)" if APP_MODE == "stocks" else "v21 · crypto site") + " — mode-split, separate services"
+APP_VERSION = ("v22 · STOCKS site (Yahoo daily)" if APP_MODE == "stocks" else "v22 · crypto site") + " — longs gated to confirmed alt-season, higher-TF shorts to weak tape"
 # One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
 # every call (open + resolved) on the next boot and start the calls scorecard fresh —
 # auto-board trades and their version history are untouched.
