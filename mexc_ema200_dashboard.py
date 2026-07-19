@@ -87,7 +87,7 @@ def send_telegram(cfg: dict, text: str) -> None:
 # slate for the new logic), while every past version's results are kept and shown in the
 # "site version" breakdown so you can compare how each iteration actually performed.
 APP_MODE = os.environ.get("APP_MODE", "crypto").strip().lower()   # "crypto" (default) or "stocks" — lets the SAME app run as two independent Render services
-APP_VERSION = ("v22 · STOCKS site (Yahoo daily)" if APP_MODE == "stocks" else "v22 · crypto site") + " — longs gated to confirmed alt-season, higher-TF shorts to weak tape"
+APP_VERSION = ("v23 · STOCKS site (Yahoo daily)" if APP_MODE == "stocks" else "v23 · crypto site") + " — +5-Tool Confluence (EMA stack + Supertrend + Fib zone), 4H/1D"
 # One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
 # every call (open + resolved) on the next boot and start the calls scorecard fresh —
 # auto-board trades and their version history are untouched.
@@ -1549,6 +1549,8 @@ def backtest_loop(state: State) -> None:
     # Runs the premium + high-win-rate strategies on BOTH crypto (MEXC futures, BTC index) and
     # US stocks (Stooq daily, SPY index) so the two markets sit side-by-side in their own tabs.
     CRYPTO_JOBS = [
+        # 5-tool confluence runs 4h/1d ONLY — the style's own rule is never to trade off 15m/1h.
+        ("emaconf", "5-Tool Confluence", "emaconf", "futures", "BTCUSDT", list(BACKTEST_BASKET), ("4h", "1d")),
         ("pro",    "Premium ★",     "pro",    "futures", "BTCUSDT", list(BACKTEST_BASKET), ("1h", "4h", "1d")),
         ("highwr", "High win-rate", "highwr", "futures", "BTCUSDT", list(BACKTEST_BASKET), ("1h", "4h", "1d")),
     ]
@@ -5078,6 +5080,7 @@ function renderBacktest(){
     highwr:'⭐ Built for WIN-RATE: trend-aligned + regime-gated + calm-only oversold/overbought snap, NEAR take-profit (banked often) + WIDE stop (rarely hit), R:R ~0.65–0.8 so a 60%+ hit-rate turns a profit. Now the ONLY strategy in the lab, over a DEEP history (daily & 4h ≈ 4 years, 1h ≈ 1.4y). Shorts win in risk-off (bear breadth); longs need risk-on.',
     pullback20:'High win-rate trend-continuation: buy the shallow pullback that tags & reclaims the fast 20-EMA in an uptrend (mirror for shorts). Near target, moderately wide stop. The fast mean reclaims often, so it tends to win frequently.',
     bullmom:'↗ The LONG-in-a-BULL hunt: only fires when the WHOLE market is risk-on (breadth ≥60%, BTC up) — buy a FRESH breakout in strong momentum and RIDE it (~2.5R). Mirror shorts a broad risk-off breakdown. Lower win-rate, bigger winners — the opposite trade-off to High win-rate.',
+    emaconf:'🧰 The 5-TOOL CONFLUENCE swing system (4H/Daily only — never LTF). Long when the HTF stack is bullish (price above the 50 & 200 EMA, 10>20 EMA, Supertrend GREEN), then buy the PULLBACK into value — a tag of the 10/20/50 EMA or the 0.618–0.786 Fib magic zone — on the close that turns back up. Stop rides the Supertrend line / swing; target the prior swing high. Shorts mirror it. Chop is deliberately NOT filtered out.',
     pro:'★ PREMIUM confluence — the cleanest-only setups, aiming for ~70% win-rate WITH R:R ≥ 1. Every filter must align: with-trend + favourable breadth + BTC not fighting + calm tape + price reacting at a REAL support/resistance (or 20-EMA) + a turned RSI extreme, and the trade is skipped unless reward:risk ≥ 1. Long = buy held support in a bull; Short = fade a rejected resistance in a bear. Fewer, higher-quality trades.',
     pro_stk:'★ PREMIUM confluence on US STOCKS (daily, ~6yr history via Stooq, SPY as the market index, breadth across ~48 large-caps). Same cleanest-only logic as the crypto Premium board — buy held support in an up-market, fade rejected resistance in a down-market, R:R ≥ 1 required. Stocks trend more cleanly than alts, so this is the honest test of whether the edge is stronger here.',
     highwr_stk:'High win-rate mean-reversion on US STOCKS (daily, SPY index, ~48 large-caps). Near take-profit / wide stop snap-back, regime-gated. The stock version of the high-win-rate board.',

@@ -4875,6 +4875,89 @@ def _bt_pro(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="
     return out
 
 
+def _bt_emaconf(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None):
+    """THE 5-TOOL CONFLUENCE SYSTEM (HTF swing style). Long only when the higher-timeframe stack is
+    bullish — price ABOVE the 50 & 200 EMA, the fast 10>20 EMA stacked up, and SUPERTREND green —
+    then buy a PULLBACK into the value zone: a tag of the 10/20/50 EMA *or* the 0.618-0.786 Fib
+    'magic zone' of the last swing, taken on the close that turns back up. Stop below the Supertrend
+    line / swing low (the trailing-stop logic), target the prior swing high. Shorts mirror it.
+    NOTE: deliberately NO chop/vol filter — this system is meant to run in choppy tape too."""
+    try:
+        H = [float(x[2]) for x in rows]; L = [float(x[3]) for x in rows]
+        C = [float(x[4]) for x in rows]; V = [float(x[5]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return []
+    n = len(C)
+    if n < warmup + horizon + 5:
+        return []
+    e10 = ema(C, 10); e20 = ema(C, 20); e50 = ema(C, 50); e200 = ema(C, 200)
+    st, sdir = _st_series(H, L, C, 10, 3.0)
+    long = side == "long"; fee_frac = fees_bps / 10000.0
+    _dv = sorted(C[i] * V[i] for i in range(n)); dvol = _dv[len(_dv) // 2] if _dv else 0.0
+    out = []; t = warmup
+    while t < n - horizon - 1:
+        a = atr(H[max(0, t - 20):t + 1], L[max(0, t - 20):t + 1], C[max(0, t - 20):t + 1])
+        if not a or a <= 0 or st[t] is None:
+            t += 1; continue
+        f10, f20, f50, f200 = e10[t], e20[t], e50[t], e200[t]
+        if None in (f10, f20, f50, f200):
+            t += 1; continue
+        price = C[t]; entry = stop = target = None
+        # --- swing window for Fib + targets ---
+        look = 60
+        sw_hi = max(H[max(0, t - look):t + 1]); sw_lo = min(L[max(0, t - look):t + 1])
+        rng = sw_hi - sw_lo
+        if rng <= 0:
+            t += 1; continue
+        if long:
+            # HTF stack bullish + Supertrend green
+            if not (price > f50 and price > f200 and f10 > f20 and sdir[t] == 1):
+                t += 1; continue
+            # PULLBACK into value: tagged the 10/20/50 EMA, or the .618-.786 Fib zone of the swing
+            lo3 = min(L[max(0, t - 2):t + 1])
+            fib618 = sw_hi - 0.618 * rng; fib786 = sw_hi - 0.786 * rng
+            tagged_ema = lo3 <= max(f10, f20) * 1.004 or lo3 <= f50 * 1.006
+            tagged_fib = fib786 * 0.997 <= lo3 <= fib618 * 1.003
+            if not (tagged_ema or tagged_fib):
+                t += 1; continue
+            if not (C[t] > C[t - 1] and price > f20 * 0.997):        # turning back up
+                t += 1; continue
+            entry = price
+            stop = min(st[t], lo3) - 0.3 * a                          # Supertrend line / swing as trail
+            risk = entry - stop
+            if risk <= 0:
+                t += 1; continue
+            target = max(sw_hi, entry + 1.8 * risk)                   # prior swing high
+        else:
+            if not (price < f50 and price < f200 and f10 < f20 and sdir[t] == -1):
+                t += 1; continue
+            hi3 = max(H[max(0, t - 2):t + 1])
+            fib618 = sw_lo + 0.618 * rng; fib786 = sw_lo + 0.786 * rng
+            tagged_ema = hi3 >= min(f10, f20) * 0.996 or hi3 >= f50 * 0.994
+            tagged_fib = fib618 * 0.997 <= hi3 <= fib786 * 1.003
+            if not (tagged_ema or tagged_fib):
+                t += 1; continue
+            if not (C[t] < C[t - 1] and price < f20 * 1.003):
+                t += 1; continue
+            entry = price
+            stop = max(st[t], hi3) + 0.3 * a
+            risk = stop - entry
+            if risk <= 0:
+                t += 1; continue
+            target = min(sw_lo, entry - 1.8 * risk)
+        if target is None or abs(target - entry) / entry < 0.002:
+            t += 1; continue
+        rr = (((target - entry) if long else (entry - target)) / risk)
+        if rr < 1.2:                                                  # HTF swing wants real reward
+            t += 1; continue
+        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx,
+                           "emaconf", long, t, entry, stop, target, a, mkt_ctx=mkt_ctx)
+        if tr is None:
+            t += 1; continue
+        out.append(tr); t = rbar + 1
+    return out
+
+
 def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="level", btc_ctx=None, tf="4h", mkt_ctx=None):
     """Replay a strategy's entry/stop/target MECHANICS over one coin's historical candles and
     return a list of resolved trades (net R after fees). WITHOUT look-ahead: every decision at
@@ -4907,6 +4990,8 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="
         return _bt_bullmom(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy == "pro":
         return _bt_pro(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
+    if strategy == "emaconf":
+        return _bt_emaconf(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy == "monday":
         return _bt_btc_monday(rows, side, fees_bps=fees_bps, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     try:
@@ -5488,6 +5573,173 @@ def retest_level(highs: list[float], lows: list[float], price: float,
     if st_val and st_val < price:
         cand.append(st_val)
     return round(max(cand) * 1.002, 10) if cand else round(price * 0.98, 10)
+
+
+def _pivot_lows(L, k=3):
+    n = len(L); out = []
+    for i in range(k, n - k):
+        if L[i] == min(L[i - k:i + k + 1]) and L[i] < L[i - 1] and L[i] <= L[i + 1]:
+            out.append(i)
+    return out
+
+
+def descending_triple_bottom(rows, k=3, min_gap=6, near_pct=0.10):
+    """RUNNER PATTERN A — the descending triple bottom (capitulation base). Three swing lows, each
+    LOWER than the last, with price now basing at/just above the third low. Big-timeframe (daily/
+    weekly) data expected. Entry near the base, stop below the 3rd low, target = the first-leg high
+    (a full measured-move retrace). Returns a hit dict or None."""
+    try:
+        H = [float(x[2]) for x in rows]; L = [float(x[3]) for x in rows]
+        C = [float(x[4]) for x in rows]; V = [float(x[5]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return None
+    n = len(C)
+    if n < 60:
+        return None
+    piv = _pivot_lows(L, k)
+    if len(piv) < 3:
+        return None
+    chosen = []
+    for idx in reversed(piv):
+        if not chosen:
+            chosen.append(idx); continue
+        if chosen[-1] - idx >= min_gap and L[idx] > L[chosen[-1]]:
+            chosen.append(idx)
+        if len(chosen) == 3:
+            break
+    if len(chosen) < 3:
+        return None
+    chosen = sorted(chosen)
+    i1, i2, i3 = chosen
+    l1, l2, l3 = L[i1], L[i2], L[i3]
+    if not (l1 > l2 > l3):
+        return None
+    price = C[-1]
+    if price < l3 * 0.98 or price > l3 * (1 + near_pct):
+        return None
+    if (n - 1) - i3 > 40:
+        return None
+    higher_low = min(L[i3:]) >= l3 * 0.995
+    rng_high = max(H[i1:])
+    recent_v = sum(V[-20:]) / 20 if n >= 20 else sum(V) / n
+    hist_v = sum(V) / n
+    return {"pattern": "descending_triple_bottom", "lows": [round(l1, 8), round(l2, 8), round(l3, 8)],
+            "price": round(price, 8), "entry": round(price, 8), "stop": round(l3 * 0.94, 8),
+            "target": round(rng_high, 8), "higher_low": bool(higher_low),
+            "quiet": bool(hist_v > 0 and recent_v < 0.8 * hist_v),
+            "bars_since_low": (n - 1) - i3,
+            "rr": round((rng_high - price) / max(1e-9, (price - l3 * 0.94)), 2)}
+
+
+def accumulation_breakout(rows, range_bars=20, vol_dry=0.6):
+    """RUNNER PATTERN B — the $LAB setup: an early TEST-PUMP, then a drop into a TIGHT accumulation
+    range with the VOLUME DRYING UP (nobody watching), then a breakout press out of the top. Big-
+    timeframe data expected. Entry on the range-high break, stop below the range, target a measured
+    move (range x3) capped at the prior pump high. Returns a hit dict or None."""
+    try:
+        H = [float(x[2]) for x in rows]; L = [float(x[3]) for x in rows]
+        C = [float(x[4]) for x in rows]; V = [float(x[5]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return None
+    n = len(C)
+    if n < range_bars + 40:
+        return None
+    hist_high = max(H[:n - range_bars]); base = C[-1]
+    if hist_high < base * 1.6:
+        return None
+    win_hi = max(H[-range_bars:]); win_lo = min(L[-range_bars:])
+    if win_lo <= 0:
+        return None
+    rng = (win_hi - win_lo) / win_lo
+    if rng > 0.35:
+        return None
+    recent_v = sum(V[-range_bars:]) / range_bars
+    hist_v = sum(V[:n - range_bars]) / max(1, (n - range_bars))
+    if hist_v <= 0 or recent_v > vol_dry * hist_v:
+        return None
+    pos = (base - win_lo) / max(1e-9, (win_hi - win_lo))
+    broke = C[-1] > win_hi * 0.999
+    if pos < 0.6 and not broke:
+        return None
+    tgt = min(hist_high, base * (1 + (win_hi - win_lo) / win_lo * 3))
+    return {"pattern": "accumulation_breakout", "range": [round(win_lo, 8), round(win_hi, 8)],
+            "range_pct": round(rng * 100, 1), "vol_ratio": round(recent_v / hist_v, 2),
+            "prior_pump_high": round(hist_high, 8), "price": round(base, 8),
+            "entry": round(win_hi * 1.001, 8), "stop": round(win_lo * 0.97, 8), "target": round(tgt, 8),
+            "broke_out": bool(broke),
+            "rr": round((tgt - win_hi) / max(1e-9, (win_hi - win_lo * 0.97)), 2)}
+
+
+def confluence_box(rows, side="long", band_atr=1.2, swing_look=60):
+    """THE BID-BOX SETUP (4H confluence style): in an established trend (Supertrend green + price
+    the right side of the 200-EMA), find where the 20/50/200 EMAs, the Supertrend line and the DEEP
+    fib (.618-.786) of the last impulse CLUSTER into a tight band near price — the 'box' / zone of
+    interest — and price is trading into it. Entry = the box, invalidation = a strong close beyond
+    it, target = the prior impulse extreme. Returns a hit dict (with the confluence members) or None."""
+    try:
+        H = [float(x[2]) for x in rows]; L = [float(x[3]) for x in rows]; C = [float(x[4]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return None
+    n = len(C)
+    if n < 210:
+        return None
+    e20 = ema(C, 20); e50 = ema(C, 50); e200 = ema(C, 200)
+    st, d = _st_series(H, L, C, 10, 3.0)
+    i = n - 1
+    if None in (e20[i], e50[i], e200[i], st[i]):
+        return None
+    a = atr(H[max(0, i - 20):i + 1], L[max(0, i - 20):i + 1], C[max(0, i - 20):i + 1])
+    if not a or a <= 0:
+        return None
+    price = C[i]; longside = (side == "long")
+    if longside and not (d[i] == 1 and price > e200[i]):
+        return None
+    if (not longside) and not (d[i] == -1 and price < e200[i]):
+        return None
+    lo_i = max(0, n - swing_look)
+    sw_hi = max(H[lo_i:]); sw_lo = min(L[lo_i:])
+    if sw_hi <= sw_lo:
+        return None
+    if longside:
+        f1 = sw_hi - (sw_hi - sw_lo) * 0.618; f2 = sw_hi - (sw_hi - sw_lo) * 0.786
+    else:
+        f1 = sw_lo + (sw_hi - sw_lo) * 0.618; f2 = sw_lo + (sw_hi - sw_lo) * 0.786
+    cands = {"EMA20": e20[i], "EMA50": e50[i], "EMA200": e200[i],
+             "Supertrend": st[i], "Fib .618-.786": (f1 + f2) / 2}
+    rel = {k: v for k, v in cands.items() if v is not None and abs(v - price) <= 3.0 * a}
+    if not rel:
+        return None
+    best = None
+    for v0 in rel.values():
+        grp = [k for k, v in rel.items() if abs(v - v0) <= band_atr * a]
+        if best is None or len(grp) > len(best):
+            best = grp
+    members = best or []
+    if len(members) < 2:
+        return None
+    vals = [rel[k] for k in members]
+    box_lo = min(vals) - 0.25 * a; box_hi = max(vals) + 0.25 * a
+    if longside and not (box_lo - 0.8 * a <= price <= box_hi + 0.8 * a):
+        return None
+    if (not longside) and not (box_lo - 0.8 * a <= price <= box_hi + 0.8 * a):
+        return None
+    entry = (box_lo + box_hi) / 2
+    stop = (box_lo - 0.5 * a) if longside else (box_hi + 0.5 * a)
+    target = sw_hi if longside else sw_lo
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+    rr = ((target - entry) / risk) if longside else ((entry - target) / risk)
+    if rr < 1.0:
+        return None
+    return {"side": side, "confluence": sorted(members), "n_conf": len(members),
+            "box_lo": round(box_lo, 10), "box_hi": round(box_hi, 10), "price": round(price, 10),
+            "entry": round(entry, 10), "stop": round(stop, 10), "target": round(target, 10),
+            "rr": round(rr, 2), "in_box": bool(box_lo <= price <= box_hi),
+            "supertrend": round(st[i], 10), "ema20": round(e20[i], 10),
+            "ema50": round(e50[i], 10), "ema200": round(e200[i], 10),
+            "invalidation": ("strong close below " + str(round(box_lo, 8))) if longside
+                            else ("strong close above " + str(round(box_hi, 8)))}
 
 
 def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
