@@ -4875,6 +4875,75 @@ def _bt_pro(rows, side, fees_bps=5.0, horizon=24, warmup=210, btc_ctx=None, tf="
     return out
 
 
+def _pivot_highs_idx(H, k=3):
+    n = len(H); out = []
+    for i in range(k, n - k):
+        if H[i] == max(H[i - k:i + k + 1]):
+            out.append(i)
+    return out
+
+
+def _liquidity_above(H, t, price, look=120, tol=0.006):
+    """TOOL 4 (target side) — the nearest LIQUIDITY POOL above price: a cluster of EQUAL HIGHS where
+    stops/limits rest. Price is drawn to these like a magnet, so they make the honest profit target.
+    Returns (level, strength) where strength = how many highs form the cluster (deeper pool = stronger)."""
+    piv = [i for i in _pivot_highs_idx(H[:t + 1], 3) if i >= max(0, t - look)]
+    highs = sorted({round(H[i], 10) for i in piv if H[i] > price * 1.005})
+    best = (None, 0)
+    for h in highs:
+        cluster = [x for x in highs if abs(x - h) / h <= tol]
+        if len(cluster) >= best[1] and (best[0] is None or h < best[0] or len(cluster) > best[1]):
+            if best[0] is None or len(cluster) > best[1] or h < best[0]:
+                best = (min(cluster), len(cluster))
+    return best
+
+
+def _trendline_up_touch(L, t, lookback=70, tol=0.012, min_touches=3):
+    """TOOL 5 — TRENDLINES. Fit a rising line through the swing lows and report whether price is
+    riding/touching it. Needs >=3 touches to count as valid (the trader's own rule)."""
+    piv = [i for i in _pivot_lows(L[:t + 1], 3) if i >= max(0, t - lookback)]
+    if len(piv) < 2:
+        return False, 0
+    best = (False, 0)
+    for a in range(len(piv) - 1):
+        for b in range(a + 1, len(piv)):
+            i1, i2 = piv[a], piv[b]
+            if i2 - i1 < 5 or L[i2] <= L[i1]:      # must be RISING (higher lows)
+                continue
+            slope = (L[i2] - L[i1]) / (i2 - i1)
+            touches = 0
+            for j in piv:
+                proj = L[i1] + slope * (j - i1)
+                if proj > 0 and abs(L[j] - proj) / proj <= tol:
+                    touches += 1
+            proj_now = L[i1] + slope * (t - i1)
+            near = proj_now > 0 and abs(L[t] - proj_now) / proj_now <= tol and L[t] >= proj_now * (1 - tol)
+            if touches >= min_touches and near and touches > best[1]:
+                best = (True, touches)
+    return best
+
+
+def _liquidity_sweep_up(H, L, C, t, look=40, tol=0.004):
+    """TOOL 4 — LIQUIDITY POOLS. Find a cluster of EQUAL LOWS (stops resting below), then detect the
+    'toe dip': price wicks THROUGH the pool and closes back above it — the sweep-and-reclaim."""
+    if t < look + 2:
+        return False
+    lows = L[t - look:t + 1]
+    piv = _pivot_lows(lows, 2)
+    if len(piv) < 2:
+        return False
+    for a in range(len(piv) - 1):
+        for b in range(a + 1, len(piv)):
+            l1, l2 = lows[piv[a]], lows[piv[b]]
+            if l1 <= 0:
+                continue
+            if abs(l1 - l2) / l1 <= tol:                    # equal-lows pool
+                pool = min(l1, l2)
+                if L[t] < pool * (1 - 0.0005) and C[t] > pool:   # swept below, closed back above
+                    return True
+    return False
+
+
 def _bt_emaconf(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None):
     """THE 5-TOOL CONFLUENCE SYSTEM (HTF swing style). Long only when the higher-timeframe stack is
     bullish — price ABOVE the 50 & 200 EMA, the fast 10>20 EMA stacked up, and SUPERTREND green —
@@ -4892,7 +4961,9 @@ def _bt_emaconf(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, 
         return []
     e10 = ema(C, 10); e20 = ema(C, 20); e50 = ema(C, 50); e200 = ema(C, 200)
     st, sdir = _st_series(H, L, C, 10, 3.0)
-    long = side == "long"; fee_frac = fees_bps / 10000.0
+    if side != "long":
+        return []                      # LONG-ONLY (your rule: no shorts on this system)
+    long = True; fee_frac = fees_bps / 10000.0
     _dv = sorted(C[i] * V[i] for i in range(n)); dvol = _dv[len(_dv) // 2] if _dv else 0.0
     out = []; t = warmup
     while t < n - horizon - 1:
@@ -4903,6 +4974,7 @@ def _bt_emaconf(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, 
         if None in (f10, f20, f50, f200):
             t += 1; continue
         price = C[t]; entry = stop = target = None
+        conf = 0; tagged_fib = False; liq_ok = False; tl_ok = False; tl_touches = 0; tgt_basis = ""
         # --- swing window for Fib + targets ---
         look = 60
         sw_hi = max(H[max(0, t - look):t + 1]); sw_lo = min(L[max(0, t - look):t + 1])
@@ -4922,12 +4994,47 @@ def _bt_emaconf(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, 
                 t += 1; continue
             if not (C[t] > C[t - 1] and price > f20 * 0.997):        # turning back up
                 t += 1; continue
+            # ---- CONFLUENCE SCORE across all 5 tools (only trade when they agree) ----
+            tl_ok, tl_touches = _trendline_up_touch(L, t)
+            liq_ok = _liquidity_sweep_up(H, L, C, t)
+            conf = 0
+            conf += 1                                    # 1 EMA stack + pullback (already required)
+            conf += 1 if tagged_fib else 0               # 2 Fib .618-.786 magic zone
+            conf += 1                                    # 3 Supertrend green (already required)
+            conf += 1 if liq_ok else 0                   # 4 liquidity sweep & reclaim
+            conf += 1 if tl_ok else 0                    # 5 rising trendline (>=3 touches)
+            if conf < 3:                                 # min confluence; board is ranked/segmented by score
+                t += 1; continue
             entry = price
             stop = min(st[t], lo3) - 0.3 * a                          # Supertrend line / swing as trail
             risk = entry - stop
             if risk <= 0:
                 t += 1; continue
-            target = max(sw_hi, entry + 1.8 * risk)                   # prior swing high
+            # ---- SMART TARGET: let winners RUN. Strong breakouts fly, so we aim at the FAR
+            # objective (deeper liquidity pool / bigger Fib extension), not the nearest one.
+            # Minimum 3R (your rule); 5R-10R is allowed and expected on the strong ones.
+            liq_lvl, liq_strength = _liquidity_above(H, t, entry)
+            fib1 = sw_lo + 1.272 * rng
+            fib2 = sw_lo + 1.618 * rng
+            fib3 = sw_lo + 2.618 * rng
+            cands = []
+            if liq_lvl and liq_lvl > entry * 1.004:
+                cands.append((liq_lvl, "liquidity pool above (x%d)" % max(1, liq_strength)))
+            for lvl, nm in ((sw_hi, "swing high"), (fib1, "fib 1.272 ext"),
+                            (fib2, "fib 1.618 ext"), (fib3, "fib 2.618 ext")):
+                if lvl and lvl > entry * 1.004:
+                    cands.append((lvl, nm))
+            if not cands:
+                t += 1; continue
+            MIN_R = 3.0                                   # your rule: at least 3R or don't bother
+            far = [(lvl, nm) for lvl, nm in cands if (lvl - entry) >= MIN_R * risk]
+            if far:
+                target, tgt_basis = max(far, key=lambda z: z[0])      # ride to the FURTHEST valid objective
+            else:
+                best = max(cands, key=lambda z: z[0])
+                if (best[0] - entry) < MIN_R * risk:
+                    t += 1; continue                       # can't reach 3R -> skip the trade entirely
+                target, tgt_basis = best
         else:
             if not (price < f50 and price < f200 and f10 < f20 and sdir[t] == -1):
                 t += 1; continue
@@ -4948,10 +5055,13 @@ def _bt_emaconf(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, 
         if target is None or abs(target - entry) / entry < 0.002:
             t += 1; continue
         rr = (((target - entry) if long else (entry - target)) / risk)
-        if rr < 1.2:                                                  # HTF swing wants real reward
+        if rr < 3.0:                                                  # >=3R only (your rule)
             t += 1; continue
         tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx,
                            "emaconf", long, t, entry, stop, target, a, mkt_ctx=mkt_ctx)
+        if tr is not None:
+            tr["conf"] = conf; tr["fib"] = bool(tagged_fib); tr["liq"] = bool(liq_ok)
+            tr["tl"] = bool(tl_ok); tr["tl_touches"] = tl_touches; tr["tgt_basis"] = tgt_basis
         if tr is None:
             t += 1; continue
         out.append(tr); t = rbar + 1
@@ -5207,6 +5317,7 @@ def _bt_findings(trades):
     add("BTC volatility", "BTC calm", "BTC volatile", lambda x: x.get("btc_vol") == "lo", minn=20)
     add_cat("Market breadth", lambda x: x.get("breadth"))
     add_cat("Index momentum", lambda x: x.get("imom"))
+    add_cat("Confluence score", lambda x: ("%d/5 tools" % x["conf"]) if x.get("conf") else None)
     add("Breadth direction", "breadth rising", "breadth falling",
         lambda x: x.get("bdir") == "rising", minn=20)
     add("Dominance", "alts leading (BTC.D falling)", "BTC leading (BTC.D rising)",

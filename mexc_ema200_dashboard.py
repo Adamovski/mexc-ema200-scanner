@@ -87,7 +87,7 @@ def send_telegram(cfg: dict, text: str) -> None:
 # slate for the new logic), while every past version's results are kept and shown in the
 # "site version" breakdown so you can compare how each iteration actually performed.
 APP_MODE = os.environ.get("APP_MODE", "crypto").strip().lower()   # "crypto" (default) or "stocks" — lets the SAME app run as two independent Render services
-APP_VERSION = ("v23 · STOCKS site (Yahoo daily)" if APP_MODE == "stocks" else "v23 · crypto site") + " — +5-Tool Confluence (EMA stack + Supertrend + Fib zone), 4H/1D"
+APP_VERSION = ("v24 · STOCKS site" if APP_MODE == "stocks" else "v24 · 5-Tool Confluence ONLY") + " — long-only, 5-tool confluence, liquidity-pool targets"
 # One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
 # every call (open + resolved) on the next boot and start the calls scorecard fresh —
 # auto-board trades and their version history are untouched.
@@ -1549,10 +1549,8 @@ def backtest_loop(state: State) -> None:
     # Runs the premium + high-win-rate strategies on BOTH crypto (MEXC futures, BTC index) and
     # US stocks (Stooq daily, SPY index) so the two markets sit side-by-side in their own tabs.
     CRYPTO_JOBS = [
-        # 5-tool confluence runs 4h/1d ONLY — the style's own rule is never to trade off 15m/1h.
+        # ONLY the 5-tool confluence system (long-only, 4H/1D — the other strategies were dropped).
         ("emaconf", "5-Tool Confluence", "emaconf", "futures", "BTCUSDT", list(BACKTEST_BASKET), ("4h", "1d")),
-        ("pro",    "Premium ★",     "pro",    "futures", "BTCUSDT", list(BACKTEST_BASKET), ("1h", "4h", "1d")),
-        ("highwr", "High win-rate", "highwr", "futures", "BTCUSDT", list(BACKTEST_BASKET), ("1h", "4h", "1d")),
     ]
     STOCK_JOBS = [
         ("pro",    "Premium ★",     "pro",    "stocks", "SPY", list(STOCK_BASKET), ("1d",)),
