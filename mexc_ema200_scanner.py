@@ -4944,7 +4944,91 @@ def _liquidity_sweep_up(H, L, C, t, look=40, tol=0.004):
     return False
 
 
-def _bt_emaconf(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None):
+def _bt_sim_scaled(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, kind, long, t,
+                   entry, stop, target, a, rs=None, mkt_ctx=None, tp1_r=1.0, part=0.5):
+    """Forward simulator WITH SCALE-OUT: bank `part` of the position at TP1 (tp1_r x risk), then move
+    the stop to BREAKEVEN and let the RUNNER ride to the far target. This is how the setup is actually
+    managed — a single all-or-nothing target throws away the many trades that move in your favour but
+    never reach 3R. Net R = part*tp1_r + (1-part)*(runner result). No look-ahead; stop-first on ties."""
+    risk = (entry - stop) if long else (stop - entry)
+    if risk <= 0 or entry <= 0:
+        return None, None
+    rr_far = (((target - entry) if long else (entry - target)) / risk)
+    if rr_far <= 0:
+        return None, None
+    tp1 = entry + tp1_r * risk if long else entry - tp1_r * risk
+    ts = int(rows[t][0]) if rows[t] else 0
+    _bs = btc_ctx.get(ts) if btc_ctx else None
+    btrend = _bs.get("t") if _bs else None; bvol = _bs.get("v") if _bs else None
+    _ms = mkt_ctx.get(ts) if mkt_ctx else None
+    mbr = _ms.get("br") if _ms else None; mdom = _ms.get("dom") if _ms else None
+    mbpct = _ms.get("bpct") if _ms else None; mim = _ms.get("im") if _ms else None
+    mbdir = _ms.get("bdir") if _ms else None
+    f = t + 1; hit1 = False; outcome = None; rbar = None; R = None; mfe = 0.0; mae = 0.0
+    for j in range(f, min(n, f + horizon + 1)):
+        if long:
+            mfe = max(mfe, (H[j] - entry) / risk); mae = max(mae, (entry - L[j]) / risk)
+        else:
+            mfe = max(mfe, (entry - L[j]) / risk); mae = max(mae, (H[j] - entry) / risk)
+        if not hit1:
+            stopped = (L[j] <= stop) if long else (H[j] >= stop)
+            if stopped:
+                R = -1.0; outcome = "loss"; rbar = j; break
+            got1 = (H[j] >= tp1) if long else (L[j] <= tp1)
+            if got1:
+                hit1 = True
+                continue
+        else:
+            be_hit = (L[j] <= entry) if long else (H[j] >= entry)
+            got_far = (H[j] >= target) if long else (L[j] <= target)
+            if got_far:
+                R = part * tp1_r + (1 - part) * rr_far; outcome = "win"; rbar = j; break
+            if be_hit:
+                R = part * tp1_r; outcome = "win" if R > 0 else "loss"; rbar = j; break
+    if R is None:
+        if hit1:                       # ran out of time holding the runner -> bank TP1, runner flat
+            R = part * tp1_r; outcome = "win"; rbar = min(n - 1, f + horizon)
+        else:
+            return None, None
+    fee_R = fee_frac / (risk / entry)
+    R = R - fee_R
+    _hr = (ts // 3600000) % 24
+    _sess = "Asia" if _hr < 8 else ("EU" if _hr < 14 else "US")
+    el = e200[t]
+    tr = {"r": round(R, 3), "rr": round(rr_far, 2), "outcome": outcome,
+          "gross": round(R + fee_R, 3), "mfe": round(mfe, 2), "mae": round(mae, 2),
+          "stop_then_tp": False, "cmp": False, "bars": (rbar - f) if rbar else 0,
+          "extd": round(abs((entry - el) / el) * 100, 2) if el else 0.0,
+          "atrp": round(a / entry * 100, 2) if entry else 0.0, "dvol": dvol,
+          "stopw": round(risk / entry * 100, 2), "tppct": round(abs(target - entry) / entry * 100, 2),
+          "ts": ts, "entry": round(entry, 10), "stop": round(stop, 10), "target": round(target, 10),
+          "rsi": round(rs, 1) if rs is not None else None, "kind": kind, "session": _sess,
+          "btc_trend": btrend, "btc_vol": bvol,
+          "btc_align": (btrend == ("up" if long else "down")) if btrend else None,
+          "btc_state": ("BTC " + btrend) if btrend else None,
+          "breadth": mbr, "dom": mdom, "bpct": mbpct, "imom": mim, "bdir": mbdir,
+          "scaled": True, "tp1_r": tp1_r, "hit_tp1": bool(hit1)}
+    return tr, rbar
+
+
+EMACONF_VARIANTS = {
+    # name        : (min_conf, tp1_r, part, need_strong_up, entry_mode, target_mode)
+    #   tp1_r=None -> single target (no scale-out).  target_mode: near | far | trail
+    "base":        (3, None, 0.0, False, "any", "far"),
+    "scaled":      (3, 1.0,  0.5, False, "any", "far"),
+    "scaled_near": (3, 1.0,  0.5, False, "any", "near"),
+    "scaled_tp05": (3, 0.5,  0.5, False, "any", "far"),
+    "strongup":    (3, 1.0,  0.5, True,  "any", "far"),
+    "conf4":       (4, 1.0,  0.5, False, "any", "far"),
+    "conf5":       (5, 1.0,  0.5, False, "any", "far"),
+    "fibonly":     (3, 1.0,  0.5, False, "fib", "far"),
+    "emaonly":     (3, 1.0,  0.5, False, "ema", "far"),
+    "trail":       (3, 1.0,  0.5, False, "any", "trail"),
+}
+
+
+def _bt_emaconf(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None,
+                variant="scaled"):
     """THE 5-TOOL CONFLUENCE SYSTEM (HTF swing style). Long only when the higher-timeframe stack is
     bullish — price ABOVE the 50 & 200 EMA, the fast 10>20 EMA stacked up, and SUPERTREND green —
     then buy a PULLBACK into the value zone: a tag of the 10/20/50 EMA *or* the 0.618-0.786 Fib
@@ -4963,6 +5047,8 @@ def _bt_emaconf(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, 
     st, sdir = _st_series(H, L, C, 10, 3.0)
     if side != "long":
         return []                      # LONG-ONLY (your rule: no shorts on this system)
+    MIN_CONF, TP1_R, PART, NEED_STRONG, ENTRY_MODE, TGT_MODE = EMACONF_VARIANTS.get(
+        variant, EMACONF_VARIANTS["scaled"])
     long = True; fee_frac = fees_bps / 10000.0
     _dv = sorted(C[i] * V[i] for i in range(n)); dvol = _dv[len(_dv) // 2] if _dv else 0.0
     out = []; t = warmup
@@ -4974,7 +5060,9 @@ def _bt_emaconf(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, 
         if None in (f10, f20, f50, f200):
             t += 1; continue
         price = C[t]; entry = stop = target = None
-        conf = 0; tagged_fib = False; liq_ok = False; tl_ok = False; tl_touches = 0; tgt_basis = ""
+        _tsb = int(rows[t][0]) if rows[t] else 0
+        _ms = mkt_ctx.get(_tsb) if mkt_ctx else None
+        conf = 0; tagged_fib = False; tagged_ema = False; liq_ok = False; tl_ok = False; tl_touches = 0; tgt_basis = ""
         # --- swing window for Fib + targets ---
         look = 60
         sw_hi = max(H[max(0, t - look):t + 1]); sw_lo = min(L[max(0, t - look):t + 1])
@@ -5003,7 +5091,13 @@ def _bt_emaconf(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, 
             conf += 1                                    # 3 Supertrend green (already required)
             conf += 1 if liq_ok else 0                   # 4 liquidity sweep & reclaim
             conf += 1 if tl_ok else 0                    # 5 rising trendline (>=3 touches)
-            if conf < 3:                                 # min confluence; board is ranked/segmented by score
+            if ENTRY_MODE == "fib" and not tagged_fib:
+                t += 1; continue                         # Fib-zone entries only
+            if ENTRY_MODE == "ema" and not tagged_ema:
+                t += 1; continue                         # EMA-pullback entries only
+            if NEED_STRONG and not (_ms and _ms.get("im") in ("up", "strong_up")):
+                t += 1; continue                         # only when the whole market is trending up
+            if conf < MIN_CONF:
                 t += 1; continue
             entry = price
             stop = min(st[t], lo3) - 0.3 * a                          # Supertrend line / swing as trail
@@ -5026,15 +5120,14 @@ def _bt_emaconf(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, 
                     cands.append((lvl, nm))
             if not cands:
                 t += 1; continue
-            MIN_R = 3.0                                   # your rule: at least 3R or don't bother
-            far = [(lvl, nm) for lvl, nm in cands if (lvl - entry) >= MIN_R * risk]
-            if far:
-                target, tgt_basis = max(far, key=lambda z: z[0])      # ride to the FURTHEST valid objective
+            # NO reward gate — RR is an OUTPUT of the test, not a filter. Pick the objective by mode.
+            valid = [(lvl, nm) for lvl, nm in cands if (lvl - entry) >= 0.3 * risk]
+            if not valid:
+                t += 1; continue
+            if TGT_MODE == "near":
+                target, tgt_basis = min(valid, key=lambda z: z[0])
             else:
-                best = max(cands, key=lambda z: z[0])
-                if (best[0] - entry) < MIN_R * risk:
-                    t += 1; continue                       # can't reach 3R -> skip the trade entirely
-                target, tgt_basis = best
+                target, tgt_basis = max(valid, key=lambda z: z[0])
         else:
             if not (price < f50 and price < f200 and f10 < f20 and sdir[t] == -1):
                 t += 1; continue
@@ -5055,10 +5148,17 @@ def _bt_emaconf(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, 
         if target is None or abs(target - entry) / entry < 0.002:
             t += 1; continue
         rr = (((target - entry) if long else (entry - target)) / risk)
-        if rr < 3.0:                                                  # >=3R only (your rule)
+        if rr < 0.3:                                                  # sanity only (no RR gating)
             t += 1; continue
-        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx,
-                           "emaconf", long, t, entry, stop, target, a, mkt_ctx=mkt_ctx)
+        if TGT_MODE == "trail":
+            target = max(target, entry + 6.0 * risk)      # let the trail decide; far notional target
+        if TP1_R:
+            tr, rbar = _bt_sim_scaled(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx,
+                                      "emaconf", long, t, entry, stop, target, a, mkt_ctx=mkt_ctx,
+                                      tp1_r=TP1_R, part=PART)
+        else:
+            tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx,
+                               "emaconf", long, t, entry, stop, target, a, mkt_ctx=mkt_ctx)
         if tr is not None:
             tr["conf"] = conf; tr["fib"] = bool(tagged_fib); tr["liq"] = bool(liq_ok)
             tr["tl"] = bool(tl_ok); tr["tl_touches"] = tl_touches; tr["tgt_basis"] = tgt_basis
@@ -5100,8 +5200,10 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="
         return _bt_bullmom(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy == "pro":
         return _bt_pro(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
-    if strategy == "emaconf":
-        return _bt_emaconf(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
+    if strategy.startswith("emaconf"):
+        _v = strategy.split(":", 1)[1] if ":" in strategy else "scaled"
+        return _bt_emaconf(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf,
+                           mkt_ctx=mkt_ctx, variant=_v)
     if strategy == "monday":
         return _bt_btc_monday(rows, side, fees_bps=fees_bps, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     try:
@@ -5596,7 +5698,8 @@ def _bt_sample(results, syms, k=40):
 
 
 def backtest_all(sess, market, tfs=("15m", "1h", "4h", "1d"), limit=1000,
-                 fees_bps=5.0, symbols=None, strategy="revert", sides=("long", "short"), index_sym="BTCUSDT"):
+                 fees_bps=5.0, symbols=None, strategy="revert", sides=("long", "short"), index_sym="BTCUSDT",
+                 strategy_list=None):
     """Sweep the whole basket across EVERY timeframe and the requested SIDES in one pass —
     fetching each coin's candles once per TF and running the given strategy on them. Returns
     {tf: {side: agg, ...}}. Run in the background so the app shows a full TF × side edge
@@ -5635,14 +5738,18 @@ def backtest_all(sess, market, tfs=("15m", "1h", "4h", "1d"), limit=1000,
         mkt_ctx = _market_ctx(rows_by, index_sym)
 
         # PHASE 2 — run every strategy/side on the pre-fetched candles.
+        # Run EVERY requested strategy over the SAME fetched candles (one download, many tests).
+        strat_names = list(strategy_list) if strategy_list else [strategy]
+
         def _one(sym):
             rows = rows_by.get(sym)
             if not rows:
                 return sym, None
-            return sym, {sd: backtest_symbol(rows, sd, fees_bps=fees_bps, strategy=strategy,
-                                             btc_ctx=btc_ctx, mkt_ctx=mkt_ctx, tf=tf)
-                         for sd in sides}
-        per = {sd: {} for sd in sides}
+            return sym, {st_name: {sd: backtest_symbol(rows, sd, fees_bps=fees_bps, strategy=st_name,
+                                                       btc_ctx=btc_ctx, mkt_ctx=mkt_ctx, tf=tf)
+                                   for sd in sides}
+                         for st_name in strat_names}
+        per = {st_name: {sd: {} for sd in sides} for st_name in strat_names}
         with ThreadPoolExecutor(max_workers=12) as ex:
             for fut in as_completed([ex.submit(_one, s) for s in syms]):
                 try:
@@ -5650,9 +5757,15 @@ def backtest_all(sess, market, tfs=("15m", "1h", "4h", "1d"), limit=1000,
                 except Exception:
                     sym, res = None, None
                 if sym and res:
-                    for sd in sides:
-                        per[sd][sym] = res.get(sd)
-        out[tf] = {sd: _bt_aggregate(per[sd], syms, tf, sd, fees_bps) for sd in sides}
+                    for st_name in strat_names:
+                        for sd in sides:
+                            per[st_name][sd][sym] = (res.get(st_name) or {}).get(sd)
+        if strategy_list:
+            for st_name in strat_names:
+                out.setdefault(st_name, {})[tf] = {sd: _bt_aggregate(per[st_name][sd], syms, tf, sd, fees_bps)
+                                                   for sd in sides}
+        else:
+            out[tf] = {sd: _bt_aggregate(per[strategy][sd], syms, tf, sd, fees_bps) for sd in sides}
     return out
 
 

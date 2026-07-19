@@ -87,7 +87,7 @@ def send_telegram(cfg: dict, text: str) -> None:
 # slate for the new logic), while every past version's results are kept and shown in the
 # "site version" breakdown so you can compare how each iteration actually performed.
 APP_MODE = os.environ.get("APP_MODE", "crypto").strip().lower()   # "crypto" (default) or "stocks" — lets the SAME app run as two independent Render services
-APP_VERSION = ("v24 · STOCKS site" if APP_MODE == "stocks" else "v24 · 5-Tool Confluence ONLY") + " — long-only, 5-tool confluence, liquidity-pool targets"
+APP_VERSION = ("v25 · STOCKS site" if APP_MODE == "stocks" else "v25 · 5-Tool scenario matrix") + " — 10 variants, no RR gating, scale-out tested"
 # One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
 # every call (open + resolved) on the next boot and start the calls scorecard fresh —
 # auto-board trades and their version history are untouched.
@@ -1548,23 +1548,48 @@ def backtest_loop(state: State) -> None:
     # STRATEGY LAB jobs: (tabKey, displayName, strategyFn, market, indexSym, basket, timeframes).
     # Runs the premium + high-win-rate strategies on BOTH crypto (MEXC futures, BTC index) and
     # US stocks (Stooq daily, SPY index) so the two markets sit side-by-side in their own tabs.
-    CRYPTO_JOBS = [
-        # ONLY the 5-tool confluence system (long-only, 4H/1D — the other strategies were dropped).
-        ("emaconf", "5-Tool Confluence", "emaconf", "futures", "BTCUSDT", list(BACKTEST_BASKET), ("4h", "1d")),
+    # SCENARIO MATRIX — 10 variants of the 5-tool confluence system, all tested on the SAME
+    # candles (one download, many tests). 4H = the style's stated sweet spot.
+    EMACONF_SCENARIOS = [
+        ("emaconf:base",        "1 Base (single far target)"),
+        ("emaconf:scaled",      "2 Scale-out 50% @1R + runner"),
+        ("emaconf:scaled_near", "3 Scale-out, NEAR target"),
+        ("emaconf:scaled_tp05", "4 Scale-out 50% @0.5R"),
+        ("emaconf:strongup",    "5 Only when market trending UP"),
+        ("emaconf:conf4",       "6 Confluence >=4 tools"),
+        ("emaconf:conf5",       "7 Confluence = all 5 tools"),
+        ("emaconf:fibonly",     "8 Fib magic-zone entries only"),
+        ("emaconf:emaonly",     "9 EMA-pullback entries only"),
+        ("emaconf:trail",       "10 Supertrend trailing exit"),
     ]
+    CRYPTO_JOBS = []
     STOCK_JOBS = [
         ("pro",    "Premium ★",     "pro",    "stocks", "SPY", list(STOCK_BASKET), ("1d",)),
         ("highwr", "High win-rate", "highwr", "stocks", "SPY", list(STOCK_BASKET), ("1d",)),
     ]
     lab_jobs = STOCK_JOBS if APP_MODE == "stocks" else CRYPTO_JOBS
     lab_limit = {"1h": 12000, "4h": 8760, "1d": 1460}
-    strat_meta = [{"key": j[0], "name": j[1]} for j in lab_jobs]
+    strat_meta = ([{"key": k, "name": nm} for k, nm in EMACONF_SCENARIOS] if APP_MODE != "stocks" else []) \
+        + [{"key": j[0], "name": j[1]} for j in lab_jobs]
     while True:
         try:
             sess = get_session()
             t0 = time.time()
             lab = {}
             total = len(lab_jobs)
+            if APP_MODE != "stocks":
+                # ONE fetch of the 4H candles -> all 10 scenarios scored against it.
+                keys = [k for k, _ in EMACONF_SCENARIOS]
+                res = backtest_all(sess, market, tfs=("4h",), limit=lab_limit.get("4h", 4380),
+                                   fees_bps=5.0, symbols=list(BACKTEST_BASKET),
+                                   sides=("long",), index_sym="BTCUSDT", strategy_list=keys)
+                for k, nm in EMACONF_SCENARIOS:
+                    lab[k] = res.get(k, {})
+                with state.lock:
+                    state.backtests = {"ts": time.time(), "took": round(time.time() - t0, 1),
+                                       "fees_bps": 5.0, "coins": len(BACKTEST_BASKET), "lab": dict(lab),
+                                       "strategies": strat_meta,
+                                       "progress": {"done": total, "total": total, "last": "scenario matrix"}}
             for ji, (tabkey, jname, strat, jmarket, jindex, jbasket, jtfs) in enumerate(lab_jobs):
                 sdata = {}
                 for tf in jtfs:
