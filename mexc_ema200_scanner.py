@@ -4884,40 +4884,50 @@ def _pivot_highs_idx(H, k=3):
 
 
 def _liquidity_above(H, t, price, look=120, tol=0.006):
-    """TOOL 4 (target side) — the nearest LIQUIDITY POOL above price: a cluster of EQUAL HIGHS where
-    stops/limits rest. Price is drawn to these like a magnet, so they make the honest profit target.
-    Returns (level, strength) where strength = how many highs form the cluster (deeper pool = stronger)."""
-    piv = [i for i in _pivot_highs_idx(H[:t + 1], 3) if i >= max(0, t - look)]
-    highs = sorted({round(H[i], 10) for i in piv if H[i] > price * 1.005})
+    """TOOL 4 (target side) — nearest LIQUIDITY POOL above price (cluster of equal highs = resting
+    stops = magnet). PERF: window-limited scan."""
+    lo = max(0, t - look)
+    seg = H[lo:t + 1]
+    if len(seg) < 12:
+        return (None, 0)
+    piv = _pivot_highs_idx(seg, 3)
+    highs = sorted({round(seg[i], 10) for i in piv if seg[i] > price * 1.005})
+    if not highs:
+        return (None, 0)
     best = (None, 0)
     for h in highs:
         cluster = [x for x in highs if abs(x - h) / h <= tol]
-        if len(cluster) >= best[1] and (best[0] is None or h < best[0] or len(cluster) > best[1]):
-            if best[0] is None or len(cluster) > best[1] or h < best[0]:
-                best = (min(cluster), len(cluster))
+        if len(cluster) > best[1] or (best[0] is not None and min(cluster) < best[0] and len(cluster) == best[1]):
+            best = (min(cluster), len(cluster))
     return best
 
 
 def _trendline_up_touch(L, t, lookback=70, tol=0.012, min_touches=3):
-    """TOOL 5 — TRENDLINES. Fit a rising line through the swing lows and report whether price is
-    riding/touching it. Needs >=3 touches to count as valid (the trader's own rule)."""
-    piv = [i for i in _pivot_lows(L[:t + 1], 3) if i >= max(0, t - lookback)]
+    """TOOL 5 — TRENDLINES. Rising line through swing lows; needs >=3 touches to be valid.
+    PERF: only the last `lookback` bars are scanned (was O(n^2) over full history)."""
+    lo = max(0, t - lookback)
+    seg = L[lo:t + 1]
+    if len(seg) < 12:
+        return False, 0
+    piv = _pivot_lows(seg, 3)                      # indices are seg-local
     if len(piv) < 2:
         return False, 0
+    last = len(seg) - 1
     best = (False, 0)
     for a in range(len(piv) - 1):
         for b in range(a + 1, len(piv)):
             i1, i2 = piv[a], piv[b]
-            if i2 - i1 < 5 or L[i2] <= L[i1]:      # must be RISING (higher lows)
+            if i2 - i1 < 5 or seg[i2] <= seg[i1]:
                 continue
-            slope = (L[i2] - L[i1]) / (i2 - i1)
+            slope = (seg[i2] - seg[i1]) / (i2 - i1)
             touches = 0
             for j in piv:
-                proj = L[i1] + slope * (j - i1)
-                if proj > 0 and abs(L[j] - proj) / proj <= tol:
+                proj = seg[i1] + slope * (j - i1)
+                if proj > 0 and abs(seg[j] - proj) / proj <= tol:
                     touches += 1
-            proj_now = L[i1] + slope * (t - i1)
-            near = proj_now > 0 and abs(L[t] - proj_now) / proj_now <= tol and L[t] >= proj_now * (1 - tol)
+            proj_now = seg[i1] + slope * (last - i1)
+            near = proj_now > 0 and abs(seg[last] - proj_now) / proj_now <= tol \
+                and seg[last] >= proj_now * (1 - tol)
             if touches >= min_touches and near and touches > best[1]:
                 best = (True, touches)
     return best
