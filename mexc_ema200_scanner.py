@@ -5817,6 +5817,31 @@ def _pivot_lows(L, k=3):
     return out
 
 
+def _to_daily(rows, per_day=6):
+    """Aggregate 4h candles into DAILY OHLCV so the big-timeframe runner patterns can be detected
+    without any extra API calls. Groups by calendar UTC day."""
+    if not rows:
+        return []
+    out = []
+    cur_day = None; o = h = l = c = None; v = 0.0; ts0 = None
+    for r in rows:
+        try:
+            t = int(r[0]); ro = float(r[1]); rh = float(r[2]); rl = float(r[3]); rc = float(r[4]); rv = float(r[5])
+        except (ValueError, IndexError, TypeError):
+            continue
+        day = t // 86400000
+        if cur_day is None:
+            cur_day = day; ts0 = day * 86400000; o, h, l, c, v = ro, rh, rl, rc, rv
+        elif day != cur_day:
+            out.append([ts0, o, h, l, c, v, ts0])
+            cur_day = day; ts0 = day * 86400000; o, h, l, c, v = ro, rh, rl, rc, rv
+        else:
+            h = max(h, rh); l = min(l, rl); c = rc; v += rv
+    if cur_day is not None:
+        out.append([ts0, o, h, l, c, v, ts0])
+    return out
+
+
 def descending_triple_bottom(rows, k=3, min_gap=6, near_pct=0.10):
     """RUNNER PATTERN A — the descending triple bottom (capitulation base). Three swing lows, each
     LOWER than the last, with price now basing at/just above the third low. Big-timeframe (daily/
@@ -6132,8 +6157,23 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
         if coil_setup:
             coil_setup["data_stale"] = True
 
+    # ---- RUNNER PATTERNS (big-timeframe): daily series built from the 4h candles ----
+    dtb_hit = accum_hit = None
+    try:
+        _drows = _to_daily(rows)
+        if len(_drows) >= 60:
+            _dtb = descending_triple_bottom(_drows)
+            if _dtb:
+                _dtb["symbol"] = symbol; _dtb["price"] = closes[-1]; dtb_hit = _dtb
+            _acc = accumulation_breakout(_drows)
+            if _acc:
+                _acc["symbol"] = symbol; _acc["price"] = closes[-1]; accum_hit = _acc
+    except Exception:
+        dtb_hit = accum_hit = None
+
     return (ema_hit, flag_hit, cpr_hit, bounce_hit, wedge_hit, short_hit,
-            st_bounce_hit, early_hit, long_setup, short_setup, coil_setup)
+            st_bounce_hit, early_hit, long_setup, short_setup, coil_setup,
+            dtb_hit, accum_hit)
 
 
 def supports_below(lows: list[float], upto: int, price: float,

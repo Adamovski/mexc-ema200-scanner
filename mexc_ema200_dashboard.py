@@ -808,6 +808,8 @@ class State:
         self.prev_stb_symbols: set[str] | None = None
         self.new_stb_symbols: list[str] = []
         self.early_hits: list[dict] = []           # early / pre-breakout accumulation
+        self.dtb_hits: list[dict] = []             # RUNNER: descending triple bottom (daily)
+        self.accum_hits: list[dict] = []           # RUNNER: test-pump -> accumulation -> breakout
         self.prev_early_symbols: set[str] | None = None
         self.new_early_symbols: list[str] = []
         self.long_board: list[dict] = []           # top-25 best longs (whole universe)
@@ -891,6 +893,8 @@ class State:
                 "stb_hits": withlive(self.stb_hits),
                 "stb_new_symbols": list(self.new_stb_symbols),
                 "early_hits": withlive(self.early_hits),
+                "dtb_hits": withlive(self.dtb_hits),
+                "accum_hits": withlive(self.accum_hits),
                 "early_new_symbols": list(self.new_early_symbols),
                 "long_board": withlive(self.long_board),
                 "short_board": withlive(self.short_board),
@@ -946,6 +950,8 @@ def run_one_scan(state: State) -> None:
     long_board: list[dict] = []
     short_board: list[dict] = []
     coil_board: list[dict] = []
+    dtb_board: list[dict] = []
+    accum_board: list[dict] = []
     done = 0
     scan_cfg = {k: cfg[k] for k in
                 ("kline_limit", "lookback", "retest_tol", "break_tol",
@@ -992,9 +998,13 @@ def run_one_scan(state: State) -> None:
                 with state.lock:
                     state.progress = (done, len(symbols))
             try:
-                h, f, c, b, w, sh, sb, el, lng, sht, coil = fut.result()
+                h, f, c, b, w, sh, sb, el, lng, sht, coil, dtb, accum = fut.result()
             except Exception:
-                h, f, c, b, w, sh, sb, el, lng, sht, coil = (None,) * 11
+                h, f, c, b, w, sh, sb, el, lng, sht, coil, dtb, accum = (None,) * 13
+            if dtb:
+                dtb_board.append(dtb)
+            if accum:
+                accum_board.append(accum)
             if lng:
                 long_board.append(lng)
             if sht:
@@ -1474,6 +1484,8 @@ def run_one_scan(state: State) -> None:
         state.long_board = long_board
         state.short_board = short_board
         state.coil_board = coil_board
+        state.dtb_hits = sorted(dtb_board, key=lambda d: -(d.get("rr") or 0))[:25]
+        state.accum_hits = sorted(accum_board, key=lambda d: -(d.get("rr") or 0))[:25]
         state.scalp_board = scalp_board
         state.spot_board = spot_board
         state.gate_learn = _learn
@@ -2297,6 +2309,8 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabHistory" onclick="showTab('history')" style="display:none">🕘 History</div>
   <div class="tab" id="tabWatch" onclick="showTab('watch')" style="display:none">📌 Watchlist</div>
   <div class="tab" id="tabEarly" onclick="showTab('early')" style="display:none">⏳ Early</div>
+  <div class="tab" id="tabDtb" onclick="showTab('dtb')">🔻 Triple bottom</div>
+  <div class="tab" id="tabAccum" onclick="showTab('accum')">🤫 Quiet accumulation</div>
   <div class="tab" id="tabCoil" onclick="showTab('coil')" style="display:none">🚀 Coiled</div>
   <div class="tab" id="tabScalp" onclick="showTab('scalp')" style="display:none">⚡ Best scalps</div>
   <div class="tab" id="tabSpot" onclick="showTab('spot')" style="display:none">💰 Spot buys</div>
@@ -2540,6 +2554,50 @@ PAGE = """<!doctype html>
     <tbody id="erows"></tbody>
   </table>
   <div class="empty" id="eempty" style="display:none">No early/accumulation setups right now. The loop keeps scanning…</div>
+</div>
+</div>
+
+<div class="view active" id="viewDtb">
+<div class="status">
+  <span>🔻 <b>Descending triple bottom</b> — three swing lows, each <b>lower than the last</b>, with price now basing at/just above the third. The classic capitulation base: sellers exhausting into a final flush. Detected on the <b>daily</b> chart (built from the 4h candles). Entry near the base, stop under the 3rd low, target the first-leg high — a full measured retrace. Ranked by reward:risk. <b>⚠ Lottery-ticket setups</b> — plenty keep making lower lows, so size small and respect the stop.</span>
+</div>
+<div class="wrap">
+  <table id="dtbtbl">
+    <thead><tr>
+      <th>Symbol</th><th>Price</th>
+      <th data-tip="First (highest) bottom.">Low 1</th>
+      <th data-tip="Second bottom — lower than the first.">Low 2</th>
+      <th data-tip="Third and lowest bottom — price is basing here now.">Low 3</th>
+      <th>Entry</th><th data-tip="Below the 3rd low — the pattern is invalid under here.">Stop</th>
+      <th data-tip="Measured-move objective: the first-leg high.">Target</th>
+      <th>R:R</th>
+      <th data-tip="Price has held above the 3rd low since making it — a higher low forming.">Higher low?</th>
+      <th data-tip="Recent volume below its own average — nobody is watching it yet.">Quiet?</th>
+    </tr></thead>
+    <tbody id="dtbrows"></tbody>
+  </table>
+  <div class="empty" id="dtbempty" style="display:none">No descending triple bottoms right now. The loop keeps scanning…</div>
+</div>
+</div>
+
+<div class="view active" id="viewAccum">
+<div class="status">
+  <span>🤫 <b>Quiet accumulation → breakout</b> — the $LAB pattern: an earlier <b>test pump</b> proves the coin can run, then it drops into a <b>tight range</b> where <b>volume dries up</b> (nobody watching), then presses/breaks out of the top. Detected on the <b>daily</b> chart. Entry on the range-high break, stop under the range, target a measured move capped at the prior pump high. <b>Vol ratio</b> = recent volume ÷ its earlier average — lower is quieter and better.</span>
+</div>
+<div class="wrap">
+  <table id="accumtbl">
+    <thead><tr>
+      <th>Symbol</th><th>Price</th>
+      <th>Range low</th><th>Range high</th>
+      <th data-tip="How tight the accumulation range is. Tighter = more coiled.">Range %</th>
+      <th data-tip="Recent volume vs its earlier average. Under 0.5x = properly quiet.">Vol ratio</th>
+      <th data-tip="The earlier test-pump high — proof this coin can move.">Prior pump</th>
+      <th>Entry</th><th>Stop</th><th>Target</th><th>R:R</th>
+      <th>State</th>
+    </tr></thead>
+    <tbody id="accumrows"></tbody>
+  </table>
+  <div class="empty" id="accumempty" style="display:none">No quiet-accumulation setups right now. The loop keeps scanning…</div>
 </div>
 </div>
 
@@ -3395,7 +3453,7 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["coil","Coil"],["scalp","Scalp"],["spot","Spot"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["dtb","Dtb"],["accum","Accum"],["coil","Coil"],["scalp","Scalp"],["spot","Spot"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
@@ -3407,6 +3465,8 @@ function showTab(which){
   if(which==="scalp") renderScalp();
   if(which==="spot") renderSpot();
   if(which==="perf") renderPerf();
+  if(which==="dtb") renderDtb();
+  if(which==="accum") renderAccum();
   if(which==="backtest") loadBacktest();
   if(which==="calls") renderCalls();
   if(which==="watch"){ renderWatch(); loadWatch(); }
@@ -4348,6 +4408,42 @@ document.querySelectorAll("th[data-ek]").forEach(th=>th.addEventListener("click"
   const k=remapTp(th.dataset.ek); if(k===eeSortKey) eeSortDir*=-1; else {eeSortKey=k; eeSortDir=(k==="symbol")?1:-1;}
   setSortArrow(th,eeSortDir); renderEarly();
 }));
+let dtblatest=[], accumlatest=[];
+function renderDtb(){
+  const tb=document.getElementById("dtbrows"); if(!tb) return; tb.innerHTML="";
+  const rows=[...dtblatest].sort((a,b)=>(b.rr||0)-(a.rr||0));
+  const emp=document.getElementById("dtbempty"); if(emp) emp.style.display=rows.length?"none":"block";
+  for(const h of rows){
+    const tr=document.createElement("tr");
+    tr.innerHTML=`<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}</div></td>`+
+      `<td>${fmtNum(h.live!=null?h.live:h.price)}</td>`+
+      `<td>${fmtNum((h.lows||[])[0])}</td><td>${fmtNum((h.lows||[])[1])}</td>`+
+      `<td>${fmtNum((h.lows||[])[2])}</td>`+
+      `<td>${fmtNum(h.entry)}</td><td>${fmtNum(h.stop)}</td><td>${fmtNum(h.target)}</td>`+
+      `<td class="${(h.rr||0)>=2?'pf-good':''}">${h.rr==null?'—':(+h.rr).toFixed(2)}</td>`+
+      `<td>${h.higher_low?'<span class="pf-good">yes</span>':'no'}</td>`+
+      `<td>${h.quiet?'<span class="pf-good">quiet</span>':'—'}</td>`;
+    tb.appendChild(tr);
+  }
+}
+function renderAccum(){
+  const tb=document.getElementById("accumrows"); if(!tb) return; tb.innerHTML="";
+  const rows=[...accumlatest].sort((a,b)=>(b.rr||0)-(a.rr||0));
+  const emp=document.getElementById("accumempty"); if(emp) emp.style.display=rows.length?"none":"block";
+  for(const h of rows){
+    const tr=document.createElement("tr");
+    tr.innerHTML=`<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}</div></td>`+
+      `<td>${fmtNum(h.live!=null?h.live:h.price)}</td>`+
+      `<td>${fmtNum((h.range||[])[0])}</td><td>${fmtNum((h.range||[])[1])}</td>`+
+      `<td>${h.range_pct==null?'—':(+h.range_pct).toFixed(1)+'%'}</td>`+
+      `<td class="${(h.vol_ratio||1)<=0.5?'pf-good':''}">${h.vol_ratio==null?'—':(+h.vol_ratio).toFixed(2)}×</td>`+
+      `<td>${fmtNum(h.prior_pump_high)}</td>`+
+      `<td>${fmtNum(h.entry)}</td><td>${fmtNum(h.stop)}</td><td>${fmtNum(h.target)}</td>`+
+      `<td class="${(h.rr||0)>=2?'pf-good':''}">${h.rr==null?'—':(+h.rr).toFixed(2)}</td>`+
+      `<td>${h.broke_out?'<span class="pf-good">broke out</span>':'coiling'}</td>`;
+    tb.appendChild(tr);
+  }
+}
 function renderEarly(){
   const rows=[...eelatest].filter(h=>biasOk(h,"early")).sort((a,b)=>{
     const x=a[eeSortKey],y=b[eeSortKey];
@@ -5746,6 +5842,8 @@ async function poll(){
     blatest=d.bounce_hits||[]; renderBounce();
     xlatest=d.stb_hits||[]; renderStb();
     eelatest=d.early_hits||[]; renderEarly();
+  dtblatest=d.dtb_hits||[]; renderDtb();
+  accumlatest=d.accum_hits||[]; renderAccum();
     slatest=d.short_hits||[]; renderShorts();
     renderBestLong(); renderBestShort(); renderCoil(); renderScalp(); renderSpot(); renderPerf(); renderCalls();
     renderMarket(); renderWatch();
