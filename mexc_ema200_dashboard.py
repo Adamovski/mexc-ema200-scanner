@@ -810,6 +810,7 @@ class State:
         self.early_hits: list[dict] = []           # early / pre-breakout accumulation
         self.dtb_hits: list[dict] = []             # RUNNER: descending triple bottom (daily)
         self.accum_hits: list[dict] = []           # RUNNER: test-pump -> accumulation -> breakout
+        self.signal_rank: dict | None = None       # SIGNAL LAB: which indicators actually pay
         self.prev_early_symbols: set[str] | None = None
         self.new_early_symbols: list[str] = []
         self.long_board: list[dict] = []           # top-25 best longs (whole universe)
@@ -895,6 +896,7 @@ class State:
                 "early_hits": withlive(self.early_hits),
                 "dtb_hits": withlive(self.dtb_hits),
                 "accum_hits": withlive(self.accum_hits),
+                "signal_rank": self.signal_rank,
                 "early_new_symbols": list(self.new_early_symbols),
                 "long_board": withlive(self.long_board),
                 "short_board": withlive(self.short_board),
@@ -1573,6 +1575,7 @@ def backtest_loop(state: State) -> None:
         ("emaconf:fibonly",     "8 Fib magic-zone entries only"),
         ("emaconf:emaonly",     "9 EMA-pullback entries only"),
         ("emaconf:trail",       "10 Supertrend trailing exit"),
+        ("signals",             "11 Signal lab (20 indicators)"),
     ]
     CRYPTO_JOBS = []
     STOCK_JOBS = [
@@ -1597,6 +1600,14 @@ def backtest_loop(state: State) -> None:
                                    sides=("long",), index_sym="BTCUSDT", strategy_list=keys)
                 for k, nm in EMACONF_SCENARIOS:
                     lab[k] = res.get(k, {})
+                # pull the signal-discovery ranking out of the signal-lab run
+                _sg = res.get("signals", {}) or {}
+                _rank = None
+                for _tf, _blk in _sg.items():
+                    if isinstance(_blk, dict) and (_blk.get("long") or {}).get("signal_ranking"):
+                        _rank = _blk["long"]["signal_ranking"]; break
+                with state.lock:
+                    state.signal_rank = _rank
                 with state.lock:
                     state.backtests = {"ts": time.time(), "took": round(time.time() - t0, 1),
                                        "fees_bps": 5.0, "coins": len(BACKTEST_BASKET), "lab": dict(lab),
@@ -2311,6 +2322,7 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabEarly" onclick="showTab('early')" style="display:none">⏳ Early</div>
   <div class="tab" id="tabDtb" onclick="showTab('dtb')">🔻 Triple bottom</div>
   <div class="tab" id="tabAccum" onclick="showTab('accum')">🤫 Quiet accumulation</div>
+  <div class="tab" id="tabSignals" onclick="showTab('signals')">🔬 Signal lab</div>
   <div class="tab" id="tabCoil" onclick="showTab('coil')" style="display:none">🚀 Coiled</div>
   <div class="tab" id="tabScalp" onclick="showTab('scalp')" style="display:none">⚡ Best scalps</div>
   <div class="tab" id="tabSpot" onclick="showTab('spot')" style="display:none">💰 Spot buys</div>
@@ -2580,6 +2592,29 @@ PAGE = """<!doctype html>
 </div>
 </div>
 
+<div class="view active" id="viewSignals">
+<div class="status">
+  <span>🔬 <b>Signal lab</b> — instead of assuming which indicators matter, this tests <b>~20 of them independently</b>. Every trade in a deliberately neutral base strategy (buy any green close, fixed 1.5&times;ATR stop / 3&times;ATR target) gets tagged with all 20 reads. Then each signal is scored by how much it <b>shifts expectancy versus the base</b>.<br>
+  <b>Lift</b> is the number that matters: expectancy with the signal on, minus the base expectancy. Positive = the signal adds something. <b>H1 / H2</b> split the history in half &mdash; a signal that only worked in one half is probably noise, not edge. <b>Robust</b> means it beat the base in <i>both</i> halves.<br>
+  <span class="warn">Read this honestly: with 20 signals and ~190 pairs, some will look good by chance alone. Treat only the <b>robust</b> ones with a decent sample as candidates, and expect the lift to shrink live.</span></span>
+</div>
+<div class="wrap" id="sigbase" style="margin-bottom:10px"></div>
+<div class="wrap">
+  <h3 style="margin:6px 0 4px">Individual signals</h3>
+  <table id="sigtbl">
+    <thead><tr><th>Signal</th><th>Trades</th><th>Win rate</th><th>Expectancy (R)</th><th>Lift vs base</th><th>1st half</th><th>2nd half</th><th>Holds up?</th></tr></thead>
+    <tbody id="sigrows"></tbody>
+  </table>
+  <div id="sigempty" class="empty">No signal results yet &mdash; the lab runs on a ~6-hour cycle.</div>
+</div>
+<div class="wrap" style="margin-top:14px">
+  <h3 style="margin:6px 0 4px">Best pairs (confluence)</h3>
+  <table id="sigptbl">
+    <thead><tr><th>Combination</th><th>Trades</th><th>Win rate</th><th>Expectancy (R)</th><th>Lift vs base</th><th>1st half</th><th>2nd half</th><th>Holds up?</th></tr></thead>
+    <tbody id="sigprows"></tbody>
+  </table>
+</div>
+</div>
 <div class="view active" id="viewAccum">
 <div class="status">
   <span>🤫 <b>Quiet accumulation → breakout</b> — the $LAB pattern: an earlier <b>test pump</b> proves the coin can run, then it drops into a <b>tight range</b> where <b>volume dries up</b> (nobody watching), then presses/breaks out of the top. Detected on the <b>daily</b> chart. Entry on the range-high break, stop under the range, target a measured move capped at the prior pump high. <b>Vol ratio</b> = recent volume ÷ its earlier average — lower is quieter and better.</span>
@@ -3453,7 +3488,7 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["dtb","Dtb"],["accum","Accum"],["coil","Coil"],["scalp","Scalp"],["spot","Spot"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["dtb","Dtb"],["accum","Accum"],["signals","Signals"],["coil","Coil"],["scalp","Scalp"],["spot","Spot"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
@@ -4425,6 +4460,26 @@ function renderDtb(){
       `<td>${h.quiet?'<span class="pf-good">quiet</span>':'—'}</td>`;
     tb.appendChild(tr);
   }
+}
+let siglatest=null;
+function sigRow(x){
+  const lift=(x.lift||0), col=lift>0?"good":(lift<0?"bad":"");
+  const rb=x.robust?'<span class="good">yes</span>':'<span class="bad">no</span>';
+  return `<td>${x.name}</td><td>${x.n}</td><td>${x.winrate}%</td><td>${(x.exp||0).toFixed(3)}</td>`+
+         `<td class="${col}">${lift>0?"+":""}${lift.toFixed(3)}</td>`+
+         `<td>${x.h1==null?"&mdash;":x.h1.toFixed(3)}</td><td>${x.h2==null?"&mdash;":x.h2.toFixed(3)}</td><td>${rb}</td>`;
+}
+function renderSignals(){
+  const b=document.getElementById("sigbase"), tb=document.getElementById("sigrows"), pb=document.getElementById("sigprows");
+  if(!tb||!pb) return;
+  tb.innerHTML=""; pb.innerHTML="";
+  const r=siglatest;
+  const emp=document.getElementById("sigempty");
+  if(!r){ if(emp) emp.style.display="block"; if(b) b.innerHTML=""; return; }
+  if(emp) emp.style.display="none";
+  if(b) b.innerHTML=`<div class="status"><span>Base strategy: <b>${r.n}</b> trades, expectancy <b>${(r.base_exp||0).toFixed(3)}R</b>. Every signal below is measured against that.</span></div>`;
+  for(const x of (r.singles||[])){ const tr=document.createElement("tr"); tr.innerHTML=sigRow(x); tb.appendChild(tr); }
+  for(const x of (r.pairs||[])){ const tr=document.createElement("tr"); tr.innerHTML=sigRow(x); pb.appendChild(tr); }
 }
 function renderAccum(){
   const tb=document.getElementById("accumrows"); if(!tb) return; tb.innerHTML="";
@@ -5844,6 +5899,7 @@ async function poll(){
     eelatest=d.early_hits||[]; renderEarly();
   dtblatest=d.dtb_hits||[]; renderDtb();
   accumlatest=d.accum_hits||[]; renderAccum();
+  siglatest=d.signal_rank||null; renderSignals();
     slatest=d.short_hits||[]; renderShorts();
     renderBestLong(); renderBestShort(); renderCoil(); renderScalp(); renderSpot(); renderPerf(); renderCalls();
     renderMarket(); renderWatch();

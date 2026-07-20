@@ -5037,6 +5037,174 @@ EMACONF_VARIANTS = {
 }
 
 
+def _macd(C, fast=12, slow=26, sig=9):
+    ef, es = ema(C, fast), ema(C, slow)
+    line = [None] * len(C)
+    for i in range(len(C)):
+        if ef[i] is not None and es[i] is not None:
+            line[i] = ef[i] - es[i]
+    vals = [x for x in line if x is not None]
+    if len(vals) < sig + 2:
+        return line, [None] * len(C)
+    off = len(C) - len(vals)
+    sg = ema(vals, sig)
+    signal = [None] * len(C)
+    for i, v in enumerate(sg):
+        signal[off + i] = v
+    return line, signal
+
+
+def _signal_flags(H, L, C, V, t, e10, e20, e50, e200, e1200, st, sdir, rsis,
+                  macd_l, macd_s, mkt_ctx=None, rows=None):
+    """THE SIGNAL LIBRARY — ~20 INDEPENDENT yes/no reads at bar t. Each is tagged onto every trade so
+    the backtest can rank them (and their combinations) by expectancy, instead of us guessing which
+    ones matter. Nothing here filters a trade; these are pure observations."""
+    f = {}
+    px = C[t]
+    def _v(x): return x is not None
+    # --- trend / EMA structure ---
+    f["ema10>20"] = bool(_v(e10[t]) and _v(e20[t]) and e10[t] > e20[t])
+    f["ema20>50"] = bool(_v(e20[t]) and _v(e50[t]) and e20[t] > e50[t])
+    f["golden50>200"] = bool(_v(e50[t]) and _v(e200[t]) and e50[t] > e200[t])
+    f["px>200ema"] = bool(_v(e200[t]) and px > e200[t])
+    f["px>50ema"] = bool(_v(e50[t]) and px > e50[t])
+    f["px>daily200"] = bool(_v(e1200[t]) and px > e1200[t])        # ~daily-200 proxy on 4h data
+    f["ema200_rising"] = bool(_v(e200[t]) and t >= 20 and _v(e200[t - 20]) and e200[t] > e200[t - 20])
+    # --- supertrend ---
+    f["supertrend_up"] = bool(sdir[t] == 1)
+    f["st_just_flipped"] = bool(t >= 1 and sdir[t] == 1 and sdir[t - 1] == -1)
+    # --- momentum ---
+    r = rsis[t]
+    f["rsi_oversold"] = bool(r is not None and r < 35)
+    f["rsi_strong"] = bool(r is not None and 55 <= r <= 72)
+    f["rsi_rising"] = bool(r is not None and t >= 3 and rsis[t - 3] is not None and r > rsis[t - 3])
+    ml, ms = macd_l[t], macd_s[t]
+    f["macd_above_signal"] = bool(_v(ml) and _v(ms) and ml > ms)
+    f["macd_cross_up"] = bool(_v(ml) and _v(ms) and t >= 1 and _v(macd_l[t - 1]) and _v(macd_s[t - 1])
+                              and macd_l[t - 1] <= macd_s[t - 1] and ml > ms)
+    # --- volume ---
+    if t >= 40:
+        av = sum(V[t - 40:t]) / 40.0
+        f["vol_expansion"] = bool(av > 0 and V[t] > 1.6 * av)
+        f["vol_dryup"] = bool(av > 0 and sum(V[t - 10:t + 1]) / 11.0 < 0.7 * av)
+    else:
+        f["vol_expansion"] = f["vol_dryup"] = False
+    # --- structure ---
+    if t >= 30:
+        lo20 = min(L[t - 20:t + 1]); lo40 = min(L[t - 40:t - 20])
+        f["higher_low"] = bool(lo20 > lo40)
+        f["breakout_20h"] = bool(C[t] > max(H[t - 20:t]))
+        rng_hi = max(H[t - 60:t + 1]) if t >= 60 else max(H[:t + 1])
+        rng_lo = min(L[t - 60:t + 1]) if t >= 60 else min(L[:t + 1])
+        rr = rng_hi - rng_lo
+        f["in_fib_zone"] = bool(rr > 0 and (rng_hi - 0.786 * rr) <= px <= (rng_hi - 0.5 * rr))
+        a20 = atr(H[t - 20:t + 1], L[t - 20:t + 1], C[t - 20:t + 1]) or 0
+        a60 = atr(H[max(0, t - 60):t + 1], L[max(0, t - 60):t + 1], C[max(0, t - 60):t + 1]) or 0
+        f["squeeze"] = bool(a60 > 0 and a20 < 0.7 * a60)
+    else:
+        f["higher_low"] = f["breakout_20h"] = f["in_fib_zone"] = f["squeeze"] = False
+    # --- the two hand-built tools ---
+    f["liq_sweep"] = bool(_liquidity_sweep_up(H, L, C, t))
+    _tl, _ = _trendline_up_touch(L, t)
+    f["trendline"] = bool(_tl)
+    # --- market environment ---
+    _ms = mkt_ctx.get(int(rows[t][0])) if (mkt_ctx and rows) else None
+    f["mkt_risk_on"] = bool(_ms and _ms.get("br") == "risk_on")
+    f["mkt_trending_up"] = bool(_ms and _ms.get("im") in ("up", "strong_up"))
+    f["breadth_rising"] = bool(_ms and _ms.get("bdir") == "rising")
+    return f
+
+
+def _bt_signals(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None):
+    """SIGNAL-DISCOVERY harness. Uses a deliberately NEUTRAL entry (any green close) with a fixed
+    ATR stop/target, so no strategy bias is baked in — then tags every trade with the whole signal
+    library. The point is not this base strategy's P&L; it's to measure which SIGNALS (and which
+    COMBINATIONS) actually shift expectancy. Long-only."""
+    if side != "long":
+        return []
+    try:
+        H = [float(x[2]) for x in rows]; L = [float(x[3]) for x in rows]
+        C = [float(x[4]) for x in rows]; V = [float(x[5]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return []
+    n = len(C)
+    if n < warmup + horizon + 5:
+        return []
+    e10, e20, e50, e200 = ema(C, 10), ema(C, 20), ema(C, 50), ema(C, 200)
+    e1200 = ema(C, 1200)
+    st, sdir = _st_series(H, L, C, 10, 3.0)
+    rsis = rsi_series(C)
+    macd_l, macd_s = _macd(C)
+    fee_frac = fees_bps / 10000.0
+    _dv = sorted(C[i] * V[i] for i in range(n)); dvol = _dv[len(_dv) // 2] if _dv else 0.0
+    out = []; t = warmup
+    while t < n - horizon - 1:
+        a = atr(H[max(0, t - 20):t + 1], L[max(0, t - 20):t + 1], C[max(0, t - 20):t + 1])
+        if not a or a <= 0 or C[t] <= C[t - 1]:      # neutral base trigger: a green close
+            t += 1; continue
+        entry = C[t]; stop = entry - 1.5 * a; target = entry + 3.0 * a
+        tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx,
+                           "signals", True, t, entry, stop, target, a, mkt_ctx=mkt_ctx)
+        if tr is None:
+            t += 1; continue
+        tr["sig"] = _signal_flags(H, L, C, V, t, e10, e20, e50, e200, e1200, st, sdir,
+                                  rsis, macd_l, macd_s, mkt_ctx, rows)
+        out.append(tr); t = rbar + 1
+    return out
+
+
+def _bt_signal_ranking(trades, min_n=60):
+    """Rank every SIGNAL, and every PAIR of signals, by expectancy — with split-half validation so a
+    combo that only worked in one era gets exposed. This is signal DISCOVERY: it tells us which
+    reads actually pay, rather than us assuming."""
+    tr = [x for x in trades if x.get("sig")]
+    if len(tr) < min_n:
+        return None
+    names = sorted(tr[0]["sig"].keys())
+    base_exp = sum(x["r"] for x in tr) / len(tr)
+    half = sorted(tr, key=lambda z: z.get("ts") or 0)
+    mid = len(half) // 2
+    first, second = half[:mid], half[mid:]
+
+    def stats(sub):
+        if not sub:
+            return None
+        w = sum(1 for x in sub if x["outcome"] == "win")
+        return {"n": len(sub), "winrate": round(w / len(sub) * 100, 1),
+                "exp": round(sum(x["r"] for x in sub) / len(sub), 3)}
+
+    singles = []
+    for nm in names:
+        on = [x for x in tr if x["sig"].get(nm)]
+        if len(on) < min_n:
+            continue
+        st_all = stats(on)
+        f1 = stats([x for x in first if x["sig"].get(nm)])
+        f2 = stats([x for x in second if x["sig"].get(nm)])
+        singles.append({"name": nm, **st_all, "lift": round(st_all["exp"] - base_exp, 3),
+                        "h1": (f1 or {}).get("exp"), "h2": (f2 or {}).get("exp"),
+                        "robust": bool(f1 and f2 and f1["exp"] > base_exp and f2["exp"] > base_exp)})
+    singles.sort(key=lambda z: -z["lift"])
+
+    pairs = []
+    top = [s["name"] for s in singles[:12]]
+    for i in range(len(top)):
+        for j in range(i + 1, len(top)):
+            a, b = top[i], top[j]
+            on = [x for x in tr if x["sig"].get(a) and x["sig"].get(b)]
+            if len(on) < min_n:
+                continue
+            st_all = stats(on)
+            f1 = stats([x for x in first if x["sig"].get(a) and x["sig"].get(b)])
+            f2 = stats([x for x in second if x["sig"].get(a) and x["sig"].get(b)])
+            pairs.append({"name": a + " + " + b, **st_all, "lift": round(st_all["exp"] - base_exp, 3),
+                          "h1": (f1 or {}).get("exp"), "h2": (f2 or {}).get("exp"),
+                          "robust": bool(f1 and f2 and f1["exp"] > base_exp and f2["exp"] > base_exp)})
+    pairs.sort(key=lambda z: -z["lift"])
+    return {"base_exp": round(base_exp, 3), "n": len(tr),
+            "singles": singles[:20], "pairs": pairs[:20]}
+
+
 def _bt_emaconf(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None,
                 variant="scaled"):
     """THE 5-TOOL CONFLUENCE SYSTEM (HTF swing style). Long only when the higher-timeframe stack is
@@ -5210,6 +5378,8 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="
         return _bt_bullmom(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy == "pro":
         return _bt_pro(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
+    if strategy == "signals":
+        return _bt_signals(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy.startswith("emaconf"):
         _v = strategy.split(":", 1)[1] if ":" in strategy else "scaled"
         return _bt_emaconf(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf,
@@ -5683,6 +5853,7 @@ def _bt_aggregate(results, syms, tf, side, fees_bps):
             "monthly": _bt_monthly(allt),
             "insights": _bt_insights(allt), "findings": _bt_findings(allt),
             "by_breadth": _bt_by_breadth(allt),
+            "signal_ranking": _bt_signal_ranking(allt),
             "portfolio": _bt_portfolio(allt, tf=tf),
             "sample": _bt_sample(results, syms),
             "per_symbol": sorted(per, key=lambda p: p["exp"], reverse=True),
