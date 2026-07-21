@@ -5429,18 +5429,19 @@ def _bt_signals(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, 
     return out
 
 
-def _r_portfolio(sub, start=10000.0, margin=100.0, lev=10.0):
+def _r_portfolio(sub, start=10000.0, margin=250.0, lev=10.0):
     """Turn a set of R-multiples into account numbers, modelled as CROSS margin.
 
-    Sizing: $10,000 account, $100 margin at 10x = a $1,000 position. Because margin is CROSS, the
-    whole account balance backs the position, not just the $100. That has one big consequence worth
-    being explicit about: a $1,000 position is not liquidated by a 10% adverse move - it would take
+    Sizing: $10,000 account, $250 margin at 10x = a $2,500 position. Because margin is CROSS, the
+    whole account balance backs the position, not just the $250. That has one big consequence worth
+    being explicit about: a $2,500 position is not liquidated by a 10% adverse move - it would take
     a move large enough to threaten the entire balance - so THE STOP IS ACTUALLY REACHED. Positions
     resolve at their stop or target rather than being force-closed early.
 
-    The dollar risk is therefore just position size x distance to stop: a 5% stop risks $50 (0.5% of
-    the account), a 20% stop risks $200 (2%). The real danger under cross is not a single trade, it
-    is a losing streak draining shared collateral - which is what max drawdown below measures."""
+    Dollar risk is position size x distance to stop, and at $2,500 that bites harder than it looks:
+    a 5% stop risks $125 (1.25% of the account) and a 20% stop risks $500 (5%). Ten consecutive
+    losses on wide stops would be half the account. Cross margin will not stop you out early, so
+    nothing caps that except the stop itself - the max drawdown column is the number to read."""
     notional = margin * lev
     eq = start; peak = start; maxdd = 0.0; busted = False
     total_r = 0.0; r_eq = 0.0; r_peak = 0.0; r_dd = 0.0
@@ -5519,7 +5520,7 @@ def _bt_signal_ranking(trades, min_n=50):
     singles = [e for e in (entry(nm, (lambda n: (lambda g: g.get(n)))(nm)) for nm in names) if e]
     singles.sort(key=lambda z: -z["lift"])
 
-    top = [x["name"] for x in singles[:15]]
+    top = [x["name"] for x in singles[:18]]
     pairs = []
     for i in range(len(top)):
         for j in range(i + 1, len(top)):
@@ -5529,7 +5530,7 @@ def _bt_signal_ranking(trades, min_n=50):
                 pairs.append(e)
     pairs.sort(key=lambda z: -z["lift"])
 
-    top3 = [x["name"] for x in singles[:8]]
+    top3 = [x["name"] for x in singles[:10]]
     triples = []
     for i in range(len(top3)):
         for j in range(i + 1, len(top3)):
@@ -5545,7 +5546,8 @@ def _bt_signal_ranking(trades, min_n=50):
     return {"base_exp": round(base_exp, 3), "n": len(tr), "tested": tested,
             "expected_false": round(tested * 0.05, 1),
             "robust_count": sum(1 for x in singles + pairs + triples if x["robust"]),
-            "singles": singles[:25], "pairs": pairs[:20], "triples": triples[:15]}
+            "n_signals": len(names),
+            "singles": singles, "pairs": pairs[:30], "triples": triples[:25]}
 
 
 def _bt_emaconf(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None,

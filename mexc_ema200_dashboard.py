@@ -1579,20 +1579,19 @@ def backtest_loop(state: State) -> None:
     # US stocks (Stooq daily, SPY index) so the two markets sit side-by-side in their own tabs.
     # SCENARIO MATRIX — 10 variants of the 5-tool confluence system, all tested on the SAME
     # candles (one download, many tests). 4H = the style's stated sweet spot.
+    # PARKED: the 10-variant 5-tool matrix and the two runner backtests. They were the CPU hogs on
+    # this free instance and the tab was not earning its keep. The code is untouched -- re-add the
+    # keys here to switch it back on once the indicator work has settled.
+    PARKED_SCENARIOS = [
+        ("emaconf:base", "1 Base"), ("emaconf:scaled", "2 Scale-out"),
+        ("emaconf:scaled_near", "3 Near target"), ("emaconf:scaled_tp05", "4 TP 0.5R"),
+        ("emaconf:strongup", "5 Market up only"), ("emaconf:conf4", "6 Confluence 4"),
+        ("emaconf:conf5", "7 Confluence 5"), ("emaconf:fibonly", "8 Fib only"),
+        ("emaconf:emaonly", "9 EMA only"), ("emaconf:trail", "10 Trailing"),
+        ("dtb", "11 Triple bottom"), ("accum", "12 Quiet accumulation"),
+    ]
     EMACONF_SCENARIOS = [
-        ("emaconf:base",        "1 Base (single far target)"),
-        ("emaconf:scaled",      "2 Scale-out 50% @1R + runner"),
-        ("emaconf:scaled_near", "3 Scale-out, NEAR target"),
-        ("emaconf:scaled_tp05", "4 Scale-out 50% @0.5R"),
-        ("emaconf:strongup",    "5 Only when market trending UP"),
-        ("emaconf:conf4",       "6 Confluence >=4 tools"),
-        ("emaconf:conf5",       "7 Confluence = all 5 tools"),
-        ("emaconf:fibonly",     "8 Fib magic-zone entries only"),
-        ("emaconf:emaonly",     "9 EMA-pullback entries only"),
-        ("emaconf:trail",       "10 Supertrend trailing exit"),
-        ("signals",             "11 Signal lab (60+ indicators)"),
-        ("dtb",                 "12 Triple bottom (daily)"),
-        ("accum",               "13 Quiet accumulation (daily)"),
+        ("signals", "Signal lab (63 indicators)"),
     ]
     CRYPTO_JOBS = []
     STOCK_JOBS = [
@@ -1652,7 +1651,7 @@ def backtest_loop(state: State) -> None:
             with state.lock:
                 if not state.backtests:
                     state.backtests = {"error": str(e)}
-        time.sleep(12 * 3600)                         # refresh twice a day (free tier is CPU-bound)
+        time.sleep(6 * 3600)                          # lighter now the matrix is parked
 
 
 def _micro_summary(micro, universe, mapped, ambiguous):
@@ -2414,7 +2413,7 @@ PAGE = """<!doctype html>
   <div class="tab active" id="tabBestLong" onclick="showTab('bestlong')">🟢 Long</div>
   <div class="tab" id="tabBestShort" onclick="showTab('bestshort')">🔴 Short</div>
   <div class="tab" id="tabPerf" onclick="showTab('perf')">📊 Performance</div>
-  <div class="tab" id="tabBacktest" onclick="showTab('backtest')">🧪 Backtest</div>
+  <div class="tab" id="tabBacktest" style="display:none" onclick="showTab('backtest')">🧪 Backtest</div>
   <div class="tab" id="tabMarket" onclick="showTab('market')" style="display:none">🧭 Market</div>
   <div class="tab" id="tabHistory" onclick="showTab('history')" style="display:none">🕘 History</div>
   <div class="tab" id="tabWatch" onclick="showTab('watch')" style="display:none">📌 Watchlist</div>
@@ -2729,7 +2728,7 @@ PAGE = """<!doctype html>
 </div>
 <div class="wrap" id="sigbase" style="margin-bottom:10px"></div>
 <div class="wrap">
-  <h3 style="margin:6px 0 4px">Individual signals</h3>
+  <h3 style="margin:6px 0 4px">Individual signals <span class="rr" id="sigcount"></span></h3>
   <table id="sigtbl">
     <thead><tr><th>Signal</th><th>Trades</th><th>Win rate</th><th>Expectancy (R)</th><th>Exp. w/ DCA</th><th>DCA helps?</th><th>Lift vs base</th><th>Total R</th><th>Max DD (R)</th><th>End equity</th><th>Return</th><th>Max DD $</th><th>Worst trade</th><th>1st half</th><th>2nd half</th><th>Holds up?</th></tr></thead>
     <tbody id="sigrows"></tbody>
@@ -4681,10 +4680,12 @@ function renderSignals(){
   if(emp) emp.style.display="none";
   if(b) b.innerHTML=`<div class="status"><span>Base strategy: <b>${r.n}</b> trades, expectancy <b>${(r.base_exp||0).toFixed(3)}R</b>. Every signal below is measured against that.<br>`+
     `<b>${r.tested||0}</b> combinations were tested. If every signal were pure noise, roughly <b>${r.expected_false||0}</b> would still look significant by chance &mdash; so treat any single top row with suspicion and weight the <b>Holds up?</b> column instead. <b>${r.robust_count||0}</b> passed both halves of history.<br>`+
-    `<b>Money columns</b> use your sizing on <b>cross</b> margin: <b>$10,000</b> account, <b>$100 margin at 10x</b> = a $1,000 position, taken in date order. Because margin is cross the whole balance backs the trade &mdash; a $1,000 position is <b>not</b> force-closed by a 10% adverse move, so <b>the stop is actually reached</b> instead of the position being liquidated early.<br>`+
-    `Dollar risk is position size &times; distance to stop: a 5% stop risks $50 (0.5% of the account), a 20% stop risks $200 (2%). Under cross the danger is not any single trade &mdash; it is a losing streak draining shared collateral, which is exactly what <b>Max DD</b> measures.<br>`+
+    `<b>Money columns</b> use your sizing on <b>cross</b> margin: <b>$10,000</b> account, <b>$250 margin at 10x</b> = a $2,500 position, taken in date order. Because margin is cross the whole balance backs the trade &mdash; a $2,500 position is <b>not</b> force-closed by a 10% adverse move, so <b>the stop is actually reached</b> instead of the position being liquidated early.<br>`+
+    `Dollar risk is position size &times; distance to stop: a 5% stop risks $125 (1.25% of the account), a 20% stop risks $500 (<b>5%</b>). Under cross the danger is not any single trade &mdash; it is a losing streak draining shared collateral, which is exactly what <b>Max DD</b> measures.<br>`+
     `<b>Exp. w/ DCA</b> adds a second equal-size unit halfway to the stop. It cuts both ways: a full stop-out becomes about <b>-1.5R</b> rather than -1R, while winners that dipped first pay considerably more. DCA does not create edge &mdash; it widens both tails. If a signal only becomes profitable with DCA switched on, treat that as a warning rather than a discovery.<br>`+
     `<span class="warn">All figures assume every signalled trade was taken with no cap on concurrent positions, so read the equity curve as an upper bound rather than a forecast.</span></span></div>`;
+  const sc=document.getElementById("sigcount");
+  if(sc) sc.textContent="— "+(r.n_signals||0)+" indicators tested, "+(r.singles||[]).length+" with enough trades to score";
   for(const x of (r.singles||[])){ const tr=document.createElement("tr"); tr.innerHTML=sigRow(x); tb.appendChild(tr); }
   for(const x of (r.pairs||[])){ const tr=document.createElement("tr"); tr.innerHTML=sigRow(x); pb.appendChild(tr); }
   const trb=document.getElementById("sigtrows");
