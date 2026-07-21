@@ -1586,7 +1586,7 @@ def backtest_loop(state: State) -> None:
         ("emaconf:fibonly",     "8 Fib magic-zone entries only"),
         ("emaconf:emaonly",     "9 EMA-pullback entries only"),
         ("emaconf:trail",       "10 Supertrend trailing exit"),
-        ("signals",             "11 Signal lab (20 indicators)"),
+        ("signals",             "11 Signal lab (60+ indicators)"),
         ("dtb",                 "12 Triple bottom (daily)"),
         ("accum",               "13 Quiet accumulation (daily)"),
     ]
@@ -2676,6 +2676,13 @@ PAGE = """<!doctype html>
   <table id="sigptbl">
     <thead><tr><th>Combination</th><th>Trades</th><th>Win rate</th><th>Expectancy (R)</th><th>Lift vs base</th><th>1st half</th><th>2nd half</th><th>Holds up?</th></tr></thead>
     <tbody id="sigprows"></tbody>
+  </table>
+</div>
+<div class="wrap" style="margin-top:14px">
+  <h3 style="margin:6px 0 4px">Best triples (3-signal confluence)</h3>
+  <table id="sigttbl">
+    <thead><tr><th>Combination</th><th>Trades</th><th>Win rate</th><th>Expectancy (R)</th><th>Lift vs base</th><th>1st half</th><th>2nd half</th><th>Holds up?</th></tr></thead>
+    <tbody id="sigtrows"></tbody>
   </table>
 </div>
 </div>
@@ -4555,9 +4562,12 @@ function renderSignals(){
   const emp=document.getElementById("sigempty");
   if(!r){ if(emp) emp.style.display="block"; if(b) b.innerHTML=""; return; }
   if(emp) emp.style.display="none";
-  if(b) b.innerHTML=`<div class="status"><span>Base strategy: <b>${r.n}</b> trades, expectancy <b>${(r.base_exp||0).toFixed(3)}R</b>. Every signal below is measured against that.</span></div>`;
+  if(b) b.innerHTML=`<div class="status"><span>Base strategy: <b>${r.n}</b> trades, expectancy <b>${(r.base_exp||0).toFixed(3)}R</b>. Every signal below is measured against that.<br>`+
+    `<b>${r.tested||0}</b> combinations were tested. If every signal were pure noise, roughly <b>${r.expected_false||0}</b> would still look significant by chance &mdash; so treat any single top row with suspicion and weight the <b>Holds up?</b> column instead. <b>${r.robust_count||0}</b> passed both halves of history.</span></div>`;
   for(const x of (r.singles||[])){ const tr=document.createElement("tr"); tr.innerHTML=sigRow(x); tb.appendChild(tr); }
   for(const x of (r.pairs||[])){ const tr=document.createElement("tr"); tr.innerHTML=sigRow(x); pb.appendChild(tr); }
+  const trb=document.getElementById("sigtrows");
+  if(trb){ trb.innerHTML=""; for(const x of (r.triples||[])){ const tr=document.createElement("tr"); tr.innerHTML=sigRow(x); trb.appendChild(tr); } }
 }
 function renderAccum(){
   const tb=document.getElementById("accumrows"); if(!tb) return; tb.innerHTML="";

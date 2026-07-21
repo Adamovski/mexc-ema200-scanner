@@ -5037,6 +5037,81 @@ EMACONF_VARIANTS = {
 }
 
 
+def _stoch(H, L, C, t, k=14):
+    if t < k:
+        return None
+    hh = max(H[t - k + 1:t + 1]); ll = min(L[t - k + 1:t + 1])
+    return None if hh <= ll else (C[t] - ll) / (hh - ll) * 100
+
+
+def _cci(H, L, C, t, n=20):
+    if t < n:
+        return None
+    tp = [(H[i] + L[i] + C[i]) / 3 for i in range(t - n + 1, t + 1)]
+    ma = sum(tp) / n
+    md = sum(abs(x - ma) for x in tp) / n
+    return None if md == 0 else (tp[-1] - ma) / (0.015 * md)
+
+
+def _obv_slope(C, V, t, n=20):
+    if t < n + 1:
+        return None
+    o = 0.0; seq = []
+    for i in range(t - n, t + 1):
+        o += V[i] if C[i] > C[i - 1] else (-V[i] if C[i] < C[i - 1] else 0.0)
+        seq.append(o)
+    return seq[-1] - seq[0]
+
+
+def _mfi(H, L, C, V, t, n=14):
+    if t < n + 1:
+        return None
+    pos = neg = 0.0
+    for i in range(t - n + 1, t + 1):
+        tp = (H[i] + L[i] + C[i]) / 3; ptp = (H[i - 1] + L[i - 1] + C[i - 1]) / 3
+        if tp > ptp:
+            pos += tp * V[i]
+        elif tp < ptp:
+            neg += tp * V[i]
+    return 100.0 if neg == 0 else 100 - (100 / (1 + pos / neg))
+
+
+def _bb(C, t, n=20, mult=2.0):
+    if t < n:
+        return None, None, None
+    seg = C[t - n + 1:t + 1]; ma = sum(seg) / n
+    var = sum((x - ma) ** 2 for x in seg) / n
+    sd = var ** 0.5
+    return ma - mult * sd, ma, ma + mult * sd
+
+
+def _vwap(H, L, C, V, t, n=20):
+    if t < n:
+        return None
+    num = den = 0.0
+    for i in range(t - n + 1, t + 1):
+        tp = (H[i] + L[i] + C[i]) / 3
+        num += tp * V[i]; den += V[i]
+    return None if den <= 0 else num / den
+
+
+def _rsi_bull_div(L, rsis, t, look=40):
+    """Regular bullish divergence: price makes a lower low while RSI makes a higher low."""
+    if t < look + 2:
+        return False
+    lo1 = i1 = None
+    for i in range(t - look, t - look // 2):
+        if lo1 is None or L[i] < lo1:
+            lo1, i1 = L[i], i
+    lo2 = i2 = None
+    for i in range(t - look // 2, t + 1):
+        if lo2 is None or L[i] < lo2:
+            lo2, i2 = L[i], i
+    if None in (lo1, lo2, i1, i2) or rsis[i1] is None or rsis[i2] is None:
+        return False
+    return lo2 < lo1 and rsis[i2] > rsis[i1]
+
+
 def _macd(C, fast=12, slow=26, sig=9):
     ef, es = ema(C, fast), ema(C, slow)
     line = [None] * len(C)
@@ -5107,11 +5182,93 @@ def _signal_flags(H, L, C, V, t, e10, e20, e50, e200, e1200, st, sdir, rsis,
     f["liq_sweep"] = bool(_liquidity_sweep_up(H, L, C, t))
     _tl, _ = _trendline_up_touch(L, t)
     f["trendline"] = bool(_tl)
+    # ================= EXPANDED LIBRARY (targeting ~50 independent reads) =================
+    # --- more EMA / trend structure ---
+    f["ema10>50"] = bool(_v(e10[t]) and _v(e50[t]) and e10[t] > e50[t])
+    f["emas_fully_stacked"] = bool(_v(e10[t]) and _v(e20[t]) and _v(e50[t]) and _v(e200[t])
+                                   and e10[t] > e20[t] > e50[t] > e200[t])
+    f["ema20_rising"] = bool(_v(e20[t]) and t >= 5 and _v(e20[t - 5]) and e20[t] > e20[t - 5])
+    f["ema50_rising"] = bool(_v(e50[t]) and t >= 10 and _v(e50[t - 10]) and e50[t] > e50[t - 10])
+    f["ema200>daily200"] = bool(_v(e200[t]) and _v(e1200[t]) and e200[t] > e1200[t])
+    f["px_within_2pct_200ema"] = bool(_v(e200[t]) and e200[t] > 0 and abs(px - e200[t]) / e200[t] < 0.02)
+    # --- oscillators ---
+    st_k = _stoch(H, L, C, t)
+    f["stoch_oversold"] = bool(st_k is not None and st_k < 20)
+    f["stoch_rising"] = bool(st_k is not None and t >= 3 and (_stoch(H, L, C, t - 3) or 100) < st_k)
+    cci = _cci(H, L, C, t)
+    f["cci_oversold"] = bool(cci is not None and cci < -100)
+    f["cci_strong"] = bool(cci is not None and cci > 100)
+    mfi = _mfi(H, L, C, V, t)
+    f["mfi_oversold"] = bool(mfi is not None and mfi < 25)
+    f["mfi_strong"] = bool(mfi is not None and 50 <= mfi <= 80)
+    f["rsi_bull_divergence"] = bool(_rsi_bull_div(L, rsis, t))
+    if t >= 20:
+        f["roc20_positive"] = bool(C[t - 20] > 0 and (px - C[t - 20]) / C[t - 20] > 0)
+        f["roc20_strong"] = bool(C[t - 20] > 0 and (px - C[t - 20]) / C[t - 20] > 0.10)
+    else:
+        f["roc20_positive"] = f["roc20_strong"] = False
+    f["macd_hist_rising"] = bool(_v(ml) and _v(ms) and t >= 2 and _v(macd_l[t - 2]) and _v(macd_s[t - 2])
+                                 and (ml - ms) > (macd_l[t - 2] - macd_s[t - 2]))
+    f["macd_above_zero"] = bool(_v(ml) and ml > 0)
+    # --- bands / volatility ---
+    bl, bm, bu = _bb(C, t)
+    f["bb_lower_tag"] = bool(bl is not None and L[t] <= bl)
+    f["bb_upper_break"] = bool(bu is not None and px > bu)
+    f["bb_above_mid"] = bool(bm is not None and px > bm)
+    if t >= 7:
+        rngs = [H[i] - L[i] for i in range(t - 6, t + 1)]
+        f["nr7"] = bool(rngs[-1] == min(rngs))
+    else:
+        f["nr7"] = False
+    f["inside_bar"] = bool(t >= 1 and H[t] <= H[t - 1] and L[t] >= L[t - 1])
+    if t >= 40:
+        a14 = atr(H[t - 14:t + 1], L[t - 14:t + 1], C[t - 14:t + 1]) or 0
+        a40 = atr(H[t - 40:t + 1], L[t - 40:t + 1], C[t - 40:t + 1]) or 0
+        f["atr_expanding"] = bool(a40 > 0 and a14 > 1.2 * a40)
+    else:
+        f["atr_expanding"] = False
+    # --- volume / flow ---
+    ob = _obv_slope(C, V, t)
+    f["obv_rising"] = bool(ob is not None and ob > 0)
+    vw = _vwap(H, L, C, V, t)
+    f["above_vwap20"] = bool(vw is not None and px > vw)
+    if t >= 40:
+        av = sum(V[t - 40:t]) / 40.0
+        f["climax_volume"] = bool(av > 0 and V[t] > 3.0 * av)
+        f["vol_above_avg"] = bool(av > 0 and V[t] > av)
+    else:
+        f["climax_volume"] = f["vol_above_avg"] = False
+    if t >= 5:
+        _rng = H[t] - L[t]
+        f["close_top_third"] = bool(_rng > 0 and (px - L[t]) / _rng > 0.66)
+    else:
+        f["close_top_third"] = False
+    # --- candles / price action ---
+    f["bullish_engulf"] = bool(t >= 1 and C[t] > C[t - 1] and C[t - 1] < C[t - 2] if t >= 2 else False)
+    if t >= 1:
+        _rng = H[t] - L[t]; _body = abs(C[t] - (C[t - 1]))
+        f["hammer_ish"] = bool(_rng > 0 and (min(C[t], C[t - 1]) - L[t]) / _rng > 0.5)
+    else:
+        f["hammer_ish"] = False
+    f["three_green"] = bool(t >= 3 and C[t] > C[t - 1] > C[t - 2] > C[t - 3])
+    # --- structure / location ---
+    if t >= 60:
+        f["higher_high"] = bool(H[t] > max(H[t - 30:t]))
+        _lo52 = min(L[max(0, t - 250):t + 1]); _hi52 = max(H[max(0, t - 250):t + 1])
+        f["near_52w_low"] = bool(_lo52 > 0 and px < _lo52 * 1.25)
+        f["near_52w_high"] = bool(_hi52 > 0 and px > _hi52 * 0.90)
+        f["reclaimed_prior_high"] = bool(px > max(H[t - 60:t - 20]))
+        f["break_of_structure"] = bool(H[t] > max(H[t - 15:t]) and min(L[t - 15:t]) > min(L[t - 40:t - 15]))
+    else:
+        f["higher_high"] = f["near_52w_low"] = f["near_52w_high"] = False
+        f["reclaimed_prior_high"] = f["break_of_structure"] = False
     # --- market environment ---
     _ms = mkt_ctx.get(int(rows[t][0])) if (mkt_ctx and rows) else None
     f["mkt_risk_on"] = bool(_ms and _ms.get("br") == "risk_on")
     f["mkt_trending_up"] = bool(_ms and _ms.get("im") in ("up", "strong_up"))
     f["breadth_rising"] = bool(_ms and _ms.get("bdir") == "rising")
+    f["mkt_strong_up"] = bool(_ms and _ms.get("im") == "strong_up")
+    f["mkt_broad_participation"] = bool(_ms and (_ms.get("bpct") or 0) > 55)
     return f
 
 
@@ -5210,18 +5367,23 @@ def _bt_signals(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, 
     return out
 
 
-def _bt_signal_ranking(trades, min_n=60):
-    """Rank every SIGNAL, and every PAIR of signals, by expectancy — with split-half validation so a
-    combo that only worked in one era gets exposed. This is signal DISCOVERY: it tells us which
-    reads actually pay, rather than us assuming."""
+def _bt_signal_ranking(trades, min_n=50):
+    """Rank ~60 SIGNALS, then their PAIRS and TRIPLES, by how much each shifts expectancy.
+
+    Two guards against fooling ourselves, because with this many signals the search space is huge
+    (60 singles, ~100 pairs, ~50 triples) and pure chance WILL produce good-looking winners:
+      1. split-half validation - a combo must beat the base in BOTH halves of history to be "robust";
+      2. a stated expected-false-positives count, so the reader knows roughly how many of the
+         top rows would look this good even if every signal were pure noise.
+    Neither guard makes a result true. They just stop a coincidence from being sold as an edge."""
     tr = [x for x in trades if x.get("sig")]
     if len(tr) < min_n:
         return None
     names = sorted(tr[0]["sig"].keys())
     base_exp = sum(x["r"] for x in tr) / len(tr)
-    half = sorted(tr, key=lambda z: z.get("ts") or 0)
-    mid = len(half) // 2
-    first, second = half[:mid], half[mid:]
+    ordered = sorted(tr, key=lambda z: z.get("ts") or 0)
+    mid = len(ordered) // 2
+    first, second = ordered[:mid], ordered[mid:]
 
     def stats(sub):
         if not sub:
@@ -5230,36 +5392,47 @@ def _bt_signal_ranking(trades, min_n=60):
         return {"n": len(sub), "winrate": round(w / len(sub) * 100, 1),
                 "exp": round(sum(x["r"] for x in sub) / len(sub), 3)}
 
-    singles = []
-    for nm in names:
-        on = [x for x in tr if x["sig"].get(nm)]
+    def entry(label, pred):
+        on = [x for x in tr if pred(x["sig"])]
         if len(on) < min_n:
-            continue
-        st_all = stats(on)
-        f1 = stats([x for x in first if x["sig"].get(nm)])
-        f2 = stats([x for x in second if x["sig"].get(nm)])
-        singles.append({"name": nm, **st_all, "lift": round(st_all["exp"] - base_exp, 3),
-                        "h1": (f1 or {}).get("exp"), "h2": (f2 or {}).get("exp"),
-                        "robust": bool(f1 and f2 and f1["exp"] > base_exp and f2["exp"] > base_exp)})
+            return None
+        a = stats(on)
+        f1 = stats([x for x in first if pred(x["sig"])])
+        f2 = stats([x for x in second if pred(x["sig"])])
+        return {"name": label, **a, "lift": round(a["exp"] - base_exp, 3),
+                "h1": (f1 or {}).get("exp"), "h2": (f2 or {}).get("exp"),
+                "robust": bool(f1 and f2 and f1["exp"] > base_exp and f2["exp"] > base_exp)}
+
+    singles = [e for e in (entry(nm, (lambda n: (lambda g: g.get(n)))(nm)) for nm in names) if e]
     singles.sort(key=lambda z: -z["lift"])
 
+    top = [x["name"] for x in singles[:15]]
     pairs = []
-    top = [s["name"] for s in singles[:12]]
     for i in range(len(top)):
         for j in range(i + 1, len(top)):
             a, b = top[i], top[j]
-            on = [x for x in tr if x["sig"].get(a) and x["sig"].get(b)]
-            if len(on) < min_n:
-                continue
-            st_all = stats(on)
-            f1 = stats([x for x in first if x["sig"].get(a) and x["sig"].get(b)])
-            f2 = stats([x for x in second if x["sig"].get(a) and x["sig"].get(b)])
-            pairs.append({"name": a + " + " + b, **st_all, "lift": round(st_all["exp"] - base_exp, 3),
-                          "h1": (f1 or {}).get("exp"), "h2": (f2 or {}).get("exp"),
-                          "robust": bool(f1 and f2 and f1["exp"] > base_exp and f2["exp"] > base_exp)})
+            e = entry(a + " + " + b, (lambda p, q: (lambda g: g.get(p) and g.get(q)))(a, b))
+            if e:
+                pairs.append(e)
     pairs.sort(key=lambda z: -z["lift"])
-    return {"base_exp": round(base_exp, 3), "n": len(tr),
-            "singles": singles[:20], "pairs": pairs[:20]}
+
+    top3 = [x["name"] for x in singles[:8]]
+    triples = []
+    for i in range(len(top3)):
+        for j in range(i + 1, len(top3)):
+            for k in range(j + 1, len(top3)):
+                a, b, c = top3[i], top3[j], top3[k]
+                e = entry(a + " + " + b + " + " + c,
+                          (lambda p, q, r: (lambda g: g.get(p) and g.get(q) and g.get(r)))(a, b, c))
+                if e:
+                    triples.append(e)
+    triples.sort(key=lambda z: -z["lift"])
+
+    tested = len(singles) + len(pairs) + len(triples)
+    return {"base_exp": round(base_exp, 3), "n": len(tr), "tested": tested,
+            "expected_false": round(tested * 0.05, 1),
+            "robust_count": sum(1 for x in singles + pairs + triples if x["robust"]),
+            "singles": singles[:25], "pairs": pairs[:20], "triples": triples[:15]}
 
 
 def _bt_emaconf(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None,
