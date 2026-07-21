@@ -1641,12 +1641,17 @@ def backtest_loop(state: State) -> None:
                 # sweep held every coin's candles in memory at once; storing signals as bitmasks and
                 # discarding candles per coin makes all ~600 tradeable pairs feasible here.
                 from mexc_ema200_scanner import (signal_lab_stream, _bt_signal_ranking_mask,
-                                                 list_symbols)
+                                                 list_symbols, liquid_universe)
                 try:
                     universe = list_symbols(sess, cfg.get("quote", "USDT"),
                                             futures_only=True, market=market)
                 except Exception:
                     universe = list(BACKTEST_BASKET)
+                # Trim to coins with real volume: illiquid pairs cannot absorb a $2,500 position
+                # and their sparse candles produce noise, so testing them makes results worse AND
+                # slower. This keeps the sweep affordable on a free instance.
+                universe = liquid_universe(sess, universe, market=market,
+                                           min_dollar_vol=250_000, cap=400)
 
                 def _prog(done, total, ntr):
                     with state.lock:

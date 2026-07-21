@@ -34,6 +34,8 @@ import argparse
 import csv
 import os
 import sys
+import json
+import os
 import random
 import time
 
@@ -5671,6 +5673,75 @@ def _walk_forward_top(tr, all_entries, ks=(5, 10), min_first=20):
     return out
 
 
+CANDLE_CACHE_DIR = os.environ.get("CANDLE_CACHE", "/tmp/apexcache")
+CACHE_TTL = 20 * 3600          # candles for a multi-year backtest barely change within a day
+
+
+def _cache_path(symbol, tf, limit):
+    try:
+        os.makedirs(CANDLE_CACHE_DIR, exist_ok=True)
+    except Exception:
+        return None
+    return os.path.join(CANDLE_CACHE_DIR, f"{symbol}_{tf}_{limit}.json")
+
+
+def fetch_candles_cached(sess, symbol, tf, limit, market):
+    """Deep candles with an on-disk cache.
+
+    Re-downloading two years of history for 600 coins on every cycle is what makes this heavy: it is
+    thousands of paginated responses to parse, and on a small instance that CPU is the difference
+    between a responsive dashboard and a hung one. History that old does not change, so the first
+    sweep pays the cost and later ones read from disk in milliseconds.
+
+    The cache is best-effort: any failure just falls through to a normal fetch, and a stale or
+    corrupt file is ignored rather than trusted."""
+    p = _cache_path(symbol, tf, limit)
+    if p:
+        try:
+            st = os.stat(p)
+            if (time.time() - st.st_mtime) < CACHE_TTL:
+                with open(p, "r") as fh:
+                    rows = json.load(fh)
+                if rows and len(rows) > 300:
+                    return rows
+        except Exception:
+            pass
+    rows = fetch_candles_deep(sess, symbol, tf, limit, market)
+    if rows and p:
+        try:
+            with open(p, "w") as fh:
+                json.dump(rows, fh, separators=(",", ":"))
+        except Exception:
+            pass
+    return rows
+
+
+def liquid_universe(sess, symbols, market="futures", min_dollar_vol=250_000, cap=400):
+    """Trim the universe to coins that can actually be traded.
+
+    Two reasons, not just speed: a pair doing a few thousand dollars a day cannot absorb a $2,500
+    position without slippage that would swamp the edge, and its candles are so sparse that any
+    pattern found in them is mostly noise. Testing them inflates the trade count while making the
+    conclusions worse."""
+    out = []
+    try:
+        r = sess.get(MEXC_FUT_TICKER if market == "futures" else MEXC_PRICE_URL, timeout=20)
+        r.raise_for_status()
+        data = r.json().get("data", []) if market == "futures" else r.json()
+        vol = {}
+        for d in data:
+            try:
+                sym = d["symbol"].replace("_", "")
+                vol[sym] = float(d.get("amount24") or d.get("volume24") or 0)
+            except Exception:
+                continue
+        ranked = sorted(((vol.get(s, 0), s) for s in symbols), reverse=True)
+        out = [s for v, s in ranked if v >= min_dollar_vol][:cap]
+    except Exception:
+        out = list(symbols)[:cap]
+    return out or list(symbols)[:cap]
+
+
 SIG_NAMES = None          # fixed, sorted signal order — set on first use
 
 
@@ -5725,7 +5796,7 @@ def signal_lab_stream(sess, market, symbols, tf="4h", limit=4380, fees_bps=5.0,
     rows_by = {}
     for sym in ref:
         try:
-            r = fetch_candles_deep(sess, sym, tf, limit, market)
+            r = fetch_candles_cached(sess, sym, tf, limit, market)
             if r:
                 rows_by[sym] = r
         except Exception:
@@ -5745,7 +5816,7 @@ def signal_lab_stream(sess, market, symbols, tf="4h", limit=4380, fees_bps=5.0,
     total = len(symbols)
     for i, sym in enumerate(symbols):
         try:
-            rows = fetch_candles_deep(sess, sym, tf, limit, market)
+            rows = fetch_candles_cached(sess, sym, tf, limit, market)
             if rows and len(rows) > 300:
                 for t in _bt_signals(rows, "long", fees_bps=fees_bps, btc_ctx=btc_ctx,
                                      tf=tf, mkt_ctx=mkt_ctx):
