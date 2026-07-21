@@ -811,6 +811,7 @@ class State:
         self.dtb_hits: list[dict] = []             # RUNNER: descending triple bottom (daily)
         self.accum_hits: list[dict] = []           # RUNNER: test-pump -> accumulation -> breakout
         self.capit_hits: list[dict] = []           # RUNNER: capitulation flush -> trendline break
+        self.long_filtered: bool = False
         self.top_combos: list = []                 # combos that survived out-of-sample
         self.micro_stats: dict | None = None       # sub-$10m market-cap cohort
         self.runner_progress: tuple = (0, 0)
@@ -907,6 +908,7 @@ class State:
                 "capit_hits": withlive(self.capit_hits),
                 "micro_stats": self.micro_stats,
                 "top_combos": self.top_combos,
+                "long_filtered": self.long_filtered,
                 "runner_progress": list(self.runner_progress),
                 "early_new_symbols": list(self.new_early_symbols),
                 "long_board": withlive(self.long_board),
@@ -1026,6 +1028,7 @@ def run_one_scan(state: State) -> None:
                 accum_board.append(accum)
             if lng:
                 _sig = lng.pop("sig", None)
+                lng["lab_hits"] = []
                 if _sig:
                     with state.lock:
                         _tc = list(state.top_combos)
@@ -1509,6 +1512,20 @@ def run_one_scan(state: State) -> None:
         state.short_hits, state.new_short_symbols, state.prev_short_symbols = srows, snew, scur
         state.stb_hits, state.new_stb_symbols, state.prev_stb_symbols = sbrows, sbnew, sbcur
         state.early_hits, state.new_early_symbols, state.prev_early_symbols = elrows, elnew, elcur
+        # LONG TAB = STRATEGIES ONLY. Once the lab has produced surviving combos, the board shows
+        # only coins one of them is firing on. Before the first lab cycle finishes there is nothing
+        # to filter by, so the graded board is shown unfiltered rather than showing an empty tab.
+        try:
+            with state.lock:
+                _have_combos = bool(state.top_combos)
+            if _have_combos:
+                _f = [b for b in long_board if b.get("lab_hits")]
+                long_board = _f
+                state.long_filtered = True
+            else:
+                state.long_filtered = False
+        except Exception:
+            pass
         state.long_board = long_board
         state.short_board = short_board
         state.coil_board = coil_board
@@ -2800,7 +2817,7 @@ PAGE = """<!doctype html>
 
 <div class="view active" id="viewBestLong">
 <div class="status">
-  <span>🏆 Best longs — the <b>25 strongest LONG</b> setups ranked across <b>every</b> scanned pair (not just pattern hits). Graded on trend structure, multi-timeframe agreement, momentum, volume, pattern confluence and proximity to support — <b>then weighted by the trade's reward:risk</b>, so a strong trend with no room to run doesn't top the list. Only tradeable R:R (≥1) shown. Click any row (⚲) for the full cross-timeframe plan.</span>
+  <span>🏆 Longs — <b>only coins where a lab strategy is currently firing.</b> These are the indicator combos that stayed profitable when tested on data they were never fitted to, so the board answers "what does the evidence say to buy right now" rather than "what looks nice". Triple-bottom, accumulation and the other pattern boards have their own tabs and no longer feed this one. Setups are then ranked across <b>every</b> scanned pair Graded on trend structure, multi-timeframe agreement, momentum, volume, pattern confluence and proximity to support — <b>then weighted by the trade's reward:risk</b>, so a strong trend with no room to run doesn't top the list. Only tradeable R:R (≥1) shown. Click any row (⚲) for the full cross-timeframe plan.</span>
   <span id="blCount"></span>
 </div>
 <div class="wrap">
@@ -4745,6 +4762,22 @@ function renderWF(){
          '<td class="bad">-'+x.max_dd_pct.toFixed(0)+'%</td></tr>';
     }
     h+='</tbody></table>';
+  }
+  const ra=w.robust_all;
+  if(ra){
+    h+='<h3 style="margin:14px 0 4px">Every strategy that was profitable in BOTH halves ('+ra.n_strategies+')</h3>'+
+       '<div class="status"><span>A stricter screen than "top N": a combo only qualifies if it made money in the <b>first half and the second half independently</b>, so nothing can fluke in by being huge in one era.<br>'+
+       '<span class="warn">Be clear on what this is not: because both halves were used to choose, there is no untouched data left to verify it against. It is a consistency screen, not an out-of-sample proof. Read it as "these behaved steadily", not "these will earn this".</span></span></div>'+
+       '<table><thead>'+hdr+'</thead><tbody><tr style="background:rgba(80,200,120,.07)">'+
+       wfRow(Object.assign({},ra,{name:"All both-half-positive strategies"}))+'</tr></tbody></table>'+
+       '<div class="status"><span>Split check: first half <b>'+(ra.h1_exp==null?"—":ra.h1_exp.toFixed(3))+'R</b>/trade vs second half <b>'+(ra.h2_exp==null?"—":ra.h2_exp.toFixed(3))+'R</b>/trade.'+
+       (ra.oos_busted?' <span class="bad">ACCOUNT BUSTED</span>':'')+'</span></div>';
+    if(ra.oos_by_regime&&ra.oos_by_regime.length){
+      h+='<table><thead><tr><th>Regime</th><th>Trades</th><th>Win rate</th><th>Exp (R)</th><th>Total R</th><th>Max DD (R)</th><th>Return</th></tr></thead><tbody>';
+      for(const x of ra.oos_by_regime)
+        h+='<tr><td><b>'+x.regime+'</b></td><td>'+x.n+'</td><td>'+x.winrate+'%</td><td class="'+((x.exp>0)?"good":"bad")+'">'+x.exp.toFixed(3)+'</td><td>'+x.total_r.toFixed(1)+'R</td><td class="bad">-'+x.max_dd_r.toFixed(1)+'R</td><td class="'+((x.ret_pct>0)?"good":"bad")+'">'+(x.ret_pct>0?"+":"")+x.ret_pct.toFixed(1)+'%</td></tr>';
+      h+='</tbody></table>';
+    }
   }
   const t5=w.top5, t10=w.top10;
   if(t5||t10){

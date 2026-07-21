@@ -5586,6 +5586,49 @@ def _walk_forward_top(tr, all_entries, ks=(5, 10), min_first=20):
                      "oos_max_dd_pct": p["max_dd_pct"], "oos_busted": p["busted"]})
 
     out = {"solo": solo}
+
+    # ---- ROBUST-ALL: every combo that made money in BOTH halves independently ----
+    # Note honestly what this is: the both-halves test uses the WHOLE dataset to choose, so unlike
+    # the walk-forward blocks there is no untouched data left to verify it on. It is a much stricter
+    # filter than "top N" - a combo cannot fluke its way in by being huge in one era - but it is a
+    # consistency screen, not an out-of-sample proof. Read it as "these behaved steadily", not as
+    # "these are predicted to earn this".
+    rb = []
+    for e in all_entries:
+        h1, h2 = e.get("h1"), e.get("h2")
+        if h1 is not None and h2 is not None and h1 > 0 and h2 > 0 and (e.get("keys") or ()):
+            rb.append(e)
+    if rb:
+        seen = {}
+        for e in rb:
+            for x in tr:
+                if all(x["sig"].get(k) for k in e["keys"]):
+                    seen[(x.get("ts"), x.get("entry"), x.get("stop"))] = x
+        allx = sorted(seen.values(), key=lambda z: z.get("ts") or 0)
+        if allx:
+            p = _r_portfolio(allx)
+            dd_ = [x for x in allx if x.get("r_dca") is not None]
+            pdc = _r_portfolio([dict(x, r=x["r_dca"]) for x in dd_]) if dd_ else None
+            w = sum(1 for x in allx if x["outcome"] == "win")
+            half = len(allx) // 2
+            fh, sh = allx[:half], allx[half:]
+            out["robust_all"] = {
+                "n_strategies": len(rb),
+                "names": [e["name"] for e in rb][:40],
+                "oos_n": len(allx), "oos_winrate": round(w / len(allx) * 100, 1),
+                "oos_exp": round(sum(x["r"] for x in allx) / len(allx), 3),
+                "oos_avg_rr": round(sum(x["rr"] for x in allx) / len(allx), 2),
+                "oos_total_r": p["total_r"], "oos_max_dd_r": p["max_dd_r"],
+                "oos_end_equity": p["end_equity"], "oos_ret_pct": p["ret_pct"],
+                "oos_max_dd_pct": p["max_dd_pct"], "oos_max_dd_usd": p["max_dd_usd"],
+                "oos_busted": p["busted"], "oos_by_regime": _bt_by_regime(allx),
+                "dca_total_r": (pdc or {}).get("total_r"),
+                "dca_max_dd_r": (pdc or {}).get("max_dd_r"),
+                "dca_ret_pct": (pdc or {}).get("ret_pct"),
+                "dca_max_dd_pct": (pdc or {}).get("max_dd_pct"),
+                "h1_exp": (round(sum(x["r"] for x in fh) / len(fh), 3) if fh else None),
+                "h2_exp": (round(sum(x["r"] for x in sh) / len(sh), 3) if sh else None),
+            }
     for k in ks:
         picks = scored[:k]
         if not picks:
