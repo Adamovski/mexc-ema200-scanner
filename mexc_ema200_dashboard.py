@@ -810,6 +810,8 @@ class State:
         self.early_hits: list[dict] = []           # early / pre-breakout accumulation
         self.dtb_hits: list[dict] = []             # RUNNER: descending triple bottom (daily)
         self.accum_hits: list[dict] = []           # RUNNER: test-pump -> accumulation -> breakout
+        self.capit_hits: list[dict] = []           # RUNNER: capitulation flush -> trendline break
+        self.micro_stats: dict | None = None       # sub-$10m market-cap cohort
         self.runner_progress: tuple = (0, 0)
         self.runner_diag: dict | None = None      # why the runner boards are empty
         self.signal_rank: dict | None = None       # SIGNAL LAB: which indicators actually pay
@@ -901,6 +903,8 @@ class State:
                 "accum_hits": withlive(self.accum_hits),
                 "signal_rank": self.signal_rank,
                 "runner_diag": self.runner_diag,
+                "capit_hits": withlive(self.capit_hits),
+                "micro_stats": self.micro_stats,
                 "runner_progress": list(self.runner_progress),
                 "early_new_symbols": list(self.new_early_symbols),
                 "long_board": withlive(self.long_board),
@@ -1651,6 +1655,20 @@ def backtest_loop(state: State) -> None:
         time.sleep(12 * 3600)                         # refresh twice a day (free tier is CPU-bound)
 
 
+def _micro_summary(micro, universe, mapped, ambiguous):
+    """What the sub-$10m coins are actually doing, versus the universe as a whole."""
+    n = len(micro)
+    if not n:
+        return {"n": 0, "universe": universe, "mapped": mapped, "ambiguous": ambiguous}
+    return {"n": n, "universe": universe, "mapped": mapped, "ambiguous": ambiguous,
+            "dtb": sum(1 for m in micro if m["dtb"]),
+            "accum": sum(1 for m in micro if m["accum"]),
+            "capit": sum(1 for m in micro if m["capit"]),
+            "any": sum(1 for m in micro if m["dtb"] or m["accum"] or m["capit"]),
+            "median_mcap": round(sorted(m["mcap"] for m in micro)[n // 2]),
+            "coins": sorted(micro, key=lambda m: m["mcap"])[:40]}
+
+
 def runner_loop(state: State) -> None:
     """RUNNER-PATTERN loop on REAL DAILY candles, run slowly and politely.
 
@@ -1659,7 +1677,7 @@ def runner_loop(state: State) -> None:
     to the setups it was supposed to find - which is very likely why both boards read zero. These
     are daily patterns; they do not change minute to minute, so this runs every few hours and sleeps
     between coins to leave CPU for serving pages."""
-    from mexc_ema200_scanner import scan_runner_daily
+    from mexc_ema200_scanner import scan_runner_daily, fetch_market_caps, _cap_bucket
     market = state.cfg.get("market", "futures")
     while True:
         try:
@@ -1668,14 +1686,29 @@ def runner_loop(state: State) -> None:
                 syms = list(state.symbol_list or [])
             if not syms:
                 time.sleep(120); continue
-            dtb_b = []; acc_b = []; tally = {"dtb": {}, "accum": {}}
+            dtb_b = []; acc_b = []; cap_b = []; tally = {"dtb": {}, "accum": {}}
+            try:
+                caps, ambiguous = fetch_market_caps(sess)
+            except Exception:
+                caps, ambiguous = {}, {}
+            micro = []
             for i, sym in enumerate(syms):
                 try:
-                    d, a, dg = scan_runner_daily(sess, sym, market)
+                    d, a, cp, dg = scan_runner_daily(sess, sym, market)
+                    _mc = caps.get(sym.replace("USDT", "").upper())
+                    _bk = _cap_bucket(_mc)
+                    for _h in (d, a, cp):
+                        if _h:
+                            _h["mcap"] = _mc; _h["cap_bucket"] = _bk
+                    if _mc is not None and _mc < 10_000_000:
+                        micro.append({"symbol": sym, "mcap": _mc,
+                                      "dtb": bool(d), "accum": bool(a), "capit": bool(cp)})
                     if d:
                         dtb_b.append(d)
                     if a:
                         acc_b.append(a)
+                    if cp:
+                        cap_b.append(cp)
                     if dg:
                         for p in ("dtb", "accum"):
                             k = dg.get(p) or "PASSED"
@@ -1689,6 +1722,9 @@ def runner_loop(state: State) -> None:
             with state.lock:
                 state.dtb_hits = sorted(dtb_b, key=lambda d: -(d.get("rr") or 0))[:25]
                 state.accum_hits = sorted(acc_b, key=lambda d: -(d.get("rr") or 0))[:25]
+                state.capit_hits = sorted(cap_b, key=lambda d: -((d.get("confidence") or 0) * 10
+                                                                 + (d.get("rr") or 0)))[:25]
+                state.micro_stats = _micro_summary(micro, len(syms), len(caps), len(ambiguous))
                 state.runner_diag = {p: sorted(v.items(), key=lambda kv: -kv[1])[:6]
                                      for p, v in tally.items()}
                 state.runner_progress = (len(syms), len(syms))
@@ -2385,6 +2421,8 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabEarly" onclick="showTab('early')" style="display:none">⏳ Early</div>
   <div class="tab" id="tabDtb" onclick="showTab('dtb')">🔻 Triple bottom</div>
   <div class="tab" id="tabAccum" onclick="showTab('accum')">🤫 Quiet accumulation</div>
+  <div class="tab" id="tabCapit" onclick="showTab('capit')">⚡ Capitulation reversal</div>
+  <div class="tab" id="tabMicro" onclick="showTab('micro')">🐜 Microcaps &lt;$10m</div>
   <div class="tab" id="tabSignals" onclick="showTab('signals')">🔬 Signal lab</div>
   <div class="tab" id="tabCoil" onclick="showTab('coil')" style="display:none">🚀 Coiled</div>
   <div class="tab" id="tabScalp" onclick="showTab('scalp')" style="display:none">⚡ Best scalps</div>
@@ -2656,6 +2694,33 @@ PAGE = """<!doctype html>
 </div>
 </div>
 
+<div class="view active" id="viewCapit">
+<div class="status">
+  <span>⚡ <b>Capitulation reversal</b> &mdash; the BKR/HEMI setup. A grinding downtrend of <b>lower highs and lower lows</b>, then a final flush that <b>squeezes the longs out into a fresh low</b>, then price <b>breaks the descending trendline</b> of those lower highs. Entry on the break, stop under the flush low, target the <b>overhead supply zone</b> the decline started from.<br>
+  <b>Confidence</b> counts confirmations on top of the required structure: <b>RSI divergence</b> (RSI refused to make a new low with price), a <b>volume surge</b>, and <b>reclaimed</b> structure. The trendline break alone is confidence 1; all three extras is 4. <span class="warn">Catching a falling knife is the highest-variance trade there is &mdash; a downtrend breaking is exactly where you find out it was not done falling. Size accordingly.</span></span>
+</div>
+<div class="wrap">
+  <table id="capittbl">
+    <thead><tr><th>Symbol</th><th>Price</th><th>Mkt cap</th><th>Flush low</th><th>Bars since</th><th>Trendline</th><th>Supply zone</th><th>Entry</th><th>Stop</th><th>Target</th><th>R:R</th><th>RSI div?</th><th>Vol surge?</th><th>Confidence</th></tr></thead>
+    <tbody id="capitrows"></tbody>
+  </table>
+  <div class="empty" id="capitempty" style="display:none">No capitulation reversals right now. The daily loop keeps scanning&hellip;</div>
+</div>
+</div>
+<div class="view active" id="viewMicro">
+<div class="status">
+  <span>🐜 <b>Microcaps under $10m</b> &mdash; market caps come from CoinGecko, matched by ticker.<br>
+  <span class="warn">Read the caveat before trusting this: tickers collide constantly in crypto (several tokens trade as BANK), so where a symbol is ambiguous the tool keeps the <b>largest</b> matching market cap. That deliberately errs away from calling something a microcap &mdash; the list below is conservative and will miss some real microcaps rather than mislabel a large coin as tiny. Coins CoinGecko does not list at all show as unknown and are excluded entirely.</span></span>
+</div>
+<div class="wrap" id="microsum"></div>
+<div class="wrap" style="margin-top:10px">
+  <table id="microtbl">
+    <thead><tr><th>Symbol</th><th>Market cap</th><th>Triple bottom?</th><th>Quiet accumulation?</th><th>Capitulation?</th></tr></thead>
+    <tbody id="microrows"></tbody>
+  </table>
+  <div class="empty" id="microempty" style="display:none">No sub-$10m coins mapped yet &mdash; the daily loop refreshes market caps every few hours.</div>
+</div>
+</div>
 <div class="view active" id="viewSignals">
 <div class="status">
   <span>🔬 <b>Signal lab</b> — instead of assuming which indicators matter, this tests <b>~20 of them independently</b>. Every trade in a deliberately neutral base strategy (buy any green close, fixed 1.5&times;ATR stop / 3&times;ATR target) gets tagged with all 20 reads. Then each signal is scored by how much it <b>shifts expectancy versus the base</b>.<br>
@@ -2666,7 +2731,7 @@ PAGE = """<!doctype html>
 <div class="wrap">
   <h3 style="margin:6px 0 4px">Individual signals</h3>
   <table id="sigtbl">
-    <thead><tr><th>Signal</th><th>Trades</th><th>Win rate</th><th>Expectancy (R)</th><th>Lift vs base</th><th>1st half</th><th>2nd half</th><th>Holds up?</th></tr></thead>
+    <thead><tr><th>Signal</th><th>Trades</th><th>Win rate</th><th>Expectancy (R)</th><th>Lift vs base</th><th>Total R</th><th>Max DD (R)</th><th>End equity</th><th>Return</th><th>Max DD $</th><th>Liq.</th><th>1st half</th><th>2nd half</th><th>Holds up?</th></tr></thead>
     <tbody id="sigrows"></tbody>
   </table>
   <div id="sigempty" class="empty">No signal results yet &mdash; the lab runs on a ~6-hour cycle.</div>
@@ -2674,14 +2739,14 @@ PAGE = """<!doctype html>
 <div class="wrap" style="margin-top:14px">
   <h3 style="margin:6px 0 4px">Best pairs (confluence)</h3>
   <table id="sigptbl">
-    <thead><tr><th>Combination</th><th>Trades</th><th>Win rate</th><th>Expectancy (R)</th><th>Lift vs base</th><th>1st half</th><th>2nd half</th><th>Holds up?</th></tr></thead>
+    <thead><tr><th>Combination</th><th>Trades</th><th>Win rate</th><th>Expectancy (R)</th><th>Lift vs base</th><th>Total R</th><th>Max DD (R)</th><th>End equity</th><th>Return</th><th>Max DD $</th><th>Liq.</th><th>1st half</th><th>2nd half</th><th>Holds up?</th></tr></thead>
     <tbody id="sigprows"></tbody>
   </table>
 </div>
 <div class="wrap" style="margin-top:14px">
   <h3 style="margin:6px 0 4px">Best triples (3-signal confluence)</h3>
   <table id="sigttbl">
-    <thead><tr><th>Combination</th><th>Trades</th><th>Win rate</th><th>Expectancy (R)</th><th>Lift vs base</th><th>1st half</th><th>2nd half</th><th>Holds up?</th></tr></thead>
+    <thead><tr><th>Combination</th><th>Trades</th><th>Win rate</th><th>Expectancy (R)</th><th>Lift vs base</th><th>Total R</th><th>Max DD (R)</th><th>End equity</th><th>Return</th><th>Max DD $</th><th>Liq.</th><th>1st half</th><th>2nd half</th><th>Holds up?</th></tr></thead>
     <tbody id="sigtrows"></tbody>
   </table>
 </div>
@@ -3560,7 +3625,7 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["dtb","Dtb"],["accum","Accum"],["signals","Signals"],["coil","Coil"],["scalp","Scalp"],["spot","Spot"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["dtb","Dtb"],["accum","Accum"],["capit","Capit"],["micro","Micro"],["signals","Signals"],["coil","Coil"],["scalp","Scalp"],["spot","Spot"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
@@ -4546,12 +4611,61 @@ function renderDtb(){
   }
 }
 let siglatest=null;
+let capitlatest=[];
+let microlatest=null;
 let rdiaglatest=null;
+function renderCapit(){
+  const tb=document.getElementById("capitrows"); if(!tb) return; tb.innerHTML="";
+  const rows=[...capitlatest];
+  const emp=document.getElementById("capitempty"); if(emp) emp.style.display=rows.length?"none":"block";
+  for(const h of rows){
+    const tr=document.createElement("tr");
+    const yn=v=>v?'<span class="good">yes</span>':'<span class="muted">no</span>';
+    tr.innerHTML=`<td class="sym"><div class="symbox">${watchStar(h.symbol)}<a href="${tvLink(h.symbol)}" target="_blank" rel="noopener">${dispSym(h.symbol)}</a>${analyzeBtn(h.symbol)}</div></td>`+
+      `<td>${fmtNum(h.live!=null?h.live:h.price)}</td><td>${h.mcap?("$"+(h.mcap/1e6).toFixed(1)+"m"):"&mdash;"}</td>`+
+      `<td>${fmtNum(h.flush_low)}</td><td>${h.bars_since_low}d</td><td>${fmtNum(h.trendline)}</td>`+
+      `<td>${fmtNum(h.supply_zone)}</td><td>${fmtNum(h.entry)}</td><td>${fmtNum(h.stop)}</td>`+
+      `<td>${fmtNum(h.target)}</td><td><b>${(h.rr||0).toFixed(2)}</b></td>`+
+      `<td>${yn(h.rsi_div)}</td><td>${yn(h.vol_surge_flag)}</td><td><b>${h.confidence||1}</b>/4</td>`;
+    tb.appendChild(tr);
+  }
+}
+function renderMicro(){
+  const tb=document.getElementById("microrows"), sm=document.getElementById("microsum");
+  if(!tb) return; tb.innerHTML="";
+  const m=microlatest;
+  const emp=document.getElementById("microempty");
+  if(!m||!m.n){ if(emp) emp.style.display="block"; if(sm) sm.innerHTML=""; return; }
+  if(emp) emp.style.display="none";
+  const pct=(a,b)=>b?((a/b*100).toFixed(1)+"%"):"0%";
+  if(sm) sm.innerHTML='<div class="status"><span>'+
+    '<b>'+m.n+'</b> of '+m.universe+' scanned coins are under $10m (CoinGecko matched '+m.mapped+' tickers; '+m.ambiguous+' were ambiguous and resolved to the larger cap).<br>'+
+    'Median cap in this cohort: <b>$'+((m.median_mcap||0)/1e6).toFixed(2)+'m</b>. Pattern hit-rate within microcaps: '+
+    '<b>'+m.dtb+'</b> triple bottoms ('+pct(m.dtb,m.n)+'), <b>'+m.accum+'</b> quiet accumulation ('+pct(m.accum,m.n)+'), '+
+    '<b>'+m.capit+'</b> capitulation reversals ('+pct(m.capit,m.n)+') &mdash; <b>'+m.any+'</b> showing at least one setup ('+pct(m.any,m.n)+').<br>'+
+    '<span class="warn">Compare each rate against the same pattern across the whole universe before concluding microcaps are special. A higher hit-rate here may just mean these charts are noisier, which makes patterns easier to find and less meaningful.</span>'+
+    '</span></div>';
+  for(const c of (m.coins||[])){
+    const tr=document.createElement("tr");
+    const yn=v=>v?'<span class="good">yes</span>':'<span class="muted">&mdash;</span>';
+    tr.innerHTML=`<td class="sym"><div class="symbox">${watchStar(c.symbol)}<a href="${tvLink(c.symbol)}" target="_blank" rel="noopener">${dispSym(c.symbol)}</a>${analyzeBtn(c.symbol)}</div></td>`+
+      `<td>$${(c.mcap/1e6).toFixed(2)}m</td><td>${yn(c.dtb)}</td><td>${yn(c.accum)}</td><td>${yn(c.capit)}</td>`;
+    tb.appendChild(tr);
+  }
+}
 function sigRow(x){
   const lift=(x.lift||0), col=lift>0?"good":(lift<0?"bad":"");
   const rb=x.robust?'<span class="good">yes</span>':'<span class="bad">no</span>';
+  const pc=(x.ret_pct||0), pcol=pc>0?"good":(pc<0?"bad":"");
+  const liq=(x.liquidations||0);
   return `<td>${x.name}</td><td>${x.n}</td><td>${x.winrate}%</td><td>${(x.exp||0).toFixed(3)}</td>`+
          `<td class="${col}">${lift>0?"+":""}${lift.toFixed(3)}</td>`+
+         `<td>${(x.total_r==null?0:x.total_r).toFixed(1)}R</td>`+
+         `<td class="bad">-${(x.max_dd_r||0).toFixed(1)}R</td>`+
+         `<td><b>$${(x.end_equity||0).toLocaleString()}</b></td>`+
+         `<td class="${pcol}">${pc>0?"+":""}${pc.toFixed(1)}%</td>`+
+         `<td class="bad">-$${(x.max_dd_usd||0).toLocaleString()} (${(x.max_dd_pct||0).toFixed(0)}%)</td>`+
+         `<td class="${liq?"bad":"muted"}">${liq}</td>`+
          `<td>${x.h1==null?"&mdash;":x.h1.toFixed(3)}</td><td>${x.h2==null?"&mdash;":x.h2.toFixed(3)}</td><td>${rb}</td>`;
 }
 function renderSignals(){
@@ -5988,6 +6102,8 @@ async function poll(){
   dtblatest=d.dtb_hits||[]; renderDtb();
   accumlatest=d.accum_hits||[]; renderAccum();
   siglatest=d.signal_rank||null; renderSignals();
+  capitlatest=d.capit_hits||[]; renderCapit();
+  microlatest=d.micro_stats||null; renderMicro();
   rdiaglatest=d.runner_diag||null; renderDiag("dtb"); renderDiag("accum");
     slatest=d.short_hits||[]; renderShorts();
     renderBestLong(); renderBestShort(); renderCoil(); renderScalp(); renderSpot(); renderPerf(); renderCalls();

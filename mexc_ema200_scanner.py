@@ -3852,6 +3852,32 @@ def _market_ctx(rows_by, btc_sym="BTCUSDT", lookback=20, min_syms=8):
     return ctx
 
 
+def _bt_by_liquidity(trades):
+    """Segment trades by the coin's HISTORICAL dollar volume at the time of the trade.
+
+    Deliberately NOT by today's market cap: a coin that is a $5m microcap now may have been a $300m
+    coin during the backtest, so bucketing history by a present-day number would leak the future into
+    the past. Median daily dollar volume is measured from the same candles the trade came from, so
+    this cut is clean. It is the honest way to ask 'do the smallest, thinnest coins behave
+    differently?'"""
+    out = {}
+    for t in trades:
+        dv = t.get("dvol") or 0
+        b = ("1 tiny <$100k/day" if dv < 100_000 else
+             "2 small $100k-1m" if dv < 1_000_000 else
+             "3 mid $1-10m" if dv < 10_000_000 else "4 large >$10m")
+        out.setdefault(b, []).append(t)
+    res = []
+    for b in sorted(out):
+        g = out[b]
+        w = sum(1 for x in g if x["outcome"] == "win")
+        res.append({"bucket": b, "n": len(g), "winrate": round(w / len(g) * 100, 1),
+                    "exp": round(sum(x["r"] for x in g) / len(g), 3),
+                    "avg_rr": round(sum(x["rr"] for x in g) / len(g), 2),
+                    "best": round(max(x["r"] for x in g), 2)})
+    return res
+
+
 def _bt_by_breadth(trades):
     """Expectancy / win-rate sliced by the market-breadth regime the trade was taken in
     (risk_on / mixed / risk_off) and by dominance (alts vs BTC leading) — the clean read on
@@ -5367,6 +5393,47 @@ def _bt_signals(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, 
     return out
 
 
+def _r_portfolio(sub, start=10000.0, margin=100.0, lev=10.0):
+    """Turn a set of R-multiples into the numbers that actually matter to an account.
+
+    Your sizing: $10,000 account, $100 margin at 10x = a $1,000 position. The dollar risk is NOT
+    fixed at $100 - it is the position size times the distance to the stop, so a 5% stop risks $50
+    and a 20% stop risks $200.
+
+    LIQUIDATION IS MODELLED HONESTLY: at 10x, roughly a 10% adverse move wipes the $100 margin. Any
+    trade whose stop sits further than that would be liquidated BEFORE the stop is reached, so the
+    loss is capped at the margin and the trade is counted as a liquidation. Ignoring this is how
+    leveraged backtests quietly overstate themselves."""
+    notional = margin * lev
+    eq = start; peak = start; maxdd = 0.0; liq = 0
+    total_r = 0.0; r_eq = 0.0; r_peak = 0.0; r_dd = 0.0
+    curve = []
+    for t in sub:
+        r = t.get("r") or 0.0
+        stopw = t.get("stopw") or 0.0            # stop distance as % of entry
+        total_r += r
+        r_eq += r; r_peak = max(r_peak, r_eq); r_dd = max(r_dd, r_peak - r_eq)
+        risk_usd = notional * (stopw / 100.0)
+        if stopw >= (100.0 / lev) and r < 0:     # stop beyond the liquidation point
+            pnl = -margin; liq += 1
+        else:
+            pnl = r * risk_usd
+            if pnl < -margin:
+                pnl = -margin; liq += 1
+        eq += pnl
+        peak = max(peak, eq); maxdd = max(maxdd, peak - eq)
+        curve.append(round(eq))
+        if eq <= 0:
+            eq = 0.0; break
+    step = max(1, len(curve) // 60)
+    return {"total_r": round(total_r, 1), "max_dd_r": round(r_dd, 1),
+            "end_equity": round(eq), "pnl": round(eq - start),
+            "ret_pct": round((eq - start) / start * 100, 1),
+            "max_dd_usd": round(maxdd),
+            "max_dd_pct": round(maxdd / max(1.0, peak) * 100, 1),
+            "liquidations": liq, "curve": curve[::step][:60]}
+
+
 def _bt_signal_ranking(trades, min_n=50):
     """Rank ~60 SIGNALS, then their PAIRS and TRIPLES, by how much each shifts expectancy.
 
@@ -5385,18 +5452,21 @@ def _bt_signal_ranking(trades, min_n=50):
     mid = len(ordered) // 2
     first, second = ordered[:mid], ordered[mid:]
 
-    def stats(sub):
+    def stats(sub, full=False):
         if not sub:
             return None
         w = sum(1 for x in sub if x["outcome"] == "win")
-        return {"n": len(sub), "winrate": round(w / len(sub) * 100, 1),
+        base = {"n": len(sub), "winrate": round(w / len(sub) * 100, 1),
                 "exp": round(sum(x["r"] for x in sub) / len(sub), 3)}
+        if full:
+            base.update(_r_portfolio(sorted(sub, key=lambda z: z.get("ts") or 0)))
+        return base
 
     def entry(label, pred):
         on = [x for x in tr if pred(x["sig"])]
         if len(on) < min_n:
             return None
-        a = stats(on)
+        a = stats(on, full=True)
         f1 = stats([x for x in first if pred(x["sig"])])
         f2 = stats([x for x in second if pred(x["sig"])])
         return {"name": label, **a, "lift": round(a["exp"] - base_exp, 3),
@@ -6086,6 +6156,7 @@ def _bt_aggregate(results, syms, tf, side, fees_bps):
             "monthly": _bt_monthly(allt),
             "insights": _bt_insights(allt), "findings": _bt_findings(allt),
             "by_breadth": _bt_by_breadth(allt),
+            "by_liquidity": _bt_by_liquidity(allt),
             "signal_ranking": _bt_signal_ranking(allt),
             "portfolio": _bt_portfolio(allt, tf=tf),
             "sample": _bt_sample(results, syms),
@@ -6254,16 +6325,19 @@ def scan_runner_daily(sess, symbol, market="futures", limit=500):
     try:
         raw = fetch_candles(sess, symbol, "1d", limit, market)
     except Exception:
-        return None, None, None
+        return None, None, None, None
     if not raw or len(raw) < 61:
-        return None, None, None
+        return None, None, None, None
     d = raw[:-1]                            # drop the still-forming daily candle
     try:
         px = float(d[-1][4])
     except (ValueError, IndexError, TypeError):
-        return None, None, None
-    dtb = accum = None
+        return None, None, None, None
+    dtb = accum = cap = None
     try:
+        _c = capitulation_reversal(d)
+        if _c:
+            _c["symbol"] = symbol; _c["price"] = px; cap = _c
         _d = descending_triple_bottom(d)
         if _d:
             _d["symbol"] = symbol; _d["price"] = px; dtb = _d
@@ -6272,8 +6346,8 @@ def scan_runner_daily(sess, symbol, market="futures", limit=500):
             _a["symbol"] = symbol; _a["price"] = px; accum = _a
         diag = runner_diag(d)
     except Exception:
-        return None, None, None
-    return dtb, accum, diag
+        return None, None, None, None
+    return dtb, accum, cap, diag
 
 
 def runner_diag(rows):
@@ -6332,6 +6406,122 @@ def runner_diag(rows):
         elif ((base - win_lo) / max(1e-9, (win_hi - win_lo))) < 0.6:
             res["accum"] = "price sitting low in the range"
     return res
+
+
+CG_MARKETS = "https://api.coingecko.com/api/v3/coins/markets"
+
+
+def fetch_market_caps(sess, pages=4):
+    """Market caps by ticker, from CoinGecko. Returns {SYMBOL: mcap_usd}.
+
+    HONEST LIMITATION: this maps by ticker symbol, and tickers collide badly in crypto (several
+    different tokens trade as BANK). Where a symbol is ambiguous we keep the LARGEST market cap,
+    which deliberately errs AWAY from calling something a microcap. So the sub-$10m list is
+    conservative: it may miss real microcaps, but it should rarely mislabel a big coin as tiny."""
+    caps = {}; seen = {}
+    for p in range(1, pages + 1):
+        try:
+            r = sess.get(CG_MARKETS, timeout=20, params={
+                "vs_currency": "usd", "order": "market_cap_desc",
+                "per_page": 250, "page": p})
+            if r.status_code != 200:
+                break
+            for c in r.json():
+                sym = (c.get("symbol") or "").upper()
+                mc = c.get("market_cap")
+                if not sym or not mc:
+                    continue
+                seen[sym] = seen.get(sym, 0) + 1
+                if sym not in caps or mc > caps[sym]:
+                    caps[sym] = float(mc)
+        except Exception:
+            break
+        time.sleep(2.0)                      # CoinGecko free tier is rate-limited; be polite
+    return caps, {k: v for k, v in seen.items() if v > 1}
+
+
+def _cap_bucket(mc):
+    if mc is None:
+        return "unknown"
+    if mc < 10_000_000:
+        return "micro <$10m"
+    if mc < 50_000_000:
+        return "small $10-50m"
+    if mc < 250_000_000:
+        return "mid $50-250m"
+    return "large >$250m"
+
+
+def capitulation_reversal(rows, atl_look=180, tl_look=60, rsi_look=40):
+    """THE BKR / HEMI PATTERN - a downtrend that finally breaks.
+
+    The chart reads: long sequence of LOWER HIGHS and LOWER LOWS, a final flush that squeezes the
+    longs out into a FRESH LOW, RSI refusing to confirm that low (bullish divergence), then price
+    breaking the descending trendline of lower highs - and running to the overhead supply zone.
+
+    Requires all four:
+      1. established downtrend (lower highs AND lower lows)
+      2. a fresh low within the recent window (the capitulation flush)
+      3. RSI bullish divergence across that low
+      4. price reclaiming the descending lower-high trendline (the trigger)
+    Target is the overhead supply shelf; stop under the flush low."""
+    try:
+        H = [float(x[2]) for x in rows]; L = [float(x[3]) for x in rows]
+        C = [float(x[4]) for x in rows]; V = [float(x[5]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return None
+    n = len(C)
+    if n < max(atl_look, 120) + 5:
+        return None
+    px = C[-1]
+    # 1. downtrend: lower highs and lower lows over the mid window
+    seg = slice(n - tl_look, n)
+    hi_recent = max(H[n - tl_look:]); hi_prior = max(H[n - 2 * tl_look:n - tl_look])
+    lo_recent = min(L[n - tl_look:]); lo_prior = min(L[n - 2 * tl_look:n - tl_look])
+    if not (hi_recent < hi_prior and lo_recent < lo_prior):
+        return None
+    # 2. fresh low: the lowest low of the whole window happened recently (the squeeze)
+    win_lo = min(L[n - atl_look:])
+    idx_lo = max(i for i in range(n - atl_look, n) if L[i] == win_lo)
+    bars_since = (n - 1) - idx_lo
+    if bars_since > 30 or bars_since < 2:
+        return None
+    # 3. RSI bullish divergence is a QUALITY flag, not a gate. Demanding it as well would over-filter
+    #    (the same mistake that left the other runner boards empty); it is scored below instead.
+    rs = rsi_series(C)
+    has_div = _rsi_bull_div(L, rs, n - 1, look=rsi_look)
+    # 4. descending lower-high trendline break
+    piv = _pivot_highs_idx(H, 3)
+    piv = [i for i in piv if i >= n - 2 * tl_look]
+    if len(piv) < 2:
+        return None
+    i1, i2 = piv[-2], piv[-1]
+    if H[i2] >= H[i1] or i2 <= i1:
+        return None
+    slope = (H[i2] - H[i1]) / (i2 - i1)
+    tl_now = H[i2] + slope * ((n - 1) - i2)
+    broke = px > tl_now
+    if not broke:
+        return None
+    # target: overhead supply shelf (the highest high before the decline began)
+    supply = max(H[n - atl_look:n - tl_look])
+    stop = win_lo * 0.97
+    if px <= stop or supply <= px:
+        return None
+    rsi_now = rs[-1] if rs and rs[-1] is not None else None
+    recent_v = sum(V[-10:]) / 10; hist_v = sum(V) / n
+    vsurge = (recent_v / hist_v) if hist_v > 0 else 0
+    reclaimed = px > max(H[idx_lo:n - 1]) * 0.98 if n - 1 > idx_lo + 1 else False
+    conf = 1 + int(bool(has_div)) + int(vsurge > 1.3) + int(bool(reclaimed))
+    return {"pattern": "capitulation_reversal", "price": round(px, 8),
+            "rsi_div": bool(has_div), "vol_surge_flag": bool(vsurge > 1.3),
+            "reclaimed": bool(reclaimed), "confidence": conf,
+            "flush_low": round(win_lo, 8), "bars_since_low": bars_since,
+            "trendline": round(tl_now, 8), "supply_zone": round(supply, 8),
+            "entry": round(px, 8), "stop": round(stop, 8), "target": round(supply, 8),
+            "rsi": round(rsi_now, 1) if rsi_now else None,
+            "vol_surge": round(recent_v / hist_v, 2) if hist_v > 0 else None,
+            "rr": round((supply - px) / max(1e-9, (px - stop)), 2)}
 
 
 def descending_triple_bottom(rows, k=3, min_gap=6, near_pct=0.10):
