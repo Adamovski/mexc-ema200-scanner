@@ -5704,8 +5704,8 @@ def _mask_bits(keys):
     return m
 
 
-def signal_lab_stream(sess, market, symbols, tf="4h", limit=8760, fees_bps=5.0,
-                      index_sym="BTCUSDT", ref_size=60, progress=None):
+def signal_lab_stream(sess, market, symbols, tf="4h", limit=4380, fees_bps=5.0,
+                      index_sym="BTCUSDT", ref_size=40, progress=None, throttle=0.25):
     """Run the signal lab over the FULL universe, one coin at a time.
 
     The old sweep pre-fetched every coin's candles and held them all at once, which caps the test at
@@ -5716,6 +5716,11 @@ def signal_lab_stream(sess, market, symbols, tf="4h", limit=8760, fees_bps=5.0,
 
     Also records which coin each trade came from, so results can be validated on coins that took no
     part in choosing the strategy."""
+    # THROTTLED ON PURPOSE. This box has ~0.1 CPU and must keep serving pages while it thinks.
+    # Fetching 600 coins of deep history means thousands of paginated responses to JSON-parse, which
+    # is CPU-bound and will starve the web server if run flat out - the symptom is the site hanging.
+    # A short pause per coin keeps the dashboard responsive; the sweep simply takes longer, which is
+    # fine for something that only needs to refresh a few times a day.
     ref = list(symbols)[:ref_size]
     rows_by = {}
     for sym in ref:
@@ -5725,6 +5730,7 @@ def signal_lab_stream(sess, market, symbols, tf="4h", limit=8760, fees_bps=5.0,
                 rows_by[sym] = r
         except Exception:
             pass
+        time.sleep(throttle)
     _brows = rows_by.get(index_sym)
     if not _brows:
         try:
@@ -5751,6 +5757,7 @@ def signal_lab_stream(sess, market, symbols, tf="4h", limit=8760, fees_bps=5.0,
             del rows
         except Exception:
             pass
+        time.sleep(throttle)                      # breathe, so the dashboard stays usable
         if progress and i % 10 == 0:
             try:
                 progress(i + 1, total, len(trades))

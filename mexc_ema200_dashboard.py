@@ -1653,8 +1653,9 @@ def backtest_loop(state: State) -> None:
                         state.backtests = {"ts": time.time(), "running": True,
                                            "progress": {"done": done, "total": total,
                                                         "last": f"{ntr} trades so far"}}
-                trades = signal_lab_stream(sess, market, universe, tf="4h", limit=8760,
-                                           fees_bps=5.0, index_sym="BTCUSDT", progress=_prog)
+                trades = signal_lab_stream(sess, market, universe, tf="4h", limit=4380,
+                                           fees_bps=5.0, index_sym="BTCUSDT", progress=_prog,
+                                           throttle=0.25)
                 _rank = _bt_signal_ranking_mask(trades)
                 del trades
                 with state.lock:
@@ -6777,7 +6778,10 @@ def main() -> None:
         threading.Thread(target=scan_loop, args=(state,), daemon=True).start()
         threading.Thread(target=breakout_watcher, args=(state,), daemon=True).start()
         threading.Thread(target=runner_loop, args=(state,), daemon=True).start()
-    threading.Thread(target=backtest_loop, args=(state,), daemon=True).start()
+    def _delayed_lab():
+        time.sleep(180)          # let the first scan finish and the site come up before thinking hard
+        backtest_loop(state)
+    threading.Thread(target=_delayed_lab, daemon=True).start()
 
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(state))
     url = f"http://localhost:{args.port}"
