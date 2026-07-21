@@ -5355,6 +5355,41 @@ def _bt_pattern(rows, side, pattern="dtb", fees_bps=5.0, horizon=60, warmup=90,
     return out
 
 
+def _sim_dca(H, L, C, f, horizon, n, entry, stop, target, fee_frac, dca_frac=0.5):
+    """What would a single DCA add have done? Same signal, same stop, same target - but if price
+    first sinks partway toward the stop, a SECOND equal-size unit is added there, lowering the
+    average entry.
+
+    Returned in R-multiples of the ORIGINAL one-unit risk so it is directly comparable to the
+    no-DCA number. The trade-off is symmetrical and worth stating plainly: adding at the halfway
+    point turns a full stop-out into roughly -1.5R instead of -1.0R, while a winner becomes worth
+    materially more than its headline R. DCA does not improve a strategy's edge - it enlarges both
+    tails. It only helps if price dips and then still resolves upward often enough to pay for the
+    deeper losses.
+
+    Pessimistic tie-handling: if the add level and the stop are both touched in the same bar, the
+    add is assumed filled FIRST and then stopped - the worst ordering for DCA."""
+    risk = entry - stop
+    if risk <= 0:
+        return None
+    dca = entry - dca_frac * risk
+    rr = (target - entry) / risk
+    filled = False
+    for j in range(f, min(n, f + horizon + 1)):
+        if L[j] <= dca:
+            filled = True
+        if L[j] <= stop:
+            base = -(1.0 + (dca - stop) / risk) if filled else -1.0
+            return round(base - fee_frac / (risk / entry) * (2 if filled else 1), 3)
+        if H[j] >= target:
+            if filled:
+                gain = rr + (target - dca) / risk
+            else:
+                gain = rr
+            return round(gain - fee_frac / (risk / entry) * (2 if filled else 1), 3)
+    return None
+
+
 def _bt_signals(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None):
     """SIGNAL-DISCOVERY harness. Uses a deliberately NEUTRAL entry (any green close) with a fixed
     ATR stop/target, so no strategy bias is baked in — then tags every trade with the whole signal
@@ -5389,49 +5424,47 @@ def _bt_signals(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, 
             t += 1; continue
         tr["sig"] = _signal_flags(H, L, C, V, t, e10, e20, e50, e200, e1200, st, sdir,
                                   rsis, macd_l, macd_s, mkt_ctx, rows)
+        tr["r_dca"] = _sim_dca(H, L, C, t + 1, horizon, n, entry, stop, target, fee_frac)
         out.append(tr); t = rbar + 1
     return out
 
 
 def _r_portfolio(sub, start=10000.0, margin=100.0, lev=10.0):
-    """Turn a set of R-multiples into the numbers that actually matter to an account.
+    """Turn a set of R-multiples into account numbers, modelled as CROSS margin.
 
-    Your sizing: $10,000 account, $100 margin at 10x = a $1,000 position. The dollar risk is NOT
-    fixed at $100 - it is the position size times the distance to the stop, so a 5% stop risks $50
-    and a 20% stop risks $200.
+    Sizing: $10,000 account, $100 margin at 10x = a $1,000 position. Because margin is CROSS, the
+    whole account balance backs the position, not just the $100. That has one big consequence worth
+    being explicit about: a $1,000 position is not liquidated by a 10% adverse move - it would take
+    a move large enough to threaten the entire balance - so THE STOP IS ACTUALLY REACHED. Positions
+    resolve at their stop or target rather than being force-closed early.
 
-    LIQUIDATION IS MODELLED HONESTLY: at 10x, roughly a 10% adverse move wipes the $100 margin. Any
-    trade whose stop sits further than that would be liquidated BEFORE the stop is reached, so the
-    loss is capped at the margin and the trade is counted as a liquidation. Ignoring this is how
-    leveraged backtests quietly overstate themselves."""
+    The dollar risk is therefore just position size x distance to stop: a 5% stop risks $50 (0.5% of
+    the account), a 20% stop risks $200 (2%). The real danger under cross is not a single trade, it
+    is a losing streak draining shared collateral - which is what max drawdown below measures."""
     notional = margin * lev
-    eq = start; peak = start; maxdd = 0.0; liq = 0
+    eq = start; peak = start; maxdd = 0.0; busted = False
     total_r = 0.0; r_eq = 0.0; r_peak = 0.0; r_dd = 0.0
-    curve = []
+    worst = 0.0; curve = []
     for t in sub:
         r = t.get("r") or 0.0
         stopw = t.get("stopw") or 0.0            # stop distance as % of entry
         total_r += r
         r_eq += r; r_peak = max(r_peak, r_eq); r_dd = max(r_dd, r_peak - r_eq)
-        risk_usd = notional * (stopw / 100.0)
-        if stopw >= (100.0 / lev) and r < 0:     # stop beyond the liquidation point
-            pnl = -margin; liq += 1
-        else:
-            pnl = r * risk_usd
-            if pnl < -margin:
-                pnl = -margin; liq += 1
+        pnl = r * (notional * (stopw / 100.0))   # cross: no early cap, the stop is honoured
+        worst = min(worst, pnl)
         eq += pnl
         peak = max(peak, eq); maxdd = max(maxdd, peak - eq)
         curve.append(round(eq))
-        if eq <= 0:
-            eq = 0.0; break
+        if eq <= 0:                              # cross margin call: the account itself is gone
+            eq = 0.0; busted = True; break
     step = max(1, len(curve) // 60)
     return {"total_r": round(total_r, 1), "max_dd_r": round(r_dd, 1),
             "end_equity": round(eq), "pnl": round(eq - start),
             "ret_pct": round((eq - start) / start * 100, 1),
             "max_dd_usd": round(maxdd),
             "max_dd_pct": round(maxdd / max(1.0, peak) * 100, 1),
-            "liquidations": liq, "curve": curve[::step][:60]}
+            "worst_trade": round(worst), "busted": bool(busted),
+            "curve": curve[::step][:60]}
 
 
 def _bt_signal_ranking(trades, min_n=50):
@@ -5458,8 +5491,18 @@ def _bt_signal_ranking(trades, min_n=50):
         w = sum(1 for x in sub if x["outcome"] == "win")
         base = {"n": len(sub), "winrate": round(w / len(sub) * 100, 1),
                 "exp": round(sum(x["r"] for x in sub) / len(sub), 3)}
+        dsub = [x for x in sub if x.get("r_dca") is not None]
+        if dsub:
+            base["exp_dca"] = round(sum(x["r_dca"] for x in dsub) / len(dsub), 3)
+            base["dca_helps"] = bool(base["exp_dca"] > base["exp"])
         if full:
             base.update(_r_portfolio(sorted(sub, key=lambda z: z.get("ts") or 0)))
+            if dsub:
+                _dp = _r_portfolio(sorted(
+                    [dict(x, r=x["r_dca"]) for x in dsub], key=lambda z: z.get("ts") or 0))
+                base["dca_end_equity"] = _dp["end_equity"]
+                base["dca_max_dd_pct"] = _dp["max_dd_pct"]
+                base["dca_busted"] = _dp["busted"]
         return base
 
     def entry(label, pred):
