@@ -6073,6 +6073,36 @@ def _to_daily(rows, per_day=6):
     return out
 
 
+def scan_runner_daily(sess, symbol, market="futures", limit=500):
+    """RUNNER SCAN on REAL DAILY candles. The fast 10-minute loop can only aggregate ~166 days out of
+    its 4h candles, which is nowhere near enough: quiet-accumulation needs to see a pump that may be
+    6-12 months old, so that loop was structurally blind to the very setups it was hunting. This
+    fetches genuine daily klines (~1.4 years) instead. Returns (dtb, accum, diag)."""
+    try:
+        raw = fetch_candles(sess, symbol, "1d", limit, market)
+    except Exception:
+        return None, None, None
+    if not raw or len(raw) < 61:
+        return None, None, None
+    d = raw[:-1]                            # drop the still-forming daily candle
+    try:
+        px = float(d[-1][4])
+    except (ValueError, IndexError, TypeError):
+        return None, None, None
+    dtb = accum = None
+    try:
+        _d = descending_triple_bottom(d)
+        if _d:
+            _d["symbol"] = symbol; _d["price"] = px; dtb = _d
+        _a = accumulation_breakout(d)
+        if _a:
+            _a["symbol"] = symbol; _a["price"] = px; accum = _a
+        diag = runner_diag(d)
+    except Exception:
+        return None, None, None
+    return dtb, accum, diag
+
+
 def runner_diag(rows):
     """WHY is nothing showing? For each runner pattern, report the FIRST gate that failed on this
     coin. Aggregated across the universe this turns an empty board into a real answer: it tells you
@@ -6449,7 +6479,7 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
     # ---- RUNNER PATTERNS (big-timeframe): daily series built from the 4h candles ----
     dtb_hit = accum_hit = None; run_diag = None
     try:
-        _drows = _to_daily(rows)
+        _drows = _to_daily(rows) if cfg.get("runner_inline") else []
         run_diag = runner_diag(_drows) if len(_drows) >= 60 else None
         if len(_drows) >= 60:
             _dtb = descending_triple_bottom(_drows)

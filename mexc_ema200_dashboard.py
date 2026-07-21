@@ -810,6 +810,7 @@ class State:
         self.early_hits: list[dict] = []           # early / pre-breakout accumulation
         self.dtb_hits: list[dict] = []             # RUNNER: descending triple bottom (daily)
         self.accum_hits: list[dict] = []           # RUNNER: test-pump -> accumulation -> breakout
+        self.runner_progress: tuple = (0, 0)
         self.runner_diag: dict | None = None      # why the runner boards are empty
         self.signal_rank: dict | None = None       # SIGNAL LAB: which indicators actually pay
         self.prev_early_symbols: set[str] | None = None
@@ -830,6 +831,7 @@ class State:
         self.scanning: bool = False
         self.progress: tuple[int, int] = (0, 0)  # (done, total)
         self.universe: int = 0
+        self.symbol_list: list = []
         self.market_context: dict | None = None    # BTC + alts big-picture read
         self.gate_learn: dict | None = None         # per-board gate adjustment from results
         self.backtests: dict | None = None          # auto TF × side backtest matrix
@@ -899,6 +901,7 @@ class State:
                 "accum_hits": withlive(self.accum_hits),
                 "signal_rank": self.signal_rank,
                 "runner_diag": self.runner_diag,
+                "runner_progress": list(self.runner_progress),
                 "early_new_symbols": list(self.new_early_symbols),
                 "long_board": withlive(self.long_board),
                 "short_board": withlive(self.short_board),
@@ -936,6 +939,7 @@ def run_one_scan(state: State) -> None:
                                market=cfg.get("market", "futures"))
         with state.lock:
             state.universe = len(symbols)
+            state.symbol_list = list(symbols)
             state.progress = (0, len(symbols))
     except requests.RequestException as e:
         with state.lock:
@@ -1493,10 +1497,8 @@ def run_one_scan(state: State) -> None:
         state.long_board = long_board
         state.short_board = short_board
         state.coil_board = coil_board
-        state.dtb_hits = sorted(dtb_board, key=lambda d: -(d.get("rr") or 0))[:25]
-        state.accum_hits = sorted(accum_board, key=lambda d: -(d.get("rr") or 0))[:25]
-        state.runner_diag = {p: sorted(v.items(), key=lambda kv: -kv[1])[:6]
-                             for p, v in diag_tally.items()}
+        _unused_dtb = sorted(dtb_board, key=lambda d: -(d.get("rr") or 0))[:25]
+        _unused_accum = sorted(accum_board, key=lambda d: -(d.get("rr") or 0))[:25]
         state.scalp_board = scalp_board
         state.spot_board = spot_board
         state.gate_learn = _learn
@@ -1606,8 +1608,11 @@ def backtest_loop(state: State) -> None:
             if APP_MODE != "stocks":
                 # ONE fetch of the 4H candles -> all 10 scenarios scored against it.
                 keys = [k for k, _ in EMACONF_SCENARIOS]
-                res = backtest_all(sess, market, tfs=("4h",), limit=lab_limit.get("4h", 4380),
-                                   fees_bps=5.0, symbols=list(BACKTEST_BASKET),
+                # FREE-TIER BUDGET: this instance has ~0.1 CPU and must keep serving pages while
+                # it thinks. A full 60-coin x 8760-bar matrix starves the web server and the whole
+                # site hangs. Smaller basket + shallower history keeps the lab honest but polite.
+                res = backtest_all(sess, market, tfs=("4h",), limit=4380,
+                                   fees_bps=5.0, symbols=list(BACKTEST_BASKET)[:24],
                                    sides=("long",), index_sym="BTCUSDT", strategy_list=keys)
                 for k, nm in EMACONF_SCENARIOS:
                     lab[k] = res.get(k, {})
@@ -1643,7 +1648,54 @@ def backtest_loop(state: State) -> None:
             with state.lock:
                 if not state.backtests:
                     state.backtests = {"error": str(e)}
-        time.sleep(6 * 3600)                          # refresh every ~6 hours (whole universe)
+        time.sleep(12 * 3600)                         # refresh twice a day (free tier is CPU-bound)
+
+
+def runner_loop(state: State) -> None:
+    """RUNNER-PATTERN loop on REAL DAILY candles, run slowly and politely.
+
+    Why this exists: the 10-minute scan aggregates its 4h candles into only ~166 daily bars. Quiet-
+    accumulation looks for a pump that can be 6-12 months old, so that loop was structurally blind
+    to the setups it was supposed to find - which is very likely why both boards read zero. These
+    are daily patterns; they do not change minute to minute, so this runs every few hours and sleeps
+    between coins to leave CPU for serving pages."""
+    from mexc_ema200_scanner import scan_runner_daily
+    market = state.cfg.get("market", "futures")
+    while True:
+        try:
+            sess = get_session()
+            with state.lock:
+                syms = list(state.symbol_list or [])
+            if not syms:
+                time.sleep(120); continue
+            dtb_b = []; acc_b = []; tally = {"dtb": {}, "accum": {}}
+            for i, sym in enumerate(syms):
+                try:
+                    d, a, dg = scan_runner_daily(sess, sym, market)
+                    if d:
+                        dtb_b.append(d)
+                    if a:
+                        acc_b.append(a)
+                    if dg:
+                        for p in ("dtb", "accum"):
+                            k = dg.get(p) or "PASSED"
+                            tally[p][k] = tally[p].get(k, 0) + 1
+                except Exception:
+                    pass
+                if i % 10 == 0:
+                    with state.lock:
+                        state.runner_progress = (i, len(syms))
+                time.sleep(0.25)                  # breathe: keep the page responsive
+            with state.lock:
+                state.dtb_hits = sorted(dtb_b, key=lambda d: -(d.get("rr") or 0))[:25]
+                state.accum_hits = sorted(acc_b, key=lambda d: -(d.get("rr") or 0))[:25]
+                state.runner_diag = {p: sorted(v.items(), key=lambda kv: -kv[1])[:6]
+                                     for p, v in tally.items()}
+                state.runner_progress = (len(syms), len(syms))
+        except Exception as e:
+            with state.lock:
+                state.runner_diag = {"error": str(e)}
+        time.sleep(4 * 3600)
 
 
 MEXC_PRICE_URL = "https://api.mexc.com/api/v3/ticker/price"
@@ -6380,6 +6432,7 @@ def main() -> None:
     if APP_MODE != "stocks":
         threading.Thread(target=scan_loop, args=(state,), daemon=True).start()
         threading.Thread(target=breakout_watcher, args=(state,), daemon=True).start()
+        threading.Thread(target=runner_loop, args=(state,), daemon=True).start()
     threading.Thread(target=backtest_loop, args=(state,), daemon=True).start()
 
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(state))
