@@ -810,6 +810,7 @@ class State:
         self.early_hits: list[dict] = []           # early / pre-breakout accumulation
         self.dtb_hits: list[dict] = []             # RUNNER: descending triple bottom (daily)
         self.accum_hits: list[dict] = []           # RUNNER: test-pump -> accumulation -> breakout
+        self.runner_diag: dict | None = None      # why the runner boards are empty
         self.signal_rank: dict | None = None       # SIGNAL LAB: which indicators actually pay
         self.prev_early_symbols: set[str] | None = None
         self.new_early_symbols: list[str] = []
@@ -897,6 +898,7 @@ class State:
                 "dtb_hits": withlive(self.dtb_hits),
                 "accum_hits": withlive(self.accum_hits),
                 "signal_rank": self.signal_rank,
+                "runner_diag": self.runner_diag,
                 "early_new_symbols": list(self.new_early_symbols),
                 "long_board": withlive(self.long_board),
                 "short_board": withlive(self.short_board),
@@ -992,6 +994,7 @@ def run_one_scan(state: State) -> None:
     except Exception:
         pass
     with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
+        diag_tally = {"dtb": {}, "accum": {}}
         futs = {ex.submit(scan_symbol_multi, sess, s, cfg["interval"], scan_cfg): s
                 for s in symbols}
         for fut in as_completed(futs):
@@ -1000,9 +1003,13 @@ def run_one_scan(state: State) -> None:
                 with state.lock:
                     state.progress = (done, len(symbols))
             try:
-                h, f, c, b, w, sh, sb, el, lng, sht, coil, dtb, accum = fut.result()
+                rdiag, h, f, c, b, w, sh, sb, el, lng, sht, coil, dtb, accum = fut.result()
             except Exception:
-                h, f, c, b, w, sh, sb, el, lng, sht, coil, dtb, accum = (None,) * 13
+                rdiag, h, f, c, b, w, sh, sb, el, lng, sht, coil, dtb, accum = (None,) * 14
+            if rdiag:
+                for _p in ("dtb", "accum"):
+                    _r = rdiag.get(_p)
+                    diag_tally[_p][_r if _r else "PASSED"] = diag_tally[_p].get(_r if _r else "PASSED", 0) + 1
             if dtb:
                 dtb_board.append(dtb)
             if accum:
@@ -1488,6 +1495,8 @@ def run_one_scan(state: State) -> None:
         state.coil_board = coil_board
         state.dtb_hits = sorted(dtb_board, key=lambda d: -(d.get("rr") or 0))[:25]
         state.accum_hits = sorted(accum_board, key=lambda d: -(d.get("rr") or 0))[:25]
+        state.runner_diag = {p: sorted(v.items(), key=lambda kv: -kv[1])[:6]
+                             for p, v in diag_tally.items()}
         state.scalp_board = scalp_board
         state.spot_board = spot_board
         state.gate_learn = _learn
@@ -1576,6 +1585,8 @@ def backtest_loop(state: State) -> None:
         ("emaconf:emaonly",     "9 EMA-pullback entries only"),
         ("emaconf:trail",       "10 Supertrend trailing exit"),
         ("signals",             "11 Signal lab (20 indicators)"),
+        ("dtb",                 "12 Triple bottom (daily)"),
+        ("accum",               "13 Quiet accumulation (daily)"),
     ]
     CRYPTO_JOBS = []
     STOCK_JOBS = [
@@ -2588,6 +2599,7 @@ PAGE = """<!doctype html>
     </tr></thead>
     <tbody id="dtbrows"></tbody>
   </table>
+  <div id="dtbdiag" style="margin-top:8px"></div>
   <div class="empty" id="dtbempty" style="display:none">No descending triple bottoms right now. The loop keeps scanning…</div>
 </div>
 </div>
@@ -2632,6 +2644,7 @@ PAGE = """<!doctype html>
     </tr></thead>
     <tbody id="accumrows"></tbody>
   </table>
+  <div id="accumdiag" style="margin-top:8px"></div>
   <div class="empty" id="accumempty" style="display:none">No quiet-accumulation setups right now. The loop keeps scanning…</div>
 </div>
 </div>
@@ -4444,6 +4457,18 @@ document.querySelectorAll("th[data-ek]").forEach(th=>th.addEventListener("click"
   setSortArrow(th,eeSortDir); renderEarly();
 }));
 let dtblatest=[], accumlatest=[];
+function renderDiag(which){
+  const el=document.getElementById(which+"diag"); if(!el) return;
+  const d=(rdiaglatest||{})[which];
+  if(!d||!d.length){ el.innerHTML=""; return; }
+  const tot=d.reduce((a,b)=>a+b[1],0);
+  const passed=(d.find(x=>x[0]==="PASSED")||[null,0])[1];
+  let h='<div class="status"><span><b>Why the board looks like this</b> &mdash; of '+tot+' coins scanned, <b>'+passed+'</b> passed every gate. The rest fell out here:</span></div><table><thead><tr><th>First gate that failed</th><th>Coins</th><th>Share</th></tr></thead><tbody>';
+  for(const [k,v] of d){ if(k==="PASSED") continue;
+    h+='<tr><td>'+k+'</td><td>'+v+'</td><td>'+(v/tot*100).toFixed(1)+'%</td></tr>'; }
+  h+='</tbody></table>';
+  el.innerHTML=h;
+}
 function renderDtb(){
   const tb=document.getElementById("dtbrows"); if(!tb) return; tb.innerHTML="";
   const rows=[...dtblatest].sort((a,b)=>(b.rr||0)-(a.rr||0));
@@ -4462,6 +4487,7 @@ function renderDtb(){
   }
 }
 let siglatest=null;
+let rdiaglatest=null;
 function sigRow(x){
   const lift=(x.lift||0), col=lift>0?"good":(lift<0?"bad":"");
   const rb=x.robust?'<span class="good">yes</span>':'<span class="bad">no</span>';
@@ -5900,6 +5926,7 @@ async function poll(){
   dtblatest=d.dtb_hits||[]; renderDtb();
   accumlatest=d.accum_hits||[]; renderAccum();
   siglatest=d.signal_rank||null; renderSignals();
+  rdiaglatest=d.runner_diag||null; renderDiag("dtb"); renderDiag("accum");
     slatest=d.short_hits||[]; renderShorts();
     renderBestLong(); renderBestShort(); renderCoil(); renderScalp(); renderSpot(); renderPerf(); renderCalls();
     renderMarket(); renderWatch();

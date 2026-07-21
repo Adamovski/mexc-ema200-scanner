@@ -5115,6 +5115,63 @@ def _signal_flags(H, L, C, V, t, e10, e20, e50, e200, e1200, st, sdir, rsis,
     return f
 
 
+def _bt_pattern(rows, side, pattern="dtb", fees_bps=5.0, horizon=60, warmup=90,
+                btc_ctx=None, tf="4h", mkt_ctx=None, trigger_window=15):
+    """BACKTEST for the two RUNNER PATTERNS (triple bottom / quiet accumulation). Walks the DAILY
+    series forward one bar at a time, asking the SAME detector the live scanner uses "would you have
+    fired here?" using only bars up to that point (no look-ahead). Triple bottom enters at the close
+    of the detection bar; quiet accumulation is a stop-buy, so it waits up to `trigger_window` days
+    for price to actually take out the range high and skips the trade if it never does. Long-only —
+    both patterns are bottom/base setups."""
+    if side != "long":
+        return []
+    d = _to_daily(rows)
+    if len(d) < warmup + horizon + 5:
+        return []
+    try:
+        H = [float(x[2]) for x in d]; L = [float(x[3]) for x in d]
+        C = [float(x[4]) for x in d]; V = [float(x[5]) for x in d]
+    except (ValueError, IndexError, TypeError):
+        return []
+    n = len(C)
+    e200 = ema(C, 200)
+    fee_frac = fees_bps / 10000.0
+    _dv = sorted(C[i] * V[i] for i in range(n)); dvol = _dv[len(_dv) // 2] if _dv else 0.0
+    det = descending_triple_bottom if pattern == "dtb" else accumulation_breakout
+    out = []; t = warmup; last_exit = -1
+    while t < n - horizon - 1:
+        if t <= last_exit:                       # one position at a time per coin
+            t += 1; continue
+        try:
+            hit = det(d[:t + 1])
+        except Exception:
+            hit = None
+        if not hit:
+            t += 1; continue
+        entry = float(hit["entry"]); stop = float(hit["stop"]); target = float(hit["target"])
+        bar = t
+        if pattern != "dtb":
+            # stop-buy: price must actually trade through the range high, else no trade at all
+            bar = None
+            for j in range(t + 1, min(n, t + 1 + trigger_window)):
+                if H[j] >= entry:
+                    bar = j; break
+            if bar is None or bar >= n - horizon - 1:
+                t += 1; continue
+        a = atr(H[max(0, bar - 20):bar + 1], L[max(0, bar - 20):bar + 1], C[max(0, bar - 20):bar + 1]) or 0.0
+        tr, rbar = _bt_sim(d, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx,
+                           pattern, True, bar, entry, stop, target, a, mkt_ctx=mkt_ctx)
+        if tr is None:
+            t += 1; continue
+        tr["pattern"] = pattern
+        tr["quiet"] = bool(hit.get("quiet") or (hit.get("vol_ratio") or 9) < 0.5)
+        tr["higher_low"] = bool(hit.get("higher_low"))
+        tr["broke_out"] = bool(hit.get("broke_out"))
+        out.append(tr); last_exit = rbar
+        t = rbar + 1
+    return out
+
+
 def _bt_signals(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None):
     """SIGNAL-DISCOVERY harness. Uses a deliberately NEUTRAL entry (any green close) with a fixed
     ATR stop/target, so no strategy bias is baked in — then tags every trade with the whole signal
@@ -5378,6 +5435,9 @@ def backtest_symbol(rows, side, fees_bps=4.0, horizon=40, warmup=210, strategy="
         return _bt_bullmom(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy == "pro":
         return _bt_pro(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
+    if strategy in ("dtb", "accum"):
+        return _bt_pattern(rows, side, pattern=strategy, fees_bps=fees_bps,
+                           btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy == "signals":
         return _bt_signals(rows, side, fees_bps=fees_bps, warmup=warmup, btc_ctx=btc_ctx, tf=tf, mkt_ctx=mkt_ctx)
     if strategy.startswith("emaconf"):
@@ -6013,6 +6073,64 @@ def _to_daily(rows, per_day=6):
     return out
 
 
+def runner_diag(rows):
+    """WHY is nothing showing? For each runner pattern, report the FIRST gate that failed on this
+    coin. Aggregated across the universe this turns an empty board into a real answer: it tells you
+    whether the market simply has no bases right now, or whether one specific threshold is doing all
+    the filtering and should be loosened."""
+    res = {"dtb": None, "accum": None}
+    try:
+        H = [float(x[2]) for x in rows]; L = [float(x[3]) for x in rows]
+        C = [float(x[4]) for x in rows]; V = [float(x[5]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return {"dtb": "bad data", "accum": "bad data"}
+    n = len(C)
+    if n < 60:
+        return {"dtb": "not enough daily history", "accum": "not enough daily history"}
+    # ---- triple bottom ----
+    piv = _pivot_lows(L, 3)
+    if len(piv) < 3:
+        res["dtb"] = "fewer than 3 swing lows"
+    else:
+        chosen = []
+        for idx in reversed(piv):
+            if not chosen:
+                chosen.append(idx); continue
+            if chosen[-1] - idx >= 6 and L[idx] > L[chosen[-1]]:
+                chosen.append(idx)
+            if len(chosen) == 3:
+                break
+        if len(chosen) < 3:
+            res["dtb"] = "lows not descending in sequence"
+        else:
+            i1, i2, i3 = sorted(chosen)
+            l3 = L[i3]; price = C[-1]
+            if (n - 1) - i3 > 40:
+                res["dtb"] = "3rd low too long ago (>40d)"
+            elif price < l3 * 0.98:
+                res["dtb"] = "price broke below the 3rd low"
+            elif price > l3 * 1.10:
+                res["dtb"] = "price already >10%% above the base"
+    # ---- quiet accumulation ----
+    rb = 20
+    if n < rb + 40:
+        res["accum"] = "not enough daily history"
+    else:
+        hist_high = max(H[:n - rb]); base = C[-1]
+        win_hi = max(H[-rb:]); win_lo = min(L[-rb:])
+        recent_v = sum(V[-rb:]) / rb
+        hist_v = sum(V[:n - rb]) / max(1, (n - rb))
+        if hist_high < base * 1.6:
+            res["accum"] = "no prior pump (need 1.6x above price)"
+        elif win_lo <= 0 or (win_hi - win_lo) / win_lo > 0.35:
+            res["accum"] = "range too wide (>35%%)"
+        elif hist_v <= 0 or recent_v > 0.6 * hist_v:
+            res["accum"] = "volume has not dried up"
+        elif ((base - win_lo) / max(1e-9, (win_hi - win_lo))) < 0.6:
+            res["accum"] = "price sitting low in the range"
+    return res
+
+
 def descending_triple_bottom(rows, k=3, min_gap=6, near_pct=0.10):
     """RUNNER PATTERN A — the descending triple bottom (capitulation base). Three swing lows, each
     LOWER than the last, with price now basing at/just above the third low. Big-timeframe (daily/
@@ -6183,7 +6301,7 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
     raw = fetch_candles(sess, symbol, interval, cfg["kline_limit"],
                         cfg.get("market", "spot"))
     if not raw or len(raw) < EMA_PERIOD + 2:
-        return (None,) * 11
+        return (None,) * 14
     # MEXC kline row: [openTime, open, high, low, close, volume, closeTime, ...]
     rows = raw[:-1]                       # drop the still-forming candle
     try:
@@ -6192,7 +6310,7 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
         closes = [float(x[4]) for x in rows]
         vols = [float(x[5]) for x in rows]
     except (ValueError, IndexError):
-        return (None,) * 8
+        return (None,) * 14
 
     rv = rel_volume(vols)                       # relative volume of the latest candle
     ksup = key_supports(rows, lows, closes[-1])  # next 4h / daily / weekly support
@@ -6329,9 +6447,10 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
             coil_setup["data_stale"] = True
 
     # ---- RUNNER PATTERNS (big-timeframe): daily series built from the 4h candles ----
-    dtb_hit = accum_hit = None
+    dtb_hit = accum_hit = None; run_diag = None
     try:
         _drows = _to_daily(rows)
+        run_diag = runner_diag(_drows) if len(_drows) >= 60 else None
         if len(_drows) >= 60:
             _dtb = descending_triple_bottom(_drows)
             if _dtb:
@@ -6342,7 +6461,7 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
     except Exception:
         dtb_hit = accum_hit = None
 
-    return (ema_hit, flag_hit, cpr_hit, bounce_hit, wedge_hit, short_hit,
+    return (run_diag, ema_hit, flag_hit, cpr_hit, bounce_hit, wedge_hit, short_hit,
             st_bounce_hit, early_hit, long_setup, short_setup, coil_setup,
             dtb_hit, accum_hit)
 
