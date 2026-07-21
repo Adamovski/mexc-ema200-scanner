@@ -811,6 +811,7 @@ class State:
         self.dtb_hits: list[dict] = []             # RUNNER: descending triple bottom (daily)
         self.accum_hits: list[dict] = []           # RUNNER: test-pump -> accumulation -> breakout
         self.capit_hits: list[dict] = []           # RUNNER: capitulation flush -> trendline break
+        self.top_combos: list = []                 # combos that survived out-of-sample
         self.micro_stats: dict | None = None       # sub-$10m market-cap cohort
         self.runner_progress: tuple = (0, 0)
         self.runner_diag: dict | None = None      # why the runner boards are empty
@@ -905,6 +906,7 @@ class State:
                 "runner_diag": self.runner_diag,
                 "capit_hits": withlive(self.capit_hits),
                 "micro_stats": self.micro_stats,
+                "top_combos": self.top_combos,
                 "runner_progress": list(self.runner_progress),
                 "early_new_symbols": list(self.new_early_symbols),
                 "long_board": withlive(self.long_board),
@@ -1023,6 +1025,15 @@ def run_one_scan(state: State) -> None:
             if accum:
                 accum_board.append(accum)
             if lng:
+                _sig = lng.pop("sig", None)
+                if _sig:
+                    with state.lock:
+                        _tc = list(state.top_combos)
+                    _fire = [c["name"] for c in _tc
+                             if c["keys"] and all(_sig.get(k) for k in c["keys"])]
+                    lng["lab_hits"] = _fire
+                    lng["lab_best"] = min([c["rank"] for c in _tc
+                                           if c["name"] in _fire], default=None)
                 long_board.append(lng)
             if sht:
                 short_board.append(sht)
@@ -1627,6 +1638,20 @@ def backtest_loop(state: State) -> None:
                         _rank = _blk["long"]["signal_ranking"]; break
                 with state.lock:
                     state.signal_rank = _rank
+                    _wf = (_rank or {}).get("walk_forward") or {}
+                    _t10 = (_wf.get("top10") or {}).get("picks") or []
+                    _byname = {e["name"]: e.get("keys") or []
+                               for e in ((_rank or {}).get("singles") or [])
+                                      + ((_rank or {}).get("pairs") or [])
+                                      + ((_rank or {}).get("triples") or [])}
+                    # only combos that stayed positive OUT-OF-SAMPLE get to touch the live board
+                    _solo = {x["name"]: x for x in (_wf.get("solo") or [])}
+                    state.top_combos = [
+                        {"name": p["name"], "keys": _byname.get(p["name"], []),
+                         "oos_exp": (_solo.get(p["name"]) or {}).get("oos_exp"),
+                         "rank": i + 1}
+                        for i, p in enumerate(_t10)
+                        if _byname.get(p["name"]) and ((_solo.get(p["name"]) or {}).get("oos_exp") or -9) > 0]
                 with state.lock:
                     state.backtests = {"ts": time.time(), "took": round(time.time() - t0, 1),
                                        "fees_bps": 5.0, "coins": len(BACKTEST_BASKET), "lab": dict(lab),
@@ -2727,6 +2752,7 @@ PAGE = """<!doctype html>
   <span class="warn">Read this honestly: with 20 signals and ~190 pairs, some will look good by chance alone. Treat only the <b>robust</b> ones with a decent sample as candidates, and expect the lift to shrink live.</span></span>
 </div>
 <div class="wrap" id="sigbase" style="margin-bottom:10px"></div>
+<div class="wrap" id="wfbox" style="margin-bottom:14px"></div>
 <div class="wrap">
   <h3 style="margin:6px 0 4px">Individual signals <span class="rr" id="sigcount"></span></h3>
   <table id="sigtbl">
@@ -2790,6 +2816,7 @@ PAGE = """<!doctype html>
       <th data-tip="Recommended stop — just beyond the next support below the entry (or an ATR buffer if none).">Stop</th>
       <th data-tip="Recommended target — the nearest resistance above (or a 2R projection if none overhead).">Target</th>
       <th data-tip="Reward:risk of the previewed trade (target vs stop from the entry).">R:R</th>
+      <th data-tip="Which of the lab's surviving strategies are firing on this coin RIGHT NOW. These are the combos that stayed profitable OUT-OF-SAMPLE (selected on the first half of history, measured on the second half they never saw). #1 is the highest-ranked. Blank means no surviving combo currently fires — the coin may still be a good setup on the other columns, it just isn't one the lab has evidence for.">🔬 Lab</th>
       <th data-tip="Plain-English reasons this coin ranks where it does.">Why</th>
     </tr></thead>
     <tbody id="blrows"></tbody>
@@ -4652,6 +4679,57 @@ function renderMicro(){
     tb.appendChild(tr);
   }
 }
+function wfRow(x){
+  const g=v=>v==null?"&mdash;":((v>0?"+":"")+v.toFixed(1)+"%");
+  const cl=v=>v==null?"":(v>0?"good":"bad");
+  return `<td>${x.name}</td><td>${x.oos_n||0}</td><td>${x.oos_winrate==null?"&mdash;":x.oos_winrate+"%"}</td>`+
+    `<td>${x.oos_exp==null?"&mdash;":x.oos_exp.toFixed(3)}</td>`+
+    `<td>${x.oos_avg_rr==null?"&mdash;":x.oos_avg_rr.toFixed(2)}</td>`+
+    `<td>${x.oos_total_r==null?"&mdash;":x.oos_total_r.toFixed(1)+"R"}</td>`+
+    `<td class="bad">${x.oos_max_dd_r==null?"&mdash;":"-"+x.oos_max_dd_r.toFixed(1)+"R"}</td>`+
+    `<td class="${cl(x.oos_ret_pct)}">${g(x.oos_ret_pct)}</td>`+
+    `<td class="bad">${x.oos_max_dd_pct==null?"&mdash;":"-"+x.oos_max_dd_pct.toFixed(0)+"%"}</td>`+
+    `<td>${x.dca_total_r==null?"&mdash;":x.dca_total_r.toFixed(1)+"R"}</td>`+
+    `<td class="bad">${x.dca_max_dd_r==null?"&mdash;":"-"+x.dca_max_dd_r.toFixed(1)+"R"}</td>`+
+    `<td class="${cl(x.dca_ret_pct)}">${g(x.dca_ret_pct)}</td>`+
+    `<td class="bad">${x.dca_max_dd_pct==null?"&mdash;":"-"+x.dca_max_dd_pct.toFixed(0)+"%"}</td>`;
+}
+function renderWF(){
+  const el=document.getElementById("wfbox"); if(!el) return;
+  const r=siglatest, w=(r&&r.walk_forward)||null;
+  if(!w){ el.innerHTML=""; return; }
+  const hdr='<tr><th>Strategy</th><th>Trades</th><th>Win rate</th><th>Exp (R)</th><th>Avg R:R</th>'+
+    '<th>Total R</th><th>Max DD (R)</th><th>Return</th><th>Max DD</th>'+
+    '<th>Total R <i>DCA</i></th><th>Max DD (R) <i>DCA</i></th><th>Return <i>DCA</i></th><th>Max DD <i>DCA</i></th></tr>';
+  let h='<div class="status"><span>🏆 <b>Top strategies, tested walk-forward</b><br>'+
+    'Every combo was ranked using <b>only the first half</b> of history. The top 10 from that ranking were then measured across the <b>second half, which they never saw</b>. '+
+    'That second-half number is the honest estimate &mdash; it is the backtest that shows whether an edge survives.<br>'+
+    '<span class="warn">Why not just rank over all history and total it up? Because those combos were chosen <i>because</i> they scored well on that data, so the total is guaranteed to look good. That is the same reasoning as picking the best fund of last year and calling it a forecast. The in-sample figure is shown below only so you can see the gap &mdash; the gap is the size of the self-deception.</span></span></div>';
+  h+='<table><thead>'+hdr+'</thead><tbody>';
+  for(const x of (w.solo||[])) h+='<tr>'+wfRow(x)+'</tr>';
+  const combo=(k,label)=>{ const b=w[k]; if(!b) return '';
+    return '<tr style="background:rgba(80,200,120,.07)"><td><b>'+label+'</b></td>'+wfRow(b).replace(/^<td>[^<]*<\/td>/,'')+'</tr>'; };
+  h+='</tbody></table>';
+  h+='<h3 style="margin:14px 0 4px">Following ALL signals from the top 5 / top 10 combined</h3>';
+  h+='<table><thead>'+hdr+'</thead><tbody>';
+  for(const [k,l] of [["top5","Top 5 combined"],["top10","Top 10 combined"]]){
+    const b=w[k]; if(!b) continue;
+    const row=wfRow(Object.assign({},b,{name:l}));
+    h+='<tr style="background:rgba(80,200,120,.07)">'+row+'</tr>';
+  }
+  h+='</tbody></table>';
+  const t5=w.top5, t10=w.top10;
+  if(t5||t10){
+    h+='<div class="status" style="margin-top:8px"><span>';
+    for(const [b,l] of [[t5,"Top 5"],[t10,"Top 10"]]){ if(!b) continue;
+      h+='<b>'+l+'</b>: in-sample '+(b.in_exp==null?"&mdash;":b.in_exp.toFixed(3))+'R/trade ('+(b.in_ret_pct==null?"&mdash;":b.in_ret_pct.toFixed(0)+'%')+
+         ') &rarr; out-of-sample <b>'+(b.oos_exp==null?"&mdash;":b.oos_exp.toFixed(3))+'R</b>/trade ('+(b.oos_ret_pct==null?"&mdash;":b.oos_ret_pct.toFixed(0)+'%')+')'+
+         (b.oos_busted?' &mdash; <span class="bad">ACCOUNT BUSTED</span>':'')+'<br>';
+    }
+    h+='<span class="warn">If out-of-sample is far below in-sample, the ranking was fitting noise. If it holds up, that is genuine evidence &mdash; but it is still one market era, and these are all long-only signals tested largely through a period when crypto rose. A rising tide flatters every long strategy.</span></span></div>';
+  }
+  el.innerHTML=h;
+}
 function sigRow(x){
   const lift=(x.lift||0), col=lift>0?"good":(lift<0?"bad":"");
   const rb=x.robust?'<span class="good">yes</span>':'<span class="bad">no</span>';
@@ -4688,6 +4766,7 @@ function renderSignals(){
   if(sc) sc.textContent="— "+(r.n_signals||0)+" indicators tested, "+(r.singles||[]).length+" with enough trades to score";
   for(const x of (r.singles||[])){ const tr=document.createElement("tr"); tr.innerHTML=sigRow(x); tb.appendChild(tr); }
   for(const x of (r.pairs||[])){ const tr=document.createElement("tr"); tr.innerHTML=sigRow(x); pb.appendChild(tr); }
+  renderWF();
   const trb=document.getElementById("sigtrows");
   if(trb){ trb.innerHTML=""; for(const x of (r.triples||[])){ const tr=document.createElement("tr"); tr.innerHTML=sigRow(x); trb.appendChild(tr); } }
 }
@@ -5051,6 +5130,13 @@ function revBadge(h){
   if(!h||!h.revert) return '';
   return ` <span class="cbadge cbounce" data-tip="Trend-aligned reversion — this setup is an oversold snap-back in an uptrend / overbought roll-over in a downtrend, BTC-aligned. It's the exact mechanic the whole-universe backtest proved wins (best on 1h+), so it leads the board.">↩ reversion</span>`;
 }
+function labCell(h){
+  const hits=h.lab_hits||[];
+  if(!hits.length) return '<span class="muted">—</span>';
+  const best=h.lab_best;
+  const lbl = hits.length>1 ? (hits.length+' combos') : hits[0].split(' + ').length+'-signal';
+  return `<span class="good"><b>#${best||'?'}</b> ${lbl}</span>`;
+}
 function renderBoard(side){
   const isLong = side==='long';
   const rows = (lastData && (isLong?lastData.long_board:lastData.short_board)) || [];
@@ -5085,11 +5171,14 @@ function renderBoard(side){
       `<td data-tip="Recommended stop — ${esc(h.stop_basis||'beyond the next level')}.">${h.stop!=null?fmtNum(h.stop):'—'}</td>`+
       `<td data-tip="Base target — ${esc((h.tps&&h.tps[0]&&h.tps[0].basis)||'the nearest level the other way')}. Row expands to the full ladder.">${h.target!=null?fmtNum(h.target):'—'}</td>`+
       `<td class="${rrCls}" data-tip="Reward:risk to the base target${h.rr_max!=null?`; the arrow shows R:R to the furthest target (${(+h.rr_max).toFixed(1)}R)`:''}. Click the row for the full ladder.">${rrTxt}</td>`+
+      (side==='long'
+        ? `<td data-tip="${esc((h.lab_hits||[]).join(' · ')||'No out-of-sample-surviving lab combo fires on this coin right now.')}">${labCell(h)}</td>`
+        : '')+
       `<td class="whycell" data-tip="${esc(why.join(' · '))}">${esc(shortWhy)}</td>`;
     tb.appendChild(tr);
     if(open){
       const dr=document.createElement('tr'); dr.className='planrow';
-      dr.innerHTML=`<td colspan="11">${planPanelHtml(h, side, P, h.symbol)}</td>`;
+      dr.innerHTML=`<td colspan="${side==='long'?12:11}">${planPanelHtml(h, side, P, h.symbol)}</td>`;
       tb.appendChild(dr);
     }
   }

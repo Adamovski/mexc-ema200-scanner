@@ -5468,6 +5468,109 @@ def _r_portfolio(sub, start=10000.0, margin=250.0, lev=10.0):
             "curve": curve[::step][:60]}
 
 
+
+def _walk_forward_top(tr, all_entries, ks=(5, 10), min_first=20):
+    """WOULD TRADING ONLY THE BEST COMBOS ACTUALLY WORK?
+
+    The tempting version of this question is: take the top 10 combos over all history, add up their
+    trades, admire the equity curve. That number is worthless. Those combos were CHOSEN because they
+    scored well on exactly that data, so of course the total looks good - it is the same circular
+    reasoning as picking last year's best fund and calling it a forecast.
+
+    So this does it walk-forward instead:
+      1. rank every combo using ONLY the FIRST HALF of history,
+      2. pick the top N from that ranking alone,
+      3. measure how those picks performed across the SECOND HALF, which they never saw.
+
+    Step 3 is the honest estimate of what following them would have done. The in-sample figure is
+    reported alongside purely so the gap between the two is visible - that gap is the size of the
+    self-deception, and it is usually large."""
+    ordered = sorted(tr, key=lambda z: z.get("ts") or 0)
+    mid = len(ordered) // 2
+    first, second = ordered[:mid], ordered[mid:]
+    if not first or not second:
+        return None
+
+    def sel(sub, keys):
+        return [x for x in sub if all(x["sig"].get(k) for k in keys)]
+
+    scored = []
+    for e in all_entries:
+        keys = e.get("keys") or ()
+        f = sel(first, keys)
+        if len(f) < min_first:
+            continue
+        scored.append((sum(x["r"] for x in f) / len(f), e["name"], keys))
+    scored.sort(key=lambda z: -z[0])
+    if not scored:
+        return None
+
+    # EACH of the top 10 measured on its own, out-of-sample
+    solo = []
+    for sc, nm, keys in scored[:max(ks)]:
+        o = sel(second, keys)
+        if not o:
+            solo.append({"name": nm, "in_exp": round(sc, 3), "oos_n": 0}); continue
+        p = _r_portfolio(o)
+        _od = [x for x in o if x.get("r_dca") is not None]
+        pd_ = _r_portfolio([dict(x, r=x["r_dca"]) for x in _od]) if _od else None
+        w = sum(1 for x in o if x["outcome"] == "win")
+        solo.append({"name": nm, "in_exp": round(sc, 3), "oos_n": len(o),
+                     "dca_exp": (round(sum(x["r_dca"] for x in _od) / len(_od), 3) if _od else None),
+                     "dca_total_r": (pd_ or {}).get("total_r"),
+                     "dca_max_dd_r": (pd_ or {}).get("max_dd_r"),
+                     "dca_ret_pct": (pd_ or {}).get("ret_pct"),
+                     "dca_end_equity": (pd_ or {}).get("end_equity"),
+                     "dca_max_dd_pct": (pd_ or {}).get("max_dd_pct"),
+                     "oos_winrate": round(w / len(o) * 100, 1),
+                     "oos_exp": round(sum(x["r"] for x in o) / len(o), 3),
+                     "oos_avg_rr": round(sum(x["rr"] for x in o) / len(o), 2),
+                     "oos_total_r": p["total_r"], "oos_max_dd_r": p["max_dd_r"],
+                     "oos_end_equity": p["end_equity"], "oos_ret_pct": p["ret_pct"],
+                     "oos_max_dd_pct": p["max_dd_pct"], "oos_busted": p["busted"]})
+
+    out = {"solo": solo}
+    for k in ks:
+        picks = scored[:k]
+        if not picks:
+            continue
+        # a trade counts once even if several of the chosen combos fire on it
+        def union(sub):
+            seen = {}
+            for _sc, _nm, keys in picks:
+                for x in sel(sub, keys):
+                    seen[(x.get("ts"), x.get("entry"), x.get("stop"))] = x
+            return sorted(seen.values(), key=lambda z: z.get("ts") or 0)
+        ins, oos = union(first), union(second)
+        if not oos:
+            continue
+        w = sum(1 for x in oos if x["outcome"] == "win")
+        pin = _r_portfolio(ins) if ins else None
+        po = _r_portfolio(oos)
+        dsub = [x for x in oos if x.get("r_dca") is not None]
+        pdca = _r_portfolio([dict(x, r=x["r_dca"]) for x in dsub]) if dsub else None
+        out["top%d" % k] = {
+            "picks": [{"name": nm, "in_exp": round(sc, 3)} for sc, nm, _ in picks],
+            "oos_n": len(oos), "oos_winrate": round(w / len(oos) * 100, 1),
+            "oos_exp": round(sum(x["r"] for x in oos) / len(oos), 3),
+            "oos_avg_rr": round(sum(x["rr"] for x in oos) / len(oos), 2),
+            "oos_total_r": po["total_r"], "oos_max_dd_r": po["max_dd_r"],
+            "oos_end_equity": po["end_equity"], "oos_ret_pct": po["ret_pct"],
+            "oos_max_dd_pct": po["max_dd_pct"], "oos_max_dd_usd": po["max_dd_usd"],
+            "oos_worst": po["worst_trade"], "oos_busted": po["busted"],
+            "oos_curve": po["curve"],
+            "oos_exp_dca": (round(sum(x["r_dca"] for x in dsub) / len(dsub), 3) if dsub else None),
+            "dca_total_r": (pdca or {}).get("total_r"), "dca_max_dd_r": (pdca or {}).get("max_dd_r"),
+            "dca_end_equity": (pdca or {}).get("end_equity"), "dca_ret_pct": (pdca or {}).get("ret_pct"),
+            "dca_max_dd_pct": (pdca or {}).get("max_dd_pct"),
+            "dca_max_dd_usd": (pdca or {}).get("max_dd_usd"),
+            "dca_busted": (pdca or {}).get("busted"), "dca_curve": (pdca or {}).get("curve"),
+            "in_n": len(ins), "in_exp": (round(sum(x["r"] for x in ins) / len(ins), 3) if ins else None),
+            "in_ret_pct": (pin or {}).get("ret_pct"),
+        }
+    return out
+
+
 def _bt_signal_ranking(trades, min_n=50):
     """Rank ~60 SIGNALS, then their PAIRS and TRIPLES, by how much each shifts expectancy.
 
@@ -5501,23 +5604,24 @@ def _bt_signal_ranking(trades, min_n=50):
             if dsub:
                 _dp = _r_portfolio(sorted(
                     [dict(x, r=x["r_dca"]) for x in dsub], key=lambda z: z.get("ts") or 0))
-                base["dca_end_equity"] = _dp["end_equity"]
-                base["dca_max_dd_pct"] = _dp["max_dd_pct"]
-                base["dca_busted"] = _dp["busted"]
+                base["dca_total_r"] = _dp["total_r"]; base["dca_max_dd_r"] = _dp["max_dd_r"]
+                base["dca_end_equity"] = _dp["end_equity"]; base["dca_pnl"] = _dp["pnl"]
+                base["dca_ret_pct"] = _dp["ret_pct"]; base["dca_max_dd_pct"] = _dp["max_dd_pct"]
+                base["dca_max_dd_usd"] = _dp["max_dd_usd"]; base["dca_busted"] = _dp["busted"]
         return base
 
-    def entry(label, pred):
+    def entry(label, pred, keys=()):
         on = [x for x in tr if pred(x["sig"])]
         if len(on) < min_n:
             return None
         a = stats(on, full=True)
         f1 = stats([x for x in first if pred(x["sig"])])
         f2 = stats([x for x in second if pred(x["sig"])])
-        return {"name": label, **a, "lift": round(a["exp"] - base_exp, 3),
+        return {"name": label, "keys": list(keys), **a, "lift": round(a["exp"] - base_exp, 3),
                 "h1": (f1 or {}).get("exp"), "h2": (f2 or {}).get("exp"),
                 "robust": bool(f1 and f2 and f1["exp"] > base_exp and f2["exp"] > base_exp)}
 
-    singles = [e for e in (entry(nm, (lambda n: (lambda g: g.get(n)))(nm)) for nm in names) if e]
+    singles = [e for e in (entry(nm, (lambda n: (lambda g: g.get(n)))(nm), (nm,)) for nm in names) if e]
     singles.sort(key=lambda z: -z["lift"])
 
     top = [x["name"] for x in singles[:18]]
@@ -5525,7 +5629,7 @@ def _bt_signal_ranking(trades, min_n=50):
     for i in range(len(top)):
         for j in range(i + 1, len(top)):
             a, b = top[i], top[j]
-            e = entry(a + " + " + b, (lambda p, q: (lambda g: g.get(p) and g.get(q)))(a, b))
+            e = entry(a + " + " + b, (lambda p, q: (lambda g: g.get(p) and g.get(q)))(a, b), (a, b))
             if e:
                 pairs.append(e)
     pairs.sort(key=lambda z: -z["lift"])
@@ -5537,17 +5641,21 @@ def _bt_signal_ranking(trades, min_n=50):
             for k in range(j + 1, len(top3)):
                 a, b, c = top3[i], top3[j], top3[k]
                 e = entry(a + " + " + b + " + " + c,
-                          (lambda p, q, r: (lambda g: g.get(p) and g.get(q) and g.get(r)))(a, b, c))
+                          (lambda p, q, r: (lambda g: g.get(p) and g.get(q) and g.get(r)))(a, b, c),
+                          (a, b, c))
                 if e:
                     triples.append(e)
     triples.sort(key=lambda z: -z["lift"])
 
+    all_entries = singles + pairs + triples
+    walk = _walk_forward_top(tr, all_entries)
     tested = len(singles) + len(pairs) + len(triples)
     return {"base_exp": round(base_exp, 3), "n": len(tr), "tested": tested,
             "expected_false": round(tested * 0.05, 1),
             "robust_count": sum(1 for x in singles + pairs + triples if x["robust"]),
-            "n_signals": len(names),
-            "singles": singles, "pairs": pairs[:30], "triples": triples[:25]}
+            "n_signals": len(names), "walk_forward": walk,
+            "singles": singles[:10], "pairs": pairs[:10], "triples": triples[:10],
+            "all_singles_n": len(singles)}
 
 
 def _bt_emaconf(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, tf="4h", mkt_ctx=None,
@@ -6728,6 +6836,30 @@ def confluence_box(rows, side="long", band_atr=1.2, swing_look=60):
                             else ("strong close above " + str(round(box_hi, 8)))}
 
 
+def signal_flags_now(rows, mkt_ctx=None):
+    """The same 63-indicator read the lab uses, evaluated on the LATEST candle. This is what lets a
+    live coin be checked against the combos that actually survived out-of-sample testing - the lab
+    and the live board must ask the identical question or the whole exercise is decorative."""
+    try:
+        H = [float(x[2]) for x in rows]; L = [float(x[3]) for x in rows]
+        C = [float(x[4]) for x in rows]; V = [float(x[5]) for x in rows]
+    except (ValueError, IndexError, TypeError):
+        return None
+    n = len(C)
+    if n < 220:
+        return None
+    try:
+        e10, e20, e50, e200 = ema(C, 10), ema(C, 20), ema(C, 50), ema(C, 200)
+        e1200 = ema(C, 1200)
+        st, sdir = _st_series(H, L, C, 10, 3.0)
+        rsis = rsi_series(C)
+        ml, ms = _macd(C)
+        return _signal_flags(H, L, C, V, n - 1, e10, e20, e50, e200, e1200,
+                             st, sdir, rsis, ml, ms, mkt_ctx, rows)
+    except Exception:
+        return None
+
+
 def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
                       cfg: dict) -> tuple:
     """Fetch klines ONCE and run every detector (200-EMA reclaim, bull flag,
@@ -6899,6 +7031,11 @@ def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
     except Exception:
         dtb_hit = accum_hit = None
 
+    try:
+        if long_setup:
+            long_setup["sig"] = signal_flags_now(rows)
+    except Exception:
+        pass
     return (run_diag, ema_hit, flag_hit, cpr_hit, bounce_hit, wedge_hit, short_hit,
             st_bounce_hit, early_hit, long_setup, short_setup, coil_setup,
             dtb_hit, accum_hit)
