@@ -5716,9 +5716,15 @@ def _bt_signal_ranking(trades, min_n=50):
         a = stats(on, full=True)
         f1 = stats([x for x in first if pred(x["sig"])])
         f2 = stats([x for x in second if pred(x["sig"])])
+        _h1 = (f1 or {}).get("exp"); _h2 = (f2 or {}).get("exp")
+        # "Holds up" must mean PROFITABLE in both halves, not merely "beat the baseline in both".
+        # The neutral base strategy loses money, so the old comparison handed a green tick to combos
+        # whose second half was negative - they just lost less than the base. That is not survival.
         return {"name": label, "keys": list(keys), **a, "lift": round(a["exp"] - base_exp, 3),
-                "h1": (f1 or {}).get("exp"), "h2": (f2 or {}).get("exp"),
-                "robust": bool(f1 and f2 and f1["exp"] > base_exp and f2["exp"] > base_exp)}
+                "h1": _h1, "h2": _h2,
+                "robust": bool(_h1 is not None and _h2 is not None and _h1 > 0 and _h2 > 0),
+                "beats_base_both": bool(f1 and f2 and f1["exp"] > base_exp and f2["exp"] > base_exp),
+                "decay": (round(_h2 - _h1, 3) if (_h1 is not None and _h2 is not None) else None)}
 
     singles = [e for e in (entry(nm, (lambda n: (lambda g: g.get(n)))(nm), (nm,)) for nm in names) if e]
     singles.sort(key=lambda z: -z["lift"])

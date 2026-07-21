@@ -2773,7 +2773,7 @@ PAGE = """<!doctype html>
 <div class="wrap">
   <h3 style="margin:6px 0 4px">Individual signals <span class="rr" id="sigcount"></span></h3>
   <table id="sigtbl">
-    <thead><tr><th>Signal</th><th>Trades</th><th>Win rate</th><th>Expectancy (R)</th><th>Exp. w/ DCA</th><th>DCA helps?</th><th>Lift vs base</th><th>Total R</th><th>Max DD (R)</th><th>End equity</th><th>Return</th><th>Max DD $</th><th>Worst trade</th><th>1st half</th><th>2nd half</th><th>Holds up?</th></tr></thead>
+    <thead><tr><th>Signal</th><th>Trades</th><th>Win rate</th><th>Expectancy (R)</th><th>Exp. w/ DCA</th><th>DCA helps?</th><th>Lift vs base</th><th>Total R</th><th>Max DD (R)</th><th>End equity</th><th>Return</th><th>Max DD $</th><th>Worst trade</th><th>1st half</th><th>2nd half</th><th>Decay</th><th>Profitable both halves?</th></tr></thead>
     <tbody id="sigrows"></tbody>
   </table>
   <div id="sigempty" class="empty">No signal results yet &mdash; the lab runs on a ~6-hour cycle.</div>
@@ -2781,14 +2781,14 @@ PAGE = """<!doctype html>
 <div class="wrap" style="margin-top:14px">
   <h3 style="margin:6px 0 4px">Best pairs (confluence)</h3>
   <table id="sigptbl">
-    <thead><tr><th>Combination</th><th>Trades</th><th>Win rate</th><th>Expectancy (R)</th><th>Exp. w/ DCA</th><th>DCA helps?</th><th>Lift vs base</th><th>Total R</th><th>Max DD (R)</th><th>End equity</th><th>Return</th><th>Max DD $</th><th>Worst trade</th><th>1st half</th><th>2nd half</th><th>Holds up?</th></tr></thead>
+    <thead><tr><th>Combination</th><th>Trades</th><th>Win rate</th><th>Expectancy (R)</th><th>Exp. w/ DCA</th><th>DCA helps?</th><th>Lift vs base</th><th>Total R</th><th>Max DD (R)</th><th>End equity</th><th>Return</th><th>Max DD $</th><th>Worst trade</th><th>1st half</th><th>2nd half</th><th>Decay</th><th>Profitable both halves?</th></tr></thead>
     <tbody id="sigprows"></tbody>
   </table>
 </div>
 <div class="wrap" style="margin-top:14px">
   <h3 style="margin:6px 0 4px">Best triples (3-signal confluence)</h3>
   <table id="sigttbl">
-    <thead><tr><th>Combination</th><th>Trades</th><th>Win rate</th><th>Expectancy (R)</th><th>Exp. w/ DCA</th><th>DCA helps?</th><th>Lift vs base</th><th>Total R</th><th>Max DD (R)</th><th>End equity</th><th>Return</th><th>Max DD $</th><th>Worst trade</th><th>1st half</th><th>2nd half</th><th>Holds up?</th></tr></thead>
+    <thead><tr><th>Combination</th><th>Trades</th><th>Win rate</th><th>Expectancy (R)</th><th>Exp. w/ DCA</th><th>DCA helps?</th><th>Lift vs base</th><th>Total R</th><th>Max DD (R)</th><th>End equity</th><th>Return</th><th>Max DD $</th><th>Worst trade</th><th>1st half</th><th>2nd half</th><th>Decay</th><th>Profitable both halves?</th></tr></thead>
     <tbody id="sigtrows"></tbody>
   </table>
 </div>
@@ -4793,7 +4793,9 @@ function renderWF(){
 }
 function sigRow(x){
   const lift=(x.lift||0), col=lift>0?"good":(lift<0?"bad":"");
-  const rb=x.robust?'<span class="good">yes</span>':'<span class="bad">no</span>';
+  const rb=x.robust?'<span class="good">yes</span>'
+        :(x.beats_base_both?'<span class="warn">beat base only</span>':'<span class="bad">no</span>');
+  const dc=(x.decay==null)?null:x.decay;
   const pc=(x.ret_pct||0), pcol=pc>0?"good":(pc<0?"bad":"");
   const wt=(x.worst_trade||0);
   const dx=(x.exp_dca==null?null:x.exp_dca);
@@ -4807,7 +4809,10 @@ function sigRow(x){
          `<td class="${pcol}">${pc>0?"+":""}${pc.toFixed(1)}%</td>`+
          `<td class="bad">-$${(x.max_dd_usd||0).toLocaleString()} (${(x.max_dd_pct||0).toFixed(0)}%)</td>`+
          `<td class="bad">$${wt.toLocaleString()}</td>`+
-         `<td>${x.h1==null?"&mdash;":x.h1.toFixed(3)}</td><td>${x.h2==null?"&mdash;":x.h2.toFixed(3)}</td><td>${rb}</td>`;
+         `<td class="${(x.h1||0)>0?"good":"bad"}">${x.h1==null?"&mdash;":x.h1.toFixed(3)}</td>`+
+         `<td class="${(x.h2||0)>0?"good":"bad"}">${x.h2==null?"&mdash;":x.h2.toFixed(3)}</td>`+
+         `<td class="${dc==null?"":(dc<0?"bad":"good")}">${dc==null?"&mdash;":(dc>0?"+":"")+dc.toFixed(3)}</td>`+
+         `<td>${rb}</td>`;
 }
 function renderSignals(){
   const b=document.getElementById("sigbase"), tb=document.getElementById("sigrows"), pb=document.getElementById("sigprows");
@@ -4818,7 +4823,9 @@ function renderSignals(){
   if(!r){ if(emp) emp.style.display="block"; if(b) b.innerHTML=""; return; }
   if(emp) emp.style.display="none";
   if(b) b.innerHTML=`<div class="status"><span>Base strategy: <b>${r.n}</b> trades, expectancy <b>${(r.base_exp||0).toFixed(3)}R</b>. Every signal below is measured against that.<br>`+
-    `<b>${r.tested||0}</b> combinations were tested. If every signal were pure noise, roughly <b>${r.expected_false||0}</b> would still look significant by chance &mdash; so treat any single top row with suspicion and weight the <b>Holds up?</b> column instead. <b>${r.robust_count||0}</b> passed both halves of history.<br>`+
+    `<b>${r.tested||0}</b> combinations were tested. If every signal were pure noise, roughly <b>${r.expected_false||0}</b> would still look significant by chance &mdash; so treat any single top row with suspicion and weight the <b>Holds up?</b> column instead. <b>${r.robust_count||0}</b> were <b>profitable in both halves</b>.<br>`+
+    `<b>Read the two half-columns before anything else.</b> "Profitable both halves" now means exactly that &mdash; positive in each half independently. It previously meant "beat the baseline in both", which was misleading, because the baseline itself loses money: a combo whose second half was <i>negative</i> could still collect a green tick simply by losing less. Those now read <span class="warn">beat base only</span>.<br>`+
+    `<b>Decay</b> is second half minus first half. Large negative decay is the signature of a fitted edge fading once it meets data it was not chosen on.<br>`+
     `<b>Money columns</b> use your sizing on <b>cross</b> margin: <b>$10,000</b> account, <b>$250 margin at 10x</b> = a $2,500 position, taken in date order. Because margin is cross the whole balance backs the trade &mdash; a $2,500 position is <b>not</b> force-closed by a 10% adverse move, so <b>the stop is actually reached</b> instead of the position being liquidated early.<br>`+
     `Dollar risk is position size &times; distance to stop: a 5% stop risks $125 (1.25% of the account), a 20% stop risks $500 (<b>5%</b>). Under cross the danger is not any single trade &mdash; it is a losing streak draining shared collateral, which is exactly what <b>Max DD</b> measures.<br>`+
     `<b>Exp. w/ DCA</b> adds a second equal-size unit halfway to the stop. It cuts both ways: a full stop-out becomes about <b>-1.5R</b> rather than -1R, while winners that dipped first pay considerably more. DCA does not create edge &mdash; it widens both tails. If a signal only becomes profitable with DCA switched on, treat that as a warning rather than a discovery.<br>`+
