@@ -4113,7 +4113,7 @@ def _st_series(H, L, C, period=10, mult=3.0):
     return st, d
 
 
-def _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, kind, long, t, entry, stop, target, a, rs=None, mkt_ctx=None):
+def _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, kind, long, t, entry, stop, target, a, rs=None, mkt_ctx=None, skip_risk_off=True):
     """Shared forward simulator: resolve one trade (stop/target first-touch, stop-first on a tie),
     net of fees, tagged with the full context every backtest metric needs. Returns (trade, rbar)."""
     risk = (entry - stop) if long else (stop - entry)
@@ -4132,7 +4132,11 @@ def _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx, kind, long
     mbpct = _ms.get("bpct") if _ms else None
     mim = _ms.get("im") if _ms else None
     mbdir = _ms.get("bdir") if _ms else None
-    if long and mbr == "risk_off":          # don't buy alts when broad breadth is risk-off
+    if long and mbr == "risk_off" and skip_risk_off:
+        # The live boards refuse to buy alts into risk-off breadth. The SIGNAL LAB must not inherit
+        # that: skipping those bars means never testing a long in a bearish tape, which is precisely
+        # the condition we most need evidence about. The lab passes skip_risk_off=False and instead
+        # carries risk-on/off as one of its 63 indicators, so the data decides whether it matters.
         return None, None
     f = t + 1; outcome = rbar = None; mfe = 0.0; mae = 0.0
     for j in range(f, min(n, f + horizon + 1)):
@@ -5419,7 +5423,8 @@ def _bt_signals(rows, side, fees_bps=5.0, horizon=30, warmup=210, btc_ctx=None, 
             t += 1; continue
         entry = C[t]; stop = entry - 1.5 * a; target = entry + 3.0 * a
         tr, rbar = _bt_sim(rows, C, H, L, e200, dvol, fee_frac, horizon, n, btc_ctx,
-                           "signals", True, t, entry, stop, target, a, mkt_ctx=mkt_ctx)
+                           "signals", True, t, entry, stop, target, a, mkt_ctx=mkt_ctx,
+                           skip_risk_off=False)
         if tr is None:
             t += 1; continue
         tr["sig"] = _signal_flags(H, L, C, V, t, e10, e20, e50, e200, e1200, st, sdir,
@@ -5467,6 +5472,57 @@ def _r_portfolio(sub, start=10000.0, margin=250.0, lev=10.0):
             "worst_trade": round(worst), "busted": bool(busted),
             "curve": curve[::step][:60]}
 
+
+
+def _bt_backdrop(trades):
+    """WHAT MARKET DID WE ACTUALLY TEST IN?
+
+    Every backtest result is meaningless without this. A long-only strategy that made money while
+    everything rose has proved little; the same strategy surviving a period when alts bled is a far
+    stronger claim. Rather than either of us guessing which it was, this measures it from the same
+    bars the trades came from: how much of the test window was risk-on vs risk-off breadth, and what
+    the market index was doing underneath."""
+    if not trades:
+        return None
+    br = {}; im = {}
+    for t in trades:
+        b = t.get("breadth") or "unknown"
+        i = t.get("imom") or "unknown"
+        br[b] = br.get(b, 0) + 1
+        im[i] = im.get(i, 0) + 1
+    n = len(trades)
+    risk_off = br.get("risk_off", 0); risk_on = br.get("risk_on", 0)
+    down = im.get("down", 0) + im.get("strong_down", 0)
+    up = im.get("up", 0) + im.get("strong_up", 0)
+    ts = sorted(t.get("ts") or 0 for t in trades)
+    return {"n": n,
+            "risk_on_pct": round(risk_on / n * 100, 1),
+            "risk_off_pct": round(risk_off / n * 100, 1),
+            "idx_up_pct": round(up / n * 100, 1),
+            "idx_down_pct": round(down / n * 100, 1),
+            "breadth": sorted(br.items(), key=lambda kv: -kv[1]),
+            "index_mom": sorted(im.items(), key=lambda kv: -kv[1]),
+            "from_ts": ts[0], "to_ts": ts[-1]}
+
+
+def _bt_by_regime(sub):
+    """The same set of trades cut by market regime. The question that matters for a long-only system
+    is not 'did it make money' but 'did it make money when the market was NOT helping'. If the whole
+    edge lives in the risk-on rows, it is a beta bet wearing a strategy costume."""
+    g = {}
+    for t in sub:
+        k = t.get("breadth") or "unknown"
+        g.setdefault(k, []).append(t)
+    out = []
+    for k in sorted(g):
+        v = g[k]
+        w = sum(1 for x in v if x["outcome"] == "win")
+        p = _r_portfolio(sorted(v, key=lambda z: z.get("ts") or 0))
+        out.append({"regime": k, "n": len(v), "winrate": round(w / len(v) * 100, 1),
+                    "exp": round(sum(x["r"] for x in v) / len(v), 3),
+                    "total_r": p["total_r"], "max_dd_r": p["max_dd_r"],
+                    "ret_pct": p["ret_pct"], "max_dd_pct": p["max_dd_pct"]})
+    return out
 
 
 def _walk_forward_top(tr, all_entries, ks=(5, 10), min_first=20):
@@ -5558,7 +5614,7 @@ def _walk_forward_top(tr, all_entries, ks=(5, 10), min_first=20):
             "oos_end_equity": po["end_equity"], "oos_ret_pct": po["ret_pct"],
             "oos_max_dd_pct": po["max_dd_pct"], "oos_max_dd_usd": po["max_dd_usd"],
             "oos_worst": po["worst_trade"], "oos_busted": po["busted"],
-            "oos_curve": po["curve"],
+            "oos_curve": po["curve"], "oos_by_regime": _bt_by_regime(oos),
             "oos_exp_dca": (round(sum(x["r_dca"] for x in dsub) / len(dsub), 3) if dsub else None),
             "dca_total_r": (pdca or {}).get("total_r"), "dca_max_dd_r": (pdca or {}).get("max_dd_r"),
             "dca_end_equity": (pdca or {}).get("end_equity"), "dca_ret_pct": (pdca or {}).get("ret_pct"),
@@ -5654,6 +5710,7 @@ def _bt_signal_ranking(trades, min_n=50):
             "expected_false": round(tested * 0.05, 1),
             "robust_count": sum(1 for x in singles + pairs + triples if x["robust"]),
             "n_signals": len(names), "walk_forward": walk,
+            "backdrop": _bt_backdrop(tr),
             "singles": singles[:10], "pairs": pairs[:10], "triples": triples[:10],
             "all_singles_n": len(singles)}
 

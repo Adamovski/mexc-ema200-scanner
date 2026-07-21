@@ -4701,7 +4701,19 @@ function renderWF(){
   const hdr='<tr><th>Strategy</th><th>Trades</th><th>Win rate</th><th>Exp (R)</th><th>Avg R:R</th>'+
     '<th>Total R</th><th>Max DD (R)</th><th>Return</th><th>Max DD</th>'+
     '<th>Total R <i>DCA</i></th><th>Max DD (R) <i>DCA</i></th><th>Return <i>DCA</i></th><th>Max DD <i>DCA</i></th></tr>';
-  let h='<div class="status"><span>🏆 <b>Top strategies, tested walk-forward</b><br>'+
+  const bd=(r&&r.backdrop)||null;
+  let h='';
+  if(bd){
+    const bear = bd.risk_off_pct > bd.risk_on_pct;
+    h+='<div class="status"><span>🌍 <b>What market did we test in?</b> &mdash; measured from the same bars, not assumed.<br>'+
+      'Breadth was <b>risk-off '+bd.risk_off_pct+'%</b> of the time vs <b>risk-on '+bd.risk_on_pct+'%</b>; '+
+      'the index was falling '+bd.idx_down_pct+'% and rising '+bd.idx_up_pct+'% of the time, across <b>'+bd.n.toLocaleString()+'</b> trades.<br>'+
+      (bear
+        ? '<b class="good">The test period was net bearish for alts.</b> That raises the bar in a useful way: a long-only edge that survives a falling tape is a much stronger claim than one earned while everything went up.'
+        : '<b class="warn">The test period was net risk-on.</b> A long-only edge earned mostly in a rising tape is partly just beta &mdash; check the regime split below before trusting it.')+
+      '</span></div>';
+  }
+  h+='<div class="status"><span>🏆 <b>Top strategies, tested walk-forward</b><br>'+
     'Every combo was ranked using <b>only the first half</b> of history. The top 10 from that ranking were then measured across the <b>second half, which they never saw</b>. '+
     'That second-half number is the honest estimate &mdash; it is the backtest that shows whether an edge survives.<br>'+
     '<span class="warn">Why not just rank over all history and total it up? Because those combos were chosen <i>because</i> they scored well on that data, so the total is guaranteed to look good. That is the same reasoning as picking the best fund of last year and calling it a forecast. The in-sample figure is shown below only so you can see the gap &mdash; the gap is the size of the self-deception.</span></span></div>';
@@ -4718,6 +4730,22 @@ function renderWF(){
     h+='<tr style="background:rgba(80,200,120,.07)">'+row+'</tr>';
   }
   h+='</tbody></table>';
+  // regime split: does the edge survive when the market is NOT helping?
+  for(const [k,l] of [["top5","Top 5"],["top10","Top 10"]]){
+    const b=w[k]; const rg=b&&b.oos_by_regime; if(!rg||!rg.length) continue;
+    h+='<h3 style="margin:14px 0 4px">'+l+' broken down by market regime</h3>'+
+       '<div class="status"><span>The question that matters for a long-only system is not whether it made money, but whether it made money <b>when the market was not helping</b>. If the entire edge sits in the risk-on row, it is a bet on market direction wearing a strategy costume.</span></div>'+
+       '<table><thead><tr><th>Regime</th><th>Trades</th><th>Win rate</th><th>Exp (R)</th><th>Total R</th><th>Max DD (R)</th><th>Return</th><th>Max DD</th></tr></thead><tbody>';
+    for(const x of rg){
+      const cl=(x.exp>0)?"good":"bad";
+      h+='<tr><td><b>'+x.regime+'</b></td><td>'+x.n+'</td><td>'+x.winrate+'%</td>'+
+         '<td class="'+cl+'">'+x.exp.toFixed(3)+'</td><td>'+x.total_r.toFixed(1)+'R</td>'+
+         '<td class="bad">-'+x.max_dd_r.toFixed(1)+'R</td>'+
+         '<td class="'+((x.ret_pct>0)?"good":"bad")+'">'+(x.ret_pct>0?"+":"")+x.ret_pct.toFixed(1)+'%</td>'+
+         '<td class="bad">-'+x.max_dd_pct.toFixed(0)+'%</td></tr>';
+    }
+    h+='</tbody></table>';
+  }
   const t5=w.top5, t10=w.top10;
   if(t5||t10){
     h+='<div class="status" style="margin-top:8px"><span>';
@@ -4726,7 +4754,7 @@ function renderWF(){
          ') &rarr; out-of-sample <b>'+(b.oos_exp==null?"&mdash;":b.oos_exp.toFixed(3))+'R</b>/trade ('+(b.oos_ret_pct==null?"&mdash;":b.oos_ret_pct.toFixed(0)+'%')+')'+
          (b.oos_busted?' &mdash; <span class="bad">ACCOUNT BUSTED</span>':'')+'<br>';
     }
-    h+='<span class="warn">If out-of-sample is far below in-sample, the ranking was fitting noise. If it holds up, that is genuine evidence &mdash; but it is still one market era, and these are all long-only signals tested largely through a period when crypto rose. A rising tide flatters every long strategy.</span></span></div>';
+    h+='<span class="warn">If out-of-sample is far below in-sample, the ranking was fitting noise. If it holds up, that is genuine evidence &mdash; but it is still one market era, and these are long-only signals, so the regime breakdown above is the part to read hardest &mdash; it shows whether the edge exists when the tape is against you or only when it is helping.</span></span></div>';
   }
   el.innerHTML=h;
 }
