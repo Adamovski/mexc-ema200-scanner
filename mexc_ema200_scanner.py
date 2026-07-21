@@ -34,6 +34,7 @@ import argparse
 import csv
 import os
 import sys
+import random
 import time
 
 # Which MEXC universe to scan:
@@ -5668,6 +5669,220 @@ def _walk_forward_top(tr, all_entries, ks=(5, 10), min_first=20):
             "in_ret_pct": (pin or {}).get("ret_pct"),
         }
     return out
+
+
+SIG_NAMES = None          # fixed, sorted signal order — set on first use
+
+
+def _sig_mask(flags):
+    """Pack the 63 indicator booleans into a single integer.
+
+    Storing a dict per trade is what makes a full-universe sweep impossible on a small instance:
+    ~180,000 trades x 63 keys is gigabytes of Python objects. As a bitmask each trade costs one
+    int, so the entire universe fits comfortably in memory and the combo tests become bitwise ANDs
+    (which are also far faster than repeated dict lookups)."""
+    global SIG_NAMES
+    if SIG_NAMES is None:
+        SIG_NAMES = sorted(flags.keys())
+    m = 0
+    for i, k in enumerate(SIG_NAMES):
+        if flags.get(k):
+            m |= (1 << i)
+    return m
+
+
+def _mask_bits(keys):
+    """Turn signal names into the bitmask to test against."""
+    if SIG_NAMES is None:
+        return 0
+    m = 0
+    for k in keys:
+        try:
+            m |= (1 << SIG_NAMES.index(k))
+        except ValueError:
+            return 0
+    return m
+
+
+def signal_lab_stream(sess, market, symbols, tf="4h", limit=8760, fees_bps=5.0,
+                      index_sym="BTCUSDT", ref_size=60, progress=None):
+    """Run the signal lab over the FULL universe, one coin at a time.
+
+    The old sweep pre-fetched every coin's candles and held them all at once, which caps the test at
+    a few dozen coins before memory runs out - that is why the lab had been limited to a 60-coin
+    basket. Here the market-breadth context is built from a reference sample (breadth is a
+    market-wide statistic, so a sample estimates it fine), then every remaining coin is fetched,
+    scored, and its candles thrown away immediately - keeping only the compact trade records.
+
+    Also records which coin each trade came from, so results can be validated on coins that took no
+    part in choosing the strategy."""
+    ref = list(symbols)[:ref_size]
+    rows_by = {}
+    for sym in ref:
+        try:
+            r = fetch_candles_deep(sess, sym, tf, limit, market)
+            if r:
+                rows_by[sym] = r
+        except Exception:
+            pass
+    _brows = rows_by.get(index_sym)
+    if not _brows:
+        try:
+            _brows = fetch_candles_deep(sess, index_sym, tf, limit, market)
+        except Exception:
+            _brows = None
+    btc_ctx = _btc_regime_ctx(_brows) if _brows else {}
+    mkt_ctx = _market_ctx(rows_by, index_sym)
+    del rows_by                                   # free the reference candles immediately
+
+    trades = []
+    total = len(symbols)
+    for i, sym in enumerate(symbols):
+        try:
+            rows = fetch_candles_deep(sess, sym, tf, limit, market)
+            if rows and len(rows) > 300:
+                for t in _bt_signals(rows, "long", fees_bps=fees_bps, btc_ctx=btc_ctx,
+                                     tf=tf, mkt_ctx=mkt_ctx):
+                    trades.append({"r": t["r"], "rr": t["rr"], "outcome": t["outcome"],
+                                   "ts": t["ts"], "stopw": t["stopw"],
+                                   "r_dca": t.get("r_dca"), "breadth": t.get("breadth"),
+                                   "imom": t.get("imom"), "sym": sym,
+                                   "mask": _sig_mask(t["sig"])})
+            del rows
+        except Exception:
+            pass
+        if progress and i % 10 == 0:
+            try:
+                progress(i + 1, total, len(trades))
+            except Exception:
+                pass
+    return trades
+
+
+def _bt_signal_ranking_mask(trades, min_n=60, holdout_frac=0.30, seed=7):
+    """Rank ~63 indicators and their combos over the FULL universe, with TWO independent holdouts.
+
+    Two different things can fool us, so both are tested separately:
+
+      TIME holdout  - rank on the first half of history, measure on the second half.
+                      Catches a combo that only worked in one market era.
+      COIN holdout  - a random 30% of coins are set aside and take NO part in ranking.
+                      Catches a combo that is really an artefact of a few specific coins.
+
+    A strategy that survives both is a much stronger claim than one that survives either. Anything
+    that only looks good in-sample is showing the size of the fitting, not the size of an edge."""
+    tr = [t for t in trades if t.get("mask") is not None]
+    if len(tr) < min_n or not SIG_NAMES:
+        return None
+    names = list(SIG_NAMES)
+    base_exp = sum(x["r"] for x in tr) / len(tr)
+
+    syms = sorted({t["sym"] for t in tr})
+    rnd = random.Random(seed)
+    rnd.shuffle(syms)
+    n_hold = max(1, int(len(syms) * holdout_frac))
+    hold_syms = set(syms[:n_hold]); rank_syms = set(syms[n_hold:])
+    rank_tr = [t for t in tr if t["sym"] in rank_syms]
+    hold_tr = [t for t in tr if t["sym"] in hold_syms]
+
+    ordered = sorted(rank_tr, key=lambda z: z["ts"] or 0)
+    mid = len(ordered) // 2
+    first, second = ordered[:mid], ordered[mid:]
+
+    def stats(sub, full=False):
+        if not sub:
+            return None
+        w = sum(1 for x in sub if x["outcome"] == "win")
+        b = {"n": len(sub), "winrate": round(w / len(sub) * 100, 1),
+             "exp": round(sum(x["r"] for x in sub) / len(sub), 3),
+             "avg_rr": round(sum(x["rr"] for x in sub) / len(sub), 2)}
+        d = [x for x in sub if x.get("r_dca") is not None]
+        if d:
+            b["exp_dca"] = round(sum(x["r_dca"] for x in d) / len(d), 3)
+            b["dca_helps"] = bool(b["exp_dca"] > b["exp"])
+        if full:
+            b.update(_r_portfolio(sorted(sub, key=lambda z: z["ts"] or 0)))
+            if d:
+                _dp = _r_portfolio(sorted([dict(x, r=x["r_dca"]) for x in d],
+                                          key=lambda z: z["ts"] or 0))
+                b["dca_total_r"] = _dp["total_r"]; b["dca_max_dd_r"] = _dp["max_dd_r"]
+                b["dca_ret_pct"] = _dp["ret_pct"]; b["dca_max_dd_pct"] = _dp["max_dd_pct"]
+                b["dca_end_equity"] = _dp["end_equity"]
+        return b
+
+    def sel(sub, bits):
+        return [x for x in sub if (x["mask"] & bits) == bits]
+
+    def entry(label, keys):
+        bits = _mask_bits(keys)
+        if not bits:
+            return None
+        on = sel(rank_tr, bits)
+        if len(on) < min_n:
+            return None
+        a = stats(on, full=True)
+        f1 = stats(sel(first, bits)); f2 = stats(sel(second, bits))
+        ho = sel(hold_tr, bits)
+        h = stats(ho, full=True) if len(ho) >= 20 else None
+        _h1 = (f1 or {}).get("exp"); _h2 = (f2 or {}).get("exp")
+        return {"name": label, "keys": list(keys), **a,
+                "lift": round(a["exp"] - base_exp, 3),
+                "h1": _h1, "h2": _h2,
+                "decay": (round(_h2 - _h1, 3) if (_h1 is not None and _h2 is not None) else None),
+                "robust": bool(_h1 is not None and _h2 is not None and _h1 > 0 and _h2 > 0),
+                "hold_n": (h or {}).get("n", 0), "hold_exp": (h or {}).get("exp"),
+                "hold_winrate": (h or {}).get("winrate"), "hold_ret_pct": (h or {}).get("ret_pct"),
+                "hold_max_dd_pct": (h or {}).get("max_dd_pct"),
+                "hold_ok": bool(h and (h.get("exp") or -9) > 0),
+                "survives_both": bool(_h1 is not None and _h2 is not None and _h1 > 0 and _h2 > 0
+                                      and h and (h.get("exp") or -9) > 0)}
+
+    singles = [e for e in (entry(nm, (nm,)) for nm in names) if e]
+    singles.sort(key=lambda z: -z["lift"])
+    top = [x["name"] for x in singles[:18]]
+    pairs = []
+    for i in range(len(top)):
+        for j in range(i + 1, len(top)):
+            e = entry(top[i] + " + " + top[j], (top[i], top[j]))
+            if e:
+                pairs.append(e)
+    pairs.sort(key=lambda z: -z["lift"])
+    top3 = [x["name"] for x in singles[:10]]
+    triples = []
+    for i in range(len(top3)):
+        for j in range(i + 1, len(top3)):
+            for k in range(j + 1, len(top3)):
+                e = entry(top3[i] + " + " + top3[j] + " + " + top3[k], (top3[i], top3[j], top3[k]))
+                if e:
+                    triples.append(e)
+    triples.sort(key=lambda z: -z["lift"])
+
+    all_e = singles + pairs + triples
+    survivors = [e for e in all_e if e["survives_both"]]
+    survivors.sort(key=lambda z: -(z.get("hold_exp") or 0))
+
+    # portfolio of everything that cleared BOTH holdouts, measured on the unseen coins only
+    combined = None
+    if survivors:
+        seen = {}
+        for e in survivors:
+            bits = _mask_bits(e["keys"])
+            for x in sel(hold_tr, bits):
+                seen[(x["ts"], x["sym"], x["stopw"])] = x
+        allx = sorted(seen.values(), key=lambda z: z["ts"] or 0)
+        if allx:
+            combined = stats(allx, full=True)
+            combined["n_strategies"] = len(survivors)
+            combined["by_regime"] = _bt_by_regime(allx)
+
+    return {"base_exp": round(base_exp, 3), "n": len(tr), "n_signals": len(names),
+            "coins": len(syms), "rank_coins": len(rank_syms), "hold_coins": len(hold_syms),
+            "tested": len(all_e), "expected_false": round(len(all_e) * 0.05, 1),
+            "robust_count": sum(1 for e in all_e if e["robust"]),
+            "survivor_count": len(survivors),
+            "singles": singles[:10], "pairs": pairs[:10], "triples": triples[:10],
+            "survivors": survivors[:15], "combined_holdout": combined,
+            "backdrop": _bt_backdrop(tr)}
 
 
 def _bt_signal_ranking(trades, min_n=50):

@@ -1637,43 +1637,37 @@ def backtest_loop(state: State) -> None:
             lab = {}
             total = len(lab_jobs)
             if APP_MODE != "stocks":
-                # ONE fetch of the 4H candles -> all 10 scenarios scored against it.
-                keys = [k for k, _ in EMACONF_SCENARIOS]
-                # FREE-TIER BUDGET: this instance has ~0.1 CPU and must keep serving pages while
-                # it thinks. A full 60-coin x 8760-bar matrix starves the web server and the whole
-                # site hangs. Smaller basket + shallower history keeps the lab honest but polite.
-                res = backtest_all(sess, market, tfs=("4h",), limit=4380,
-                                   fees_bps=5.0, symbols=list(BACKTEST_BASKET)[:24],
-                                   sides=("long",), index_sym="BTCUSDT", strategy_list=keys)
-                for k, nm in EMACONF_SCENARIOS:
-                    lab[k] = res.get(k, {})
-                # pull the signal-discovery ranking out of the signal-lab run
-                _sg = res.get("signals", {}) or {}
-                _rank = None
-                for _tf, _blk in _sg.items():
-                    if isinstance(_blk, dict) and (_blk.get("long") or {}).get("signal_ranking"):
-                        _rank = _blk["long"]["signal_ranking"]; break
+                # FULL UNIVERSE, streamed. Previously this ran on a 60-coin basket because the old
+                # sweep held every coin's candles in memory at once; storing signals as bitmasks and
+                # discarding candles per coin makes all ~600 tradeable pairs feasible here.
+                from mexc_ema200_scanner import (signal_lab_stream, _bt_signal_ranking_mask,
+                                                 list_symbols)
+                try:
+                    universe = list_symbols(sess, cfg.get("quote", "USDT"),
+                                            futures_only=True, market=market)
+                except Exception:
+                    universe = list(BACKTEST_BASKET)
+
+                def _prog(done, total, ntr):
+                    with state.lock:
+                        state.backtests = {"ts": time.time(), "running": True,
+                                           "progress": {"done": done, "total": total,
+                                                        "last": f"{ntr} trades so far"}}
+                trades = signal_lab_stream(sess, market, universe, tf="4h", limit=8760,
+                                           fees_bps=5.0, index_sym="BTCUSDT", progress=_prog)
+                _rank = _bt_signal_ranking_mask(trades)
+                del trades
                 with state.lock:
                     state.signal_rank = _rank
-                    _wf = (_rank or {}).get("walk_forward") or {}
-                    _t10 = (_wf.get("top10") or {}).get("picks") or []
-                    _byname = {e["name"]: e.get("keys") or []
-                               for e in ((_rank or {}).get("singles") or [])
-                                      + ((_rank or {}).get("pairs") or [])
-                                      + ((_rank or {}).get("triples") or [])}
-                    # only combos that stayed positive OUT-OF-SAMPLE get to touch the live board
-                    _solo = {x["name"]: x for x in (_wf.get("solo") or [])}
-                    state.top_combos = [
-                        {"name": p["name"], "keys": _byname.get(p["name"], []),
-                         "oos_exp": (_solo.get(p["name"]) or {}).get("oos_exp"),
-                         "rank": i + 1}
-                        for i, p in enumerate(_t10)
-                        if _byname.get(p["name"]) and ((_solo.get(p["name"]) or {}).get("oos_exp") or -9) > 0]
-                with state.lock:
+                    _sv = (_rank or {}).get("survivors") or []
+                    # only combos that cleared BOTH holdouts may drive the live board
+                    state.top_combos = [{"name": e["name"], "keys": e.get("keys") or [],
+                                         "oos_exp": e.get("hold_exp"), "rank": i + 1}
+                                        for i, e in enumerate(_sv) if e.get("keys")]
                     state.backtests = {"ts": time.time(), "took": round(time.time() - t0, 1),
-                                       "fees_bps": 5.0, "coins": len(BACKTEST_BASKET), "lab": dict(lab),
-                                       "strategies": strat_meta,
-                                       "progress": {"done": total, "total": total, "last": "scenario matrix"}}
+                                       "fees_bps": 5.0, "coins": (_rank or {}).get("coins", 0),
+                                       "lab": {}, "strategies": strat_meta,
+                                       "progress": {"done": 1, "total": 1, "last": "done"}}
             for ji, (tabkey, jname, strat, jmarket, jindex, jbasket, jtfs) in enumerate(lab_jobs):
                 sdata = {}
                 for tf in jtfs:
@@ -4713,7 +4707,66 @@ function wfRow(x){
 }
 function renderWF(){
   const el=document.getElementById("wfbox"); if(!el) return;
-  const r=siglatest, w=(r&&r.walk_forward)||null;
+  const r=siglatest; if(!r){ el.innerHTML=""; return; }
+  // NEW full-universe format: survivors of BOTH holdouts
+  if(r.survivors!==undefined){
+    const bd=r.backdrop||null;
+    let h='';
+    if(bd){
+      const bear=bd.risk_off_pct>bd.risk_on_pct;
+      h+='<div class="status"><span>🌍 <b>What market did we test in?</b> Measured from the bars, not assumed. '+
+        'Breadth was <b>risk-off '+bd.risk_off_pct+'%</b> vs <b>risk-on '+bd.risk_on_pct+'%</b>; index falling '+bd.idx_down_pct+'% of the time.<br>'+
+        (bear?'<b class="good">Net bearish for alts</b> — a long-only edge surviving this is a stronger claim than one earned in a rising tape.'
+             :'<b class="warn">Net risk-on</b> — some of any long-only edge here is simply market direction.')+'</span></div>';
+    }
+    h+='<div class="status"><span>🧪 <b>Full universe, two independent holdouts</b><br>'+
+      'Tested <b>'+(r.n||0).toLocaleString()+'</b> trades across <b>'+(r.coins||0)+'</b> coins. Strategies were ranked using only <b>'+(r.rank_coins||0)+'</b> of them; the other <b>'+(r.hold_coins||0)+'</b> coins were held back entirely and took no part in choosing anything.<br>'+
+      '<b>Time holdout</b>: profitable in the first AND second half of history. <b>Coin holdout</b>: still profitable on coins it never saw. A combo must pass <b>both</b> to appear below.<br>'+
+      '<b>'+(r.tested||0)+'</b> combinations tested, of which roughly <b>'+(r.expected_false||0)+'</b> would look good by chance alone. '+
+      '<b>'+(r.robust_count||0)+'</b> passed the time split; <b class="good">'+(r.survivor_count||0)+'</b> passed both.'+
+      ((r.survivor_count||0)===0?' <span class="bad">Nothing cleared both bars this run — that is a real result, not a bug.</span>':'')+
+      '</span></div>';
+    if((r.survivors||[]).length){
+      h+='<h3 style="margin:12px 0 4px">Strategies that survived both holdouts</h3>'+
+         '<table><thead><tr><th>Strategy</th><th>Trades</th><th>Win rate</th><th>Exp (R)</th><th>Avg R:R</th>'+
+         '<th>1st half</th><th>2nd half</th><th>Decay</th>'+
+         '<th>Unseen coins: n</th><th>Exp</th><th>Win rate</th><th>Return</th><th>Max DD</th></tr></thead><tbody>';
+      for(const e of r.survivors){
+        h+='<tr><td>'+e.name+'</td><td>'+e.n+'</td><td>'+e.winrate+'%</td><td>'+e.exp.toFixed(3)+'</td><td>'+(e.avg_rr||0).toFixed(2)+'</td>'+
+           '<td class="good">'+(e.h1==null?"—":e.h1.toFixed(3))+'</td><td class="good">'+(e.h2==null?"—":e.h2.toFixed(3))+'</td>'+
+           '<td class="'+((e.decay||0)<0?"bad":"good")+'">'+(e.decay==null?"—":((e.decay>0?"+":"")+e.decay.toFixed(3)))+'</td>'+
+           '<td>'+(e.hold_n||0)+'</td><td class="'+(((e.hold_exp||0)>0)?"good":"bad")+'"><b>'+(e.hold_exp==null?"—":e.hold_exp.toFixed(3))+'</b></td>'+
+           '<td>'+(e.hold_winrate==null?"—":e.hold_winrate+"%")+'</td>'+
+           '<td class="'+(((e.hold_ret_pct||0)>0)?"good":"bad")+'">'+(e.hold_ret_pct==null?"—":((e.hold_ret_pct>0?"+":"")+e.hold_ret_pct.toFixed(1)+"%"))+'</td>'+
+           '<td class="bad">'+(e.hold_max_dd_pct==null?"—":"-"+e.hold_max_dd_pct.toFixed(0)+"%")+'</td></tr>';
+      }
+      h+='</tbody></table>';
+    }
+    const c=r.combined_holdout;
+    if(c){
+      h+='<h3 style="margin:14px 0 4px">Trading ALL survivors — measured only on the unseen coins</h3>'+
+         '<div class="status"><span>Every surviving strategy combined into one portfolio, scored purely on the '+(r.hold_coins||0)+' coins that played no part in selecting them. This is the closest thing here to an honest forward estimate.</span></div>'+
+         '<table><thead><tr><th>Strategies</th><th>Trades</th><th>Win rate</th><th>Exp (R)</th><th>Avg R:R</th><th>Total R</th><th>Max DD (R)</th><th>End equity</th><th>Return</th><th>Max DD</th><th>Exp w/ DCA</th><th>Return w/ DCA</th></tr></thead><tbody><tr style="background:rgba(80,200,120,.07)">'+
+         '<td><b>'+(c.n_strategies||0)+' combined</b></td><td>'+c.n+'</td><td>'+c.winrate+'%</td>'+
+         '<td class="'+((c.exp>0)?"good":"bad")+'"><b>'+c.exp.toFixed(3)+'</b></td><td>'+(c.avg_rr||0).toFixed(2)+'</td>'+
+         '<td>'+(c.total_r||0).toFixed(1)+'R</td><td class="bad">-'+(c.max_dd_r||0).toFixed(1)+'R</td>'+
+         '<td><b>$'+(c.end_equity||0).toLocaleString()+'</b></td>'+
+         '<td class="'+((c.ret_pct>0)?"good":"bad")+'">'+(c.ret_pct>0?"+":"")+(c.ret_pct||0).toFixed(1)+'%</td>'+
+         '<td class="bad">-'+(c.max_dd_pct||0).toFixed(0)+'%</td>'+
+         '<td>'+(c.exp_dca==null?"—":c.exp_dca.toFixed(3))+'</td>'+
+         '<td>'+(c.dca_ret_pct==null?"—":((c.dca_ret_pct>0?"+":"")+c.dca_ret_pct.toFixed(1)+"%"))+'</td></tr></tbody></table>';
+      if(c.by_regime&&c.by_regime.length){
+        h+='<h3 style="margin:12px 0 4px">…and split by market regime</h3>'+
+           '<div class="status"><span>If the whole edge sits in the risk-on row, it is a bet on market direction wearing a strategy costume.</span></div>'+
+           '<table><thead><tr><th>Regime</th><th>Trades</th><th>Win rate</th><th>Exp (R)</th><th>Total R</th><th>Max DD (R)</th><th>Return</th></tr></thead><tbody>';
+        for(const x of c.by_regime)
+          h+='<tr><td><b>'+x.regime+'</b></td><td>'+x.n+'</td><td>'+x.winrate+'%</td><td class="'+((x.exp>0)?"good":"bad")+'">'+x.exp.toFixed(3)+'</td><td>'+x.total_r.toFixed(1)+'R</td><td class="bad">-'+x.max_dd_r.toFixed(1)+'R</td><td class="'+((x.ret_pct>0)?"good":"bad")+'">'+(x.ret_pct>0?"+":"")+x.ret_pct.toFixed(1)+'%</td></tr>';
+        h+='</tbody></table>';
+      }
+    }
+    el.innerHTML=h; return;
+  }
+  const w=(r&&r.walk_forward)||null;
   if(!w){ el.innerHTML=""; return; }
   const hdr='<tr><th>Strategy</th><th>Trades</th><th>Win rate</th><th>Exp (R)</th><th>Avg R:R</th>'+
     '<th>Total R</th><th>Max DD (R)</th><th>Return</th><th>Max DD</th>'+
