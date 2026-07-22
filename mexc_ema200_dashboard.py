@@ -1658,7 +1658,7 @@ def backtest_loop(state: State) -> None:
                 # and their sparse candles produce noise, so testing them makes results worse AND
                 # slower. This keeps the sweep affordable on a free instance.
                 universe = liquid_universe(sess, universe, market=market,
-                                           min_dollar_vol=250_000, cap=400)
+                                           min_dollar_vol=500_000, cap=150)
 
                 def _prog(done, total, ntr):
                     with state.lock:
@@ -6456,6 +6456,8 @@ applyHeaderTips();
 poll(); setInterval(poll, 3000);
 </script>
 </body></html>"""
+PAGE_BYTES = PAGE.encode("utf-8")   # encode once, not on every request
+
 
 
 # ===========================================================================
@@ -6723,7 +6725,7 @@ def make_handler(state: State):
             elif self.path.startswith("/analyze"):
                 self._analyze()
             elif self.path in ("/", "/index.html"):
-                self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+                self._send(200, PAGE_BYTES, "text/html; charset=utf-8")
             else:
                 self._send(404, b"not found", "text/plain")
 
