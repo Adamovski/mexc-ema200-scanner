@@ -811,6 +811,7 @@ class State:
         self.dtb_hits: list[dict] = []             # RUNNER: descending triple bottom (daily)
         self.accum_hits: list[dict] = []           # RUNNER: test-pump -> accumulation -> breakout
         self.capit_hits: list[dict] = []           # RUNNER: capitulation flush -> trendline break
+        self.scanning: bool = False
         self.long_filtered: bool = False
         self.top_combos: list = []                 # combos that survived out-of-sample
         self.micro_stats: dict | None = None       # sub-$10m market-cap cohort
@@ -1007,6 +1008,8 @@ def run_one_scan(state: State) -> None:
         pass
     with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
         diag_tally = {"dtb": {}, "accum": {}}
+        with state.lock:
+            state.scanning = True
         futs = {ex.submit(scan_symbol_multi, sess, s, cfg["interval"], scan_cfg): s
                 for s in symbols}
         for fut in as_completed(futs):
@@ -1526,6 +1529,7 @@ def run_one_scan(state: State) -> None:
                 state.long_filtered = False
         except Exception:
             pass
+        state.scanning = False
         state.long_board = long_board
         state.short_board = short_board
         state.coil_board = coil_board
@@ -1632,6 +1636,9 @@ def backtest_loop(state: State) -> None:
         + [{"key": j[0], "name": j[1]} for j in lab_jobs]
     while True:
         try:
+            _wait_for_quiet(state)
+            if not HEAVY_LANE.acquire(blocking=False):
+                time.sleep(600); continue
             sess = get_session()
             t0 = time.time()
             lab = {}
@@ -1693,6 +1700,11 @@ def backtest_loop(state: State) -> None:
             with state.lock:
                 if not state.backtests:
                     state.backtests = {"error": str(e)}
+        finally:
+            try:
+                HEAVY_LANE.release()
+            except Exception:
+                pass
         time.sleep(6 * 3600)                          # lighter now the matrix is parked
 
 
@@ -1710,6 +1722,26 @@ def _micro_summary(micro, universe, mapped, ambiguous):
             "coins": sorted(micro, key=lambda m: m["mcap"])[:40]}
 
 
+HEAVY_LANE = threading.Lock()      # only ONE background sweep may run at a time
+
+
+def _wait_for_quiet(state, max_wait=1800):
+    """Hold off while the main scan is running.
+
+    This box has ~0.1 CPU. The scan that powers the visible boards must win every time; a research
+    sweep that makes the dashboard unreachable is worse than a sweep that finishes later. Background
+    work therefore waits for the scan to finish and takes the single heavy lane, so at most one
+    expensive job is ever competing with page serving."""
+    t0 = time.time()
+    while time.time() - t0 < max_wait:
+        with state.lock:
+            busy = getattr(state, "scanning", False)
+        if not busy:
+            return True
+        time.sleep(5)
+    return False
+
+
 def runner_loop(state: State) -> None:
     """RUNNER-PATTERN loop on REAL DAILY candles, run slowly and politely.
 
@@ -1725,6 +1757,8 @@ def runner_loop(state: State) -> None:
             sess = get_session()
             with state.lock:
                 syms = list(state.symbol_list or [])
+            if not HEAVY_LANE.acquire(blocking=False):
+                time.sleep(300); continue
             if not syms:
                 time.sleep(120); continue
             dtb_b = []; acc_b = []; cap_b = []; tally = {"dtb": {}, "accum": {}}
@@ -1772,6 +1806,11 @@ def runner_loop(state: State) -> None:
         except Exception as e:
             with state.lock:
                 state.runner_diag = {"error": str(e)}
+        finally:
+            try:
+                HEAVY_LANE.release()
+            except Exception:
+                pass
         time.sleep(4 * 3600)
 
 
@@ -6784,7 +6823,7 @@ def main() -> None:
         threading.Thread(target=breakout_watcher, args=(state,), daemon=True).start()
         threading.Thread(target=runner_loop, args=(state,), daemon=True).start()
     def _delayed_lab():
-        time.sleep(180)          # let the first scan finish and the site come up before thinking hard
+        time.sleep(300)          # let the first scan finish and the site come up before thinking hard
         backtest_loop(state)
     threading.Thread(target=_delayed_lab, daemon=True).start()
 
