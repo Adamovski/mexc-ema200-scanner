@@ -1634,78 +1634,74 @@ def backtest_loop(state: State) -> None:
     lab_limit = {"1h": 12000, "4h": 8760, "1d": 1460}
     strat_meta = ([{"key": k, "name": nm} for k, nm in EMACONF_SCENARIOS] if APP_MODE != "stocks" else []) \
         + [{"key": j[0], "name": j[1]} for j in lab_jobs]
+    # ---------- INCREMENTAL SIGNAL LAB ----------
+    # The lab used to sweep the whole universe in one long blocking pass, which on 0.1 CPU held the
+    # processor for minutes and made the site unreachable. Instead it now processes a SMALL BATCH of
+    # coins each tick (a few seconds of CPU), yields, and accumulates trades in memory. Only once the
+    # cursor has swept the entire universe does it run the ranking and publish. Each unit of work is
+    # tiny, so the live scan and page-serving always get their turn.
+    from mexc_ema200_scanner import (build_lab_context, score_lab_batch, _bt_signal_ranking_mask,
+                                     list_symbols, liquid_universe)
+    BATCH = 12                    # coins scored per tick — small enough to never starve the server
+    universe = []; cursor = 0; ctx = None; acc = []
     while True:
         try:
+            if APP_MODE == "stocks":
+                time.sleep(6 * 3600); continue
             _wait_for_quiet(state)
             if not HEAVY_LANE.acquire(blocking=False):
-                time.sleep(600); continue
-            sess = get_session()
-            t0 = time.time()
-            lab = {}
-            total = len(lab_jobs)
-            if APP_MODE != "stocks":
-                # FULL UNIVERSE, streamed. Previously this ran on a 60-coin basket because the old
-                # sweep held every coin's candles in memory at once; storing signals as bitmasks and
-                # discarding candles per coin makes all ~600 tradeable pairs feasible here.
-                from mexc_ema200_scanner import (signal_lab_stream, _bt_signal_ranking_mask,
-                                                 list_symbols, liquid_universe)
-                try:
-                    universe = list_symbols(sess, cfg.get("quote", "USDT"),
-                                            futures_only=True, market=market)
-                except Exception:
-                    universe = list(BACKTEST_BASKET)
-                # Trim to coins with real volume: illiquid pairs cannot absorb a $2,500 position
-                # and their sparse candles produce noise, so testing them makes results worse AND
-                # slower. This keeps the sweep affordable on a free instance.
-                universe = liquid_universe(sess, universe, market=market,
-                                           min_dollar_vol=500_000, cap=150)
-
-                def _prog(done, total, ntr):
+                time.sleep(120); continue
+            try:
+                sess = get_session()
+                # start (or restart) a cycle: pick the liquid universe and build context once
+                if cursor == 0 or not universe:
+                    try:
+                        _u = list_symbols(sess, cfg.get("quote", "USDT"),
+                                          futures_only=True, market=market)
+                    except Exception:
+                        _u = list(BACKTEST_BASKET)
+                    universe = liquid_universe(sess, _u, market=market,
+                                               min_dollar_vol=500_000, cap=150)
+                    ctx = build_lab_context(sess, market, universe[:40], tf="4h", limit=4380)
+                    acc = []
                     with state.lock:
                         state.backtests = {"ts": time.time(), "running": True,
-                                           "progress": {"done": done, "total": total,
-                                                        "last": f"{ntr} trades so far"}}
-                trades = signal_lab_stream(sess, market, universe, tf="4h", limit=4380,
-                                           fees_bps=5.0, index_sym="BTCUSDT", progress=_prog,
-                                           throttle=0.25)
-                _rank = _bt_signal_ranking_mask(trades)
-                del trades
+                                           "progress": {"done": 0, "total": len(universe),
+                                                        "last": "starting cycle"}}
+                # score one small batch
+                batch = universe[cursor:cursor + BATCH]
+                acc.extend(score_lab_batch(sess, market, batch, ctx[0], ctx[1],
+                                           tf="4h", limit=4380))
+                cursor += len(batch)
                 with state.lock:
-                    state.signal_rank = _rank
-                    _sv = (_rank or {}).get("survivors") or []
-                    # only combos that cleared BOTH holdouts may drive the live board
-                    state.top_combos = [{"name": e["name"], "keys": e.get("keys") or [],
-                                         "oos_exp": e.get("hold_exp"), "rank": i + 1}
-                                        for i, e in enumerate(_sv) if e.get("keys")]
-                    state.backtests = {"ts": time.time(), "took": round(time.time() - t0, 1),
-                                       "fees_bps": 5.0, "coins": (_rank or {}).get("coins", 0),
-                                       "lab": {}, "strategies": strat_meta,
-                                       "progress": {"done": 1, "total": 1, "last": "done"}}
-            for ji, (tabkey, jname, strat, jmarket, jindex, jbasket, jtfs) in enumerate(lab_jobs):
-                sdata = {}
-                for tf in jtfs:
-                    part = backtest_all(sess, jmarket, tfs=(tf,), limit=lab_limit.get(tf, 1500),
-                                        fees_bps=5.0, symbols=jbasket, strategy=strat, index_sym=jindex)
-                    sdata.update(part)
-                    lab[tabkey] = dict(sdata)
+                    state.backtests = {"ts": time.time(), "running": True,
+                                       "progress": {"done": cursor, "total": len(universe),
+                                                    "last": f"{len(acc)} trades so far"}}
+                # cycle complete -> rank and publish
+                if cursor >= len(universe):
+                    _rank = _bt_signal_ranking_mask(acc)
                     with state.lock:
-                        state.backtests = {"ts": time.time(), "took": round(time.time() - t0, 1),
-                                           "fees_bps": 5.0, "coins": len(jbasket), "lab": dict(lab),
-                                           "strategies": strat_meta,
-                                           "progress": {"done": ji, "total": total, "last": f"{jname} · {tf}"}}
-            with state.lock:
-                if state.backtests and "lab" in state.backtests:
-                    state.backtests["progress"] = {"done": total, "total": total, "last": "done"}
+                        state.signal_rank = _rank
+                        _sv = (_rank or {}).get("survivors") or []
+                        state.top_combos = [{"name": e["name"], "keys": e.get("keys") or [],
+                                             "oos_exp": e.get("hold_exp"), "rank": i + 1}
+                                            for i, e in enumerate(_sv) if e.get("keys")]
+                        state.backtests = {"ts": time.time(), "coins": (_rank or {}).get("coins", 0),
+                                           "progress": {"done": len(universe), "total": len(universe),
+                                                        "last": "done"}}
+                    acc = []; cursor = 0; universe = []
+            finally:
+                try:
+                    HEAVY_LANE.release()
+                except Exception:
+                    pass
         except Exception as e:
             with state.lock:
-                if not state.backtests:
+                if not state.signal_rank:
                     state.backtests = {"error": str(e)}
-        finally:
-            try:
-                HEAVY_LANE.release()
-            except Exception:
-                pass
-        time.sleep(6 * 3600)                          # lighter now the matrix is parked
+            cursor = 0; universe = []; acc = []
+        # short pause between batches within a cycle; long rest after a full cycle completes
+        time.sleep(20 if universe else 3 * 3600)
 
 
 def _micro_summary(micro, universe, mapped, ambiguous):

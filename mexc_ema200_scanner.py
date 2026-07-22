@@ -5775,6 +5775,57 @@ def _mask_bits(keys):
     return m
 
 
+def build_lab_context(sess, market, ref_syms, tf="4h", limit=4380, index_sym="BTCUSDT"):
+    """Build the market-breadth + BTC-regime context ONCE per cycle, from a reference sample.
+
+    Breadth is a market-wide statistic, so a sample estimates it fine, and computing it once means
+    the per-coin batches that follow do not each have to rebuild it."""
+    rows_by = {}
+    for sym in ref_syms:
+        try:
+            r = fetch_candles_cached(sess, sym, tf, limit, market)
+            if r:
+                rows_by[sym] = r
+        except Exception:
+            pass
+        time.sleep(0.15)
+    _brows = rows_by.get(index_sym)
+    if not _brows:
+        try:
+            _brows = fetch_candles_cached(sess, index_sym, tf, limit, market)
+        except Exception:
+            _brows = None
+    btc_ctx = _btc_regime_ctx(_brows) if _brows else {}
+    mkt_ctx = _market_ctx(rows_by, index_sym)
+    return btc_ctx, mkt_ctx
+
+
+def score_lab_batch(sess, market, syms, btc_ctx, mkt_ctx, tf="4h", limit=4380, fees_bps=5.0,
+                    throttle=0.15):
+    """Score ONE small batch of coins and return their compact trade records.
+
+    This is the unit of the incremental lab: each call is deliberately tiny (a dozen-ish coins), so
+    it holds the CPU for only a few seconds before yielding it back to the live scan and to serving
+    pages. The full universe is covered by calling this many times across many ticks, which spreads
+    the load out instead of dumping it in one long blocking sweep."""
+    out = []
+    for sym in syms:
+        try:
+            rows = fetch_candles_cached(sess, sym, tf, limit, market)
+            if rows and len(rows) > 300:
+                for t in _bt_signals(rows, "long", fees_bps=fees_bps, btc_ctx=btc_ctx,
+                                     tf=tf, mkt_ctx=mkt_ctx):
+                    out.append({"r": t["r"], "rr": t["rr"], "outcome": t["outcome"],
+                                "ts": t["ts"], "stopw": t["stopw"], "r_dca": t.get("r_dca"),
+                                "breadth": t.get("breadth"), "imom": t.get("imom"),
+                                "sym": sym, "mask": _sig_mask(t["sig"])})
+            del rows
+        except Exception:
+            pass
+        time.sleep(throttle)
+    return out
+
+
 def signal_lab_stream(sess, market, symbols, tf="4h", limit=4380, fees_bps=5.0,
                       index_sym="BTCUSDT", ref_size=40, progress=None, throttle=0.25):
     """Run the signal lab over the FULL universe, one coin at a time.
