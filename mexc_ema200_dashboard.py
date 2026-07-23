@@ -1644,6 +1644,20 @@ def backtest_loop(state: State) -> None:
                                      list_symbols, liquid_universe)
     BATCH = 12                    # coins scored per tick — small enough to never starve the server
     universe = []; cursor = 0; ctx = None; acc = []
+    # RESTORE last saved results so a freshly-woken (cold) instance shows the previous cycle
+    # immediately instead of a blank table, while it quietly recomputes in the background.
+    try:
+        _saved = STORE.get("lab:signal_rank")
+        if _saved:
+            _sr = json.loads(_saved)
+            with state.lock:
+                state.signal_rank = _sr
+                _sv = (_sr or {}).get("survivors") or []
+                state.top_combos = [{"name": e["name"], "keys": e.get("keys") or [],
+                                     "oos_exp": e.get("hold_exp"), "rank": i + 1}
+                                    for i, e in enumerate(_sv) if e.get("keys")]
+    except Exception:
+        pass
     while True:
         try:
             if APP_MODE == "stocks":
@@ -1680,6 +1694,13 @@ def backtest_loop(state: State) -> None:
                 # cycle complete -> rank and publish
                 if cursor >= len(universe):
                     _rank = _bt_signal_ranking_mask(acc)
+                    # persist so results survive spin-downs / restarts (30-day TTL)
+                    try:
+                        if _rank:
+                            _rank["saved_ts"] = time.time()
+                            STORE.setex("lab:signal_rank", 30 * 24 * 3600, json.dumps(_rank))
+                    except Exception:
+                        pass
                     with state.lock:
                         state.signal_rank = _rank
                         _sv = (_rank or {}).get("survivors") or []

@@ -5162,6 +5162,16 @@ def _macd(C, fast=12, slow=26, sig=9):
     return line, signal
 
 
+# CORE_SIGNALS — the lab was expanded to 63 indicators, but on a free instance and for honest
+# statistics fewer is better: 10 signals means ~55 combinations instead of ~325, so the sweep
+# finishes far faster AND far fewer results look good by pure chance. These ten span the bases a
+# discretionary trader actually uses (long-term trend, cross, short trend, Supertrend, an RSI entry,
+# a MACD trigger, volume confirmation, structure, a breakout, and a pullback zone).
+CORE_SIGNALS = (
+    "px>200ema", "golden50>200", "ema10>20", "supertrend_up", "rsi_oversold",
+    "macd_cross_up", "vol_expansion", "higher_low", "breakout_20h", "in_fib_zone",
+)
+
 def _signal_flags(H, L, C, V, t, e10, e20, e50, e200, e1200, st, sdir, rsis,
                   macd_l, macd_s, mkt_ctx=None, rows=None):
     """THE SIGNAL LIBRARY — ~20 INDEPENDENT yes/no reads at bar t. Each is tagged onto every trade so
@@ -5302,7 +5312,7 @@ def _signal_flags(H, L, C, V, t, e10, e20, e50, e200, e1200, st, sdir, rsis,
     f["breadth_rising"] = bool(_ms and _ms.get("bdir") == "rising")
     f["mkt_strong_up"] = bool(_ms and _ms.get("im") == "strong_up")
     f["mkt_broad_participation"] = bool(_ms and (_ms.get("bpct") or 0) > 55)
-    return f
+    return {k: f[k] for k in CORE_SIGNALS if k in f}
 
 
 def _bt_pattern(rows, side, pattern="dtb", fees_bps=5.0, horizon=60, warmup=90,
