@@ -812,6 +812,7 @@ class State:
         self.accum_hits: list[dict] = []           # RUNNER: test-pump -> accumulation -> breakout
         self.capit_hits: list[dict] = []           # RUNNER: capitulation flush -> trendline break
         self.scanning: bool = False
+        self.watchlist_mon: dict | None = None     # Julius Elum curated watchlist monitor
         self.long_filtered: bool = False
         self.top_combos: list = []                 # combos that survived out-of-sample
         self.micro_stats: dict | None = None       # sub-$10m market-cap cohort
@@ -909,6 +910,7 @@ class State:
                 "capit_hits": withlive(self.capit_hits),
                 "micro_stats": self.micro_stats,
                 "top_combos": self.top_combos,
+                "watchlist_mon": self.watchlist_mon,
                 "long_filtered": self.long_filtered,
                 "runner_progress": list(self.runner_progress),
                 "early_new_symbols": list(self.new_early_symbols),
@@ -1759,6 +1761,32 @@ def _wait_for_quiet(state, max_wait=1800):
     return False
 
 
+def watchlist_loop(state: State) -> None:
+    """Monitor the curated watchlist every ~20 min. Small and infrequent, and it takes the shared
+    heavy lane so it never overlaps the scan or lab."""
+    from mexc_ema200_scanner import scan_watchlist
+    time.sleep(150)
+    market = state.cfg.get("market", "futures")
+    while True:
+        try:
+            _wait_for_quiet(state)
+            if HEAVY_LANE.acquire(blocking=False):
+                try:
+                    res = scan_watchlist(get_session(), market=market, tf="4h")
+                    with state.lock:
+                        state.watchlist_mon = {"ts": time.time(), **res}
+                finally:
+                    try:
+                        HEAVY_LANE.release()
+                    except Exception:
+                        pass
+        except Exception as e:
+            with state.lock:
+                if not state.watchlist_mon:
+                    state.watchlist_mon = {"error": str(e)}
+        time.sleep(20 * 60)
+
+
 def runner_loop(state: State) -> None:
     """RUNNER-PATTERN loop on REAL DAILY candles, run slowly and politely.
 
@@ -2520,6 +2548,7 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabAccum" onclick="showTab('accum')">🤫 Quiet accumulation</div>
   <div class="tab" id="tabCapit" onclick="showTab('capit')">⚡ Capitulation reversal</div>
   <div class="tab" id="tabMicro" onclick="showTab('micro')">🐜 Microcaps &lt;$10m</div>
+  <div class="tab" id="tabWatch2" onclick="showTab('watch2')">⭐ Watchlist monitor</div>
   <div class="tab" id="tabSignals" onclick="showTab('signals')">🔬 Signal lab</div>
   <div class="tab" id="tabCoil" onclick="showTab('coil')" style="display:none">🚀 Coiled</div>
   <div class="tab" id="tabScalp" onclick="showTab('scalp')" style="display:none">⚡ Best scalps</div>
@@ -2816,6 +2845,20 @@ PAGE = """<!doctype html>
     <tbody id="microrows"></tbody>
   </table>
   <div class="empty" id="microempty" style="display:none">No sub-$10m coins mapped yet &mdash; the daily loop refreshes market caps every few hours.</div>
+</div>
+</div>
+<div class="view active" id="viewWatch2">
+<div class="status">
+  <span>⭐ <b>Watchlist monitor</b> — the curated list of ~80 Binance-Alpha / AI-narrative / RWA tokens (the $LAB, $SKYAI, $RIVER type names). For each that trades as a USDT perp on MEXC, this shows the <b>same 10 core indicators the lab uses</b>, evaluated live, plus trend / RSI / relative-volume / recent change. Sorted by <b>how many indicators are firing</b> — a quick read on which names are waking up.<br>
+  <span class="warn">This is a monitor, not a buy list. A high indicator count means the setup is technically active right now; it says nothing about whether the pump already happened. Many of these are thin — check liquidity before sizing.</span></span>
+</div>
+<div class="wrap" id="watch2sum"></div>
+<div class="wrap" style="margin-top:8px">
+  <table id="watch2tbl">
+    <thead><tr><th>Token</th><th>Price</th><th>24h</th><th>~7d</th><th>&gt;200EMA</th><th>RSI</th><th>Rel vol</th><th>Indicators firing</th><th>Which</th></tr></thead>
+    <tbody id="watch2rows"></tbody>
+  </table>
+  <div class="empty" id="watch2empty" style="display:none">Watchlist monitor warming up — first pass runs a few minutes after boot.</div>
 </div>
 </div>
 <div class="view active" id="viewSignals">
@@ -3590,6 +3633,30 @@ function setWatchArrows(){
     th.childNodes[0].nodeValue = base + arrow;
   });
 }
+function renderWatch2(){
+  const tb=document.getElementById("watch2rows"), sm=document.getElementById("watch2sum");
+  if(!tb) return; tb.innerHTML="";
+  const m=watch2latest;
+  const emp=document.getElementById("watch2empty");
+  if(!m||!m.rows){ if(emp) emp.style.display="block"; if(sm) sm.innerHTML=""; return; }
+  if(emp) emp.style.display=m.rows.length?"none":"block";
+  if(sm) sm.innerHTML='<div class="status"><span><b>'+m.n_listed+'</b> of '+m.n_total+' watchlist tokens trade on MEXC futures.'+
+    (m.not_listed&&m.not_listed.length?' Not on MEXC: <span class="muted">'+m.not_listed.join(', ')+'</span>':'')+'</span></div>';
+  for(const r of m.rows){
+    const tr=document.createElement("tr");
+    const c24=r.chg24||0, c7=r.chg7d;
+    tr.innerHTML=`<td class="sym"><div class="symbox">${watchStar(r.symbol)}<a href="${tvLink(r.symbol)}" target="_blank" rel="noopener">${r.token}</a>${analyzeBtn(r.symbol)}</div></td>`+
+      `<td>${fmtNum(r.live!=null?r.live:r.price)}</td>`+
+      `<td class="${c24>0?'good':(c24<0?'bad':'')}">${c24>0?'+':''}${c24.toFixed(1)}%</td>`+
+      `<td class="${(c7||0)>0?'good':((c7||0)<0?'bad':'')}">${c7==null?'—':((c7>0?'+':'')+c7.toFixed(0)+'%')}</td>`+
+      `<td>${r.above200?'<span class="good">yes</span>':'<span class="muted">no</span>'}</td>`+
+      `<td>${r.rsi==null?'—':r.rsi}</td>`+
+      `<td class="${(r.rvol||0)>1.5?'good':''}">${r.rvol==null?'—':r.rvol+'×'}</td>`+
+      `<td><b>${r.n_fired||0}</b>/10</td>`+
+      `<td class="muted" style="font-size:11px">${(r.fired||[]).join(', ')||'—'}</td>`;
+    tb.appendChild(tr);
+  }
+}
 function renderWatch(){
   const tb=document.getElementById('wlrows'); if(!tb) return;
   const syms=[...WATCH].sort((a,b)=>{
@@ -3724,7 +3791,7 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["dtb","Dtb"],["accum","Accum"],["capit","Capit"],["micro","Micro"],["signals","Signals"],["coil","Coil"],["scalp","Scalp"],["spot","Spot"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["dtb","Dtb"],["accum","Accum"],["capit","Capit"],["micro","Micro"],["signals","Signals"],["watch2","Watch2"],["coil","Coil"],["scalp","Scalp"],["spot","Spot"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
@@ -4710,6 +4777,7 @@ function renderDtb(){
   }
 }
 let siglatest=null;
+let watch2latest=null;
 let capitlatest=[];
 let microlatest=null;
 let rdiaglatest=null;
@@ -6382,6 +6450,7 @@ async function poll(){
   dtblatest=d.dtb_hits||[]; renderDtb();
   accumlatest=d.accum_hits||[]; renderAccum();
   siglatest=d.signal_rank||null; renderSignals();
+  watch2latest=d.watchlist_mon||null; renderWatch2();
   capitlatest=d.capit_hits||[]; renderCapit();
   microlatest=d.micro_stats||null; renderMicro();
   rdiaglatest=d.runner_diag||null; renderDiag("dtb"); renderDiag("accum");
@@ -6841,6 +6910,7 @@ def main() -> None:
         threading.Thread(target=scan_loop, args=(state,), daemon=True).start()
         threading.Thread(target=breakout_watcher, args=(state,), daemon=True).start()
         threading.Thread(target=runner_loop, args=(state,), daemon=True).start()
+        threading.Thread(target=watchlist_loop, args=(state,), daemon=True).start()
     def _delayed_lab():
         time.sleep(300)          # let the first scan finish and the site come up before thinking hard
         backtest_loop(state)

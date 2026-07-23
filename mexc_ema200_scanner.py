@@ -7320,6 +7320,53 @@ def signal_flags_now(rows, mkt_ctx=None):
         return None
 
 
+WATCHLIST_TOKENS = (
+    "BAN", "GRIFFAIN", "SAPIEN", "EVAA", "FHE", "ARC", "VIC", "BABY", "BANK", "AIOT", "SOON", "SQD", "PUMPBTC", "H", "BULLA", "AIN", "VELVET", "TA", "NAORIS", "CARV", "XYN", "USELESS", "BAS", "MITO", "HEMI", "Q", "TAKE", "XPIN", "BLESS", "FLUID", "COAI", "MIRA", "AKE", "XAN", "LYN", "KGEN", "GIGGLE", "YB", "MET", "ENSO", "RECALL", "BLUAI", "ON", "BR", "UAI", "JCT", "CLANKER", "PIEVERSE", "IRYS", "CYS", "BREV", "COLLECT", "MAGMA", "ZAMA", "AIA", "SPACE", "FIGHT", "BIRB", "MEGA", "CHIP", "INX", "TRIA", "ESP", "ROBO", "BASED", "PRL", "BARD", "MERL", "PLAY", "UB", "GENIUS", "CFG", "OPG", "SWARMS", "RIVER", "PIPPIN", "SIREN", "RAVE", "SKYAI", "LAB",
+)
+
+def scan_watchlist(sess, market="futures", tf="4h", limit=1000):
+    """Monitor Julius Elum's curated watchlist. For each token that trades as a USDT perp on MEXC,
+    pull the SAME 10-indicator read the lab uses on the latest candle, plus trend/RSI/volume/price,
+    so the whole list can be watched in one place and ranked by how many indicators are firing.
+
+    Tokens not listed on MEXC futures are reported as 'not on MEXC' rather than silently dropped, so
+    the watchlist stays honest about coverage."""
+    out = []
+    for tok in WATCHLIST_TOKENS:
+        sym = tok + "USDT"
+        try:
+            raw = fetch_candles(sess, sym, tf, limit, market)
+        except Exception:
+            raw = None
+        if not raw or len(raw) < 220:
+            out.append({"token": tok, "symbol": sym, "listed": False})
+            continue
+        rows = raw[:-1]
+        try:
+            C = [float(x[4]) for x in rows]; H = [float(x[2]) for x in rows]
+            L = [float(x[3]) for x in rows]; V = [float(x[5]) for x in rows]
+        except (ValueError, IndexError):
+            out.append({"token": tok, "symbol": sym, "listed": False}); continue
+        sig = signal_flags_now(rows) or {}
+        fired = [k for k, v in sig.items() if v]
+        e200 = ema(C, 200); rsis = rsi_series(C)
+        px = C[-1]
+        chg = round((px / C[-2] - 1) * 100, 2) if len(C) > 1 else 0.0
+        chg7 = round((px / C[-42] - 1) * 100, 1) if len(C) > 42 else None  # ~7d on 4h
+        av = sum(V[-40:]) / 40 if len(V) >= 40 else (sum(V) / len(V))
+        out.append({"token": tok, "symbol": sym, "listed": True,
+                    "price": px, "chg24": chg, "chg7d": chg7,
+                    "above200": bool(e200[-1] and px > e200[-1]),
+                    "rsi": round(rsis[-1], 1) if rsis and rsis[-1] is not None else None,
+                    "rvol": round(V[-1] / av, 2) if av else None,
+                    "n_fired": len(fired), "fired": sorted(fired)})
+    listed = [o for o in out if o.get("listed")]
+    listed.sort(key=lambda o: (-(o.get("n_fired") or 0), -(o.get("chg7d") or -999)))
+    missing = [o["token"] for o in out if not o.get("listed")]
+    return {"rows": listed, "not_listed": missing, "n_total": len(WATCHLIST_TOKENS),
+            "n_listed": len(listed)}
+
+
 def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
                       cfg: dict) -> tuple:
     """Fetch klines ONCE and run every detector (200-EMA reclaim, bull flag,
