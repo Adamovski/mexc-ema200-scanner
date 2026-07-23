@@ -7324,13 +7324,48 @@ WATCHLIST_TOKENS = (
     "BAN", "GRIFFAIN", "SAPIEN", "EVAA", "FHE", "ARC", "VIC", "BABY", "BANK", "AIOT", "SOON", "SQD", "PUMPBTC", "H", "BULLA", "AIN", "VELVET", "TA", "NAORIS", "CARV", "XYN", "USELESS", "BAS", "MITO", "HEMI", "Q", "TAKE", "XPIN", "BLESS", "FLUID", "COAI", "MIRA", "AKE", "XAN", "LYN", "KGEN", "GIGGLE", "YB", "MET", "ENSO", "RECALL", "BLUAI", "ON", "BR", "UAI", "JCT", "CLANKER", "PIEVERSE", "IRYS", "CYS", "BREV", "COLLECT", "MAGMA", "ZAMA", "AIA", "SPACE", "FIGHT", "BIRB", "MEGA", "CHIP", "INX", "TRIA", "ESP", "ROBO", "BASED", "PRL", "BARD", "MERL", "PLAY", "UB", "GENIUS", "CFG", "OPG", "SWARMS", "RIVER", "PIPPIN", "SIREN", "RAVE", "SKYAI", "LAB",
 )
 
-def scan_watchlist(sess, market="futures", tf="4h", limit=1000):
-    """Monitor Julius Elum's curated watchlist. For each token that trades as a USDT perp on MEXC,
-    pull the SAME 10-indicator read the lab uses on the latest candle, plus trend/RSI/volume/price,
-    so the whole list can be watched in one place and ranked by how many indicators are firing.
+def fetch_fut_tickers(sess):
+    """MEXC futures ticker map -> {DISPLAYSYM: {"oi": open_interest, "vol24": 24h_turnover_usd,
+    "last": last_price}}. One request powers OI + volume for the whole watchlist."""
+    out = {}
+    try:
+        r = sess.get(MEXC_FUT_TICKER, timeout=20)
+        r.raise_for_status()
+        for d in r.json().get("data", []):
+            try:
+                sym = d["symbol"].replace("_", "")
+                out[sym] = {"oi": float(d.get("holdVol") or 0),
+                            "vol24": float(d.get("amount24") or 0),
+                            "last": float(d.get("lastPrice") or 0)}
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
 
-    Tokens not listed on MEXC futures are reported as 'not on MEXC' rather than silently dropped, so
-    the watchlist stays honest about coverage."""
+
+def _ema_formation(px, e10, e20, e50, e200):
+    """A one-glance read of how the EMAs are stacked."""
+    if None in (e10, e20, e50, e200):
+        return "n/a"
+    if e10 > e20 > e50 > e200:
+        return "Bull stack"
+    if e10 < e20 < e50 < e200:
+        return "Bear stack"
+    if px > e200 and e50 > e200:
+        return "Above 200"
+    if px < e200 and e50 < e200:
+        return "Below 200"
+    return "Mixed"
+
+
+def scan_watchlist(sess, market="futures", tf="4h", limit=1000, caps=None, tickers=None):
+    """State snapshot of Julius Elum's curated watchlist. For each token on MEXC futures, report the
+    things that tell you WHERE it is, not just whether a signal fired: EMA formation, Supertrend,
+    open interest, 24h volume, market cap, RSI, and how far it sits above its recent low (a proxy
+    for 'near all-time low' within the fetched window)."""
+    caps = caps or {}
+    tickers = tickers or {}
     out = []
     for tok in WATCHLIST_TOKENS:
         sym = tok + "USDT"
@@ -7339,33 +7374,62 @@ def scan_watchlist(sess, market="futures", tf="4h", limit=1000):
         except Exception:
             raw = None
         if not raw or len(raw) < 220:
-            out.append({"token": tok, "symbol": sym, "listed": False})
-            continue
+            out.append({"token": tok, "symbol": sym, "listed": False}); continue
         rows = raw[:-1]
         try:
             C = [float(x[4]) for x in rows]; H = [float(x[2]) for x in rows]
             L = [float(x[3]) for x in rows]; V = [float(x[5]) for x in rows]
         except (ValueError, IndexError):
             out.append({"token": tok, "symbol": sym, "listed": False}); continue
-        sig = signal_flags_now(rows) or {}
-        fired = [k for k, v in sig.items() if v]
-        e200 = ema(C, 200); rsis = rsi_series(C)
         px = C[-1]
-        chg = round((px / C[-2] - 1) * 100, 2) if len(C) > 1 else 0.0
-        chg7 = round((px / C[-42] - 1) * 100, 1) if len(C) > 42 else None  # ~7d on 4h
+        e10 = ema(C, 10)[-1]; e20 = ema(C, 20)[-1]; e50 = ema(C, 50)[-1]; e200 = ema(C, 200)[-1]
+        _st, sdir = _st_series(H, L, C, 10, 3.0)
+        rsis = rsi_series(C)
+        lo = min(L); hi = max(H)
+        atl_pct = round((px / lo - 1) * 100, 1) if lo > 0 else None    # % above the window low
+        ath_pct = round((px / hi - 1) * 100, 1) if hi > 0 else None    # % from the window high (<=0)
+        chg7 = round((px / C[-42] - 1) * 100, 1) if len(C) > 42 else None
+        chg24 = round((px / C[-6] - 1) * 100, 1) if len(C) > 6 else None    # ~24h on 4h
+        chg30 = round((px / C[-180] - 1) * 100, 1) if len(C) > 180 else None  # ~30d
+        # volatility: ATR% of price (typical bar swing), + a rising/falling vol read
+        a14 = atr(H[-14:], L[-14:], C[-14:]) or 0
+        a50 = atr(H[-50:], L[-50:], C[-50:]) or 0
+        vol_pct = round(a14 / px * 100, 1) if px else None
+        vol_state = ("expanding" if a50 > 0 and a14 > 1.3 * a50
+                     else "quiet" if a50 > 0 and a14 < 0.7 * a50 else "normal")
+        # recent behaviour: relative volume + a plain-language momentum read
         av = sum(V[-40:]) / 40 if len(V) >= 40 else (sum(V) / len(V))
-        out.append({"token": tok, "symbol": sym, "listed": True,
-                    "price": px, "chg24": chg, "chg7d": chg7,
-                    "above200": bool(e200[-1] and px > e200[-1]),
+        rvol = round(sum(V[-6:]) / 6 / av, 2) if av else None
+        if chg7 is None:
+            behav = "—"
+        elif chg7 > 25:
+            behav = "ripping"
+        elif chg7 > 8:
+            behav = "climbing"
+        elif chg7 < -25:
+            behav = "dumping"
+        elif chg7 < -8:
+            behav = "bleeding"
+        else:
+            behav = "coiling" if vol_state == "quiet" else "chopping"
+        tk = tickers.get(sym, {})
+        mc = caps.get(tok)
+        out.append({"token": tok, "symbol": sym, "listed": True, "price": px,
+                    "ema_form": _ema_formation(px, e10, e20, e50, e200),
+                    "supertrend": ("up" if sdir[-1] == 1 else "down"),
                     "rsi": round(rsis[-1], 1) if rsis and rsis[-1] is not None else None,
-                    "rvol": round(V[-1] / av, 2) if av else None,
-                    "n_fired": len(fired), "fired": sorted(fired)})
+                    "oi": tk.get("oi"), "vol24": tk.get("vol24"), "mcap": mc,
+                    "above_low_pct": atl_pct, "from_high_pct": ath_pct,
+                    "near_low": bool(atl_pct is not None and atl_pct < 25),
+                    "chg24": chg24, "chg7d": chg7, "chg30d": chg30,
+                    "vol_pct": vol_pct, "vol_state": vol_state,
+                    "rvol": rvol, "behaviour": behav})
     listed = [o for o in out if o.get("listed")]
-    listed.sort(key=lambda o: (-(o.get("n_fired") or 0), -(o.get("chg7d") or -999)))
+    # default sort: nearest to its lows first (recapitulation / accumulation candidates)
+    listed.sort(key=lambda o: (o.get("above_low_pct") if o.get("above_low_pct") is not None else 9e9))
     missing = [o["token"] for o in out if not o.get("listed")]
     return {"rows": listed, "not_listed": missing, "n_total": len(WATCHLIST_TOKENS),
             "n_listed": len(listed)}
-
 
 def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
                       cfg: dict) -> tuple:

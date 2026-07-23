@@ -1764,7 +1764,7 @@ def _wait_for_quiet(state, max_wait=1800):
 def watchlist_loop(state: State) -> None:
     """Monitor the curated watchlist every ~20 min. Small and infrequent, and it takes the shared
     heavy lane so it never overlaps the scan or lab."""
-    from mexc_ema200_scanner import scan_watchlist
+    from mexc_ema200_scanner import scan_watchlist, fetch_fut_tickers, fetch_market_caps
     time.sleep(150)
     market = state.cfg.get("market", "futures")
     while True:
@@ -1772,7 +1772,16 @@ def watchlist_loop(state: State) -> None:
             _wait_for_quiet(state)
             if HEAVY_LANE.acquire(blocking=False):
                 try:
-                    res = scan_watchlist(get_session(), market=market, tf="4h")
+                    _sess = get_session()
+                    try:
+                        _caps, _amb = fetch_market_caps(_sess)
+                    except Exception:
+                        _caps = {}
+                    try:
+                        _tk = fetch_fut_tickers(_sess)
+                    except Exception:
+                        _tk = {}
+                    res = scan_watchlist(_sess, market=market, tf="4h", caps=_caps, tickers=_tk)
                     with state.lock:
                         state.watchlist_mon = {"ts": time.time(), **res}
                 finally:
@@ -2849,13 +2858,13 @@ PAGE = """<!doctype html>
 </div>
 <div class="view active" id="viewWatch2">
 <div class="status">
-  <span>⭐ <b>Watchlist monitor</b> — the curated list of ~80 Binance-Alpha / AI-narrative / RWA tokens (the $LAB, $SKYAI, $RIVER type names). For each that trades as a USDT perp on MEXC, this shows the <b>same 10 core indicators the lab uses</b>, evaluated live, plus trend / RSI / relative-volume / recent change. Sorted by <b>how many indicators are firing</b> — a quick read on which names are waking up.<br>
+  <span>⭐ <b>Watchlist monitor</b> — the curated list of ~80 Binance-Alpha / AI-narrative / RWA tokens (the $LAB, $SKYAI, $RIVER type names). For each that trades as a USDT perp on MEXC, this shows a <b>state snapshot</b>: EMA formation (how the 10/20/50/200 are stacked), Supertrend, RSI, open interest, 24h volume, market cap, <b>recent behaviour</b> (ripping / climbing / coiling / bleeding, from 7d move + volatility), <b>volatility</b> (ATR % and whether it is expanding or quiet), and how far it sits <b>above its recent low</b>. Sorted <b>nearest-to-lows first</b> — the accumulation / recapitulation end of the list, where the "next $LAB" tends to hide before it moves.<br>
   <span class="warn">This is a monitor, not a buy list. A high indicator count means the setup is technically active right now; it says nothing about whether the pump already happened. Many of these are thin — check liquidity before sizing.</span></span>
 </div>
 <div class="wrap" id="watch2sum"></div>
 <div class="wrap" style="margin-top:8px">
   <table id="watch2tbl">
-    <thead><tr><th>Token</th><th>Price</th><th>24h</th><th>~7d</th><th>&gt;200EMA</th><th>RSI</th><th>Rel vol</th><th>Indicators firing</th><th>Which</th></tr></thead>
+    <thead><tr><th>Token</th><th>Price</th><th>Mkt cap</th><th>Behaviour</th><th>EMA form</th><th>S.trend</th><th>Volatility</th><th>Rel vol</th><th>RSI</th><th>Open interest</th><th>24h vol</th><th>Above low</th><th>From high</th><th>24h</th><th>~7d</th><th>~30d</th></tr></thead>
     <tbody id="watch2rows"></tbody>
   </table>
   <div class="empty" id="watch2empty" style="display:none">Watchlist monitor warming up — first pass runs a few minutes after boot.</div>
@@ -3642,18 +3651,28 @@ function renderWatch2(){
   if(emp) emp.style.display=m.rows.length?"none":"block";
   if(sm) sm.innerHTML='<div class="status"><span><b>'+m.n_listed+'</b> of '+m.n_total+' watchlist tokens trade on MEXC futures.'+
     (m.not_listed&&m.not_listed.length?' Not on MEXC: <span class="muted">'+m.not_listed.join(', ')+'</span>':'')+'</span></div>';
+  const usd=v=>{ if(v==null) return '—'; if(v>=1e9) return '$'+(v/1e9).toFixed(2)+'B'; if(v>=1e6) return '$'+(v/1e6).toFixed(1)+'M'; if(v>=1e3) return '$'+(v/1e3).toFixed(0)+'K'; return '$'+v.toFixed(0); };
+  const formCls=f=>f==='Bull stack'?'good':(f==='Bear stack'?'bad':'');
+  const behClr=b=>['ripping','climbing'].includes(b)?'good':(['dumping','bleeding'].includes(b)?'bad':(b==='coiling'?'muted':''));
   for(const r of m.rows){
     const tr=document.createElement("tr");
-    const c24=r.chg24||0, c7=r.chg7d;
+    const c7=r.chg7d, al=r.above_low_pct, fh=r.from_high_pct;
     tr.innerHTML=`<td class="sym"><div class="symbox">${watchStar(r.symbol)}<a href="${tvLink(r.symbol)}" target="_blank" rel="noopener">${r.token}</a>${analyzeBtn(r.symbol)}</div></td>`+
       `<td>${fmtNum(r.live!=null?r.live:r.price)}</td>`+
-      `<td class="${c24>0?'good':(c24<0?'bad':'')}">${c24>0?'+':''}${c24.toFixed(1)}%</td>`+
-      `<td class="${(c7||0)>0?'good':((c7||0)<0?'bad':'')}">${c7==null?'—':((c7>0?'+':'')+c7.toFixed(0)+'%')}</td>`+
-      `<td>${r.above200?'<span class="good">yes</span>':'<span class="muted">no</span>'}</td>`+
-      `<td>${r.rsi==null?'—':r.rsi}</td>`+
+      `<td>${usd(r.mcap)}</td>`+
+      `<td class="${behClr(r.behaviour)}"><b>${r.behaviour||'—'}</b></td>`+
+      `<td class="${formCls(r.ema_form)}">${r.ema_form||'—'}</td>`+
+      `<td class="${r.supertrend==='up'?'good':'bad'}">${r.supertrend==='up'?'▲':'▼'}</td>`+
+      `<td class="${r.vol_state==='expanding'?'good':(r.vol_state==='quiet'?'muted':'')}" title="ATR as % of price; state vs its 50-bar average">${r.vol_pct==null?'—':r.vol_pct+'% '}<span style="font-size:10px">${r.vol_state||''}</span></td>`+
       `<td class="${(r.rvol||0)>1.5?'good':''}">${r.rvol==null?'—':r.rvol+'×'}</td>`+
-      `<td><b>${r.n_fired||0}</b>/10</td>`+
-      `<td class="muted" style="font-size:11px">${(r.fired||[]).join(', ')||'—'}</td>`;
+      `<td>${r.rsi==null?'—':r.rsi}</td>`+
+      `<td>${usd(r.oi&&r.price?r.oi*r.price:null)}</td>`+
+      `<td>${usd(r.vol24)}</td>`+
+      `<td class="${r.near_low?'good':''}" title="% above the lowest low in the fetched window (proxy for near-ATL)">${al==null?'—':'+'+al.toFixed(0)+'%'}</td>`+
+      `<td class="bad">${fh==null?'—':fh.toFixed(0)+'%'}</td>`+
+      `<td class="${(r.chg24||0)>0?'good':((r.chg24||0)<0?'bad':'')}">${r.chg24==null?'—':((r.chg24>0?'+':'')+r.chg24.toFixed(0)+'%')}</td>`+
+      `<td class="${(c7||0)>0?'good':((c7||0)<0?'bad':'')}">${c7==null?'—':((c7>0?'+':'')+c7.toFixed(0)+'%')}</td>`+
+      `<td class="${(r.chg30d||0)>0?'good':((r.chg30d||0)<0?'bad':'')}">${r.chg30d==null?'—':((r.chg30d>0?'+':'')+r.chg30d.toFixed(0)+'%')}</td>`;
     tb.appendChild(tr);
   }
 }
