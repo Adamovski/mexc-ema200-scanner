@@ -1591,6 +1591,15 @@ def run_one_scan(state: State) -> None:
 
 def scan_loop(state: State) -> None:
     every = state.cfg["scan_every"] * 60
+    # WATCHLIST FIRST: on a cold boot, let the small curated watchlist finish before the big scan
+    # takes the CPU, so the ⭐ tab is populated almost immediately. Bounded wait so a watchlist
+    # failure can never block the main scan forever.
+    _t0 = time.time()
+    while time.time() - _t0 < 150:
+        with state.lock:
+            if state.watchlist_mon:
+                break
+        time.sleep(5)
     while True:
         run_one_scan(state)
         with state.lock:
@@ -1765,12 +1774,15 @@ def watchlist_loop(state: State) -> None:
     """Monitor the curated watchlist every ~20 min. Small and infrequent, and it takes the shared
     heavy lane so it never overlaps the scan or lab."""
     from mexc_ema200_scanner import scan_watchlist, fetch_fut_tickers, fetch_market_caps
-    time.sleep(150)
+    time.sleep(10)                        # go early so the curated list fills before the big scan
     market = state.cfg.get("market", "futures")
+    first = True
     while True:
         try:
-            _wait_for_quiet(state)
-            if HEAVY_LANE.acquire(blocking=False):
+            if not first:
+                _wait_for_quiet(state)
+            # first pass: block until we get the lane so the watchlist is guaranteed to go first
+            if HEAVY_LANE.acquire(blocking=bool(first), timeout=60) if first else HEAVY_LANE.acquire(blocking=False):
                 try:
                     _sess = get_session()
                     try:
@@ -1784,6 +1796,7 @@ def watchlist_loop(state: State) -> None:
                     res = scan_watchlist(_sess, market=market, tf="4h", caps=_caps, tickers=_tk)
                     with state.lock:
                         state.watchlist_mon = {"ts": time.time(), **res}
+                    first = False
                 finally:
                     try:
                         HEAVY_LANE.release()
