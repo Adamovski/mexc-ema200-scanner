@@ -2557,8 +2557,9 @@ PAGE = """<!doctype html>
 <div class="tabs">
   <!-- LEAN BUILD: only the reversion core is shown. The rest are hidden (not removed) while
        we build up from the ground up around the backtest-proven reversion logic. -->
+    <div class="tab active" id="tabWatch2" onclick="showTab('watch2')">⭐ Watchlist monitor</div>
   <div class="tab" id="tabAnalyze" onclick="showTab('analyze')">🔎 Analyze a coin</div>
-  <div class="tab active" id="tabBestLong" onclick="showTab('bestlong')">🟢 Long</div>
+  <div class="tab" id="tabBestLong" onclick="showTab('bestlong')">🟢 Long</div>
   <div class="tab" id="tabBestShort" onclick="showTab('bestshort')">🔴 Short</div>
   <div class="tab" id="tabPerf" onclick="showTab('perf')">📊 Performance</div>
   <div class="tab" id="tabBacktest" style="display:none" onclick="showTab('backtest')">🧪 Backtest</div>
@@ -2570,7 +2571,6 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabAccum" onclick="showTab('accum')">🤫 Quiet accumulation</div>
   <div class="tab" id="tabCapit" onclick="showTab('capit')">⚡ Capitulation reversal</div>
   <div class="tab" id="tabMicro" onclick="showTab('micro')">🐜 Microcaps &lt;$10m</div>
-  <div class="tab" id="tabWatch2" onclick="showTab('watch2')">⭐ Watchlist monitor</div>
   <div class="tab" id="tabSignals" onclick="showTab('signals')">🔬 Signal lab</div>
   <div class="tab" id="tabCoil" onclick="showTab('coil')" style="display:none">🚀 Coiled</div>
   <div class="tab" id="tabScalp" onclick="showTab('scalp')" style="display:none">⚡ Best scalps</div>
@@ -2818,7 +2818,7 @@ PAGE = """<!doctype html>
 </div>
 </div>
 
-<div class="view active" id="viewDtb">
+<div class="view" id="viewDtb">
 <div class="status">
   <span>🔻 <b>Descending triple bottom</b> — three swing lows, each <b>lower than the last</b>, with price now basing at/just above the third. The classic capitulation base: sellers exhausting into a final flush. Detected on the <b>daily</b> chart (built from the 4h candles). Entry near the base, stop under the 3rd low, target the first-leg high — a full measured retrace. Ranked by reward:risk. <b>⚠ Lottery-ticket setups</b> — plenty keep making lower lows, so size small and respect the stop.</span>
 </div>
@@ -2842,7 +2842,7 @@ PAGE = """<!doctype html>
 </div>
 </div>
 
-<div class="view active" id="viewCapit">
+<div class="view" id="viewCapit">
 <div class="status">
   <span>⚡ <b>Capitulation reversal</b> &mdash; the BKR/HEMI setup. A grinding downtrend of <b>lower highs and lower lows</b>, then a final flush that <b>squeezes the longs out into a fresh low</b>, then price <b>breaks the descending trendline</b> of those lower highs. Entry on the break, stop under the flush low, target the <b>overhead supply zone</b> the decline started from.<br>
   <b>Confidence</b> counts confirmations on top of the required structure: <b>RSI divergence</b> (RSI refused to make a new low with price), a <b>volume surge</b>, and <b>reclaimed</b> structure. The trendline break alone is confidence 1; all three extras is 4. <span class="warn">Catching a falling knife is the highest-variance trade there is &mdash; a downtrend breaking is exactly where you find out it was not done falling. Size accordingly.</span></span>
@@ -2855,7 +2855,7 @@ PAGE = """<!doctype html>
   <div class="empty" id="capitempty" style="display:none">No capitulation reversals right now. The daily loop keeps scanning&hellip;</div>
 </div>
 </div>
-<div class="view active" id="viewMicro">
+<div class="view" id="viewMicro">
 <div class="status">
   <span>🐜 <b>Microcaps under $10m</b> &mdash; market caps come from CoinGecko, matched by ticker.<br>
   <span class="warn">Read the caveat before trusting this: tickers collide constantly in crypto (several tokens trade as BANK), so where a symbol is ambiguous the tool keeps the <b>largest</b> matching market cap. That deliberately errs away from calling something a microcap &mdash; the list below is conservative and will miss some real microcaps rather than mislabel a large coin as tiny. Coins CoinGecko does not list at all show as unknown and are excluded entirely.</span></span>
@@ -2883,7 +2883,7 @@ PAGE = """<!doctype html>
   <div class="empty" id="watch2empty" style="display:none">Watchlist monitor warming up — first pass runs a few minutes after boot.</div>
 </div>
 </div>
-<div class="view active" id="viewSignals">
+<div class="view" id="viewSignals">
 <div class="status">
   <span>🔬 <b>Signal lab</b> — instead of assuming which indicators matter, this tests <b>~20 of them independently</b>. Every trade in a deliberately neutral base strategy (buy any green close, fixed 1.5&times;ATR stop / 3&times;ATR target) gets tagged with all 20 reads. Then each signal is scored by how much it <b>shifts expectancy versus the base</b>.<br>
   <b>Lift</b> is the number that matters: expectancy with the signal on, minus the base expectancy. Positive = the signal adds something. <b>H1 / H2</b> split the history in half &mdash; a signal that only worked in one half is probably noise, not edge. <b>Robust</b> means it beat the base in <i>both</i> halves.<br>
@@ -2914,7 +2914,7 @@ PAGE = """<!doctype html>
   </table>
 </div>
 </div>
-<div class="view active" id="viewAccum">
+<div class="view" id="viewAccum">
 <div class="status">
   <span>🤫 <b>Quiet accumulation → breakout</b> — the $LAB pattern: an earlier <b>test pump</b> proves the coin can run, then it drops into a <b>tight range</b> where <b>volume dries up</b> (nobody watching), then presses/breaks out of the top. Detected on the <b>daily</b> chart. Entry on the range-high break, stop under the range, target a measured move capped at the prior pump high. <b>Vol ratio</b> = recent volume ÷ its earlier average — lower is quieter and better.</span>
 </div>
@@ -2936,7 +2936,7 @@ PAGE = """<!doctype html>
 </div>
 </div>
 
-<div class="view active" id="viewBestLong">
+<div class="view" id="viewBestLong">
 <div class="status">
   <span>🏆 Longs — <b>only coins where a lab strategy is currently firing.</b> These are the indicator combos that stayed profitable when tested on data they were never fitted to, so the board answers "what does the evidence say to buy right now" rather than "what looks nice". Triple-bottom, accumulation and the other pattern boards have their own tabs and no longer feed this one. Setups are then ranked across <b>every</b> scanned pair Graded on trend structure, multi-timeframe agreement, momentum, volume, pattern confluence and proximity to support — <b>then weighted by the trade's reward:risk</b>, so a strong trend with no room to run doesn't top the list. Only tradeable R:R (≥1) shown. Click any row (⚲) for the full cross-timeframe plan.</span>
   <span id="blCount"></span>
@@ -3437,7 +3437,7 @@ let wSortKey="score", wSortDir=-1, wlatest=[];
 let sSortKey="score", sSortDir=-1, slatest=[];
 let xSortKey="score", xSortDir=-1, xlatest=[];
 let eeSortKey="score", eeSortDir=-1, eelatest=[];
-let activeTab="bestlong", lastData=null;
+let activeTab="watch2", lastData=null;
 let topSyms=null, topNew=[];   // track coins newly entering Top setups
 // Per-tab filters so a filter on one tab never hides rows on another.
 const FILT={ setups:{bias:"all",biasTf:"4h",fresh:false}, flags:{bias:"all",biasTf:"4h",phase:"all"},
@@ -3839,6 +3839,10 @@ function showTab(which){
   if(which==="accum") renderAccum();
   if(which==="backtest") loadBacktest();
   if(which==="calls") renderCalls();
+  if(which==="watch2") renderWatch2();
+  if(which==="micro") renderMicro();
+  if(which==="capit") renderCapit();
+  if(which==="signals") renderSignals();
   if(which==="watch"){ renderWatch(); loadWatch(); }
   renderBanner();  // banner follows the active scan tab
   renderFilterBar();  // filters are per-tab
@@ -6571,7 +6575,7 @@ function applyHeaderTips(){
   });
 }
 applyHeaderTips();
-poll(); setInterval(poll, 3000);
+showTab(activeTab); poll(); setInterval(poll, 3000);
 </script>
 </body></html>"""
 PAGE_BYTES = PAGE.encode("utf-8")   # encode once, not on every request
