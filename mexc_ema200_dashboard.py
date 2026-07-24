@@ -1771,41 +1771,37 @@ def _wait_for_quiet(state, max_wait=1800):
 
 
 def watchlist_loop(state: State) -> None:
-    """Monitor the curated watchlist every ~20 min. Small and infrequent, and it takes the shared
-    heavy lane so it never overlaps the scan or lab."""
+    """Monitor the curated watchlist. Deliberately SELF-SUFFICIENT and hang-proof: it does NOT wait
+    for the heavy lane or the scan (it is only ~80 small fetches), it wraps every external call so a
+    slow/blocked CoinGecko or ticker call can never stall it, and it publishes a result on EVERY
+    pass - even an empty one - so the tab shows the truth ("X of 80 on MEXC") instead of a permanent
+    'warming up' spinner."""
     from mexc_ema200_scanner import scan_watchlist, fetch_fut_tickers, fetch_market_caps
-    time.sleep(10)                        # go early so the curated list fills before the big scan
+    time.sleep(8)
     market = state.cfg.get("market", "futures")
-    first = True
     while True:
         try:
-            if not first:
-                _wait_for_quiet(state)
-            # first pass: block until we get the lane so the watchlist is guaranteed to go first
-            if HEAVY_LANE.acquire(blocking=bool(first), timeout=60) if first else HEAVY_LANE.acquire(blocking=False):
-                try:
-                    _sess = get_session()
-                    try:
-                        _caps, _amb = fetch_market_caps(_sess)
-                    except Exception:
-                        _caps = {}
-                    try:
-                        _tk = fetch_fut_tickers(_sess)
-                    except Exception:
-                        _tk = {}
-                    res = scan_watchlist(_sess, market=market, tf="4h", caps=_caps, tickers=_tk)
-                    with state.lock:
-                        state.watchlist_mon = {"ts": time.time(), **res}
-                    first = False
-                finally:
-                    try:
-                        HEAVY_LANE.release()
-                    except Exception:
-                        pass
+            _sess = get_session()
+            # Market caps are a NICE-TO-HAVE. CoinGecko rate-limits cloud IPs, so never let it block
+            # the whole pass - try once, move on if it is slow or fails.
+            try:
+                _caps, _amb = fetch_market_caps(_sess)
+            except Exception:
+                _caps = {}
+            try:
+                _tk = fetch_fut_tickers(_sess)
+            except Exception:
+                _tk = {}
+            try:
+                res = scan_watchlist(_sess, market=market, tf="4h", caps=_caps, tickers=_tk)
+            except Exception as e:
+                res = {"rows": [], "not_listed": [], "n_total": 0, "n_listed": 0, "error": str(e)}
+            with state.lock:
+                state.watchlist_mon = {"ts": time.time(), **res}
         except Exception as e:
             with state.lock:
-                if not state.watchlist_mon:
-                    state.watchlist_mon = {"error": str(e)}
+                state.watchlist_mon = {"ts": time.time(), "rows": [], "n_listed": 0,
+                                       "n_total": 0, "not_listed": [], "error": str(e)}
         time.sleep(20 * 60)
 
 
@@ -3660,8 +3656,14 @@ function renderWatch2(){
   if(!tb) return; tb.innerHTML="";
   const m=watch2latest;
   const emp=document.getElementById("watch2empty");
-  if(!m||!m.rows){ if(emp) emp.style.display="block"; if(sm) sm.innerHTML=""; return; }
-  if(emp) emp.style.display=m.rows.length?"none":"block";
+  if(!m){ if(emp){emp.style.display="block"; emp.textContent="Watchlist monitor warming up — first pass runs a minute or two after boot.";} if(sm) sm.innerHTML=""; return; }
+  if(emp){
+    if(m.rows&&m.rows.length){ emp.style.display="none"; }
+    else { emp.style.display="block";
+      emp.textContent = m.error ? ("Watchlist error: "+m.error)
+        : ("None of the "+(m.n_total||0)+" watchlist tokens are currently listed as USDT perpetuals on MEXC futures, so there is nothing to chart here. "+
+           ((m.not_listed&&m.not_listed.length)?("Not on MEXC: "+m.not_listed.slice(0,80).join(', ')):"")); }
+  }
   if(sm) sm.innerHTML='<div class="status"><span><b>'+m.n_listed+'</b> of '+m.n_total+' watchlist tokens trade on MEXC futures.'+
     (m.not_listed&&m.not_listed.length?' Not on MEXC: <span class="muted">'+m.not_listed.join(', ')+'</span>':'')+'</span></div>';
   const usd=v=>{ if(v==null) return '—'; if(v>=1e9) return '$'+(v/1e9).toFixed(2)+'B'; if(v>=1e6) return '$'+(v/1e6).toFixed(1)+'M'; if(v>=1e3) return '$'+(v/1e3).toFixed(0)+'K'; return '$'+v.toFixed(0); };
