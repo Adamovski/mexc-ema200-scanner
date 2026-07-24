@@ -1770,6 +1770,50 @@ def _wait_for_quiet(state, max_wait=1800):
     return False
 
 
+def _enrich_oi_divergence(res):
+    """Build an OI time-series from the snapshots we already fetch each pass (no extra API calls),
+    persisted in STORE, and tag each row with a price-vs-open-interest divergence read.
+
+    Interpretation (same logic the Analyze card uses):
+      price up   + OI up   -> real up-move (new money)
+      price up   + OI down -> fake pump / short-covering (fades)
+      price flat + OI up   -> quiet accumulation via leverage (the $LAB/Zetoshi tell)
+      price down + OI down -> longs unwinding, selloff may be exhausting
+    Needs a few passes to accumulate history; until then it reads 'building'."""
+    rows = (res or {}).get("rows") or []
+    try:
+        hist = json.loads(STORE.get("wl:oihist") or "{}")
+    except Exception:
+        hist = {}
+    now = int(time.time())
+    for r in rows:
+        sym = r.get("symbol"); oi = r.get("oi"); px = r.get("price")
+        if not sym or not oi or not px:
+            r["oi_div"] = None; continue
+        ser = hist.get(sym) or []
+        ser.append([now, oi, px])
+        ser = ser[-24:]                      # keep ~8 hours at a 20-min cadence
+        hist[sym] = ser
+        if len(ser) < 4:
+            r["oi_div"] = "building"; continue
+        oi0, px0 = ser[0][1], ser[0][2]
+        oc = (oi / oi0 - 1) * 100 if oi0 else 0
+        pc = (px / px0 - 1) * 100 if px0 else 0
+        pu, pd = pc > 0.7, pc < -0.7
+        ou, od = oc > 3, oc < -3
+        if pu and ou: r["oi_div"] = "real up"
+        elif pu and od: r["oi_div"] = "fake pump"
+        elif abs(pc) <= 0.7 and ou: r["oi_div"] = "accumulating"
+        elif pd and od: r["oi_div"] = "exhausting"
+        elif pd and ou: r["oi_div"] = "fresh shorts"
+        else: r["oi_div"] = "flat"
+        r["oi_chg_w"] = round(oc, 1)
+    try:
+        STORE.setex("wl:oihist", 3 * 24 * 3600, json.dumps(hist))
+    except Exception:
+        pass
+
+
 def watchlist_loop(state: State) -> None:
     """Monitor the curated watchlist. Deliberately SELF-SUFFICIENT and hang-proof: it does NOT wait
     for the heavy lane or the scan (it is only ~80 small fetches), it wraps every external call so a
@@ -1803,6 +1847,7 @@ def watchlist_loop(state: State) -> None:
                 _tk = {}
             try:
                 res = scan_watchlist(_sess, market=market, tf="4h", caps=_caps, tickers=_tk)
+                _enrich_oi_divergence(res)
             except Exception as e:
                 res = {"rows": [], "not_listed": [], "n_total": 0, "n_listed": 0, "error": str(e)}
             with state.lock:
@@ -2882,7 +2927,7 @@ PAGE = """<!doctype html>
 <div class="wrap" id="watch2sum"></div>
 <div class="wrap" style="margin-top:8px">
   <table id="watch2tbl">
-    <thead><tr><th data-tip="Ticker. ☆ stars it to your personal list; the magnifier opens the full Analyze card. Click the symbol to open it on TradingView.">Token</th><th data-tip="Latest traded price on MEXC (4h close, updates each scan).">Price</th><th data-tip="Market capitalisation from CoinGecko, matched by ticker. Shows — when CoinGecko rate-limits the lookup (common from cloud IPs) or the symbol is ambiguous; it fills on a later pass.">Mkt cap</th><th data-tip="Plain-language read of the last ~7 days combined with volatility: ripping (>25% up), climbing (>8%), coiling (flat + quiet volatility — often the pre-move state), chopping (flat + normal vol), bleeding (>8% down), dumping (>25% down).">Behaviour</th><th data-tip="How the 10/20/50/200 EMAs are stacked. Bull stack = 10>20>50>200 (clean uptrend). Above 200 = price and 50 above the 200. Mixed = tangled. Below 200 / Bear stack = downtrend. A flip from Bear stack toward Above 200 is an early trend-change tell.">EMA form</th><th data-tip="Supertrend (ATR 10, mult 3) direction on the 4h. ▲ = trend up (dynamic support below price), ▼ = trend down (dynamic resistance above).">S.trend</th><th data-tip="Average True Range as a % of price = the typical 4h candle swing. The word is its state vs the 50-bar average: expanding (a move is underway), quiet (coiling — energy building), or normal.">Volatility</th><th data-tip="Relative volume — the latest ~24h volume divided by its 40-bar average. Above ~1.5× means unusual participation is showing up (attention arriving).">Rel vol</th><th data-tip="Relative Strength Index (14) on the 4h. Below ~30 = oversold/washed out, above ~70 = overbought/extended, 40–60 = neutral.">RSI</th><th data-tip="Bullish RSI divergence — price made a lower low while RSI made a HIGHER low over the last ~40 bars. Classic early sign that selling is exhausting near the lows and a reversal may be building. &quot;bull&quot; = present.">Divergence</th><th data-tip="Open interest in USD (contracts × price) from MEXC futures — how much leveraged money is positioned. Rising OI with rising price = new longs; shows — if MEXC did not return it this pass.">Open interest</th><th data-tip="24-hour traded turnover in USD from MEXC futures. A liquidity gauge — thin names (low here) slip badly on a $2,500 order, so size down.">24h vol</th><th data-tip="How far price sits ABOVE the lowest low in the fetched window — a proxy for &quot;near all-time low&quot;. Small = basing right on support (the accumulation end). The board is sorted by this, smallest first.">Above low</th><th data-tip="How far price sits BELOW its highest high in the fetched window (a proxy for all-time high — limited to the history MEXC returns per call). How much it has already given back from the peak; deeply negative = beaten down, lots of overhead room if it turns.">From ATH</th><th data-tip="Price change over roughly the last 24 hours.">24h</th><th data-tip="Price change over roughly the last 7 days (drives the Behaviour read).">~7d</th><th data-tip="Price change over roughly the last 30 days — the medium-term trend.">~30d</th></tr></thead>
+    <thead><tr><th data-tip="Ticker. ☆ stars it to your personal list; the magnifier opens the full Analyze card. Click the symbol to open it on TradingView.">Token</th><th data-tip="Latest traded price on MEXC (4h close, updates each scan).">Price</th><th data-tip="Market capitalisation from CoinGecko, matched by ticker. Shows — when CoinGecko rate-limits the lookup (common from cloud IPs) or the symbol is ambiguous; it fills on a later pass.">Mkt cap</th><th data-tip="Plain-language read of the last ~7 days combined with volatility: ripping (>25% up), climbing (>8%), coiling (flat + quiet volatility — often the pre-move state), chopping (flat + normal vol), bleeding (>8% down), dumping (>25% down).">Behaviour</th><th data-tip="How the 10/20/50/200 EMAs are stacked. Bull stack = 10>20>50>200 (clean uptrend). Above 200 = price and 50 above the 200. Mixed = tangled. Below 200 / Bear stack = downtrend. A flip from Bear stack toward Above 200 is an early trend-change tell.">EMA form</th><th data-tip="Supertrend (ATR 10, mult 3) direction on the 4h. ▲ = trend up (dynamic support below price), ▼ = trend down (dynamic resistance above).">S.trend</th><th data-tip="Average True Range as a % of price = the typical 4h candle swing. The word is its state vs the 50-bar average: expanding (a move is underway), quiet (coiling — energy building), or normal.">Volatility</th><th data-tip="Relative volume — the latest ~24h volume divided by its 40-bar average. Above ~1.5× means unusual participation is showing up (attention arriving).">Rel vol</th><th data-tip="Relative Strength Index (14) on the 4h. Below ~30 = oversold/washed out, above ~70 = overbought/extended, 40–60 = neutral.">RSI</th><th data-tip="RSI divergence over the last ~40 bars. bull = regular bullish (price lower low, RSI higher low — reversal up). h-bull = hidden bullish (higher low in price, lower low in RSI — uptrend continuation). bear = regular bearish (reversal-down risk). h-bear = hidden bearish (downtrend continuation). Hover a cell for the full read.">RSI div</th><th data-tip="Price-vs-OPEN-INTEREST divergence, built from OI snapshots recorded each pass (needs a few hours to warm up — shows &quot;building&quot; until then). accumulating = price flat while OI climbs (leverage quietly stacking — the $LAB tell). real up = price + OI both up (new money). fake pump = price up, OI down (short-covering, fades). exhausting = price + OI both down (longs unwinding, bounce risk).">OI div</th><th data-tip="Open interest in USD (contracts × price) from MEXC futures — how much leveraged money is positioned. Rising OI with rising price = new longs; shows — if MEXC did not return it this pass.">Open interest</th><th data-tip="24-hour traded turnover in USD from MEXC futures. A liquidity gauge — thin names (low here) slip badly on a $2,500 order, so size down.">24h vol</th><th data-tip="How far price sits ABOVE the lowest low in the fetched window — a proxy for &quot;near all-time low&quot;. Small = basing right on support (the accumulation end). The board is sorted by this, smallest first.">Above low</th><th data-tip="How far price sits BELOW its highest high in the fetched window (a proxy for all-time high — limited to the history MEXC returns per call). How much it has already given back from the peak; deeply negative = beaten down, lots of overhead room if it turns.">From ATH</th><th data-tip="Price change over roughly the last 24 hours.">24h</th><th data-tip="Price change over roughly the last 7 days (drives the Behaviour read).">~7d</th><th data-tip="Price change over roughly the last 30 days — the medium-term trend.">~30d</th></tr></thead>
     <tbody id="watch2rows"></tbody>
   </table>
   <div class="empty" id="watch2empty" style="display:none">Watchlist monitor warming up — first pass runs a few minutes after boot.</div>
@@ -3677,6 +3722,9 @@ function renderWatch2(){
     (m.not_listed&&m.not_listed.length?' Not on MEXC: <span class="muted">'+m.not_listed.join(', ')+'</span>':'')+'</span></div>';
   const usd=v=>{ if(v==null) return '—'; if(v>=1e9) return '$'+(v/1e9).toFixed(2)+'B'; if(v>=1e6) return '$'+(v/1e6).toFixed(1)+'M'; if(v>=1e3) return '$'+(v/1e3).toFixed(0)+'K'; return '$'+v.toFixed(0); };
   const formCls=f=>f==='Bull stack'?'good':(f==='Bear stack'?'bad':'');
+  const rsiDivLbl=d=>({bull:'bull','hidden_bull':'h-bull',bear:'bear','hidden_bear':'h-bear'})[d]||'—';
+  const rsiDivCls=d=>(d==='bull'||d==='hidden_bull')?'good':((d==='bear'||d==='hidden_bear')?'bad':'muted');
+  const oiDivCls=d=>['accumulating','real up'].includes(d)?'good':(['fake pump','fresh shorts'].includes(d)?'bad':'muted');
   const behClr=b=>['ripping','climbing'].includes(b)?'good':(['dumping','bleeding'].includes(b)?'bad':(b==='coiling'?'muted':''));
   for(const r of m.rows){
     const tr=document.createElement("tr");
@@ -3690,7 +3738,8 @@ function renderWatch2(){
       `<td class="${r.vol_state==='expanding'?'good':(r.vol_state==='quiet'?'muted':'')}" title="ATR as % of price; state vs its 50-bar average">${r.vol_pct==null?'—':r.vol_pct+'% '}<span style="font-size:10px">${r.vol_state||''}</span></td>`+
       `<td class="${(r.rvol||0)>1.5?'good':''}">${r.rvol==null?'—':r.rvol+'×'}</td>`+
       `<td>${r.rsi==null?'—':r.rsi}</td>`+
-      `<td class="${r.rsi_div?'good':'muted'}">${r.rsi_div?'bull':'—'}</td>`+
+      `<td class="${rsiDivCls(r.rsi_div)}" data-tip="${esc(r.rsi_div_note||'no RSI divergence right now')}">${rsiDivLbl(r.rsi_div)}</td>`+
+      `<td class="${oiDivCls(r.oi_div)}">${r.oi_div||'—'}</td>`+
       `<td>${usd(r.oi&&r.price?r.oi*r.price:null)}</td>`+
       `<td>${usd(r.vol24)}</td>`+
       `<td class="${r.near_low?'good':''}" title="% above the lowest low in the fetched window (proxy for near-ATL)">${al==null?'—':'+'+al.toFixed(0)+'%'}</td>`+

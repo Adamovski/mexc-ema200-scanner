@@ -5145,6 +5145,42 @@ def _rsi_bull_div(L, rsis, t, look=40):
     return lo2 < lo1 and rsis[i2] > rsis[i1]
 
 
+def _rsi_divergence(H, L, C, rsis, t, look=40):
+    """Detect the four RSI divergences on the last ~look bars. Compares the swing in the FIRST half
+    of the window to the swing in the SECOND half.
+
+      regular bullish  : price LOWER low  + RSI HIGHER low   -> selling exhausting, reversal UP
+      hidden bullish   : price HIGHER low  + RSI LOWER low    -> pullback in an uptrend, continuation UP
+      regular bearish  : price HIGHER high + RSI LOWER high   -> buying exhausting, reversal DOWN
+      hidden bearish   : price LOWER high  + RSI HIGHER high   -> bounce in a downtrend, continuation DOWN
+
+    Returns (code, note) or (None, None). Bullish reversals are checked first since that is what this
+    board hunts near the lows."""
+    if t < look + 2 or rsis is None:
+        return (None, None)
+    a, b = t - look, t - look // 2
+    # lows in each half
+    l1 = min(range(a, b), key=lambda i: L[i]); l2 = min(range(b, t + 1), key=lambda i: L[i])
+    # highs in each half
+    h1 = max(range(a, b), key=lambda i: H[i]); h2 = max(range(b, t + 1), key=lambda i: H[i])
+    r = rsis
+    if None in (r[l1], r[l2], r[h1], r[h2]):
+        return (None, None)
+    if L[l2] < L[l1] and r[l2] > r[l1]:
+        return ("bull", "regular bullish — price made a lower low but RSI made a higher low: "
+                "selling is exhausting, reversal up building")
+    if L[l2] > L[l1] and r[l2] < r[l1]:
+        return ("hidden_bull", "hidden bullish — higher low in price, lower low in RSI: a pullback "
+                "inside an uptrend, continuation up")
+    if H[h2] > H[h1] and r[h2] < r[h1]:
+        return ("bear", "regular bearish — price made a higher high but RSI made a lower high: "
+                "buying is exhausting, reversal down risk")
+    if H[h2] < H[h1] and r[h2] > r[h1]:
+        return ("hidden_bear", "hidden bearish — lower high in price, higher high in RSI: a bounce "
+                "inside a downtrend, continuation down")
+    return (None, None)
+
+
 def _macd(C, fast=12, slow=26, sig=9):
     ef, es = ema(C, fast), ema(C, slow)
     line = [None] * len(C)
@@ -7391,9 +7427,9 @@ def scan_watchlist(sess, market="futures", tf="4h", limit=1000, caps=None, ticke
         _st, sdir = _st_series(H, L, C, 10, 3.0)
         rsis = rsi_series(C)
         try:
-            has_div = _rsi_bull_div(L, rsis, len(C) - 1, look=40)
+            _dvc, _dvn = _rsi_divergence(H, L, C, rsis, len(C) - 1, look=40)
         except Exception:
-            has_div = False
+            _dvc, _dvn = (None, None)
         lo = min(L); hi = max(H)
         atl_pct = round((px / lo - 1) * 100, 1) if lo > 0 else None    # % above the window low
         ath_pct = round((px / hi - 1) * 100, 1) if hi > 0 else None    # % from the window high (<=0)
@@ -7430,7 +7466,7 @@ def scan_watchlist(sess, market="futures", tf="4h", limit=1000, caps=None, ticke
                     "oi": tk.get("oi"), "vol24": tk.get("vol24"), "mcap": mc,
                     "above_low_pct": atl_pct, "from_high_pct": ath_pct,
                     "near_low": bool(atl_pct is not None and atl_pct < 25),
-                    "rsi_div": bool(has_div),
+                    "rsi_div": _dvc, "rsi_div_note": _dvn,
                     "chg24": chg24, "chg7d": chg7, "chg30d": chg30,
                     "vol_pct": vol_pct, "vol_state": vol_state,
                     "rvol": rvol, "behaviour": behav})
