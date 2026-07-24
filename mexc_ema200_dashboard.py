@@ -1786,8 +1786,17 @@ def watchlist_loop(state: State) -> None:
             # the whole pass - try once, move on if it is slow or fails.
             try:
                 _caps, _amb = fetch_market_caps(_sess)
+                if _caps:
+                    try: STORE.setex("wl:caps", 24 * 3600, json.dumps(_caps))
+                    except Exception: pass
             except Exception:
                 _caps = {}
+            if not _caps:                       # CoinGecko rate-limited -> reuse last good caps
+                try:
+                    _cached = STORE.get("wl:caps")
+                    if _cached: _caps = json.loads(_cached)
+                except Exception:
+                    _caps = {}
             try:
                 _tk = fetch_fut_tickers(_sess)
             except Exception:
@@ -2873,7 +2882,7 @@ PAGE = """<!doctype html>
 <div class="wrap" id="watch2sum"></div>
 <div class="wrap" style="margin-top:8px">
   <table id="watch2tbl">
-    <thead><tr><th>Token</th><th>Price</th><th>Mkt cap</th><th>Behaviour</th><th>EMA form</th><th>S.trend</th><th>Volatility</th><th>Rel vol</th><th>RSI</th><th>Open interest</th><th>24h vol</th><th>Above low</th><th>From high</th><th>24h</th><th>~7d</th><th>~30d</th></tr></thead>
+    <thead><tr><th data-tip="Ticker. ☆ stars it to your personal list; the magnifier opens the full Analyze card. Click the symbol to open it on TradingView.">Token</th><th data-tip="Latest traded price on MEXC (4h close, updates each scan).">Price</th><th data-tip="Market capitalisation from CoinGecko, matched by ticker. Shows — when CoinGecko rate-limits the lookup (common from cloud IPs) or the symbol is ambiguous; it fills on a later pass.">Mkt cap</th><th data-tip="Plain-language read of the last ~7 days combined with volatility: ripping (>25% up), climbing (>8%), coiling (flat + quiet volatility — often the pre-move state), chopping (flat + normal vol), bleeding (>8% down), dumping (>25% down).">Behaviour</th><th data-tip="How the 10/20/50/200 EMAs are stacked. Bull stack = 10>20>50>200 (clean uptrend). Above 200 = price and 50 above the 200. Mixed = tangled. Below 200 / Bear stack = downtrend. A flip from Bear stack toward Above 200 is an early trend-change tell.">EMA form</th><th data-tip="Supertrend (ATR 10, mult 3) direction on the 4h. ▲ = trend up (dynamic support below price), ▼ = trend down (dynamic resistance above).">S.trend</th><th data-tip="Average True Range as a % of price = the typical 4h candle swing. The word is its state vs the 50-bar average: expanding (a move is underway), quiet (coiling — energy building), or normal.">Volatility</th><th data-tip="Relative volume — the latest ~24h volume divided by its 40-bar average. Above ~1.5× means unusual participation is showing up (attention arriving).">Rel vol</th><th data-tip="Relative Strength Index (14) on the 4h. Below ~30 = oversold/washed out, above ~70 = overbought/extended, 40–60 = neutral.">RSI</th><th data-tip="Bullish RSI divergence — price made a lower low while RSI made a HIGHER low over the last ~40 bars. Classic early sign that selling is exhausting near the lows and a reversal may be building. &quot;bull&quot; = present.">Divergence</th><th data-tip="Open interest in USD (contracts × price) from MEXC futures — how much leveraged money is positioned. Rising OI with rising price = new longs; shows — if MEXC did not return it this pass.">Open interest</th><th data-tip="24-hour traded turnover in USD from MEXC futures. A liquidity gauge — thin names (low here) slip badly on a $2,500 order, so size down.">24h vol</th><th data-tip="How far price sits ABOVE the lowest low in the fetched window — a proxy for &quot;near all-time low&quot;. Small = basing right on support (the accumulation end). The board is sorted by this, smallest first.">Above low</th><th data-tip="How far price sits BELOW its highest high in the fetched window (a proxy for all-time high — limited to the history MEXC returns per call). How much it has already given back from the peak; deeply negative = beaten down, lots of overhead room if it turns.">From ATH</th><th data-tip="Price change over roughly the last 24 hours.">24h</th><th data-tip="Price change over roughly the last 7 days (drives the Behaviour read).">~7d</th><th data-tip="Price change over roughly the last 30 days — the medium-term trend.">~30d</th></tr></thead>
     <tbody id="watch2rows"></tbody>
   </table>
   <div class="empty" id="watch2empty" style="display:none">Watchlist monitor warming up — first pass runs a few minutes after boot.</div>
@@ -3681,6 +3690,7 @@ function renderWatch2(){
       `<td class="${r.vol_state==='expanding'?'good':(r.vol_state==='quiet'?'muted':'')}" title="ATR as % of price; state vs its 50-bar average">${r.vol_pct==null?'—':r.vol_pct+'% '}<span style="font-size:10px">${r.vol_state||''}</span></td>`+
       `<td class="${(r.rvol||0)>1.5?'good':''}">${r.rvol==null?'—':r.rvol+'×'}</td>`+
       `<td>${r.rsi==null?'—':r.rsi}</td>`+
+      `<td class="${r.rsi_div?'good':'muted'}">${r.rsi_div?'bull':'—'}</td>`+
       `<td>${usd(r.oi&&r.price?r.oi*r.price:null)}</td>`+
       `<td>${usd(r.vol24)}</td>`+
       `<td class="${r.near_low?'good':''}" title="% above the lowest low in the fetched window (proxy for near-ATL)">${al==null?'—':'+'+al.toFixed(0)+'%'}</td>`+

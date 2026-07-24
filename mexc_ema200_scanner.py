@@ -7334,9 +7334,14 @@ def fetch_fut_tickers(sess):
         for d in r.json().get("data", []):
             try:
                 sym = d["symbol"].replace("_", "")
-                out[sym] = {"oi": float(d.get("holdVol") or 0),
-                            "vol24": float(d.get("amount24") or 0),
-                            "last": float(d.get("lastPrice") or 0)}
+                last = float(d.get("lastPrice") or d.get("fairPrice") or 0)
+                # OI: MEXC exposes it as holdVol (contracts). Fallbacks cover naming drift.
+                oi = float(d.get("holdVol") or d.get("holdVol24") or d.get("openInterest") or 0)
+                # 24h turnover in USD: amount24 is quote turnover; else volume24 (contracts) x price
+                v24 = float(d.get("amount24") or 0)
+                if not v24:
+                    v24 = float(d.get("volume24") or d.get("vol24") or 0) * last
+                out[sym] = {"oi": oi, "vol24": v24, "last": last}
             except Exception:
                 continue
     except Exception:
@@ -7385,6 +7390,10 @@ def scan_watchlist(sess, market="futures", tf="4h", limit=1000, caps=None, ticke
         e10 = ema(C, 10)[-1]; e20 = ema(C, 20)[-1]; e50 = ema(C, 50)[-1]; e200 = ema(C, 200)[-1]
         _st, sdir = _st_series(H, L, C, 10, 3.0)
         rsis = rsi_series(C)
+        try:
+            has_div = _rsi_bull_div(L, rsis, len(C) - 1, look=40)
+        except Exception:
+            has_div = False
         lo = min(L); hi = max(H)
         atl_pct = round((px / lo - 1) * 100, 1) if lo > 0 else None    # % above the window low
         ath_pct = round((px / hi - 1) * 100, 1) if hi > 0 else None    # % from the window high (<=0)
@@ -7421,6 +7430,7 @@ def scan_watchlist(sess, market="futures", tf="4h", limit=1000, caps=None, ticke
                     "oi": tk.get("oi"), "vol24": tk.get("vol24"), "mcap": mc,
                     "above_low_pct": atl_pct, "from_high_pct": ath_pct,
                     "near_low": bool(atl_pct is not None and atl_pct < 25),
+                    "rsi_div": bool(has_div),
                     "chg24": chg24, "chg7d": chg7, "chg30d": chg30,
                     "vol_pct": vol_pct, "vol_state": vol_state,
                     "rvol": rvol, "behaviour": behav})
