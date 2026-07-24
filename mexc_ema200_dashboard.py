@@ -813,6 +813,7 @@ class State:
         self.capit_hits: list[dict] = []           # RUNNER: capitulation flush -> trendline break
         self.scanning: bool = False
         self.watchlist_mon: dict | None = None     # Julius Elum curated watchlist monitor
+        self.watchlist_all: dict | None = None     # same snapshot over the whole liquid universe
         self.long_filtered: bool = False
         self.top_combos: list = []                 # combos that survived out-of-sample
         self.micro_stats: dict | None = None       # sub-$10m market-cap cohort
@@ -911,6 +912,7 @@ class State:
                 "micro_stats": self.micro_stats,
                 "top_combos": self.top_combos,
                 "watchlist_mon": self.watchlist_mon,
+                "watchlist_all": self.watchlist_all,
                 "long_filtered": self.long_filtered,
                 "runner_progress": list(self.runner_progress),
                 "early_new_symbols": list(self.new_early_symbols),
@@ -1770,7 +1772,7 @@ def _wait_for_quiet(state, max_wait=1800):
     return False
 
 
-def _enrich_oi_divergence(res):
+def _enrich_oi_divergence(res, store_key="wl:oihist"):
     """Build an OI time-series from the snapshots we already fetch each pass (no extra API calls),
     persisted in STORE, and tag each row with a price-vs-open-interest divergence read.
 
@@ -1782,7 +1784,7 @@ def _enrich_oi_divergence(res):
     Needs a few passes to accumulate history; until then it reads 'building'."""
     rows = (res or {}).get("rows") or []
     try:
-        hist = json.loads(STORE.get("wl:oihist") or "{}")
+        hist = json.loads(STORE.get(store_key) or "{}")
     except Exception:
         hist = {}
     now = int(time.time())
@@ -1809,9 +1811,57 @@ def _enrich_oi_divergence(res):
         else: r["oi_div"] = "flat"
         r["oi_chg_w"] = round(oc, 1)
     try:
-        STORE.setex("wl:oihist", 3 * 24 * 3600, json.dumps(hist))
+        STORE.setex(store_key, 3 * 24 * 3600, json.dumps(hist))
     except Exception:
         pass
+
+
+
+def watchlist_all_loop(state: State) -> None:
+    """Same snapshot as the curated watchlist, but over the whole LIQUID universe. Heavier (~150
+    coins) so it runs on the shared heavy lane, waits for the scan, and refreshes on a slow cadence.
+    Reuses the cached market caps + one ticker call, so the extra cost is just the candle fetches."""
+    from mexc_ema200_scanner import (scan_watchlist, fetch_fut_tickers, list_symbols,
+                                     liquid_universe)
+    time.sleep(200)
+    market = state.cfg.get("market", "futures")
+    while True:
+        try:
+            _wait_for_quiet(state)
+            if HEAVY_LANE.acquire(blocking=False):
+                try:
+                    _sess = get_session()
+                    try:
+                        _u = list_symbols(_sess, state.cfg.get("quote", "USDT"),
+                                          futures_only=True, market=market)
+                        univ = liquid_universe(_sess, _u, market=market,
+                                               min_dollar_vol=500_000, cap=150)
+                    except Exception:
+                        univ = list(BACKTEST_BASKET)
+                    try:
+                        _tk = fetch_fut_tickers(_sess)
+                    except Exception:
+                        _tk = {}
+                    try:
+                        _caps = json.loads(STORE.get("wl:caps") or "{}")
+                    except Exception:
+                        _caps = {}
+                    res = scan_watchlist(_sess, market=market, tf="4h", caps=_caps,
+                                         tickers=_tk, symbols=univ)
+                    _enrich_oi_divergence(res, store_key="wla:oihist")
+                    with state.lock:
+                        state.watchlist_all = {"ts": time.time(), **res}
+                finally:
+                    try:
+                        HEAVY_LANE.release()
+                    except Exception:
+                        pass
+        except Exception as e:
+            with state.lock:
+                if not state.watchlist_all:
+                    state.watchlist_all = {"ts": time.time(), "rows": [], "n_listed": 0,
+                                           "n_total": 0, "not_listed": [], "error": str(e)}
+        time.sleep(30 * 60)
 
 
 def watchlist_loop(state: State) -> None:
@@ -2608,6 +2658,7 @@ PAGE = """<!doctype html>
   <!-- LEAN BUILD: only the reversion core is shown. The rest are hidden (not removed) while
        we build up from the ground up around the backtest-proven reversion logic. -->
     <div class="tab active" id="tabWatch2" onclick="showTab('watch2')">⭐ Watchlist monitor</div>
+  <div class="tab" id="tabWatch3" onclick="showTab('watch3')">🌐 All coins</div>
   <div class="tab" id="tabAnalyze" onclick="showTab('analyze')">🔎 Analyze a coin</div>
   <div class="tab" id="tabBestLong" onclick="showTab('bestlong')">🟢 Long</div>
   <div class="tab" id="tabBestShort" onclick="showTab('bestshort')">🔴 Short</div>
@@ -2919,6 +2970,21 @@ PAGE = """<!doctype html>
   <div class="empty" id="microempty" style="display:none">No sub-$10m coins mapped yet &mdash; the daily loop refreshes market caps every few hours.</div>
 </div>
 </div>
+<div class="view active" id="viewWatch3">
+<div class="status">
+  <span>🌐 <b>All coins</b> — the SAME snapshot as the watchlist, over the whole <b>liquid MEXC-futures universe</b> ($500k+/day, capped for the free tier). Same sortable columns, so you can hunt the entire market for OI "accumulating", fresh bullish divergence, etc. For each coin this shows a <b>state snapshot</b>: EMA formation (how the 10/20/50/200 are stacked), Supertrend, RSI, open interest, 24h volume, market cap, <b>recent behaviour</b> (ripping / climbing / coiling / bleeding, from 7d move + volatility), <b>volatility</b> (ATR % and whether it is expanding or quiet), and how far it sits <b>above its recent low</b>. Sorted <b>nearest-to-lows first</b> — the accumulation / recapitulation end of the list, where the "next $LAB" tends to hide before it moves.<br>
+  <span class="warn">This is a monitor, not a buy list. A high indicator count means the setup is technically active right now; it says nothing about whether the pump already happened. Many of these are thin — check liquidity before sizing.</span></span>
+</div>
+<div class="wrap" id="watch3sum"></div>
+<div class="wrap" style="margin-top:8px">
+  <table id="watch3tbl">
+    <thead><tr><th data-tip="Ticker. ☆ stars it to your personal list; the magnifier opens the full Analyze card. Click the symbol to open it on TradingView." onclick="wlSortByA('token')" style="cursor:pointer" data-sortkey="token">Token <span class="wlarrowA" data-k="token"></span></th><th data-tip="Latest traded price on MEXC (4h close, updates each scan).">Price</th><th data-tip="Market capitalisation from CoinGecko, matched by ticker. Shows — when CoinGecko rate-limits the lookup (common from cloud IPs) or the symbol is ambiguous; it fills on a later pass." onclick="wlSortByA('mcap')" style="cursor:pointer" data-sortkey="mcap">Mkt cap <span class="wlarrowA" data-k="mcap"></span></th><th data-tip="Plain-language read of the last ~7 days combined with volatility: ripping (>25% up), climbing (>8%), coiling (flat + quiet volatility — often the pre-move state), chopping (flat + normal vol), bleeding (>8% down), dumping (>25% down)." onclick="wlSortByA('behaviour')" style="cursor:pointer" data-sortkey="behaviour">Behaviour <span class="wlarrowA" data-k="behaviour"></span></th><th data-tip="How the 10/20/50/200 EMAs are stacked. Bull stack = 10>20>50>200 (clean uptrend). Above 200 = price and 50 above the 200. Mixed = tangled. Below 200 / Bear stack = downtrend. A flip from Bear stack toward Above 200 is an early trend-change tell." onclick="wlSortByA('ema_form')" style="cursor:pointer" data-sortkey="ema_form">EMA form <span class="wlarrowA" data-k="ema_form"></span></th><th data-tip="Supertrend (ATR 10, mult 3) direction on the 4h. ▲ = trend up (dynamic support below price), ▼ = trend down (dynamic resistance above)." onclick="wlSortByA('supertrend')" style="cursor:pointer" data-sortkey="supertrend">S.trend <span class="wlarrowA" data-k="supertrend"></span></th><th data-tip="Average True Range as a % of price = the typical 4h candle swing. The word is its state vs the 50-bar average: expanding (a move is underway), quiet (coiling — energy building), or normal." onclick="wlSortByA('vol_pct')" style="cursor:pointer" data-sortkey="vol_pct">Volatility <span class="wlarrowA" data-k="vol_pct"></span></th><th data-tip="Relative volume — the latest ~24h volume divided by its 40-bar average. Above ~1.5× means unusual participation is showing up (attention arriving)." onclick="wlSortByA('rvol')" style="cursor:pointer" data-sortkey="rvol">Rel vol <span class="wlarrowA" data-k="rvol"></span></th><th data-tip="Relative Strength Index (14) on the 4h. Below ~30 = oversold/washed out, above ~70 = overbought/extended, 40–60 = neutral.">RSI</th><th data-tip="RSI divergence over the last ~40 bars. bull = regular bullish (price lower low, RSI higher low — reversal up). h-bull = hidden bullish (higher low in price, lower low in RSI — uptrend continuation). bear = regular bearish (reversal-down risk). h-bear = hidden bearish (downtrend continuation). Hover a cell for the full read." onclick="wlSortByA('rsi_div')" style="cursor:pointer" data-sortkey="rsi_div">RSI div <span class="wlarrowA" data-k="rsi_div"></span></th><th data-tip="Price-vs-OPEN-INTEREST divergence, built from OI snapshots recorded each pass (needs a few hours to warm up — shows &quot;building&quot; until then). accumulating = price flat while OI climbs (leverage quietly stacking — the $LAB tell). real up = price + OI both up (new money). fake pump = price up, OI down (short-covering, fades). exhausting = price + OI both down (longs unwinding, bounce risk)." onclick="wlSortByA('oi_div')" style="cursor:pointer" data-sortkey="oi_div">OI div <span class="wlarrowA" data-k="oi_div"></span></th><th data-tip="Open interest in USD (contracts × price) from MEXC futures — how much leveraged money is positioned. Rising OI with rising price = new longs; shows — if MEXC did not return it this pass." onclick="wlSortByA('oi')" style="cursor:pointer" data-sortkey="oi">Open interest <span class="wlarrowA" data-k="oi"></span></th><th data-tip="24-hour traded turnover in USD from MEXC futures. A liquidity gauge — thin names (low here) slip badly on a $2,500 order, so size down." onclick="wlSortByA('vol24')" style="cursor:pointer" data-sortkey="vol24">24h vol <span class="wlarrowA" data-k="vol24"></span></th><th data-tip="How far price sits ABOVE the lowest low in the fetched window — a proxy for &quot;near all-time low&quot;. Small = basing right on support (the accumulation end). The board is sorted by this, smallest first." onclick="wlSortByA('above_low_pct')" style="cursor:pointer" data-sortkey="above_low_pct">Above low <span class="wlarrowA" data-k="above_low_pct"></span></th><th data-tip="How far price sits BELOW its highest high in the fetched window (a proxy for all-time high — limited to the history MEXC returns per call). How much it has already given back from the peak; deeply negative = beaten down, lots of overhead room if it turns." onclick="wlSortByA('from_high_pct')" style="cursor:pointer" data-sortkey="from_high_pct">From ATH <span class="wlarrowA" data-k="from_high_pct"></span></th><th data-tip="Price change over roughly the last 24 hours." onclick="wlSortByA('chg24')" style="cursor:pointer" data-sortkey="chg24">24h <span class="wlarrowA" data-k="chg24"></span></th><th data-tip="Price change over roughly the last 7 days (drives the Behaviour read)." onclick="wlSortByA('chg7d')" style="cursor:pointer" data-sortkey="chg7d">~7d <span class="wlarrowA" data-k="chg7d"></span></th><th data-tip="Price change over roughly the last 30 days — the medium-term trend." onclick="wlSortByA('chg30d')" style="cursor:pointer" data-sortkey="chg30d">~30d <span class="wlarrowA" data-k="chg30d"></span></th></tr></thead>
+    <tbody id="watch3rows"></tbody>
+  </table>
+  <div class="empty" id="watch3empty" style="display:none">Watchlist monitor warming up — first pass runs a few minutes after boot.</div>
+</div>
+</div>
+
 <div class="view active" id="viewWatch2">
 <div class="status">
   <span>⭐ <b>Watchlist monitor</b> — the curated list of ~80 Binance-Alpha / AI-narrative / RWA tokens (the $LAB, $SKYAI, $RIVER type names). For each that trades as a USDT perp on MEXC, this shows a <b>state snapshot</b>: EMA formation (how the 10/20/50/200 are stacked), Supertrend, RSI, open interest, 24h volume, market cap, <b>recent behaviour</b> (ripping / climbing / coiling / bleeding, from 7d move + volatility), <b>volatility</b> (ATR % and whether it is expanding or quiet), and how far it sits <b>above its recent low</b>. Sorted <b>nearest-to-lows first</b> — the accumulation / recapitulation end of the list, where the "next $LAB" tends to hide before it moves.<br>
@@ -3705,67 +3771,65 @@ function setWatchArrows(){
     th.childNodes[0].nodeValue = base + arrow;
   });
 }
-function wlSortBy(k){
-  if(wlSort.key===k){ wlSort.dir*=-1; } else { wlSort.key=k; wlSort.dir=(k==='above_low_pct'?1:-1); }
-  renderWatch2();
-}
-function renderWatch2(){
-  const tb=document.getElementById("watch2rows"), sm=document.getElementById("watch2sum");
-  if(!tb) return; tb.innerHTML="";
-  const m=watch2latest;
-  const emp=document.getElementById("watch2empty");
-  if(!m){ if(emp){emp.style.display="block"; emp.textContent="Watchlist monitor warming up — first pass runs a minute or two after boot.";} if(sm) sm.innerHTML=""; return; }
-  if(emp){
-    if(m.rows&&m.rows.length){ emp.style.display="none"; }
-    else { emp.style.display="block";
-      emp.textContent = m.error ? ("Watchlist error: "+m.error)
-        : ("None of the "+(m.n_total||0)+" watchlist tokens are currently listed as USDT perpetuals on MEXC futures, so there is nothing to chart here. "+
-           ((m.not_listed&&m.not_listed.length)?("Not on MEXC: "+m.not_listed.slice(0,80).join(', ')):"")); }
-  }
-  if(sm) sm.innerHTML='<div class="status"><span><b>'+m.n_listed+'</b> of '+m.n_total+' watchlist tokens trade on MEXC futures.'+
-    (m.not_listed&&m.not_listed.length?' Not on MEXC: <span class="muted">'+m.not_listed.join(', ')+'</span>':'')+'</span></div>';
-  const usd=v=>{ if(v==null) return '—'; if(v>=1e9) return '$'+(v/1e9).toFixed(2)+'B'; if(v>=1e6) return '$'+(v/1e6).toFixed(1)+'M'; if(v>=1e3) return '$'+(v/1e3).toFixed(0)+'K'; return '$'+v.toFixed(0); };
+let wlSortA={key:null,dir:1};
+function _wlUsd(v){ if(v==null) return '—'; if(v>=1e9) return '$'+(v/1e9).toFixed(2)+'B'; if(v>=1e6) return '$'+(v/1e6).toFixed(1)+'M'; if(v>=1e3) return '$'+(v/1e3).toFixed(0)+'K'; return '$'+v.toFixed(0); }
+function _wlRowHtml(r){
+  const usd=_wlUsd;
   const formCls=f=>f==='Bull stack'?'good':(f==='Bear stack'?'bad':'');
   const rsiDivLbl=d=>({bull:'bull','hidden_bull':'h-bull',bear:'bear','hidden_bear':'h-bear'})[d]||'—';
   const rsiDivCls=d=>(d==='bull'||d==='hidden_bull')?'good':((d==='bear'||d==='hidden_bear')?'bad':'muted');
   const oiDivCls=d=>['accumulating','real up'].includes(d)?'good':(['fake pump','fresh shorts'].includes(d)?'bad':'muted');
   const behClr=b=>['ripping','climbing'].includes(b)?'good':(['dumping','bleeding'].includes(b)?'bad':(b==='coiling'?'muted':''));
-  let rows=[...m.rows];
-  if(wlSort.key){
-    const k=wlSort.key, d=wlSort.dir;
-    rows.sort((a,b)=>{
-      let x=a[k], y=b[k];
+  const c7=r.chg7d, al=r.above_low_pct, fh=r.from_high_pct;
+  return `<td class="sym"><div class="symbox">${watchStar(r.symbol)}<a href="${tvLink(r.symbol)}" target="_blank" rel="noopener">${r.token}</a>${analyzeBtn(r.symbol)}</div></td>`+
+    `<td>${fmtNum(r.live!=null?r.live:r.price)}</td>`+
+    `<td>${usd(r.mcap)}</td>`+
+    `<td class="${behClr(r.behaviour)}"><b>${r.behaviour||'—'}</b></td>`+
+    `<td class="${formCls(r.ema_form)}">${r.ema_form||'—'}</td>`+
+    `<td class="${r.supertrend==='up'?'good':'bad'}">${r.supertrend==='up'?'▲':'▼'}</td>`+
+    `<td class="${r.vol_state==='expanding'?'good':(r.vol_state==='quiet'?'muted':'')}">${r.vol_pct==null?'—':r.vol_pct+'% '}<span style="font-size:10px">${r.vol_state||''}</span></td>`+
+    `<td class="${(r.rvol||0)>1.5?'good':''}">${r.rvol==null?'—':r.rvol+'×'}</td>`+
+    `<td>${r.rsi==null?'—':r.rsi}</td>`+
+    `<td class="${rsiDivCls(r.rsi_div)}" data-tip="${esc(r.rsi_div_note||'no RSI divergence right now')}">${rsiDivLbl(r.rsi_div)}</td>`+
+    `<td class="${oiDivCls(r.oi_div)}">${r.oi_div||'—'}</td>`+
+    `<td>${usd(r.oi&&r.price?r.oi*r.price:null)}</td>`+
+    `<td>${usd(r.vol24)}</td>`+
+    `<td class="${r.near_low?'good':''}">${al==null?'—':'+'+al.toFixed(0)+'%'}</td>`+
+    `<td class="bad">${fh==null?'—':fh.toFixed(0)+'%'}</td>`+
+    `<td class="${(r.chg24||0)>0?'good':((r.chg24||0)<0?'bad':'')}">${r.chg24==null?'—':((r.chg24>0?'+':'')+r.chg24.toFixed(0)+'%')}</td>`+
+    `<td class="${(c7||0)>0?'good':((c7||0)<0?'bad':'')}">${c7==null?'—':((c7>0?'+':'')+c7.toFixed(0)+'%')}</td>`+
+    `<td class="${(r.chg30d||0)>0?'good':((r.chg30d||0)<0?'bad':'')}">${r.chg30d==null?'—':((r.chg30d>0?'+':'')+r.chg30d.toFixed(0)+'%')}</td>`;
+}
+function _wlRender(m, ids, sortState, arrowSel, warmMsg, curated){
+  const tb=document.getElementById(ids.rows), sm=document.getElementById(ids.sum), emp=document.getElementById(ids.empty);
+  if(!tb) return; tb.innerHTML="";
+  if(!m){ if(emp){emp.style.display="block"; emp.textContent=warmMsg;} if(sm) sm.innerHTML=""; return; }
+  if(emp){
+    if(m.rows&&m.rows.length){ emp.style.display="none"; }
+    else { emp.style.display="block";
+      emp.textContent = m.error ? ("Error: "+m.error)
+        : (curated ? ("None of the "+(m.n_total||0)+" watchlist tokens are currently listed as USDT perpetuals on MEXC futures. "+
+             ((m.not_listed&&m.not_listed.length)?("Not on MEXC: "+m.not_listed.slice(0,80).join(', ')):""))
+                   : "Scanning the universe — first pass runs a few minutes after boot."); }
+  }
+  if(sm) sm.innerHTML='<div class="status"><span><b>'+(m.n_listed||0)+'</b>'+(curated?(' of '+m.n_total+' watchlist tokens trade on MEXC futures.'):' liquid coins scanned.')+
+    (curated&&m.not_listed&&m.not_listed.length?' Not on MEXC: <span class="muted">'+m.not_listed.join(', ')+'</span>':'')+'</span></div>';
+  let rows=[...(m.rows||[])];
+  if(sortState.key){
+    const k=sortState.key, d=sortState.dir;
+    rows.sort((a,b)=>{ let x=a[k], y=b[k];
       if(x==null&&y==null) return 0; if(x==null) return 1; if(y==null) return -1;
       if(typeof x==="string"||typeof y==="string") return d*String(x).localeCompare(String(y));
-      return d*(x-y);
-    });
+      return d*(x-y); });
   }
-  // reflect the active sort arrow in the headers
-  document.querySelectorAll(".wlarrow").forEach(el=>{ el.textContent = (el.getAttribute("data-k")===wlSort.key)?(wlSort.dir>0?"▲":"▼"):""; });
-  for(const r of rows){
-    const tr=document.createElement("tr");
-    const c7=r.chg7d, al=r.above_low_pct, fh=r.from_high_pct;
-    tr.innerHTML=`<td class="sym"><div class="symbox">${watchStar(r.symbol)}<a href="${tvLink(r.symbol)}" target="_blank" rel="noopener">${r.token}</a>${analyzeBtn(r.symbol)}</div></td>`+
-      `<td>${fmtNum(r.live!=null?r.live:r.price)}</td>`+
-      `<td>${usd(r.mcap)}</td>`+
-      `<td class="${behClr(r.behaviour)}"><b>${r.behaviour||'—'}</b></td>`+
-      `<td class="${formCls(r.ema_form)}">${r.ema_form||'—'}</td>`+
-      `<td class="${r.supertrend==='up'?'good':'bad'}">${r.supertrend==='up'?'▲':'▼'}</td>`+
-      `<td class="${r.vol_state==='expanding'?'good':(r.vol_state==='quiet'?'muted':'')}" title="ATR as % of price; state vs its 50-bar average">${r.vol_pct==null?'—':r.vol_pct+'% '}<span style="font-size:10px">${r.vol_state||''}</span></td>`+
-      `<td class="${(r.rvol||0)>1.5?'good':''}">${r.rvol==null?'—':r.rvol+'×'}</td>`+
-      `<td>${r.rsi==null?'—':r.rsi}</td>`+
-      `<td class="${rsiDivCls(r.rsi_div)}" data-tip="${esc(r.rsi_div_note||'no RSI divergence right now')}">${rsiDivLbl(r.rsi_div)}</td>`+
-      `<td class="${oiDivCls(r.oi_div)}">${r.oi_div||'—'}</td>`+
-      `<td>${usd(r.oi&&r.price?r.oi*r.price:null)}</td>`+
-      `<td>${usd(r.vol24)}</td>`+
-      `<td class="${r.near_low?'good':''}" title="% above the lowest low in the fetched window (proxy for near-ATL)">${al==null?'—':'+'+al.toFixed(0)+'%'}</td>`+
-      `<td class="bad">${fh==null?'—':fh.toFixed(0)+'%'}</td>`+
-      `<td class="${(r.chg24||0)>0?'good':((r.chg24||0)<0?'bad':'')}">${r.chg24==null?'—':((r.chg24>0?'+':'')+r.chg24.toFixed(0)+'%')}</td>`+
-      `<td class="${(c7||0)>0?'good':((c7||0)<0?'bad':'')}">${c7==null?'—':((c7>0?'+':'')+c7.toFixed(0)+'%')}</td>`+
-      `<td class="${(r.chg30d||0)>0?'good':((r.chg30d||0)<0?'bad':'')}">${r.chg30d==null?'—':((r.chg30d>0?'+':'')+r.chg30d.toFixed(0)+'%')}</td>`;
-    tb.appendChild(tr);
-  }
+  document.querySelectorAll(arrowSel).forEach(el=>{ el.textContent=(el.getAttribute("data-k")===sortState.key)?(sortState.dir>0?"▲":"▼"):""; });
+  for(const r of rows){ const tr=document.createElement("tr"); tr.innerHTML=_wlRowHtml(r); tb.appendChild(tr); }
 }
+function wlSortBy(k){ if(wlSort.key===k){ wlSort.dir*=-1; } else { wlSort.key=k; wlSort.dir=(k==='above_low_pct'?1:-1); } renderWatch2(); }
+function wlSortByA(k){ if(wlSortA.key===k){ wlSortA.dir*=-1; } else { wlSortA.key=k; wlSortA.dir=(k==='above_low_pct'?1:-1); } renderWatch3(); }
+function renderWatch2(){ _wlRender(watch2latest, {rows:'watch2rows',sum:'watch2sum',empty:'watch2empty'}, wlSort, '.wlarrow', 'Watchlist monitor warming up — first pass runs a minute or two after boot.', true); }
+function renderWatch3(){ _wlRender(watch3latest, {rows:'watch3rows',sum:'watch3sum',empty:'watch3empty'}, wlSortA, '.wlarrowA', 'All-coins scan warming up — first pass runs a few minutes after boot.', false); }
+
 function renderWatch(){
   const tb=document.getElementById('wlrows'); if(!tb) return;
   const syms=[...WATCH].sort((a,b)=>{
@@ -3900,7 +3964,7 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["dtb","Dtb"],["accum","Accum"],["capit","Capit"],["micro","Micro"],["signals","Signals"],["watch2","Watch2"],["coil","Coil"],["scalp","Scalp"],["spot","Spot"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["dtb","Dtb"],["accum","Accum"],["capit","Capit"],["micro","Micro"],["signals","Signals"],["watch2","Watch2"],["watch3","Watch3"],["coil","Coil"],["scalp","Scalp"],["spot","Spot"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
     document.getElementById("tab"+v).classList.toggle("active", t===which);
     document.getElementById("view"+v).classList.toggle("active", t===which);
   }
@@ -3917,6 +3981,7 @@ function showTab(which){
   if(which==="backtest") loadBacktest();
   if(which==="calls") renderCalls();
   if(which==="watch2") renderWatch2();
+  if(which==="watch3") renderWatch3();
   if(which==="micro") renderMicro();
   if(which==="capit") renderCapit();
   if(which==="signals") renderSignals();
@@ -4891,6 +4956,7 @@ function renderDtb(){
 }
 let siglatest=null;
 let watch2latest=null;
+let watch3latest=null;
 let wlSort={key:null,dir:1};
 let capitlatest=[];
 let microlatest=null;
@@ -6565,6 +6631,7 @@ async function poll(){
   accumlatest=d.accum_hits||[]; renderAccum();
   siglatest=d.signal_rank||null; renderSignals();
   watch2latest=d.watchlist_mon||null; renderWatch2();
+  watch3latest=d.watchlist_all||null; renderWatch3();
   capitlatest=d.capit_hits||[]; renderCapit();
   microlatest=d.micro_stats||null; renderMicro();
   rdiaglatest=d.runner_diag||null; renderDiag("dtb"); renderDiag("accum");
@@ -7025,6 +7092,7 @@ def main() -> None:
         threading.Thread(target=breakout_watcher, args=(state,), daemon=True).start()
         threading.Thread(target=runner_loop, args=(state,), daemon=True).start()
         threading.Thread(target=watchlist_loop, args=(state,), daemon=True).start()
+        threading.Thread(target=watchlist_all_loop, args=(state,), daemon=True).start()
     def _delayed_lab():
         time.sleep(300)          # let the first scan finish and the site come up before thinking hard
         backtest_loop(state)

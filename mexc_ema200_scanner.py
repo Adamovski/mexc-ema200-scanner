@@ -7400,16 +7400,22 @@ def _ema_formation(px, e10, e20, e50, e200):
     return "Mixed"
 
 
-def scan_watchlist(sess, market="futures", tf="4h", limit=1000, caps=None, tickers=None):
+def scan_watchlist(sess, market="futures", tf="4h", limit=1000, caps=None, tickers=None, symbols=None):
     """State snapshot of Julius Elum's curated watchlist. For each token on MEXC futures, report the
     things that tell you WHERE it is, not just whether a signal fired: EMA formation, Supertrend,
     open interest, 24h volume, market cap, RSI, and how far it sits above its recent low (a proxy
     for 'near all-time low' within the fetched window)."""
     caps = caps or {}
     tickers = tickers or {}
+    # symbols: explicit list of DISPLAY symbols (e.g. "BTCUSDT") for the all-coins board; else the
+    # curated token list. The token label is just the symbol minus its USDT quote.
+    if symbols:
+        pairs = [(sy[:-4] if sy.endswith("USDT") else sy, sy) for sy in symbols]
+    else:
+        pairs = [(t, t + "USDT") for t in WATCHLIST_TOKENS]
+    n_total_src = len(pairs)
     out = []
-    for tok in WATCHLIST_TOKENS:
-        sym = tok + "USDT"
+    for tok, sym in pairs:
         try:
             raw = fetch_candles(sess, sym, tf, limit, market)
         except Exception:
@@ -7474,7 +7480,7 @@ def scan_watchlist(sess, market="futures", tf="4h", limit=1000, caps=None, ticke
     # default sort: nearest to its lows first (recapitulation / accumulation candidates)
     listed.sort(key=lambda o: (o.get("above_low_pct") if o.get("above_low_pct") is not None else 9e9))
     missing = [o["token"] for o in out if not o.get("listed")]
-    return {"rows": listed, "not_listed": missing, "n_total": len(WATCHLIST_TOKENS),
+    return {"rows": listed, "not_listed": missing, "n_total": n_total_src,
             "n_listed": len(listed)}
 
 def scan_symbol_multi(sess: requests.Session, symbol: str, interval: str,
