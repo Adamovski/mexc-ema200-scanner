@@ -2648,7 +2648,7 @@ PAGE = """<!doctype html>
   <table id="tbl">
     <thead><tr>
       <th data-k="symbol">Symbol</th>
-      <th data-k="price">Price</th>
+      <th data-k="price" onclick="wlSortBy('price')" style="cursor:pointer" data-sortkey="price">Price <span class="wlarrow" data-k="price"></span></th>
       <th data-k="pct_above_ema">% &gt; EMA</th>
       <th data-k="bars_since_cross">Bars</th>
       <th data-k="bias">Bias</th>
@@ -2747,7 +2747,7 @@ PAGE = """<!doctype html>
       <th data-bk="tf">TF</th>
       <th data-bk="touches">Touches</th>
       <th data-bk="dist_to_support_pct">Dist %</th>
-      <th data-bk="rsi">RSI</th>
+      <th data-bk="rsi" onclick="wlSortBy('rsi')" style="cursor:pointer" data-sortkey="rsi">RSI <span class="wlarrow" data-k="rsi"></span></th>
       <th data-bk="bias">Bias</th>
       <th data-bk="optimal_entry">Optimal entry</th>
       <th data-bk="sl_tight">SL tight</th>
@@ -2927,7 +2927,7 @@ PAGE = """<!doctype html>
 <div class="wrap" id="watch2sum"></div>
 <div class="wrap" style="margin-top:8px">
   <table id="watch2tbl">
-    <thead><tr><th data-tip="Ticker. ☆ stars it to your personal list; the magnifier opens the full Analyze card. Click the symbol to open it on TradingView.">Token</th><th data-tip="Latest traded price on MEXC (4h close, updates each scan).">Price</th><th data-tip="Market capitalisation from CoinGecko, matched by ticker. Shows — when CoinGecko rate-limits the lookup (common from cloud IPs) or the symbol is ambiguous; it fills on a later pass.">Mkt cap</th><th data-tip="Plain-language read of the last ~7 days combined with volatility: ripping (>25% up), climbing (>8%), coiling (flat + quiet volatility — often the pre-move state), chopping (flat + normal vol), bleeding (>8% down), dumping (>25% down).">Behaviour</th><th data-tip="How the 10/20/50/200 EMAs are stacked. Bull stack = 10>20>50>200 (clean uptrend). Above 200 = price and 50 above the 200. Mixed = tangled. Below 200 / Bear stack = downtrend. A flip from Bear stack toward Above 200 is an early trend-change tell.">EMA form</th><th data-tip="Supertrend (ATR 10, mult 3) direction on the 4h. ▲ = trend up (dynamic support below price), ▼ = trend down (dynamic resistance above).">S.trend</th><th data-tip="Average True Range as a % of price = the typical 4h candle swing. The word is its state vs the 50-bar average: expanding (a move is underway), quiet (coiling — energy building), or normal.">Volatility</th><th data-tip="Relative volume — the latest ~24h volume divided by its 40-bar average. Above ~1.5× means unusual participation is showing up (attention arriving).">Rel vol</th><th data-tip="Relative Strength Index (14) on the 4h. Below ~30 = oversold/washed out, above ~70 = overbought/extended, 40–60 = neutral.">RSI</th><th data-tip="RSI divergence over the last ~40 bars. bull = regular bullish (price lower low, RSI higher low — reversal up). h-bull = hidden bullish (higher low in price, lower low in RSI — uptrend continuation). bear = regular bearish (reversal-down risk). h-bear = hidden bearish (downtrend continuation). Hover a cell for the full read.">RSI div</th><th data-tip="Price-vs-OPEN-INTEREST divergence, built from OI snapshots recorded each pass (needs a few hours to warm up — shows &quot;building&quot; until then). accumulating = price flat while OI climbs (leverage quietly stacking — the $LAB tell). real up = price + OI both up (new money). fake pump = price up, OI down (short-covering, fades). exhausting = price + OI both down (longs unwinding, bounce risk).">OI div</th><th data-tip="Open interest in USD (contracts × price) from MEXC futures — how much leveraged money is positioned. Rising OI with rising price = new longs; shows — if MEXC did not return it this pass.">Open interest</th><th data-tip="24-hour traded turnover in USD from MEXC futures. A liquidity gauge — thin names (low here) slip badly on a $2,500 order, so size down.">24h vol</th><th data-tip="How far price sits ABOVE the lowest low in the fetched window — a proxy for &quot;near all-time low&quot;. Small = basing right on support (the accumulation end). The board is sorted by this, smallest first.">Above low</th><th data-tip="How far price sits BELOW its highest high in the fetched window (a proxy for all-time high — limited to the history MEXC returns per call). How much it has already given back from the peak; deeply negative = beaten down, lots of overhead room if it turns.">From ATH</th><th data-tip="Price change over roughly the last 24 hours.">24h</th><th data-tip="Price change over roughly the last 7 days (drives the Behaviour read).">~7d</th><th data-tip="Price change over roughly the last 30 days — the medium-term trend.">~30d</th></tr></thead>
+    <thead><tr><th data-tip="Ticker. ☆ stars it to your personal list; the magnifier opens the full Analyze card. Click the symbol to open it on TradingView." onclick="wlSortBy('token')" style="cursor:pointer" data-sortkey="token">Token <span class="wlarrow" data-k="token"></span></th><th data-tip="Latest traded price on MEXC (4h close, updates each scan).">Price</th><th data-tip="Market capitalisation from CoinGecko, matched by ticker. Shows — when CoinGecko rate-limits the lookup (common from cloud IPs) or the symbol is ambiguous; it fills on a later pass." onclick="wlSortBy('mcap')" style="cursor:pointer" data-sortkey="mcap">Mkt cap <span class="wlarrow" data-k="mcap"></span></th><th data-tip="Plain-language read of the last ~7 days combined with volatility: ripping (>25% up), climbing (>8%), coiling (flat + quiet volatility — often the pre-move state), chopping (flat + normal vol), bleeding (>8% down), dumping (>25% down)." onclick="wlSortBy('behaviour')" style="cursor:pointer" data-sortkey="behaviour">Behaviour <span class="wlarrow" data-k="behaviour"></span></th><th data-tip="How the 10/20/50/200 EMAs are stacked. Bull stack = 10>20>50>200 (clean uptrend). Above 200 = price and 50 above the 200. Mixed = tangled. Below 200 / Bear stack = downtrend. A flip from Bear stack toward Above 200 is an early trend-change tell." onclick="wlSortBy('ema_form')" style="cursor:pointer" data-sortkey="ema_form">EMA form <span class="wlarrow" data-k="ema_form"></span></th><th data-tip="Supertrend (ATR 10, mult 3) direction on the 4h. ▲ = trend up (dynamic support below price), ▼ = trend down (dynamic resistance above)." onclick="wlSortBy('supertrend')" style="cursor:pointer" data-sortkey="supertrend">S.trend <span class="wlarrow" data-k="supertrend"></span></th><th data-tip="Average True Range as a % of price = the typical 4h candle swing. The word is its state vs the 50-bar average: expanding (a move is underway), quiet (coiling — energy building), or normal." onclick="wlSortBy('vol_pct')" style="cursor:pointer" data-sortkey="vol_pct">Volatility <span class="wlarrow" data-k="vol_pct"></span></th><th data-tip="Relative volume — the latest ~24h volume divided by its 40-bar average. Above ~1.5× means unusual participation is showing up (attention arriving)." onclick="wlSortBy('rvol')" style="cursor:pointer" data-sortkey="rvol">Rel vol <span class="wlarrow" data-k="rvol"></span></th><th data-tip="Relative Strength Index (14) on the 4h. Below ~30 = oversold/washed out, above ~70 = overbought/extended, 40–60 = neutral.">RSI</th><th data-tip="RSI divergence over the last ~40 bars. bull = regular bullish (price lower low, RSI higher low — reversal up). h-bull = hidden bullish (higher low in price, lower low in RSI — uptrend continuation). bear = regular bearish (reversal-down risk). h-bear = hidden bearish (downtrend continuation). Hover a cell for the full read." onclick="wlSortBy('rsi_div')" style="cursor:pointer" data-sortkey="rsi_div">RSI div <span class="wlarrow" data-k="rsi_div"></span></th><th data-tip="Price-vs-OPEN-INTEREST divergence, built from OI snapshots recorded each pass (needs a few hours to warm up — shows &quot;building&quot; until then). accumulating = price flat while OI climbs (leverage quietly stacking — the $LAB tell). real up = price + OI both up (new money). fake pump = price up, OI down (short-covering, fades). exhausting = price + OI both down (longs unwinding, bounce risk)." onclick="wlSortBy('oi_div')" style="cursor:pointer" data-sortkey="oi_div">OI div <span class="wlarrow" data-k="oi_div"></span></th><th data-tip="Open interest in USD (contracts × price) from MEXC futures — how much leveraged money is positioned. Rising OI with rising price = new longs; shows — if MEXC did not return it this pass." onclick="wlSortBy('oi')" style="cursor:pointer" data-sortkey="oi">Open interest <span class="wlarrow" data-k="oi"></span></th><th data-tip="24-hour traded turnover in USD from MEXC futures. A liquidity gauge — thin names (low here) slip badly on a $2,500 order, so size down." onclick="wlSortBy('vol24')" style="cursor:pointer" data-sortkey="vol24">24h vol <span class="wlarrow" data-k="vol24"></span></th><th data-tip="How far price sits ABOVE the lowest low in the fetched window — a proxy for &quot;near all-time low&quot;. Small = basing right on support (the accumulation end). The board is sorted by this, smallest first." onclick="wlSortBy('above_low_pct')" style="cursor:pointer" data-sortkey="above_low_pct">Above low <span class="wlarrow" data-k="above_low_pct"></span></th><th data-tip="How far price sits BELOW its highest high in the fetched window (a proxy for all-time high — limited to the history MEXC returns per call). How much it has already given back from the peak; deeply negative = beaten down, lots of overhead room if it turns." onclick="wlSortBy('from_high_pct')" style="cursor:pointer" data-sortkey="from_high_pct">From ATH <span class="wlarrow" data-k="from_high_pct"></span></th><th data-tip="Price change over roughly the last 24 hours." onclick="wlSortBy('chg24')" style="cursor:pointer" data-sortkey="chg24">24h <span class="wlarrow" data-k="chg24"></span></th><th data-tip="Price change over roughly the last 7 days (drives the Behaviour read)." onclick="wlSortBy('chg7d')" style="cursor:pointer" data-sortkey="chg7d">~7d <span class="wlarrow" data-k="chg7d"></span></th><th data-tip="Price change over roughly the last 30 days — the medium-term trend." onclick="wlSortBy('chg30d')" style="cursor:pointer" data-sortkey="chg30d">~30d <span class="wlarrow" data-k="chg30d"></span></th></tr></thead>
     <tbody id="watch2rows"></tbody>
   </table>
   <div class="empty" id="watch2empty" style="display:none">Watchlist monitor warming up — first pass runs a few minutes after boot.</div>
@@ -3705,6 +3705,10 @@ function setWatchArrows(){
     th.childNodes[0].nodeValue = base + arrow;
   });
 }
+function wlSortBy(k){
+  if(wlSort.key===k){ wlSort.dir*=-1; } else { wlSort.key=k; wlSort.dir=(k==='above_low_pct'?1:-1); }
+  renderWatch2();
+}
 function renderWatch2(){
   const tb=document.getElementById("watch2rows"), sm=document.getElementById("watch2sum");
   if(!tb) return; tb.innerHTML="";
@@ -3726,7 +3730,19 @@ function renderWatch2(){
   const rsiDivCls=d=>(d==='bull'||d==='hidden_bull')?'good':((d==='bear'||d==='hidden_bear')?'bad':'muted');
   const oiDivCls=d=>['accumulating','real up'].includes(d)?'good':(['fake pump','fresh shorts'].includes(d)?'bad':'muted');
   const behClr=b=>['ripping','climbing'].includes(b)?'good':(['dumping','bleeding'].includes(b)?'bad':(b==='coiling'?'muted':''));
-  for(const r of m.rows){
+  let rows=[...m.rows];
+  if(wlSort.key){
+    const k=wlSort.key, d=wlSort.dir;
+    rows.sort((a,b)=>{
+      let x=a[k], y=b[k];
+      if(x==null&&y==null) return 0; if(x==null) return 1; if(y==null) return -1;
+      if(typeof x==="string"||typeof y==="string") return d*String(x).localeCompare(String(y));
+      return d*(x-y);
+    });
+  }
+  // reflect the active sort arrow in the headers
+  document.querySelectorAll(".wlarrow").forEach(el=>{ el.textContent = (el.getAttribute("data-k")===wlSort.key)?(wlSort.dir>0?"▲":"▼"):""; });
+  for(const r of rows){
     const tr=document.createElement("tr");
     const c7=r.chg7d, al=r.above_low_pct, fh=r.from_high_pct;
     tr.innerHTML=`<td class="sym"><div class="symbox">${watchStar(r.symbol)}<a href="${tvLink(r.symbol)}" target="_blank" rel="noopener">${r.token}</a>${analyzeBtn(r.symbol)}</div></td>`+
@@ -4875,6 +4891,7 @@ function renderDtb(){
 }
 let siglatest=null;
 let watch2latest=null;
+let wlSort={key:null,dir:1};
 let capitlatest=[];
 let microlatest=null;
 let rdiaglatest=null;
