@@ -7481,7 +7481,8 @@ def fetch_binance_alpha_tokens(sess):
                          "chg24": _f("percentChange24h"), "vol24_alpha": _f("volume24h"),
                          "mcap": _f("marketCap"), "fdv": _f("fdv"), "liquidity": _f("liquidity"),
                          "holders": _f("holders"), "on_binance": bool(x.get("listingCex")),
-                         "chain": x.get("chainName")}
+                         "chain": x.get("chainName"), "name": x.get("name"),
+                         "raw_symbol": x.get("symbol")}
     if len(out) < 50:                       # implausibly small -> treat as a bad response
         raise ValueError("binance alpha list too small: %d" % len(out))
     return out, listed, meta
@@ -7490,15 +7491,36 @@ def fetch_binance_alpha_tokens(sess):
 ALPHA_KLINES_URL = "https://www.binance.com/bapi/defi/v1/public/alpha-trade/klines"
 
 
-def fetch_alpha_klines(sess, alpha_id, interval="4h", limit=1000):
-    """Binance Alpha candles for one token (alpha_id like 'ALPHA_123'). Same row shape as MEXC
-    klines: [open_ms, o, h, l, c, vol, ...]. Returns None on failure."""
-    if not alpha_id:
+def fetch_alpha_pairs(sess):
+    """{alpha_id: trading_pair} from Binance Alpha exchange info. Alpha tokens are quoted in USDT,
+    USDC or 'U' depending on chain (Base -> USDC, Robinhood -> U), so the pair must be looked up
+    rather than assumed. Preference: USDT > USDC > U, TRADING only."""
+    pref = {"USDT": 0, "USDC": 1, "U": 2}
+    out, rank = {}, {}
+    r = sess.get("https://www.binance.com/bapi/defi/v1/public/alpha-trade/get-exchange-info",
+                 timeout=20, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+    r.raise_for_status()
+    for x in ((r.json().get("data") or {}).get("symbols") or []):
+        if x.get("status") != "TRADING":
+            continue
+        b, q = x.get("baseAsset"), x.get("quoteAsset")
+        if not b or q not in pref:
+            continue
+        if b not in out or pref[q] < rank[b]:
+            out[b] = x.get("symbol"); rank[b] = pref[q]
+    return out
+
+
+def fetch_alpha_klines(sess, alpha_id, interval="4h", limit=1000, pair=None):
+    """Binance Alpha candles for one token (alpha_id like 'ALPHA_123'; pair like 'ALPHA_123USDC').
+    Same row shape as MEXC klines: [open_ms, o, h, l, c, vol, ...]. Returns None on failure."""
+    if not alpha_id and not pair:
         return None
     for attempt in range(2):
         try:
             r = sess.get(ALPHA_KLINES_URL, timeout=20,
-                         params={"symbol": alpha_id + "USDT", "interval": interval, "limit": limit},
+                         params={"symbol": pair or (alpha_id + "USDT"), "interval": interval,
+                                 "limit": limit},
                          headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
             if r.status_code == 429:
                 time.sleep(3 * (attempt + 1)); continue

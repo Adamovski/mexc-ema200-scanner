@@ -91,7 +91,7 @@ APP_VERSION = ("v25 · STOCKS site" if APP_MODE == "stocks" else "v25 · 5-Tool 
 # One-time reset marker for the user's own "My calls" tracker. Bump this string to wipe
 # every call (open + resolved) on the next boot and start the calls scorecard fresh —
 # auto-board trades and their version history are untouched.
-CALLS_RESET = "2026-07-17-v8b"
+CALLS_RESET = "2026-11-03-v59-clean"
 # ----------------------------------------------------------------------------
 class Tracker:
     def __init__(self):
@@ -163,11 +163,8 @@ class Tracker:
                 # One-time wipe on a version/reset bump: drop every manual "call" AND the
                 # retired scalp/coil auto-board trades (their tabs are gone in v8), so the
                 # scorecard starts clean on just Long + Short.
-                _drop = {"call", "scalp", "coil"}
-                if self.calls_reset != CALLS_RESET:
-                    self.open = {k: t for k, t in self.open.items()
-                                 if t.get("board") not in _drop}
-                    self.closed = [t for t in self.closed if t.get("board") not in _drop]
+                if self.calls_reset != CALLS_RESET:      # one-time full wipe (user reset)
+                    self.open = {}; self.closed = []; self.cooldowns = {}
                     self.calls_reset = CALLS_RESET
                     self._save()
             except Exception:
@@ -217,7 +214,8 @@ class Tracker:
         raw = [1.0 / (1.0 + 0.5 * max(t.get("rr") or 1.0, 0.1)) for t in clean]
         tot = sum(raw) or 1.0
         w = [x / tot for x in raw] if n else [1.0]
-        return {"board": board, "symbol": sym, "side": side, "entry": entry, "stop": stop,
+        return {"id": os.urandom(6).hex(),
+                "board": board, "symbol": sym, "side": side, "entry": entry, "stop": stop,
                 "tps": clean, "weights": w, "phase": 0, "realized": 0.0,
                 "cur_stop": stop, "cur_stop_r": -1.0, "px0": px, "ts": now,
                 "tf": tf, "note": note, "tps_hit": [], "rr": (clean[0]["rr"] if clean else None),
@@ -264,6 +262,26 @@ class Tracker:
         if changed:
             with self.lock:
                 self._save()
+
+    def delete_call(self, cid):
+        """Remove one tracked call (open or resolved) by id."""
+        if not cid:
+            return False
+        with self.lock:
+            n0 = len(self.open) + len(self.closed)
+            self.open = {k: t for k, t in self.open.items() if t.get("id") != cid and k != cid}
+            self.closed = [t for t in self.closed if t.get("id") != cid]
+            hit = (len(self.open) + len(self.closed)) != n0
+            if hit:
+                self._save()
+        return hit
+
+    def reset_all(self):
+        """Wipe every tracked trade and its history - a clean scorecard."""
+        with self.lock:
+            self.open = {}; self.closed = []; self.cooldowns = {}
+            self._save()
+        return True
 
     def add_call(self, symbol, side, targets, entry, stop, tf="", note=""):
         """Manually track a curated 'call' (from the Analyze tab), with its full TP
@@ -505,7 +523,7 @@ class Tracker:
                         "exp": round(sum((t.get("r") or 0) for t in rows) / n, 2),
                         "sumR": round(sum((t.get("r") or 0) for t in rows), 2),
                         "tp_rates": tp_rates, "allout": allout_exp}
-            _cf = ("board", "symbol", "side", "entry", "stop", "tps", "rr", "status",
+            _cf = ("id", "board", "symbol", "side", "entry", "stop", "tps", "rr", "status",
                    "r", "ts", "closed_ts", "tf", "note", "px0", "tps_hit", "state",
                    "phase", "filled_ts", "regime", "ver", "realized", "cur_stop_r",
                    "entry_tf", "stop_tf")
@@ -1873,7 +1891,8 @@ def watchlist_loop(state: State) -> None:
     batches instead of sitting on "warming up"."""
     from mexc_ema200_scanner import (scan_watchlist, fetch_fut_tickers, list_symbols,
                                      fetch_binance_alpha_tokens, fetch_alpha_klines,
-                                     fetch_binance_futures, ALPHA_FALLBACK, ALPHA_LISTED_DAY)
+                                     fetch_binance_futures, fetch_alpha_pairs,
+                                     ALPHA_FALLBACK, ALPHA_LISTED_DAY)
     time.sleep(8)
     while True:
         try:
@@ -1912,25 +1931,53 @@ def watchlist_loop(state: State) -> None:
                 _spot = set()
             def _mexc(tok):
                 sym = tok + "USDT"
-                return "perp" if sym in _tk else ("spot" if sym in _spot else None)
+                if sym in _tk:
+                    _ap = (meta.get(tok) or {}).get("price"); _lp = (_tk[sym] or {}).get("last")
+                    if _ap and _lp and not (0.8 < _lp / _ap < 1.25):
+                        return None                  # same ticker, different coin on MEXC
+                    return "perp"
+                return "spot" if sym in _spot else None
 
-            # 3) Binance futures: OI + futures volume
+            try:
+                pairs = fetch_alpha_pairs(_sess)
+            except Exception:
+                pairs = {}
+            def _pair(tok):
+                aid = (meta.get(tok) or {}).get("alpha_id")
+                return aid, (pairs.get(aid) if aid else None)
+
+            # 3) Binance futures: OI + futures volume. Tickers collide (Alpha "PePe" on TRON is not
+            # the PEPE perp), so only accept a perp if the token graduated to Binance or the perp
+            # price matches the Alpha price within ~20%.
             bfut, bfut_err = fetch_binance_futures(_sess, alpha)
+            for _t in list(bfut):
+                _m = meta.get(_t) or {}
+                _ap, _mk = _m.get("price"), (bfut[_t] or {}).get("mark")
+                ok = bool(_m.get("on_binance")) or bool(_ap and _mk and 0.8 < _mk / _ap < 1.25)
+                if not ok:
+                    bfut.pop(_t, None)
 
-            # 4) candles: Binance Alpha 4h (fallback: MEXC) + daily for ATH/ATL
+            # 4) candles: Binance only. Alpha pair (USDT/USDC/U), else the Binance USD-M perp.
             src_used = {}
             def _fetch(tok, sym):
-                aid = (meta.get(tok) or {}).get("alpha_id")
-                rows = fetch_alpha_klines(_sess, aid, "4h", 1000) if aid else None
-                time.sleep(0.08)
+                aid, pr = _pair(tok)
+                rows = None
+                if aid and (pr or not pairs):
+                    rows = fetch_alpha_klines(_sess, aid, "4h", 1000, pair=pr)
+                    time.sleep(0.08)
                 if rows and len(rows) >= 21:
                     src_used[tok] = "Binance Alpha"; return rows
-                m = _mexc(tok)
-                if m:
-                    from mexc_ema200_scanner import fetch_candles
-                    rows = fetch_candles(_sess, sym, "4h", 1000, "futures" if m == "perp" else "spot")
-                    if rows:
-                        src_used[tok] = "MEXC"; return rows
+                if tok in bfut:
+                    try:
+                        q = _sess.get("https://www.binance.com/fapi/v1/klines", timeout=20,
+                                      params={"symbol": tok + "USDT", "interval": "4h", "limit": 1000},
+                                      headers={"User-Agent": "Mozilla/5.0"})
+                        q.raise_for_status()
+                        rows = [[float(c[0]), c[1], c[2], c[3], c[4], c[5]] for c in q.json()]
+                        if rows:
+                            src_used[tok] = "Binance Futures"; return rows
+                    except Exception:
+                        pass
                 return None
             tick = {}
             for t in alpha:
@@ -1946,18 +1993,27 @@ def watchlist_loop(state: State) -> None:
                 r["age_days"] = _age(tok); r["alpha_listed"] = listed.get(tok)
                 r["mexc"] = _mexc(tok); r["mkt"] = r["mexc"] or "none"
                 r["candles_src"] = src_used.get(tok)
-                r["oi_usd"] = b.get("oi_usd"); r["oi_src"] = "Binance" if b.get("oi") else None
-                if not b.get("oi") and (tok + "USDT") in _tk and _tk[tok + "USDT"].get("oi"):
-                    _mx = _tk[tok + "USDT"]
-                    r["oi"] = _mx["oi"]; r["oi_usd"] = _mx["oi"] * (r.get("price") or 0)
-                    r["oi_src"] = "MEXC"
+                r["oi"] = b.get("oi"); r["oi_usd"] = b.get("oi_usd")
+                r["oi_src"] = "Binance" if b.get("oi") else None
+                r["has_perp"] = bool(b)
                 r["vol24"] = b.get("vol24") if b.get("vol24") else m.get("vol24_alpha")
                 r["vol_src"] = "Binance Futures" if b.get("vol24") else ("Binance Alpha" if m.get("vol24_alpha") else None)
                 r["holders"] = m.get("holders"); r["liquidity"] = m.get("liquidity")
+                r["disp"] = m.get("raw_symbol") or tok; r["name"] = m.get("name"); r["chain"] = m.get("chain")
                 r["on_binance"] = m.get("on_binance")
                 # true ATH / ATL since listing from DAILY candles (4h window is only ~166 days)
-                aid = m.get("alpha_id")
-                d1 = fetch_alpha_klines(_sess, aid, "1d", 1000) if aid else None
+                aid, pr = _pair(tok)
+                d1 = None
+                if src_used.get(tok) == "Binance Alpha":
+                    d1 = fetch_alpha_klines(_sess, aid, "1d", 1000, pair=pr)
+                elif src_used.get(tok) == "Binance Futures":
+                    try:
+                        q = _sess.get("https://www.binance.com/fapi/v1/klines", timeout=20,
+                                      params={"symbol": tok + "USDT", "interval": "1d", "limit": 1000},
+                                      headers={"User-Agent": "Mozilla/5.0"})
+                        d1 = [[float(c[0]), c[1], c[2], c[3], c[4], c[5]] for c in q.json()]
+                    except Exception:
+                        d1 = None
                 if d1:
                     try:
                         hi = max(float(x[2]) for x in d1); lo = min(float(x[3]) for x in d1)
@@ -1991,10 +2047,10 @@ def watchlist_loop(state: State) -> None:
             _enrich_oi_divergence(res, store_key="wl:oihist:bn")
             res["too_new"] = [(t + (" (%dd)" % _age(t) if _age(t) is not None else "")) for t in nl_acc]
             n_b = sum(1 for r in rows_acc if r.get("oi_src") == "Binance")
-            res["oi_note"] = ("Data: Binance Alpha candles; OI + futures volume from Binance Futures "
-                              "(%d coins have a Binance perp)" % n_b) if not bfut_err else \
-                             ("Data: Binance Alpha candles; Binance Futures unavailable (%s) - OI from MEXC"
-                              % bfut_err)
+            res["oi_note"] = ("All data from Binance: Alpha candles, Alpha list, Binance Futures OI + volume "
+                              "(%d coins have a Binance perp). mx = tradeable on MEXC." % n_b) if not bfut_err else \
+                             ("Data: Binance Alpha candles; Binance Futures unavailable right now (%s) - "
+                              "no OI this pass" % bfut_err)
             with state.lock:
                 state.watchlist_mon = {"ts": time.time(), **res}
         except Exception as e:
@@ -2269,6 +2325,7 @@ PAGE = """<!doctype html>
   .info table.def td:first-child{color:var(--accent);font-weight:600;
        white-space:nowrap;width:170px}
   .info .warn{color:var(--warn)}
+  .wlsel{padding:7px 8px;border-radius:8px;border:1px solid var(--line);background:rgba(21,28,41,.7);color:var(--txt);font-size:12px}
   /* analyze tab */
   .azbar{display:flex;gap:8px;max-width:520px;margin:4px 0 8px}
   .azbar input{flex:1;background:var(--panel);border:1px solid var(--line);
@@ -2764,6 +2821,20 @@ PAGE = """<!doctype html>
   <span class="warn">This is a monitor, not a buy list. A high indicator count means the setup is technically active right now; it says nothing about whether the pump already happened. Many of these are thin — check liquidity before sizing.</span></span>
 </div>
 <div class="wrap" id="watch2sum"></div>
+<div class="wrap wlfilters" id="wlFilters" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0">
+  <input id="wlSearch" type="text" placeholder="🔍 Search coin…" oninput="WLF.q=this.value;renderWatch2()" style="padding:7px 10px;border-radius:8px;border:1px solid var(--line);background:rgba(21,28,41,.7);color:var(--txt);min-width:160px">
+  <select onchange="WLF.st=this.value;renderWatch2()" class="wlsel"><option value="">S.Trend: any</option><option value="up">▲ up</option><option value="down">▼ down</option></select>
+  <select onchange="WLF.ema=this.value;renderWatch2()" class="wlsel"><option value="">EMA form: any</option><option value="Bull stack">Bull stack</option><option value="Above 200">Above 200</option><option value="Mixed">Mixed</option><option value="Below 200">Below 200</option><option value="Bear stack">Bear stack</option><option value="(new)">New (no 200 yet)</option></select>
+  <select onchange="WLF.beh=this.value;renderWatch2()" class="wlsel"><option value="">Behaviour: any</option><option>ripping</option><option>climbing</option><option>coiling</option><option>chopping</option><option>bleeding</option><option>dumping</option></select>
+  <select onchange="WLF.rsi=this.value;renderWatch2()" class="wlsel"><option value="">RSI: any</option><option value="lt30">&lt; 30 oversold</option><option value="30-50">30–50</option><option value="50-70">50–70</option><option value="gt70">&gt; 70 overbought</option></select>
+  <select onchange="WLF.age=this.value;renderWatch2()" class="wlsel"><option value="">Age: any</option><option value="30">&lt; 30 days</option><option value="90">&lt; 90 days</option><option value="180">&lt; 6 months</option><option value="old">&gt; 6 months</option></select>
+  <select onchange="WLF.oi=this.value;renderWatch2()" class="wlsel"><option value="">Binance perp: any</option><option value="yes">Has Binance perp (OI)</option><option value="no">No Binance perp</option></select>
+  <select onchange="WLF.mx=this.value;renderWatch2()" class="wlsel"><option value="">MEXC: any</option><option value="perp">Tradeable on MEXC perp</option><option value="spot">MEXC spot only</option><option value="any">On MEXC (perp or spot)</option><option value="none">Not on MEXC</option></select>
+  <select onchange="WLF.low=this.value;renderWatch2()" class="wlsel"><option value="">Above ATL: any</option><option value="25">&lt; 25% above ATL</option><option value="50">&lt; 50% above ATL</option><option value="100">&lt; 100% above ATL</option></select>
+  <select onchange="WLF.grad=this.value;renderWatch2()" class="wlsel"><option value="">Listing: any</option><option value="alpha">Alpha-only (not on Binance main)</option><option value="grad">Graduated to Binance main</option></select>
+  <span class="wlbtn" onclick="resetWlFilters()">Clear filters</span>
+  <span id="wlFiltCount" class="muted" style="font-size:12px"></span>
+</div>
 <div class="wrap" style="margin-top:8px">
   <table id="watch2tbl">
     <thead><tr><th data-tip="Ticker. ☆ stars it to your personal list; the magnifier opens the full Analyze card. Click the symbol to open it on TradingView." onclick="wlSortBy('token')" style="cursor:pointer" data-sortkey="token">Token <span class="wlarrow" data-k="token"></span></th><th data-tip="Coin age = time since it was listed on Binance Alpha (roughly its TGE). Green = under 60 days — still fresh. Hover a cell for the exact date." onclick="wlSortBy('age_days')" style="cursor:pointer" data-sortkey="age_days">Age <span class="wlarrow" data-k="age_days"></span></th><th data-tip="Latest traded price on MEXC (4h close, updates each scan).">Price</th><th data-tip="Market capitalisation from CoinGecko, matched by ticker. Shows — when CoinGecko rate-limits the lookup (common from cloud IPs) or the symbol is ambiguous; it fills on a later pass." onclick="wlSortBy('mcap')" style="cursor:pointer" data-sortkey="mcap">Mkt cap <span class="wlarrow" data-k="mcap"></span></th><th data-tip="Plain-language read of the last ~7 days combined with volatility: ripping (>25% up), climbing (>8%), coiling (flat + quiet volatility — often the pre-move state), chopping (flat + normal vol), bleeding (>8% down), dumping (>25% down)." onclick="wlSortBy('behaviour')" style="cursor:pointer" data-sortkey="behaviour">Behaviour <span class="wlarrow" data-k="behaviour"></span></th><th data-tip="How the 10/20/50/200 EMAs are stacked. Bull stack = 10>20>50>200 (clean uptrend). Above 200 = price and 50 above the 200. Mixed = tangled. Below 200 / Bear stack = downtrend. A flip from Bear stack toward Above 200 is an early trend-change tell." onclick="wlSortBy('ema_form')" style="cursor:pointer" data-sortkey="ema_form">EMA form <span class="wlarrow" data-k="ema_form"></span></th><th data-tip="Supertrend (ATR 10, mult 3) direction on the 4h. ▲ = trend up (dynamic support below price), ▼ = trend down (dynamic resistance above)." onclick="wlSortBy('supertrend')" style="cursor:pointer" data-sortkey="supertrend">S.trend <span class="wlarrow" data-k="supertrend"></span></th><th data-tip="Average True Range as a % of price = the typical 4h candle swing. The word is its state vs the 50-bar average: expanding (a move is underway), quiet (coiling — energy building), or normal." onclick="wlSortBy('vol_pct')" style="cursor:pointer" data-sortkey="vol_pct">Volatility <span class="wlarrow" data-k="vol_pct"></span></th><th data-tip="Relative volume — the latest ~24h volume divided by its 40-bar average. Above ~1.5× means unusual participation is showing up (attention arriving)." onclick="wlSortBy('rvol')" style="cursor:pointer" data-sortkey="rvol">Rel vol <span class="wlarrow" data-k="rvol"></span></th><th data-tip="Relative Strength Index (14) on the 4h. Below ~30 = oversold/washed out, above ~70 = overbought/extended, 40–60 = neutral.">RSI</th><th data-tip="RSI divergence over the last ~40 bars. bull = regular bullish (price lower low, RSI higher low — reversal up). h-bull = hidden bullish (higher low in price, lower low in RSI — uptrend continuation). bear = regular bearish (reversal-down risk). h-bear = hidden bearish (downtrend continuation). Hover a cell for the full read." onclick="wlSortBy('rsi_div')" style="cursor:pointer" data-sortkey="rsi_div">RSI div <span class="wlarrow" data-k="rsi_div"></span></th><th data-tip="Price-vs-OPEN-INTEREST divergence, built from OI snapshots recorded each pass (needs a few hours to warm up — shows &quot;building&quot; until then). accumulating = price flat while OI climbs (leverage quietly stacking — the $LAB tell). real up = price + OI both up (new money). fake pump = price up, OI down (short-covering, fades). exhausting = price + OI both down (longs unwinding, bounce risk)." onclick="wlSortBy('oi_div')" style="cursor:pointer" data-sortkey="oi_div">OI div <span class="wlarrow" data-k="oi_div"></span></th><th data-tip="Open interest in USD (contracts × price) from MEXC futures — how much leveraged money is positioned. Rising OI with rising price = new longs; shows — if MEXC did not return it this pass." onclick="wlSortBy('oi')" style="cursor:pointer" data-sortkey="oi">Open interest <span class="wlarrow" data-k="oi"></span></th><th data-tip="24-hour traded turnover in USD from MEXC futures. A liquidity gauge — thin names (low here) slip badly on a $2,500 order, so size down." onclick="wlSortBy('vol24')" style="cursor:pointer" data-sortkey="vol24">24h vol <span class="wlarrow" data-k="vol24"></span></th><th data-tip="How far price sits above its ALL-TIME LOW since Binance Alpha listing (daily candles). Small = basing near the lows." onclick="wlSortBy('above_low_pct')" style="cursor:pointer" data-sortkey="above_low_pct">Above low <span class="wlarrow" data-k="above_low_pct"></span></th><th data-tip="How far price sits below its ALL-TIME HIGH since Binance Alpha listing (daily candles)." onclick="wlSortBy('from_high_pct')" style="cursor:pointer" data-sortkey="from_high_pct">From ATH <span class="wlarrow" data-k="from_high_pct"></span></th><th data-tip="Price change over roughly the last 24 hours." onclick="wlSortBy('chg24')" style="cursor:pointer" data-sortkey="chg24">24h <span class="wlarrow" data-k="chg24"></span></th><th data-tip="Price change over roughly the last 7 days (drives the Behaviour read)." onclick="wlSortBy('chg7d')" style="cursor:pointer" data-sortkey="chg7d">~7d <span class="wlarrow" data-k="chg7d"></span></th><th data-tip="Price change over roughly the last 30 days — the medium-term trend." onclick="wlSortBy('chg30d')" style="cursor:pointer" data-sortkey="chg30d">~30d <span class="wlarrow" data-k="chg30d"></span></th></tr></thead>
@@ -2799,17 +2870,18 @@ PAGE = """<!doctype html>
 <div class="status">
   <span>📌 My calls — setups you chose to track (via <b>📌 Track this setup</b> on the Analyze tab). Apex watches the live price and grades each one exactly like the plan: banks each TP, moves the stop to <b>break-even after TP1</b>, and scores the result in R. Their win-rate and per-TP hit rates are kept <b>separate</b> from the auto boards.</span>
   <span id="callsMeta"></span>
+  <span class="wlbtn" style="margin-left:10px;border-color:rgba(248,81,73,.5);color:#f85149" onclick="resetCalls()" data-tip="Delete every tracked call and wipe the scorecard.">🗑 Reset all</span>
 </div>
 <div class="wrap">
   <div id="callsCards" class="perfcards"></div>
   <div class="perfsub">Open calls</div>
   <table id="callsopen"><thead><tr>
-      <th>Added</th><th>Symbol</th><th>Side</th><th>TF</th><th>Entry</th><th>Stop</th><th>Targets</th><th>Progress</th>
+      <th>Added</th><th>Symbol</th><th>Side</th><th>TF</th><th>Entry</th><th>Stop</th><th>Targets</th><th>Progress</th><th></th>
     </tr></thead><tbody id="callsopenrows"></tbody></table>
   <div class="perfsub">Resolved calls</div>
   <table id="callsclosed"><thead><tr>
       <th>Closed</th><th>Symbol</th><th>Side</th><th>TF</th><th>Entry</th><th>Stop</th><th data-tip="The furthest level price reached before close — highest TP hit, or the stop.">Reached</th><th>Result</th>
-    </tr></thead><tbody id="callsclosedrows"></tbody></table>
+    <th></th></tr></thead><tbody id="callsclosedrows"></tbody></table>
   <div class="empty" id="callsempty" style="display:none">No tracked calls yet. Open <b>🔎 Analyze a coin</b>, and on any setup that clears the R:R bar you'll see a <b>📌 Track this setup</b> button — click it to start tracking.</div>
 </div>
 </div>
@@ -3052,7 +3124,7 @@ function _wlRowHtml(r){
   const oiDivCls=d=>['accumulating','real up'].includes(d)?'good':(['fake pump','fresh shorts'].includes(d)?'bad':'muted');
   const behClr=b=>['ripping','climbing'].includes(b)?'good':(['dumping','bleeding'].includes(b)?'bad':(b==='coiling'?'muted':''));
   const c7=r.chg7d, al=r.above_low_pct, fh=r.from_high_pct;
-  return `<td class="sym"><div class="symbox">${watchStar(r.symbol)}<a href="${tvLink(r.symbol)}" target="_blank" rel="noopener">${r.token}</a>${analyzeBtn(r.symbol)}${r.mexc?`<span class="rr" data-tip="Tradeable on MEXC as ${r.mexc==='perp'?'a USDT perpetual':'spot only'}">mx ${r.mexc}</span>`:'<span class="rr" data-tip="Not listed on MEXC">no mx</span>'}</div></td>`+
+  return `<td class="sym"><div class="symbox">${watchStar(r.symbol)}<a href="${tvLink(r.symbol)}" target="_blank" rel="noopener" data-tip="${esc((r.name||r.token)+(r.chain?' · '+r.chain+' chain':'')+' (Binance Alpha)')}">${esc(r.disp||r.token)}</a>${analyzeBtn(r.symbol)}${r.mexc?`<span class="rr" data-tip="Tradeable on MEXC as ${r.mexc==='perp'?'a USDT perpetual':'spot only'}">mx ${r.mexc}</span>`:'<span class="rr" data-tip="Not listed on MEXC">no mx</span>'}${r.on_binance?'<span class="rr" style="color:#f0b90b" data-tip="Graduated from Alpha to the main Binance exchange">BN</span>':''}</div></td>`+
     (r.age_days!==undefined?`<td class="${r.age_days!=null&&r.age_days<60?'good':''}" data-tip="${esc(r.alpha_listed?('Listed on Binance Alpha '+new Date(r.alpha_listed*1000).toISOString().slice(0,10)):'listing date unknown')}">${_ageTxt(r.age_days)}</td>`:'')+
     `<td>${fmtNum(r.live!=null?r.live:r.price)}</td>`+
     `<td>${usd(r.mcap)}</td>`+
@@ -3064,7 +3136,7 @@ function _wlRowHtml(r){
     `<td>${r.rsi==null?'—':r.rsi}</td>`+
     `<td class="${rsiDivCls(r.rsi_div)}" data-tip="${esc(r.rsi_div_note||'no RSI divergence right now')}">${rsiDivLbl(r.rsi_div)}</td>`+
     `<td class="${oiDivCls(r.oi_div)}">${r.oi_div||'—'}</td>`+
-    `<td data-tip="${esc(r.oi_src?('Open interest from '+r.oi_src+' futures'):'No perp open interest (spot-only, not on Binance futures)')}">${usd(r.oi_usd!=null?r.oi_usd:(r.oi&&r.price?r.oi*r.price:null))}${r.oi_src==='MEXC'?'<span class="rr">mx</span>':''}</td>`+
+    `<td data-tip="${esc(r.oi_src?('Open interest from '+r.oi_src+' futures'):'No Binance perpetual for this coin, so no open interest')}">${usd(r.oi_usd!=null?r.oi_usd:(r.oi&&r.price?r.oi*r.price:null))}</td>`+
     `<td data-tip="${esc(r.vol_src?('24h volume from '+r.vol_src):'no volume data')}">${usd(r.vol24)}</td>`+
     `<td class="${r.near_low?'good':''}">${al==null?'—':'+'+al.toFixed(0)+'%'}</td>`+
     `<td class="bad">${fh==null?'—':fh.toFixed(0)+'%'}</td>`+
@@ -3072,6 +3144,27 @@ function _wlRowHtml(r){
     `<td class="${(c7||0)>0?'good':((c7||0)<0?'bad':'')}">${c7==null?'—':((c7>0?'+':'')+c7.toFixed(0)+'%')}</td>`+
     `<td class="${(r.chg30d||0)>0?'good':((r.chg30d||0)<0?'bad':'')}">${r.chg30d==null?'—':((r.chg30d>0?'+':'')+r.chg30d.toFixed(0)+'%')}</td>`;
 }
+const WLF={q:'',st:'',ema:'',beh:'',rsi:'',age:'',oi:'',mx:'',low:'',grad:''};
+function wlPass(r){
+  const F=WLF;
+  if(F.q){ const q=F.q.trim().toUpperCase(); if(q && !String(r.token||'').toUpperCase().includes(q) && !String(r.name||'').toUpperCase().includes(q)) return false; }
+  if(F.st && r.supertrend!==F.st) return false;
+  if(F.ema){ const f=r.ema_form||''; if(F.ema==='(new)'){ if(!f.includes('(new)')) return false; } else if(f!==F.ema && f!==F.ema+' (new)') return false; }
+  if(F.beh && r.behaviour!==F.beh) return false;
+  if(F.rsi){ const v=r.rsi; if(v==null) return false;
+    if(F.rsi==='lt30'&&!(v<30)) return false; if(F.rsi==='30-50'&&!(v>=30&&v<50)) return false;
+    if(F.rsi==='50-70'&&!(v>=50&&v<=70)) return false; if(F.rsi==='gt70'&&!(v>70)) return false; }
+  if(F.age){ const a=r.age_days; if(a==null) return false; if(F.age==='old'){ if(!(a>180)) return false; } else if(!(a<+F.age)) return false; }
+  if(F.oi==='yes'&&!r.oi_src) return false; if(F.oi==='no'&&r.oi_src) return false;
+  if(F.mx){ const m=r.mexc||null; if(F.mx==='perp'&&m!=='perp') return false; if(F.mx==='spot'&&m!=='spot') return false;
+    if(F.mx==='any'&&!m) return false; if(F.mx==='none'&&m) return false; }
+  if(F.low){ const l=r.above_low_pct; if(l==null||!(l<+F.low)) return false; }
+  if(F.grad==='alpha'&&r.on_binance) return false; if(F.grad==='grad'&&!r.on_binance) return false;
+  return true;
+}
+function resetWlFilters(){ for(const k in WLF) WLF[k]='';
+  const box=document.getElementById('wlFilters'); if(box){ box.querySelectorAll('select').forEach(x=>x.value=''); const i=document.getElementById('wlSearch'); if(i) i.value=''; }
+  renderWatch2(); }
 function _wlRender(m, ids, sortState, arrowSel, warmMsg, curated){
   const tb=document.getElementById(ids.rows), sm=document.getElementById(ids.sum), emp=document.getElementById(ids.empty);
   if(!tb) return; tb.innerHTML="";
@@ -3087,6 +3180,8 @@ function _wlRender(m, ids, sortState, arrowSel, warmMsg, curated){
   if(sm) sm.innerHTML='<div class="status"><span><b>'+(m.n_listed||0)+'</b>'+(curated?(' of '+m.n_total+' live Binance Alpha tokens'+(m.progress?' <span class="muted">(first pass in progress: '+m.progress+' scanned)</span>':'')+(m.alpha_src&&m.alpha_src!=='live'?' <span class="muted">(Alpha list: '+m.alpha_src+')</span>':'')+'.'):' liquid coins scanned.')+
     (curated&&m.oi_note?' · <span class="muted">'+m.oi_note+'</span>':'')+(curated&&m.too_new&&m.too_new.length?' · Just listed / no candles yet: <span class="muted">'+m.too_new.join(', ')+'</span>':'')+'</span></div>';
   let rows=[...(m.rows||[])];
+  if(curated){ const n0=rows.length; rows=rows.filter(wlPass);
+    const fc=document.getElementById('wlFiltCount'); if(fc) fc.textContent=(rows.length!==n0)?`showing ${rows.length} of ${n0}`:''; }
   if(sortState.key){
     const k=sortState.key, d=sortState.dir;
     rows.sort((a,b)=>{ let x=a[k], y=b[k];
@@ -5815,6 +5910,16 @@ function perfStatusHtml(t){
   if(s==='expired')return `<span class="pf-miss" data-tip="Entry never filled in the allotted window — cancelled, counts as no trade.">EXPIRED</span>`;
   return `<span class="rr">${s||'—'}</span>`;
 }
+function delCallTd(t){ return t.id?`<td><span class="wlbtn" style="color:#f85149" onclick="deleteCall('${t.id}',event)" data-tip="Delete this call">✕</span></td>`:'<td></td>'; }
+async function deleteCall(id,ev){ if(ev) ev.stopPropagation();
+  if(!confirmSafe('Delete this call?')) return;
+  try{ await fetch('/calls/delete?id='+encodeURIComponent(id),{cache:'no-store'}); }catch(e){}
+  poll(); }
+async function resetCalls(){
+  if(!confirmSafe('Delete ALL tracked calls and reset the scorecard? This cannot be undone.')) return;
+  try{ await fetch('/calls/reset',{cache:'no-store'}); }catch(e){}
+  poll(); }
+function confirmSafe(msg){ try{ return window.confirm(msg); }catch(e){ return true; } }
 function renderCalls(){
   const perf=(lastData&&lastData.perf)||null;
   const cards=document.getElementById('callsCards'); if(!cards) return;
@@ -5844,7 +5949,7 @@ function renderCalls(){
         +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></div></td>`
         +`<td>${leanPill(t.side==='short'?'bearish':'bullish')}</td><td>${t.tf||'—'}</td>`
         +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td class="whycell">${tgts(t)}</td>`
-        +`<td>${prog}</td>`;
+        +`<td>${prog}</td>`+delCallTd(t);
       openrows.appendChild(tr);
     }
   }
@@ -5856,7 +5961,7 @@ function renderCalls(){
         +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></div></td>`
         +`<td>${sideLabel(t)}</td><td>${t.tf||'—'}</td>`
         +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${reachedHtml(t)}</td>`
-        +`<td>${perfStatusHtml(t)}</td>`;
+        +`<td>${perfStatusHtml(t)}</td>`+delCallTd(t);
       closedrows.appendChild(tr);
     }
   }
@@ -6221,6 +6326,14 @@ def make_handler(state: State):
                 self._send(200, body, "application/json")
             elif self.path.startswith("/backtest"):
                 self._backtest()
+            elif self.path.startswith("/calls/delete"):
+                from urllib.parse import urlparse, parse_qs
+                cid = (parse_qs(urlparse(self.path).query).get("id") or [""])[0]
+                ok = TRACKER.delete_call(cid)
+                self._send(200, json.dumps({"ok": ok}).encode(), "application/json")
+            elif self.path.startswith("/calls/reset"):
+                ok = TRACKER.reset_all()
+                self._send(200, json.dumps({"ok": ok}).encode(), "application/json")
             elif self.path.startswith("/track"):
                 self._track()
             elif self.path.startswith("/analyze"):
