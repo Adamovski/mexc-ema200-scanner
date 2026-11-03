@@ -1865,107 +1865,144 @@ def watchlist_all_loop(state: State) -> None:
 
 
 def watchlist_loop(state: State) -> None:
-    """Monitor the curated watchlist. Deliberately SELF-SUFFICIENT and hang-proof: it does NOT wait
-    for the heavy lane or the scan (it is only ~80 small fetches), it wraps every external call so a
-    slow/blocked CoinGecko or ticker call can never stall it, and it publishes a result on EVERY
-    pass - even an empty one - so the tab shows the truth ("X of 80 on MEXC") instead of a permanent
-    'warming up' spinner."""
-    from mexc_ema200_scanner import (scan_watchlist, fetch_fut_tickers, fetch_market_caps,
-                                     fetch_binance_alpha_tokens, ALPHA_FALLBACK,
-                                     ALPHA_LISTED_DAY)
+    """Binance Alpha monitor. Universe = every live Binance Alpha token. All market data comes from
+    BINANCE: Alpha candles (4h for indicators, daily for true ATH/ATL since listing), Alpha list
+    (market cap, Alpha 24h volume), and Binance USD-M futures (open interest, futures volume).
+    MEXC is only used to show where each coin can be traded (perp / spot) - with MEXC candles as a
+    last-resort fallback if Binance is unreachable. Publishes progressively so the tab fills in
+    batches instead of sitting on "warming up"."""
+    from mexc_ema200_scanner import (scan_watchlist, fetch_fut_tickers, list_symbols,
+                                     fetch_binance_alpha_tokens, fetch_alpha_klines,
+                                     fetch_binance_futures, ALPHA_FALLBACK, ALPHA_LISTED_DAY)
     time.sleep(8)
-    market = state.cfg.get("market", "futures")
     while True:
         try:
             _sess = get_session()
-            # Market caps are a NICE-TO-HAVE. CoinGecko rate-limits cloud IPs, so never let it block
-            # the whole pass - try once, move on if it is slow or fails.
+            # 1) Alpha universe + metadata (live -> cached -> embedded snapshot)
+            alpha, listed, meta, alpha_src = [], {}, {}, "live"
             try:
-                _caps, _amb = fetch_market_caps(_sess)
-                if _caps:
-                    try: STORE.setex("wl:caps", 24 * 3600, json.dumps(_caps))
-                    except Exception: pass
-            except Exception:
-                _caps = {}
-            if not _caps:                       # CoinGecko rate-limited -> reuse last good caps
-                try:
-                    _cached = STORE.get("wl:caps")
-                    if _cached: _caps = json.loads(_cached)
-                except Exception:
-                    _caps = {}
-            try:
-                _tk = fetch_fut_tickers(_sess)
-            except Exception:
-                _tk = {}
-            # Universe = every live Binance Alpha token. Live list first, then the last good list
-            # from STORE, then the embedded snapshot (Binance blocks some cloud IPs).
-            alpha, alpha_src, listed = [], "live", {}
-            try:
-                alpha, listed = fetch_binance_alpha_tokens(_sess)
-                try: STORE.setex("alpha:list", 7 * 24 * 3600,
-                                 json.dumps({"tokens": alpha, "listed": listed}))
+                alpha, listed, meta = fetch_binance_alpha_tokens(_sess)
+                try: STORE.setex("alpha:list2", 7 * 24 * 3600,
+                                 json.dumps({"tokens": alpha, "listed": listed, "meta": meta}))
                 except Exception: pass
             except Exception:
                 try:
-                    _c = json.loads(STORE.get("alpha:list") or "{}")
-                    alpha, listed = list(_c.get("tokens") or []), dict(_c.get("listed") or {})
-                    alpha_src = "cached"
+                    _c = json.loads(STORE.get("alpha:list2") or "{}")
+                    alpha = list(_c.get("tokens") or []); listed = dict(_c.get("listed") or {})
+                    meta = dict(_c.get("meta") or {}); alpha_src = "cached"
                 except Exception:
-                    alpha, listed = [], {}
+                    alpha = []
                 if not alpha:
                     alpha = list(ALPHA_FALLBACK); alpha_src = "snapshot"
-            for _t, _d in ALPHA_LISTED_DAY.items():        # fill any gaps from the snapshot
+            for _t, _d in ALPHA_LISTED_DAY.items():
                 listed.setdefault(_t, _d * 86400)
             _now = time.time()
             def _age(tok):
                 ts = listed.get(tok)
                 return max(0, int((_now - ts) // 86400)) if ts else None
-            # Only scan the ones that have a USDT perp on MEXC (saves hundreds of dead fetches).
-            if _tk:
-                on_mexc = [t + "USDT" for t in alpha if (t + "USDT") in _tk]
-            else:
-                on_mexc = [t + "USDT" for t in alpha]
+
+            # 2) where it trades on MEXC (for the MEXC column / fallback candles)
             try:
-                # Scan in batches and publish after each one, so the tab fills in progressively
-                # instead of sitting on "warming up" for the whole pass.
-                rows_acc, nl_acc = [], []
-                _first = not (state.watchlist_mon and state.watchlist_mon.get("rows"))
-                for _i in range(0, len(on_mexc), 20):
-                    _part = scan_watchlist(_sess, market=market, tf="4h", caps=_caps,
-                                           tickers=_tk, symbols=on_mexc[_i:_i + 20])
-                    for _r in _part.get("rows") or []:
-                        _r["age_days"] = _age(_r.get("token"))
-                        _r["alpha_listed"] = listed.get(_r.get("token"))
-                    rows_acc += _part.get("rows") or []
-                    nl_acc += _part.get("not_listed") or []
-                    if _first:
-                        with state.lock:
-                            state.watchlist_mon = {
-                                "ts": time.time(), "rows": list(rows_acc), "not_listed": [],
-                                "too_new": [], "n_total": len(alpha), "n_listed": len(rows_acc),
-                                "n_on_mexc": len(on_mexc), "alpha_src": alpha_src,
-                                "progress": "%d/%d" % (min(_i + 20, len(on_mexc)), len(on_mexc))}
-                    print("[alpha] scanned %d/%d (%d rows)" % (min(_i + 20, len(on_mexc)),
-                                                                len(on_mexc), len(rows_acc)), flush=True)
-                res = {"rows": rows_acc, "not_listed": nl_acc, "n_listed": len(rows_acc)}
-                _enrich_oi_divergence(res)
-                for _r in res.get("rows") or []:
-                    _r["age_days"] = _age(_r.get("token"))
-                    _r["alpha_listed"] = listed.get(_r.get("token"))
-                res["too_new"] = [(t + (" (%dd)" % _age(t) if _age(t) is not None else ""))
-                                  for t in (res.get("not_listed") or [])]   # on MEXC, <220 4h candles
-                res["not_listed"] = []
-                res["n_total"] = len(alpha)
-                res["n_on_mexc"] = len(on_mexc)
-                res["alpha_src"] = alpha_src
-            except Exception as e:
-                res = {"rows": [], "not_listed": [], "n_total": 0, "n_listed": 0, "error": str(e)}
+                _tk = fetch_fut_tickers(_sess)
+            except Exception:
+                _tk = {}
+            try:
+                _spot = set(list_symbols(_sess, "USDT", futures_only=False, market="spot"))
+            except Exception:
+                _spot = set()
+            def _mexc(tok):
+                sym = tok + "USDT"
+                return "perp" if sym in _tk else ("spot" if sym in _spot else None)
+
+            # 3) Binance futures: OI + futures volume
+            bfut, bfut_err = fetch_binance_futures(_sess, alpha)
+
+            # 4) candles: Binance Alpha 4h (fallback: MEXC) + daily for ATH/ATL
+            src_used = {}
+            def _fetch(tok, sym):
+                aid = (meta.get(tok) or {}).get("alpha_id")
+                rows = fetch_alpha_klines(_sess, aid, "4h", 1000) if aid else None
+                time.sleep(0.08)
+                if rows and len(rows) >= 21:
+                    src_used[tok] = "Binance Alpha"; return rows
+                m = _mexc(tok)
+                if m:
+                    from mexc_ema200_scanner import fetch_candles
+                    rows = fetch_candles(_sess, sym, "4h", 1000, "futures" if m == "perp" else "spot")
+                    if rows:
+                        src_used[tok] = "MEXC"; return rows
+                return None
+            tick = {}
+            for t in alpha:
+                b = bfut.get(t) or {}
+                tick[t + "USDT"] = {"oi": b.get("oi"), "vol24": b.get("vol24")}
+            caps = {t: (meta.get(t) or {}).get("mcap") for t in alpha}
+
+            syms = [t + "USDT" for t in alpha]
+            rows_acc, nl_acc = [], []
+            first = not (state.watchlist_mon and state.watchlist_mon.get("rows"))
+            def _finish(r):
+                tok = r.get("token"); m = meta.get(tok) or {}; b = bfut.get(tok) or {}
+                r["age_days"] = _age(tok); r["alpha_listed"] = listed.get(tok)
+                r["mexc"] = _mexc(tok); r["mkt"] = r["mexc"] or "none"
+                r["candles_src"] = src_used.get(tok)
+                r["oi_usd"] = b.get("oi_usd"); r["oi_src"] = "Binance" if b.get("oi") else None
+                if not b.get("oi") and (tok + "USDT") in _tk and _tk[tok + "USDT"].get("oi"):
+                    _mx = _tk[tok + "USDT"]
+                    r["oi"] = _mx["oi"]; r["oi_usd"] = _mx["oi"] * (r.get("price") or 0)
+                    r["oi_src"] = "MEXC"
+                r["vol24"] = b.get("vol24") if b.get("vol24") else m.get("vol24_alpha")
+                r["vol_src"] = "Binance Futures" if b.get("vol24") else ("Binance Alpha" if m.get("vol24_alpha") else None)
+                r["holders"] = m.get("holders"); r["liquidity"] = m.get("liquidity")
+                r["on_binance"] = m.get("on_binance")
+                # true ATH / ATL since listing from DAILY candles (4h window is only ~166 days)
+                aid = m.get("alpha_id")
+                d1 = fetch_alpha_klines(_sess, aid, "1d", 1000) if aid else None
+                if d1:
+                    try:
+                        hi = max(float(x[2]) for x in d1); lo = min(float(x[3]) for x in d1)
+                        px = r.get("price")
+                        if px:
+                            hi = max(hi, px); lo = min(lo, px)
+                        if px and hi > 0 and lo > 0:
+                            r["from_high_pct"] = round((px / hi - 1) * 100, 1)
+                            r["above_low_pct"] = round((px / lo - 1) * 100, 1)
+                            r["near_low"] = r["above_low_pct"] < 25
+                            r["ath"] = hi; r["atl"] = lo; r["hl_src"] = "since listing"
+                    except Exception:
+                        pass
+                time.sleep(0.05)
+                return r
+            for _i in range(0, len(syms), 20):
+                part = scan_watchlist(_sess, market="futures", tf="4h", caps=caps, tickers=tick,
+                                      symbols=syms[_i:_i + 20], fetcher=_fetch)
+                rows_acc += [_finish(r) for r in (part.get("rows") or [])]
+                nl_acc += part.get("not_listed") or []
+                if first:
+                    with state.lock:
+                        state.watchlist_mon = {
+                            "ts": time.time(), "rows": list(rows_acc), "not_listed": [], "too_new": [],
+                            "n_total": len(alpha), "n_listed": len(rows_acc), "alpha_src": alpha_src,
+                            "progress": "%d/%d" % (min(_i + 20, len(syms)), len(syms))}
+                print("[alpha] %d/%d scanned, %d rows" % (min(_i + 20, len(syms)), len(syms),
+                                                          len(rows_acc)), flush=True)
+            res = {"rows": rows_acc, "n_listed": len(rows_acc), "n_total": len(alpha),
+                   "alpha_src": alpha_src, "not_listed": []}
+            _enrich_oi_divergence(res, store_key="wl:oihist:bn")
+            res["too_new"] = [(t + (" (%dd)" % _age(t) if _age(t) is not None else "")) for t in nl_acc]
+            n_b = sum(1 for r in rows_acc if r.get("oi_src") == "Binance")
+            res["oi_note"] = ("Data: Binance Alpha candles; OI + futures volume from Binance Futures "
+                              "(%d coins have a Binance perp)" % n_b) if not bfut_err else \
+                             ("Data: Binance Alpha candles; Binance Futures unavailable (%s) - OI from MEXC"
+                              % bfut_err)
             with state.lock:
                 state.watchlist_mon = {"ts": time.time(), **res}
         except Exception as e:
+            print("[alpha] pass failed: %s" % e, flush=True)
             with state.lock:
-                state.watchlist_mon = {"ts": time.time(), "rows": [], "n_listed": 0,
-                                       "n_total": 0, "not_listed": [], "error": str(e)}
+                if not state.watchlist_mon:
+                    state.watchlist_mon = {"ts": time.time(), "rows": [], "n_listed": 0,
+                                           "n_total": 0, "not_listed": [], "error": str(e)}
         time.sleep(20 * 60)
 
 
@@ -2723,13 +2760,13 @@ PAGE = """<!doctype html>
 
 <div class="view" id="viewWatch2">
 <div class="status">
-  <span>🅰️ <b>Binance Alpha</b> — every live token on Binance Alpha (pulled from Binance each pass) that trades as a USDT perp on MEXC. For each one: EMA formation (10/20/50/200), Supertrend, RSI, <b>open interest</b> and the price-vs-OI read, <b>24h volume</b>, market cap, recent behaviour, volatility and distance above its recent low. <b>Age</b> = days since its Binance Alpha listing. Click any column header to sort — e.g. by age, OI or volume. Refreshes every ~20 min.<br>
+  <span>🅰️ <b>Binance Alpha</b> — every live Binance Alpha token, with all market data from <b>Binance</b>: indicators from Binance Alpha 4h candles (EMA 10/20/50/200, Supertrend, RSI, volatility, % moves), <b>From ATH / Above low measured since listing</b> (daily candles), market cap from Binance, and <b>open interest + 24h volume from Binance Futures</b> where the coin has a Binance perp (Alpha volume otherwise). The <b>mx</b> tag shows whether you can trade it on MEXC (perp / spot). <b>Age</b> = days since Alpha listing. Click any header to sort. Refreshes every ~20 min.<br>
   <span class="warn">This is a monitor, not a buy list. A high indicator count means the setup is technically active right now; it says nothing about whether the pump already happened. Many of these are thin — check liquidity before sizing.</span></span>
 </div>
 <div class="wrap" id="watch2sum"></div>
 <div class="wrap" style="margin-top:8px">
   <table id="watch2tbl">
-    <thead><tr><th data-tip="Ticker. ☆ stars it to your personal list; the magnifier opens the full Analyze card. Click the symbol to open it on TradingView." onclick="wlSortBy('token')" style="cursor:pointer" data-sortkey="token">Token <span class="wlarrow" data-k="token"></span></th><th data-tip="Coin age = time since it was listed on Binance Alpha (roughly its TGE). Green = under 60 days — still fresh. Hover a cell for the exact date." onclick="wlSortBy('age_days')" style="cursor:pointer" data-sortkey="age_days">Age <span class="wlarrow" data-k="age_days"></span></th><th data-tip="Latest traded price on MEXC (4h close, updates each scan).">Price</th><th data-tip="Market capitalisation from CoinGecko, matched by ticker. Shows — when CoinGecko rate-limits the lookup (common from cloud IPs) or the symbol is ambiguous; it fills on a later pass." onclick="wlSortBy('mcap')" style="cursor:pointer" data-sortkey="mcap">Mkt cap <span class="wlarrow" data-k="mcap"></span></th><th data-tip="Plain-language read of the last ~7 days combined with volatility: ripping (>25% up), climbing (>8%), coiling (flat + quiet volatility — often the pre-move state), chopping (flat + normal vol), bleeding (>8% down), dumping (>25% down)." onclick="wlSortBy('behaviour')" style="cursor:pointer" data-sortkey="behaviour">Behaviour <span class="wlarrow" data-k="behaviour"></span></th><th data-tip="How the 10/20/50/200 EMAs are stacked. Bull stack = 10>20>50>200 (clean uptrend). Above 200 = price and 50 above the 200. Mixed = tangled. Below 200 / Bear stack = downtrend. A flip from Bear stack toward Above 200 is an early trend-change tell." onclick="wlSortBy('ema_form')" style="cursor:pointer" data-sortkey="ema_form">EMA form <span class="wlarrow" data-k="ema_form"></span></th><th data-tip="Supertrend (ATR 10, mult 3) direction on the 4h. ▲ = trend up (dynamic support below price), ▼ = trend down (dynamic resistance above)." onclick="wlSortBy('supertrend')" style="cursor:pointer" data-sortkey="supertrend">S.trend <span class="wlarrow" data-k="supertrend"></span></th><th data-tip="Average True Range as a % of price = the typical 4h candle swing. The word is its state vs the 50-bar average: expanding (a move is underway), quiet (coiling — energy building), or normal." onclick="wlSortBy('vol_pct')" style="cursor:pointer" data-sortkey="vol_pct">Volatility <span class="wlarrow" data-k="vol_pct"></span></th><th data-tip="Relative volume — the latest ~24h volume divided by its 40-bar average. Above ~1.5× means unusual participation is showing up (attention arriving)." onclick="wlSortBy('rvol')" style="cursor:pointer" data-sortkey="rvol">Rel vol <span class="wlarrow" data-k="rvol"></span></th><th data-tip="Relative Strength Index (14) on the 4h. Below ~30 = oversold/washed out, above ~70 = overbought/extended, 40–60 = neutral.">RSI</th><th data-tip="RSI divergence over the last ~40 bars. bull = regular bullish (price lower low, RSI higher low — reversal up). h-bull = hidden bullish (higher low in price, lower low in RSI — uptrend continuation). bear = regular bearish (reversal-down risk). h-bear = hidden bearish (downtrend continuation). Hover a cell for the full read." onclick="wlSortBy('rsi_div')" style="cursor:pointer" data-sortkey="rsi_div">RSI div <span class="wlarrow" data-k="rsi_div"></span></th><th data-tip="Price-vs-OPEN-INTEREST divergence, built from OI snapshots recorded each pass (needs a few hours to warm up — shows &quot;building&quot; until then). accumulating = price flat while OI climbs (leverage quietly stacking — the $LAB tell). real up = price + OI both up (new money). fake pump = price up, OI down (short-covering, fades). exhausting = price + OI both down (longs unwinding, bounce risk)." onclick="wlSortBy('oi_div')" style="cursor:pointer" data-sortkey="oi_div">OI div <span class="wlarrow" data-k="oi_div"></span></th><th data-tip="Open interest in USD (contracts × price) from MEXC futures — how much leveraged money is positioned. Rising OI with rising price = new longs; shows — if MEXC did not return it this pass." onclick="wlSortBy('oi')" style="cursor:pointer" data-sortkey="oi">Open interest <span class="wlarrow" data-k="oi"></span></th><th data-tip="24-hour traded turnover in USD from MEXC futures. A liquidity gauge — thin names (low here) slip badly on a $2,500 order, so size down." onclick="wlSortBy('vol24')" style="cursor:pointer" data-sortkey="vol24">24h vol <span class="wlarrow" data-k="vol24"></span></th><th data-tip="How far price sits ABOVE the lowest low in the fetched window — a proxy for &quot;near all-time low&quot;. Small = basing right on support (the accumulation end). The board is sorted by this, smallest first." onclick="wlSortBy('above_low_pct')" style="cursor:pointer" data-sortkey="above_low_pct">Above low <span class="wlarrow" data-k="above_low_pct"></span></th><th data-tip="How far price sits BELOW its highest high in the fetched window (a proxy for all-time high — limited to the history MEXC returns per call). How much it has already given back from the peak; deeply negative = beaten down, lots of overhead room if it turns." onclick="wlSortBy('from_high_pct')" style="cursor:pointer" data-sortkey="from_high_pct">From ATH <span class="wlarrow" data-k="from_high_pct"></span></th><th data-tip="Price change over roughly the last 24 hours." onclick="wlSortBy('chg24')" style="cursor:pointer" data-sortkey="chg24">24h <span class="wlarrow" data-k="chg24"></span></th><th data-tip="Price change over roughly the last 7 days (drives the Behaviour read)." onclick="wlSortBy('chg7d')" style="cursor:pointer" data-sortkey="chg7d">~7d <span class="wlarrow" data-k="chg7d"></span></th><th data-tip="Price change over roughly the last 30 days — the medium-term trend." onclick="wlSortBy('chg30d')" style="cursor:pointer" data-sortkey="chg30d">~30d <span class="wlarrow" data-k="chg30d"></span></th></tr></thead>
+    <thead><tr><th data-tip="Ticker. ☆ stars it to your personal list; the magnifier opens the full Analyze card. Click the symbol to open it on TradingView." onclick="wlSortBy('token')" style="cursor:pointer" data-sortkey="token">Token <span class="wlarrow" data-k="token"></span></th><th data-tip="Coin age = time since it was listed on Binance Alpha (roughly its TGE). Green = under 60 days — still fresh. Hover a cell for the exact date." onclick="wlSortBy('age_days')" style="cursor:pointer" data-sortkey="age_days">Age <span class="wlarrow" data-k="age_days"></span></th><th data-tip="Latest traded price on MEXC (4h close, updates each scan).">Price</th><th data-tip="Market capitalisation from CoinGecko, matched by ticker. Shows — when CoinGecko rate-limits the lookup (common from cloud IPs) or the symbol is ambiguous; it fills on a later pass." onclick="wlSortBy('mcap')" style="cursor:pointer" data-sortkey="mcap">Mkt cap <span class="wlarrow" data-k="mcap"></span></th><th data-tip="Plain-language read of the last ~7 days combined with volatility: ripping (>25% up), climbing (>8%), coiling (flat + quiet volatility — often the pre-move state), chopping (flat + normal vol), bleeding (>8% down), dumping (>25% down)." onclick="wlSortBy('behaviour')" style="cursor:pointer" data-sortkey="behaviour">Behaviour <span class="wlarrow" data-k="behaviour"></span></th><th data-tip="How the 10/20/50/200 EMAs are stacked. Bull stack = 10>20>50>200 (clean uptrend). Above 200 = price and 50 above the 200. Mixed = tangled. Below 200 / Bear stack = downtrend. A flip from Bear stack toward Above 200 is an early trend-change tell." onclick="wlSortBy('ema_form')" style="cursor:pointer" data-sortkey="ema_form">EMA form <span class="wlarrow" data-k="ema_form"></span></th><th data-tip="Supertrend (ATR 10, mult 3) direction on the 4h. ▲ = trend up (dynamic support below price), ▼ = trend down (dynamic resistance above)." onclick="wlSortBy('supertrend')" style="cursor:pointer" data-sortkey="supertrend">S.trend <span class="wlarrow" data-k="supertrend"></span></th><th data-tip="Average True Range as a % of price = the typical 4h candle swing. The word is its state vs the 50-bar average: expanding (a move is underway), quiet (coiling — energy building), or normal." onclick="wlSortBy('vol_pct')" style="cursor:pointer" data-sortkey="vol_pct">Volatility <span class="wlarrow" data-k="vol_pct"></span></th><th data-tip="Relative volume — the latest ~24h volume divided by its 40-bar average. Above ~1.5× means unusual participation is showing up (attention arriving)." onclick="wlSortBy('rvol')" style="cursor:pointer" data-sortkey="rvol">Rel vol <span class="wlarrow" data-k="rvol"></span></th><th data-tip="Relative Strength Index (14) on the 4h. Below ~30 = oversold/washed out, above ~70 = overbought/extended, 40–60 = neutral.">RSI</th><th data-tip="RSI divergence over the last ~40 bars. bull = regular bullish (price lower low, RSI higher low — reversal up). h-bull = hidden bullish (higher low in price, lower low in RSI — uptrend continuation). bear = regular bearish (reversal-down risk). h-bear = hidden bearish (downtrend continuation). Hover a cell for the full read." onclick="wlSortBy('rsi_div')" style="cursor:pointer" data-sortkey="rsi_div">RSI div <span class="wlarrow" data-k="rsi_div"></span></th><th data-tip="Price-vs-OPEN-INTEREST divergence, built from OI snapshots recorded each pass (needs a few hours to warm up — shows &quot;building&quot; until then). accumulating = price flat while OI climbs (leverage quietly stacking — the $LAB tell). real up = price + OI both up (new money). fake pump = price up, OI down (short-covering, fades). exhausting = price + OI both down (longs unwinding, bounce risk)." onclick="wlSortBy('oi_div')" style="cursor:pointer" data-sortkey="oi_div">OI div <span class="wlarrow" data-k="oi_div"></span></th><th data-tip="Open interest in USD (contracts × price) from MEXC futures — how much leveraged money is positioned. Rising OI with rising price = new longs; shows — if MEXC did not return it this pass." onclick="wlSortBy('oi')" style="cursor:pointer" data-sortkey="oi">Open interest <span class="wlarrow" data-k="oi"></span></th><th data-tip="24-hour traded turnover in USD from MEXC futures. A liquidity gauge — thin names (low here) slip badly on a $2,500 order, so size down." onclick="wlSortBy('vol24')" style="cursor:pointer" data-sortkey="vol24">24h vol <span class="wlarrow" data-k="vol24"></span></th><th data-tip="How far price sits above its ALL-TIME LOW since Binance Alpha listing (daily candles). Small = basing near the lows." onclick="wlSortBy('above_low_pct')" style="cursor:pointer" data-sortkey="above_low_pct">Above low <span class="wlarrow" data-k="above_low_pct"></span></th><th data-tip="How far price sits below its ALL-TIME HIGH since Binance Alpha listing (daily candles)." onclick="wlSortBy('from_high_pct')" style="cursor:pointer" data-sortkey="from_high_pct">From ATH <span class="wlarrow" data-k="from_high_pct"></span></th><th data-tip="Price change over roughly the last 24 hours." onclick="wlSortBy('chg24')" style="cursor:pointer" data-sortkey="chg24">24h <span class="wlarrow" data-k="chg24"></span></th><th data-tip="Price change over roughly the last 7 days (drives the Behaviour read)." onclick="wlSortBy('chg7d')" style="cursor:pointer" data-sortkey="chg7d">~7d <span class="wlarrow" data-k="chg7d"></span></th><th data-tip="Price change over roughly the last 30 days — the medium-term trend." onclick="wlSortBy('chg30d')" style="cursor:pointer" data-sortkey="chg30d">~30d <span class="wlarrow" data-k="chg30d"></span></th></tr></thead>
     <tbody id="watch2rows"></tbody>
   </table>
   <div class="empty" id="watch2empty" style="display:none">Watchlist monitor warming up — first pass runs a few minutes after boot.</div>
@@ -3015,7 +3052,7 @@ function _wlRowHtml(r){
   const oiDivCls=d=>['accumulating','real up'].includes(d)?'good':(['fake pump','fresh shorts'].includes(d)?'bad':'muted');
   const behClr=b=>['ripping','climbing'].includes(b)?'good':(['dumping','bleeding'].includes(b)?'bad':(b==='coiling'?'muted':''));
   const c7=r.chg7d, al=r.above_low_pct, fh=r.from_high_pct;
-  return `<td class="sym"><div class="symbox">${watchStar(r.symbol)}<a href="${tvLink(r.symbol)}" target="_blank" rel="noopener">${r.token}</a>${analyzeBtn(r.symbol)}</div></td>`+
+  return `<td class="sym"><div class="symbox">${watchStar(r.symbol)}<a href="${tvLink(r.symbol)}" target="_blank" rel="noopener">${r.token}</a>${analyzeBtn(r.symbol)}${r.mexc?`<span class="rr" data-tip="Tradeable on MEXC as ${r.mexc==='perp'?'a USDT perpetual':'spot only'}">mx ${r.mexc}</span>`:'<span class="rr" data-tip="Not listed on MEXC">no mx</span>'}</div></td>`+
     (r.age_days!==undefined?`<td class="${r.age_days!=null&&r.age_days<60?'good':''}" data-tip="${esc(r.alpha_listed?('Listed on Binance Alpha '+new Date(r.alpha_listed*1000).toISOString().slice(0,10)):'listing date unknown')}">${_ageTxt(r.age_days)}</td>`:'')+
     `<td>${fmtNum(r.live!=null?r.live:r.price)}</td>`+
     `<td>${usd(r.mcap)}</td>`+
@@ -3027,8 +3064,8 @@ function _wlRowHtml(r){
     `<td>${r.rsi==null?'—':r.rsi}</td>`+
     `<td class="${rsiDivCls(r.rsi_div)}" data-tip="${esc(r.rsi_div_note||'no RSI divergence right now')}">${rsiDivLbl(r.rsi_div)}</td>`+
     `<td class="${oiDivCls(r.oi_div)}">${r.oi_div||'—'}</td>`+
-    `<td>${usd(r.oi&&r.price?r.oi*r.price:null)}</td>`+
-    `<td>${usd(r.vol24)}</td>`+
+    `<td data-tip="${esc(r.oi_src?('Open interest from '+r.oi_src+' futures'):'No perp open interest (spot-only, not on Binance futures)')}">${usd(r.oi_usd!=null?r.oi_usd:(r.oi&&r.price?r.oi*r.price:null))}${r.oi_src==='MEXC'?'<span class="rr">mx</span>':''}</td>`+
+    `<td data-tip="${esc(r.vol_src?('24h volume from '+r.vol_src):'no volume data')}">${usd(r.vol24)}</td>`+
     `<td class="${r.near_low?'good':''}">${al==null?'—':'+'+al.toFixed(0)+'%'}</td>`+
     `<td class="bad">${fh==null?'—':fh.toFixed(0)+'%'}</td>`+
     `<td class="${(r.chg24||0)>0?'good':((r.chg24||0)<0?'bad':'')}">${r.chg24==null?'—':((r.chg24>0?'+':'')+r.chg24.toFixed(0)+'%')}</td>`+
@@ -3047,8 +3084,8 @@ function _wlRender(m, ids, sortState, arrowSel, warmMsg, curated){
              ((m.not_listed&&m.not_listed.length)?("Not on MEXC: "+m.not_listed.slice(0,80).join(', ')):""))
                    : "Scanning the universe — first pass runs a few minutes after boot."); }
   }
-  if(sm) sm.innerHTML='<div class="status"><span><b>'+(m.n_listed||0)+'</b>'+(curated?(' of '+m.n_total+' Binance Alpha tokens are on MEXC futures with enough history'+(m.progress?' <span class="muted">(first pass in progress: '+m.progress+' scanned)</span>':'')+(m.alpha_src&&m.alpha_src!=='live'?' <span class="muted">(Alpha list: '+m.alpha_src+')</span>':'')+'.'):' liquid coins scanned.')+
-    (curated&&m.too_new&&m.too_new.length?' Too new for the 4h EMA200 (&lt;220 candles): <span class="muted">'+m.too_new.join(', ')+'</span>':'')+'</span></div>';
+  if(sm) sm.innerHTML='<div class="status"><span><b>'+(m.n_listed||0)+'</b>'+(curated?(' of '+m.n_total+' live Binance Alpha tokens'+(m.progress?' <span class="muted">(first pass in progress: '+m.progress+' scanned)</span>':'')+(m.alpha_src&&m.alpha_src!=='live'?' <span class="muted">(Alpha list: '+m.alpha_src+')</span>':'')+'.'):' liquid coins scanned.')+
+    (curated&&m.oi_note?' · <span class="muted">'+m.oi_note+'</span>':'')+(curated&&m.too_new&&m.too_new.length?' · Just listed / no candles yet: <span class="muted">'+m.too_new.join(', ')+'</span>':'')+'</span></div>';
   let rows=[...(m.rows||[])];
   if(sortState.key){
     const k=sortState.key, d=sortState.dir;

@@ -7456,7 +7456,7 @@ def fetch_binance_alpha_tokens(sess):
                  headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
     r.raise_for_status()
     data = r.json().get("data") or []
-    out, listed = [], {}
+    out, listed, meta = [], {}, {}
     for x in data:
         if x.get("offline") or x.get("fullyDelisted") or x.get("rwaInfo") or x.get("stockState"):
             continue
@@ -7471,15 +7471,111 @@ def fetch_binance_alpha_tokens(sess):
                     listed[sym] = int(lt)
             except (TypeError, ValueError):
                 pass
+            def _f(k):
+                try:
+                    v = x.get(k)
+                    return float(v) if v not in (None, "") else None
+                except (TypeError, ValueError):
+                    return None
+            meta[sym] = {"alpha_id": x.get("alphaId"), "price": _f("price"),
+                         "chg24": _f("percentChange24h"), "vol24_alpha": _f("volume24h"),
+                         "mcap": _f("marketCap"), "fdv": _f("fdv"), "liquidity": _f("liquidity"),
+                         "holders": _f("holders"), "on_binance": bool(x.get("listingCex")),
+                         "chain": x.get("chainName")}
     if len(out) < 50:                       # implausibly small -> treat as a bad response
         raise ValueError("binance alpha list too small: %d" % len(out))
-    return out, listed
+    return out, listed, meta
+
+
+ALPHA_KLINES_URL = "https://www.binance.com/bapi/defi/v1/public/alpha-trade/klines"
+
+
+def fetch_alpha_klines(sess, alpha_id, interval="4h", limit=1000):
+    """Binance Alpha candles for one token (alpha_id like 'ALPHA_123'). Same row shape as MEXC
+    klines: [open_ms, o, h, l, c, vol, ...]. Returns None on failure."""
+    if not alpha_id:
+        return None
+    for attempt in range(2):
+        try:
+            r = sess.get(ALPHA_KLINES_URL, timeout=20,
+                         params={"symbol": alpha_id + "USDT", "interval": interval, "limit": limit},
+                         headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+            if r.status_code == 429:
+                time.sleep(3 * (attempt + 1)); continue
+            r.raise_for_status()
+            rows = r.json().get("data") or []
+            return [[float(c[0]), c[1], c[2], c[3], c[4], c[5]] for c in rows] or None
+        except Exception:
+            time.sleep(0.5)
+    return None
+
+
+BINANCE_FUT_HOSTS = ("https://www.binance.com", "https://fapi.binance.com")
+
+
+def fetch_binance_futures(sess, tokens):
+    """Binance USD-M futures data for Alpha tokens that have a TOKENUSDT perp:
+    {TOKEN: {"oi": coins, "oi_usd": usd, "vol24": 24h_quote_volume_usd, "mark": price}}.
+    Tries www.binance.com first (reachable from regions where fapi.binance.com is geo-blocked).
+    Returns (data, error_or_None)."""
+    hdr = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    last = None
+    for host in BINANCE_FUT_HOSTS:
+        try:
+            r = sess.get(host + "/fapi/v1/ticker/24hr", timeout=20, headers=hdr)
+            if r.status_code in (403, 451):
+                last = "%s blocked (HTTP %d)" % (host, r.status_code); continue
+            r.raise_for_status()
+            tick = {d["symbol"]: d for d in r.json()}
+        except Exception as e:
+            last = "%s: %s" % (host, e); continue
+        out = {}
+        for tok in tokens:
+            d = tick.get(tok + "USDT")
+            if not d:
+                continue
+            try:
+                last_px = float(d.get("lastPrice") or 0)
+                row = {"vol24": float(d.get("quoteVolume") or 0), "mark": last_px}
+                q = sess.get(host + "/fapi/v1/openInterest", params={"symbol": tok + "USDT"},
+                             timeout=10, headers=hdr)
+                if q.ok:
+                    oi = float(q.json().get("openInterest") or 0)
+                    row["oi"] = oi; row["oi_usd"] = oi * last_px
+                out[tok] = row
+            except Exception:
+                continue
+            time.sleep(0.05)
+        return out, None
+    return {}, last or "Binance futures unreachable"
+
+
+MEXC_FUT_TICKER = "https://contract.mexc.com/api/v1/contract/ticker"
+MEXC_PRICE_URL = "https://api.mexc.com/api/v3/ticker/price"
+
+
+def fetch_contract_sizes(sess):
+    """{DISPLAYSYM: contractSize} - MEXC reports open interest in CONTRACTS, and one contract can be
+    0.1, 1, 10, 1000... coins, so OI must be multiplied by this to mean anything."""
+    out = {}
+    try:
+        r = sess.get(f"{FUTURES_BASE}/api/v1/contract/detail", timeout=30)
+        r.raise_for_status()
+        for c in r.json().get("data", []):
+            try:
+                out[str(c["symbol"]).replace("_", "")] = float(c.get("contractSize") or 1)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
 
 
 def fetch_fut_tickers(sess):
-    """MEXC futures ticker map -> {DISPLAYSYM: {"oi": open_interest, "vol24": 24h_turnover_usd,
+    """MEXC futures ticker map -> {DISPLAYSYM: {"oi": open_interest_in_coins, "vol24": 24h_turnover_usd,
     "last": last_price}}. One request powers OI + volume for the whole watchlist."""
     out = {}
+    sizes = fetch_contract_sizes(sess)
     try:
         r = sess.get(MEXC_FUT_TICKER, timeout=20)
         r.raise_for_status()
@@ -7489,10 +7585,12 @@ def fetch_fut_tickers(sess):
                 last = float(d.get("lastPrice") or d.get("fairPrice") or 0)
                 # OI: MEXC exposes it as holdVol (contracts). Fallbacks cover naming drift.
                 oi = float(d.get("holdVol") or d.get("holdVol24") or d.get("openInterest") or 0)
+                oi *= sizes.get(sym, 1.0)          # contracts -> coins (UI multiplies by price)
                 # 24h turnover in USD: amount24 is quote turnover; else volume24 (contracts) x price
                 v24 = float(d.get("amount24") or 0)
                 if not v24:
-                    v24 = float(d.get("volume24") or d.get("vol24") or 0) * last
+                    v24 = (float(d.get("volume24") or d.get("vol24") or 0)
+                           * sizes.get(sym, 1.0) * last)
                 out[sym] = {"oi": oi, "vol24": v24, "last": last}
             except Exception:
                 continue
@@ -7503,6 +7601,12 @@ def fetch_fut_tickers(sess):
 
 def _ema_formation(px, e10, e20, e50, e200):
     """A one-glance read of how the EMAs are stacked."""
+    if e200 is None and None not in (e10, e20, e50):      # too new for a 200 EMA
+        if e10 > e20 > e50:
+            return "Bull stack (new)"
+        if e10 < e20 < e50:
+            return "Bear stack (new)"
+        return "Mixed (new)"
     if None in (e10, e20, e50, e200):
         return "n/a"
     if e10 > e20 > e50 > e200:
@@ -7516,7 +7620,8 @@ def _ema_formation(px, e10, e20, e50, e200):
     return "Mixed"
 
 
-def scan_watchlist(sess, market="futures", tf="4h", limit=1000, caps=None, tickers=None, symbols=None):
+def scan_watchlist(sess, market="futures", tf="4h", limit=1000, caps=None, tickers=None, symbols=None,
+                   fetcher=None):
     """State snapshot of Julius Elum's curated watchlist. For each token on MEXC futures, report the
     things that tell you WHERE it is, not just whether a signal fired: EMA formation, Supertrend,
     open interest, 24h volume, market cap, RSI, and how far it sits above its recent low (a proxy
@@ -7533,10 +7638,10 @@ def scan_watchlist(sess, market="futures", tf="4h", limit=1000, caps=None, ticke
     out = []
     for tok, sym in pairs:
         try:
-            raw = fetch_candles(sess, sym, tf, limit, market)
+            raw = fetcher(tok, sym) if fetcher else fetch_candles(sess, sym, tf, limit, market)
         except Exception:
             raw = None
-        if not raw or len(raw) < 220:
+        if not raw or len(raw) < 21:           # ~3.5 days of 4h candles is enough for a row
             out.append({"token": tok, "symbol": sym, "listed": False}); continue
         rows = raw[:-1]
         try:
@@ -7560,7 +7665,7 @@ def scan_watchlist(sess, market="futures", tf="4h", limit=1000, caps=None, ticke
         chg30 = round((px / C[-180] - 1) * 100, 1) if len(C) > 180 else None  # ~30d
         # volatility: ATR% of price (typical bar swing), + a rising/falling vol read
         a14 = atr(H[-14:], L[-14:], C[-14:]) or 0
-        a50 = atr(H[-50:], L[-50:], C[-50:]) or 0
+        a50 = (atr(H[-50:], L[-50:], C[-50:]) or 0) if len(C) >= 50 else 0
         vol_pct = round(a14 / px * 100, 1) if px else None
         vol_state = ("expanding" if a50 > 0 and a14 > 1.3 * a50
                      else "quiet" if a50 > 0 and a14 < 0.7 * a50 else "normal")
@@ -7591,7 +7696,9 @@ def scan_watchlist(sess, market="futures", tf="4h", limit=1000, caps=None, ticke
                     "rsi_div": _dvc, "rsi_div_note": _dvn,
                     "chg24": chg24, "chg7d": chg7, "chg30d": chg30,
                     "vol_pct": vol_pct, "vol_state": vol_state,
-                    "rvol": rvol, "behaviour": behav})
+                    "rvol": rvol, "behaviour": behav,
+                    "mkt": "perp" if sym in tickers else "spot",
+                    "hist_days": round(len(rows) * 4 / 24)})
     listed = [o for o in out if o.get("listed")]
     # default sort: nearest to its lows first (recapitulation / accumulation candidates)
     listed.sort(key=lambda o: (o.get("above_low_pct") if o.get("above_low_pct") is not None else 9e9))
