@@ -527,7 +527,8 @@ class Tracker:
                    "r", "ts", "closed_ts", "tf", "note", "px0", "tps_hit", "state",
                    "phase", "filled_ts", "regime", "ver", "realized", "cur_stop_r",
                    "entry_tf", "stop_tf")
-            _pk = lambda t: {**{c: t.get(c) for c in _cf}, "cur_r": _cur_r(t)}
+            _pk = lambda t: {**{c: t.get(c) for c in _cf}, "cur_r": _cur_r(t),
+                             "px_now": prices.get(t.get("symbol"))}
             _open_all = list(self.open.values())
             # Current-version open only. Old-version open trades keep resolving quietly in
             # the background (so they still score under their own version in by_version),
@@ -2880,7 +2881,7 @@ PAGE = """<!doctype html>
   <div id="callsCards" class="perfcards"></div>
   <div class="perfsub">Open calls</div>
   <table id="callsopen"><thead><tr>
-      <th>Added</th><th>Symbol</th><th>Side</th><th>TF</th><th>Entry</th><th>Stop</th><th>Targets</th><th>Progress</th><th></th>
+      <th>Added</th><th>Symbol</th><th>Side</th><th>TF</th><th>Entry</th><th>Price</th><th>Stop</th><th>Targets</th><th>Progress</th><th></th>
     </tr></thead><tbody id="callsopenrows"></tbody></table>
   <div class="perfsub">Resolved calls</div>
   <table id="callsclosed"><thead><tr>
@@ -5915,6 +5916,11 @@ function perfStatusHtml(t){
   if(s==='expired')return `<span class="pf-miss" data-tip="Entry never filled in the allotted window — cancelled, counts as no trade.">EXPIRED</span>`;
   return `<span class="rr">${s||'—'}</span>`;
 }
+function pxNowTd(t){
+  const p=t.px_now; if(p==null||!t.entry) return '<td><span style="color:var(--dim)">—</span></td>';
+  const ch=(p/t.entry-1)*100*(t.side==='short'?-1:1);
+  const c=ch>=0?'var(--up,#3fb950)':'var(--down,#f85149)';
+  return `<td data-tip="Live MEXC price (updates every ~20s). % is vs your entry, in your trade's favour.">${fmtNum(p)}<span class="rr" style="color:${c}">${ch>=0?'+':''}${ch.toFixed(1)}%</span></td>`; }
 function delCallTd(t){ return t.id?`<td><span class="wlbtn" style="color:#f85149" onclick="deleteCall('${t.id}',event)" data-tip="Delete this call">✕</span></td>`:'<td></td>'; }
 async function deleteCall(id,ev){ if(ev) ev.stopPropagation();
   if(!confirmSafe('Delete this call?')) return;
@@ -5953,7 +5959,7 @@ function renderCalls(){
       tr.innerHTML=`<td style="color:var(--dim);white-space:nowrap">${when}</td>`
         +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></div></td>`
         +`<td>${leanPill(t.side==='short'?'bearish':'bullish')}</td><td>${t.tf||'—'}</td>`
-        +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td class="whycell">${tgts(t)}</td>`
+        +`<td>${fmtNum(t.entry)}</td>`+pxNowTd(t)+`<td>${fmtNum(t.stop)}</td><td class="whycell">${tgts(t)}</td>`
         +`<td>${prog}</td>`+delCallTd(t);
       openrows.appendChild(tr);
     }
