@@ -1926,8 +1926,28 @@ def watchlist_loop(state: State) -> None:
             else:
                 on_mexc = [t + "USDT" for t in alpha]
             try:
-                res = scan_watchlist(_sess, market=market, tf="4h", caps=_caps, tickers=_tk,
-                                     symbols=on_mexc)
+                # Scan in batches and publish after each one, so the tab fills in progressively
+                # instead of sitting on "warming up" for the whole pass.
+                rows_acc, nl_acc = [], []
+                _first = not (state.watchlist_mon and state.watchlist_mon.get("rows"))
+                for _i in range(0, len(on_mexc), 20):
+                    _part = scan_watchlist(_sess, market=market, tf="4h", caps=_caps,
+                                           tickers=_tk, symbols=on_mexc[_i:_i + 20])
+                    for _r in _part.get("rows") or []:
+                        _r["age_days"] = _age(_r.get("token"))
+                        _r["alpha_listed"] = listed.get(_r.get("token"))
+                    rows_acc += _part.get("rows") or []
+                    nl_acc += _part.get("not_listed") or []
+                    if _first:
+                        with state.lock:
+                            state.watchlist_mon = {
+                                "ts": time.time(), "rows": list(rows_acc), "not_listed": [],
+                                "too_new": [], "n_total": len(alpha), "n_listed": len(rows_acc),
+                                "n_on_mexc": len(on_mexc), "alpha_src": alpha_src,
+                                "progress": "%d/%d" % (min(_i + 20, len(on_mexc)), len(on_mexc))}
+                    print("[alpha] scanned %d/%d (%d rows)" % (min(_i + 20, len(on_mexc)),
+                                                                len(on_mexc), len(rows_acc)), flush=True)
+                res = {"rows": rows_acc, "not_listed": nl_acc, "n_listed": len(rows_acc)}
                 _enrich_oi_divergence(res)
                 for _r in res.get("rows") or []:
                     _r["age_days"] = _age(_r.get("token"))
@@ -3854,7 +3874,7 @@ function _wlRender(m, ids, sortState, arrowSel, warmMsg, curated){
              ((m.not_listed&&m.not_listed.length)?("Not on MEXC: "+m.not_listed.slice(0,80).join(', ')):""))
                    : "Scanning the universe — first pass runs a few minutes after boot."); }
   }
-  if(sm) sm.innerHTML='<div class="status"><span><b>'+(m.n_listed||0)+'</b>'+(curated?(' of '+m.n_total+' Binance Alpha tokens are on MEXC futures with enough history'+(m.alpha_src&&m.alpha_src!=='live'?' <span class="muted">(Alpha list: '+m.alpha_src+')</span>':'')+'.'):' liquid coins scanned.')+
+  if(sm) sm.innerHTML='<div class="status"><span><b>'+(m.n_listed||0)+'</b>'+(curated?(' of '+m.n_total+' Binance Alpha tokens are on MEXC futures with enough history'+(m.progress?' <span class="muted">(first pass in progress: '+m.progress+' scanned)</span>':'')+(m.alpha_src&&m.alpha_src!=='live'?' <span class="muted">(Alpha list: '+m.alpha_src+')</span>':'')+'.'):' liquid coins scanned.')+
     (curated&&m.too_new&&m.too_new.length?' Too new for the 4h EMA200 (&lt;220 candles): <span class="muted">'+m.too_new.join(', ')+'</span>':'')+'</span></div>';
   let rows=[...(m.rows||[])];
   if(sortState.key){
@@ -7130,15 +7150,15 @@ def main() -> None:
         print("  Telegram alerts: off (set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)")
 
     if APP_MODE != "stocks":
-        threading.Thread(target=scan_loop, args=(state,), daemon=True).start()
+        # threading.Thread(target=scan_loop, args=(state,), daemon=True).start()  # boards hidden; frees CPU
         threading.Thread(target=breakout_watcher, args=(state,), daemon=True).start()
-        threading.Thread(target=runner_loop, args=(state,), daemon=True).start()
+        # threading.Thread(target=runner_loop, args=(state,), daemon=True).start()  # boards hidden
         threading.Thread(target=watchlist_loop, args=(state,), daemon=True).start()
         # threading.Thread(target=watchlist_all_loop, args=(state,), daemon=True).start()  # All-coins tab removed
     def _delayed_lab():
         time.sleep(300)          # let the first scan finish and the site come up before thinking hard
         backtest_loop(state)
-    threading.Thread(target=_delayed_lab, daemon=True).start()
+    # threading.Thread(target=_delayed_lab, daemon=True).start()  # signal lab hidden; frees CPU
 
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(state))
     url = f"http://localhost:{args.port}"
