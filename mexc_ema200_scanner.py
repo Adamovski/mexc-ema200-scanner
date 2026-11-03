@@ -7360,6 +7360,122 @@ WATCHLIST_TOKENS = (
     "BAN", "GRIFFAIN", "SAPIEN", "EVAA", "FHE", "ARC", "VIC", "BABY", "BANK", "AIOT", "SOON", "SQD", "PUMPBTC", "H", "BULLA", "AIN", "VELVET", "TA", "NAORIS", "CARV", "XYN", "USELESS", "BAS", "MITO", "HEMI", "Q", "TAKE", "XPIN", "BLESS", "FLUID", "COAI", "MIRA", "AKE", "XAN", "LYN", "KGEN", "GIGGLE", "YB", "MET", "ENSO", "RECALL", "BLUAI", "ON", "BR", "UAI", "JCT", "CLANKER", "PIEVERSE", "IRYS", "CYS", "BREV", "COLLECT", "MAGMA", "ZAMA", "AIA", "SPACE", "FIGHT", "BIRB", "MEGA", "CHIP", "INX", "TRIA", "ESP", "ROBO", "BASED", "PRL", "BARD", "MERL", "PLAY", "UB", "GENIUS", "CFG", "OPG", "SWARMS", "RIVER", "PIPPIN", "SIREN", "RAVE", "SKYAI", "LAB",
 )
 
+# ---- Binance Alpha universe ------------------------------------------------------------------
+BINANCE_ALPHA_URL = ("https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/"
+                     "cex/alpha/all/token/list")
+
+# Snapshot of the live (not offline / delisted, non-stock) Binance Alpha tokens, taken 2026-11-03.
+# Used only when the live list can't be fetched (Binance geo-blocks some cloud IPs).
+ALPHA_FALLBACK = (
+    "AXIS", "DNA", "DRV", "CT", "XDP", "GSTOCK", "BREW", "APM", "DGAI", "NES", "MEME", "4STOCK",
+    "CNPY", "AI", "UP", "CASHCAT", "TAC", "CP", "PONS", "FLORK", "DEBIT", "TMX", "KII", "DOS",
+    "QUID", "GRVT", "AEON", "DATAIP", "CAP", "ARX", "O", "H", "QAIT", "CTR", "SLX", "NEX",
+    "ZEST", "BABYSHARK", "PHAROS", "SHARE", "BILL", "ACN", "XMN", "ST", "CHECK", "EDGE", "R2",
+    "BASED", "PRL", "PLAY", "LAB", "SIGMA", "AIA", "MAGMA", "IN", "BLUAI", "BSB", "BTW", "GUA",
+    "TRUTH", "VELVET", "COAI", "STABLE", "RNBW", "ICNT", "JCT", "TRIA", "INX", "PIGGY", "BIRB",
+    "ARTX", "BTG", "NAORIS", "XPIN", "SPACE", "FIGHT", "SKR", "GWEI", "1", "ACU", "ELSA", "ROLL",
+    "FUN", "BLESS", "ZTC", "ESIM", "Q", "COLLECT", "SENTIS", "KGEN", "UB", "BEAT", "RTX", "VOOI",
+    "LISA", "IR", "THQ", "AIOT", "RAVE", "US", "LAVA", "DOYR", "WET", "POWER", "ESPORTS", "TAKE",
+    "RLS", "SQD", "VSN", "IRYS", "BNBHOLDER", "BOB", "GAIB", "PIEVERSE", "CROSS", "FOLKS", "UAI",
+    "TRUST", "TITN", "BAY", "NB", "42", "AIO", "B2", "ON", "APR", "MYX", "MERL", "ANOME",
+    "RECALL", "CLO", "PIPE", "PALU", "P", "EVAA", "4", "VFY", "XAN", "LIGHT", "GOATED", "HANA",
+    "GAIN", "RIVER", "NUMI", "FROGGIE", "AOP", "DL", "STBL", "ALEO", "ZEUS", "POP", "STAR",
+    "TRADOOR", "FOREST", "WOD", "ZENT", "BTR", "ARIA", "AKE", "YZY", "BAS", "DAM", "RICE",
+    "WILD", "MLK", "TCOM", "PUBLIC", "WAI", "XCX", "GAME", "X", "CYC", "TOSHI", "MIA", "RHEA",
+    "USELESS", "PUNDIAI", "ASP", "XNY", "TA", "ORDER", "RION", "SPA", "PEAQ", "SUNDOG", "PEPE",
+    "NFT", "MPLX", "AIN", "M", "EGL1", "BGSC", "NODE", "FUEL", "REKT", "CESS", "DMC", "MGO",
+    "CARV", "BULLA", "LOT", "AVAIL", "MAT", "BEE", "TAG", "VELO", "DEGEN", "ROAM", "IDOL", "OL",
+    "AB", "FLY", "POKT", "FLOCK", "ZRC", "TAIKO", "OBT", "RWA", "B", "XTER", "AGT", "NS", "BLUE",
+    "NAVX", "SCA", "PUFFER", "MOODENG", "GOAT", "DOOD", "OBOL", "ZKJ", "JAGER", "BOOP", "ANON",
+    "BEETS", "SHADOW", "ZORA", "SKYAI", "TROLL", "SPX", "MOG", "POPCAT", "CULT", "PROMPT", "FHE",
+    "ZETA", "SAFE", "GRASS", "ATH", "MEW", "KILO", "QUQ", "MUBARAKAH", "BR", "JELLYJELLY", "AVL",
+    "B3", "FLUID", "VVV", "TOKEN", "CPOOL", "DRIFT", "BROCCOLI", "OLAS", "BID", "VINE", "VITA",
+    "PIPPIN", "SWARMS", "ALCH", "ARC", "APU", "BITCOIN", "AVAAI", "ZEREBRO", "KOGE", "MGP",
+    "GRIFFAIN", "CLANKER", "CKP", "GEAR", "SD", "FARTCOIN", "KOMA",
+)
+
+# Binance Alpha listing date per token, as days since 1970-01-01 (same snapshot as above).
+ALPHA_LISTED_DAY = {
+    "1": 20473, "4": 20363, "42": 20388, "AXIS": 20747, "DNA": 20742, "DRV": 20740, "CT": 20726,
+    "XDP": 20724, "GSTOCK": 20721, "BREW": 20721, "APM": 20713, "DGAI": 20712, "NES": 20706,
+    "MEME": 20705, "4STOCK": 20705, "CNPY": 20703, "AI": 20700, "UP": 20700, "CASHCAT": 20700,
+    "TAC": 20700, "CP": 20700, "PONS": 20698, "FLORK": 20698, "DEBIT": 20691, "TMX": 20690,
+    "KII": 20679, "DOS": 20675, "QUID": 20669, "GRVT": 20664, "AEON": 20661, "DATAIP": 20636,
+    "CAP": 20630, "ARX": 20626, "O": 20621, "H": 20621, "QAIT": 20601, "CTR": 20599,
+    "SLX": 20598, "NEX": 20593, "ZEST": 20592, "BABYSHARK": 20587, "PHAROS": 20586,
+    "SHARE": 20581, "BILL": 20577, "ACN": 20572, "XMN": 20558, "ST": 20558, "CHECK": 20545,
+    "EDGE": 20543, "R2": 20542, "BASED": 20542, "PRL": 20537, "PLAY": 20535, "LAB": 20522,
+    "SIGMA": 20522, "AIA": 20522, "MAGMA": 20518, "IN": 20517, "BLUAI": 20517, "BSB": 20516,
+    "BTW": 20514, "GUA": 20508, "TRUTH": 20504, "VELVET": 20502, "COAI": 20493, "STABLE": 20490,
+    "RNBW": 20489, "ICNT": 20489, "JCT": 20489, "TRIA": 20487, "INX": 20483, "PIGGY": 20482,
+    "BIRB": 20481, "ARTX": 20481, "BTG": 20481, "NAORIS": 20481, "XPIN": 20480, "SPACE": 20476,
+    "FIGHT": 20475, "SKR": 20475, "GWEI": 20474, "ACU": 20473, "ELSA": 20473, "ROLL": 20469,
+    "FUN": 20468, "BLESS": 20461, "ZTC": 20460, "ESIM": 20458, "Q": 20453, "COLLECT": 20449,
+    "SENTIS": 20448, "KGEN": 20447, "UB": 20446, "BEAT": 20445, "RTX": 20441, "VOOI": 20440,
+    "LISA": 20440, "IR": 20439, "THQ": 20438, "AIOT": 20437, "RAVE": 20434, "US": 20433,
+    "LAVA": 20432, "DOYR": 20432, "WET": 20431, "POWER": 20427, "ESPORTS": 20426, "TAKE": 20424,
+    "RLS": 20423, "SQD": 20422, "VSN": 20419, "IRYS": 20417, "BNBHOLDER": 20417, "BOB": 20412,
+    "GAIB": 20411, "PIEVERSE": 20406, "CROSS": 20404, "FOLKS": 20398, "UAI": 20398,
+    "TRUST": 20397, "TITN": 20395, "BAY": 20393, "NB": 20392, "AIO": 20387, "B2": 20386,
+    "ON": 20385, "APR": 20384, "MYX": 20380, "MERL": 20379, "ANOME": 20378, "RECALL": 20376,
+    "CLO": 20375, "PIPE": 20369, "PALU": 20368, "P": 20364, "EVAA": 20364, "VFY": 20361,
+    "XAN": 20360, "LIGHT": 20358, "GOATED": 20358, "HANA": 20357, "GAIN": 20355, "RIVER": 20353,
+    "NUMI": 20352, "FROGGIE": 20351, "AOP": 20350, "DL": 20350, "STBL": 20347, "ALEO": 20345,
+    "ZEUS": 20344, "POP": 20341, "STAR": 20337, "TRADOOR": 20335, "FOREST": 20332, "WOD": 20331,
+    "ZENT": 20330, "BTR": 20327, "ARIA": 20321, "AKE": 20321, "YZY": 20321, "BAS": 20319,
+    "DAM": 20318, "RICE": 20318, "WILD": 20317, "MLK": 20316, "TCOM": 20315, "PUBLIC": 20315,
+    "WAI": 20312, "XCX": 20311, "GAME": 20310, "X": 20307, "CYC": 20304, "TOSHI": 20301,
+    "MIA": 20301, "RHEA": 20299, "USELESS": 20297, "PUNDIAI": 20294, "ASP": 20293, "XNY": 20292,
+    "TA": 20290, "ORDER": 20286, "RION": 20285, "SPA": 20282, "PEAQ": 20281, "SUNDOG": 20280,
+    "PEPE": 20280, "NFT": 20280, "MPLX": 20275, "AIN": 20274, "M": 20272, "EGL1": 20270,
+    "BGSC": 20270, "NODE": 20269, "FUEL": 20268, "REKT": 20267, "CESS": 20266, "DMC": 20263,
+    "MGO": 20263, "CARV": 20262, "BULLA": 20261, "LOT": 20259, "AVAIL": 20259, "MAT": 20258,
+    "BEE": 20257, "TAG": 20257, "VELO": 20255, "DEGEN": 20253, "ROAM": 20252, "IDOL": 20250,
+    "OL": 20247, "AB": 20246, "FLY": 20245, "POKT": 20243, "FLOCK": 20243, "ZRC": 20242,
+    "TAIKO": 20239, "OBT": 20232, "RWA": 20230, "B": 20229, "XTER": 20227, "AGT": 20224,
+    "NS": 20224, "BLUE": 20222, "NAVX": 20221, "SCA": 20221, "PUFFER": 20220, "MOODENG": 20219,
+    "GOAT": 20219, "DOOD": 20217, "OBOL": 20215, "ZKJ": 20215, "JAGER": 20213, "BOOP": 20213,
+    "ANON": 20209, "BEETS": 20209, "SHADOW": 20209, "ZORA": 20201, "SKYAI": 20200,
+    "TROLL": 20200, "SPX": 20199, "MOG": 20199, "POPCAT": 20199, "CULT": 20199, "PROMPT": 20188,
+    "FHE": 20188, "ZETA": 20180, "SAFE": 20180, "GRASS": 20179, "ATH": 20179, "MEW": 20179,
+    "KILO": 20174, "QUQ": 20169, "MUBARAKAH": 20168, "BR": 20167, "JELLYJELLY": 20145,
+    "AVL": 20145, "B3": 20140, "FLUID": 20140, "VVV": 20140, "TOKEN": 20140, "CPOOL": 20140,
+    "DRIFT": 20140, "BROCCOLI": 20138, "OLAS": 20130, "BID": 20111, "VINE": 20111, "VITA": 20103,
+    "PIPPIN": 20094, "SWARMS": 20090, "ALCH": 20087, "ARC": 20084, "APU": 20084,
+    "BITCOIN": 20083, "AVAAI": 20083, "ZEREBRO": 20080, "KOGE": 20077, "MGP": 20077,
+    "GRIFFAIN": 20076, "CLANKER": 20076, "CKP": 20075, "GEAR": 20075, "SD": 20075,
+    "FARTCOIN": 20075, "KOMA": 20075,
+}
+
+
+def fetch_binance_alpha_tokens(sess):
+    """Live list of Binance Alpha token tickers (active, non-tokenized-stock) plus each one's Alpha
+    listing time -> (tokens, {token: listed_epoch_seconds}). Raises on failure so the caller can fall
+    back to a cached / embedded list."""
+    r = sess.get(BINANCE_ALPHA_URL, timeout=20,
+                 headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+    r.raise_for_status()
+    data = r.json().get("data") or []
+    out, listed = [], {}
+    for x in data:
+        if x.get("offline") or x.get("fullyDelisted") or x.get("rwaInfo") or x.get("stockState"):
+            continue
+        sym = str(x.get("symbol") or "").upper().strip()
+        if sym and sym.isalnum() and len(sym) <= 15 and sym not in listed and sym not in out:
+            out.append(sym)
+            try:
+                lt = float(x.get("listingTime") or 0)
+                if lt > 1e11:                   # milliseconds -> seconds
+                    lt /= 1000.0
+                if lt > 0:
+                    listed[sym] = int(lt)
+            except (TypeError, ValueError):
+                pass
+    if len(out) < 50:                       # implausibly small -> treat as a bad response
+        raise ValueError("binance alpha list too small: %d" % len(out))
+    return out, listed
+
+
 def fetch_fut_tickers(sess):
     """MEXC futures ticker map -> {DISPLAYSYM: {"oi": open_interest, "vol24": 24h_turnover_usd,
     "last": last_price}}. One request powers OI + volume for the whole watchlist."""
