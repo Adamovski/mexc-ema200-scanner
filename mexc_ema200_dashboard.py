@@ -1930,13 +1930,17 @@ def watchlist_loop(state: State) -> None:
             except Exception:
                 _spot = set()
             def _mexc(tok):
+                """'perp+spot' / 'perp' / 'spot' / None - where it trades on MEXC."""
                 sym = tok + "USDT"
-                if sym in _tk:
+                perp = sym in _tk
+                if perp:
                     _ap = (meta.get(tok) or {}).get("price"); _lp = (_tk[sym] or {}).get("last")
                     if _ap and _lp and not (0.8 < _lp / _ap < 1.25):
                         return None                  # same ticker, different coin on MEXC
-                    return "perp"
-                return "spot" if sym in _spot else None
+                spot = sym in _spot
+                if perp and spot:
+                    return "perp+spot"
+                return "perp" if perp else ("spot" if spot else None)
 
             try:
                 pairs = fetch_alpha_pairs(_sess)
@@ -2829,7 +2833,7 @@ PAGE = """<!doctype html>
   <select onchange="WLF.rsi=this.value;renderWatch2()" class="wlsel"><option value="">RSI: any</option><option value="lt30">&lt; 30 oversold</option><option value="30-50">30–50</option><option value="50-70">50–70</option><option value="gt70">&gt; 70 overbought</option></select>
   <select onchange="WLF.age=this.value;renderWatch2()" class="wlsel"><option value="">Age: any</option><option value="30">&lt; 30 days</option><option value="90">&lt; 90 days</option><option value="180">&lt; 6 months</option><option value="old">&gt; 6 months</option></select>
   <select onchange="WLF.oi=this.value;renderWatch2()" class="wlsel"><option value="">Binance perp: any</option><option value="yes">Has Binance perp (OI)</option><option value="no">No Binance perp</option></select>
-  <select onchange="WLF.mx=this.value;renderWatch2()" class="wlsel"><option value="">MEXC: any</option><option value="perp">Tradeable on MEXC perp</option><option value="spot">MEXC spot only</option><option value="any">On MEXC (perp or spot)</option><option value="none">Not on MEXC</option></select>
+  <select onchange="WLF.mx=this.value;renderWatch2()" class="wlsel"><option value="">MEXC: any</option><option value="perp">MEXC perp (any)</option><option value="both">MEXC perp + spot</option><option value="perponly">MEXC perp only</option><option value="spot">MEXC spot only</option><option value="any">On MEXC (perp or spot)</option><option value="none">Not on MEXC</option></select>
   <select onchange="WLF.low=this.value;renderWatch2()" class="wlsel"><option value="">Above ATL: any</option><option value="25">&lt; 25% above ATL</option><option value="50">&lt; 50% above ATL</option><option value="100">&lt; 100% above ATL</option></select>
   <select onchange="WLF.grad=this.value;renderWatch2()" class="wlsel"><option value="">Listing: any</option><option value="alpha">Alpha-only (not on Binance main)</option><option value="grad">Graduated to Binance main</option></select>
   <span class="wlbtn" onclick="resetWlFilters()">Clear filters</span>
@@ -3124,7 +3128,7 @@ function _wlRowHtml(r){
   const oiDivCls=d=>['accumulating','real up'].includes(d)?'good':(['fake pump','fresh shorts'].includes(d)?'bad':'muted');
   const behClr=b=>['ripping','climbing'].includes(b)?'good':(['dumping','bleeding'].includes(b)?'bad':(b==='coiling'?'muted':''));
   const c7=r.chg7d, al=r.above_low_pct, fh=r.from_high_pct;
-  return `<td class="sym"><div class="symbox">${watchStar(r.symbol)}<a href="${tvLink(r.symbol)}" target="_blank" rel="noopener" data-tip="${esc((r.name||r.token)+(r.chain?' · '+r.chain+' chain':'')+' (Binance Alpha)')}">${esc(r.disp||r.token)}</a>${analyzeBtn(r.symbol)}${r.mexc?`<span class="rr" data-tip="Tradeable on MEXC as ${r.mexc==='perp'?'a USDT perpetual':'spot only'}">mx ${r.mexc}</span>`:'<span class="rr" data-tip="Not listed on MEXC">no mx</span>'}${r.on_binance?'<span class="rr" style="color:#f0b90b" data-tip="Graduated from Alpha to the main Binance exchange">BN</span>':''}</div></td>`+
+  return `<td class="sym"><div class="symbox">${watchStar(r.symbol)}<a href="${tvLink(r.symbol)}" target="_blank" rel="noopener" data-tip="${esc((r.name||r.token)+(r.chain?' · '+r.chain+' chain':'')+' (Binance Alpha)')}">${esc(r.disp||r.token)}</a>${analyzeBtn(r.symbol)}${r.mexc?`<span class="rr" data-tip="Tradeable on MEXC: ${r.mexc==='perp+spot'?'USDT perpetual AND spot':(r.mexc==='perp'?'USDT perpetual only':'spot only')}">mx ${r.mexc}</span>`:'<span class="rr" data-tip="Not listed on MEXC">no mx</span>'}${r.on_binance?'<span class="rr" style="color:#f0b90b" data-tip="Graduated from Alpha to the main Binance exchange">BN</span>':''}</div></td>`+
     (r.age_days!==undefined?`<td class="${r.age_days!=null&&r.age_days<60?'good':''}" data-tip="${esc(r.alpha_listed?('Listed on Binance Alpha '+new Date(r.alpha_listed*1000).toISOString().slice(0,10)):'listing date unknown')}">${_ageTxt(r.age_days)}</td>`:'')+
     `<td>${fmtNum(r.live!=null?r.live:r.price)}</td>`+
     `<td>${usd(r.mcap)}</td>`+
@@ -3156,7 +3160,8 @@ function wlPass(r){
     if(F.rsi==='50-70'&&!(v>=50&&v<=70)) return false; if(F.rsi==='gt70'&&!(v>70)) return false; }
   if(F.age){ const a=r.age_days; if(a==null) return false; if(F.age==='old'){ if(!(a>180)) return false; } else if(!(a<+F.age)) return false; }
   if(F.oi==='yes'&&!r.oi_src) return false; if(F.oi==='no'&&r.oi_src) return false;
-  if(F.mx){ const m=r.mexc||null; if(F.mx==='perp'&&m!=='perp') return false; if(F.mx==='spot'&&m!=='spot') return false;
+  if(F.mx){ const m=r.mexc||null; if(F.mx==='perp'&&!(m||'').includes('perp')) return false; if(F.mx==='both'&&m!=='perp+spot') return false;
+    if(F.mx==='perponly'&&m!=='perp') return false; if(F.mx==='spot'&&m!=='spot') return false;
     if(F.mx==='any'&&!m) return false; if(F.mx==='none'&&m) return false; }
   if(F.low){ const l=r.above_low_pct; if(l==null||!(l<+F.low)) return false; }
   if(F.grad==='alpha'&&r.on_binance) return false; if(F.grad==='grad'&&!r.on_binance) return false;
