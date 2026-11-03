@@ -2699,6 +2699,7 @@ PAGE = """<!doctype html>
        we build up from the ground up around the backtest-proven reversion logic. -->
   <div class="tab active" id="tabAnalyze" onclick="showTab('analyze')">🔎 Analyze a coin</div>
   <div class="tab" id="tabWatch2" onclick="showTab('watch2')">🅰️ Binance Alpha</div>
+  <div class="tab" id="tabCalls" onclick="showTab('calls')">📌 My calls</div>
   <div class="tab" style="display:none" id="tabWatch3" onclick="showTab('watch3')">🌐 All coins</div>
   <div class="tab" style="display:none" id="tabBestLong" onclick="showTab('bestlong')">🟢 Long</div>
   <div class="tab" style="display:none" id="tabBestShort" onclick="showTab('bestshort')">🔴 Short</div>
@@ -2722,7 +2723,6 @@ PAGE = """<!doctype html>
   <div class="tab" style="display:none" id="tabBounce" onclick="showTab('bounce')">Support bounce</div>
   <div class="tab" style="display:none" id="tabStb" onclick="showTab('stb')">Supertrend support bounce</div>
   <div class="tab" style="display:none" id="tabShorts" onclick="showTab('shorts')">Shorts</div>
-  <div class="tab" style="display:none" id="tabCalls" onclick="showTab('calls')">📌 My calls</div>
   <div class="tab" style="display:none" id="tabInfo" onclick="showTab('info')">Info</div>
 </div>
 <div class="filterbar" id="filterbar"></div>
