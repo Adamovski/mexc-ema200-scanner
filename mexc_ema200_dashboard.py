@@ -53,7 +53,7 @@ try:
         bias_on_tf, enrich_1h, best_pattern, coil_tfs_finer, scalp_setup,
         bounce_scalp_setup, backtest_board, backtest_all,
         compute_market_context, fetch_deriv_series, backfill_market_history, ema, BACKTEST_BASKET,
-        STOCK_BASKET,
+        STOCK_BASKET, fetch_live_price,
     )
 except ImportError:
     sys.exit("Could not import mexc_ema200_scanner.py — keep both files in the "
@@ -106,6 +106,7 @@ class Tracker:
         # Per-board last-time-a-setup-appeared, for the "drought" auto-loosen: if a board
         # produces nothing for a couple of hours the gate is probably too tight, so relax it.
         self.board_seen: dict[str, float] = {}
+        self.migrations: list = []     # one-time data migrations already applied
         try:
             self.path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                      "apex_perf.json")
@@ -154,6 +155,7 @@ class Tracker:
                 self.cooldowns = d.get("cooldowns", {})
                 self.board_seen = d.get("board_seen", {})
                 self.calls_reset = d.get("calls_reset", "")
+                self.migrations = d.get("migrations", [])
                 # Anything recorded before versioning belongs to the previous epoch —
                 # tag it v1 so the current version's headline starts fresh but the old
                 # results are kept and shown in the site-version breakdown.
@@ -173,7 +175,8 @@ class Tracker:
     def _save(self):
         blob = json.dumps({"open": self.open, "closed": self.closed[-1000:],
                            "cooldowns": self.cooldowns, "calls_reset": self.calls_reset,
-                           "board_seen": self.board_seen})
+                           "board_seen": self.board_seen,
+                           "migrations": getattr(self, "migrations", [])})
         try:
             with open(self.path, "w") as f:
                 f.write(blob)
@@ -283,14 +286,26 @@ class Tracker:
             self._save()
         return True
 
-    def add_call(self, symbol, side, targets, entry, stop, tf="", note=""):
+    def add_call(self, symbol, side, targets, entry, stop, tf="", note="", mode="entry", px=None):
         """Manually track a curated 'call' (from the Analyze tab), with its full TP
         ladder. `targets` is a comma-separated string of TP levels. Recorded with a
-        unique key so the same coin can be called more than once."""
+        unique key so the same coin can be called more than once.
+
+        mode="entry"  (📌 Track): the call starts PENDING and only goes live once price
+                       actually reaches the RECOMMENDED entry (same fill logic as the
+                       auto boards). Runs to TP1 without filling = 'missed', not a loss.
+        mode="market" (⚡ Track @ market): you're in NOW at the live market price — the
+                       entry is replaced by `px`, stop + TP ladder kept, R:R re-measured
+                       from the market fill; TPs already behind price are dropped.
+        Returns the created trade dict, or None if the geometry is invalid."""
         try:
             entry, stop = float(entry), float(stop)
         except (TypeError, ValueError):
-            return False
+            return None
+        try:
+            px = float(px) if px else None
+        except (TypeError, ValueError):
+            px = None
         tps = []
         for x in str(targets).split(","):
             x = x.strip()
@@ -300,21 +315,129 @@ class Tracker:
                 except ValueError:
                     pass
         if not (symbol and entry and stop and tps):
-            return False
+            return None
         long = side != "short"
+        market = (mode == "market")
+        if market:
+            if not px:
+                return None
+            entry = px
+            # Keep only the targets still ahead of the market fill.
+            tps = [t for t in tps if (t["lvl"] > entry if long else t["lvl"] < entry)]
+            if not tps:
+                return None
         t1 = tps[0]["lvl"]
         if long and not (stop < entry < t1):
-            return False
+            return None
         if (not long) and not (t1 < entry < stop):
-            return False
+            return None
         now = time.time()
+        if market:
+            state = "active"
+        else:
+            # Already sitting at/through the entry (on the fill side)? then it's live now.
+            state = "pending"
+            if px is None:
+                px = entry
         with self.lock:
-            # A manual call = you're taking the trade now, so it starts ACTIVE.
-            self.open[f"call:{symbol}:{int(now)}"] = self._mk(
-                "call", symbol, side, entry, stop, tps, entry, now, tf, (note or "")[:120],
-                state="active")
+            t = self._mk("call", symbol, side, entry, stop, tps, px, now, tf,
+                         (note or "")[:120], state=state)
+            t["mode"] = "market" if market else "entry"
+            self.open[f"call:{symbol}:{int(now)}:{t['id'][:4]}"] = t
             self._save()
+        return t
+
+    # ── one-time migration (v63): re-base every pre-existing 📌 call on the MARKET price
+    # at the moment it was tracked (they were originally booked at the recommended entry).
+    @staticmethod
+    def _hist_price(sess, sym, ts):
+        """Price of `sym` at epoch `ts` — the 1-minute candle containing ts (spot, then perp)."""
+        m0 = int(ts // 60) * 60
+        try:
+            r = sess.get("https://api.mexc.com/api/v3/klines",
+                         params={"symbol": sym, "interval": "1m", "startTime": m0 * 1000, "limit": 1},
+                         timeout=15)
+            if r.status_code == 200:
+                k = r.json()
+                if k and abs(int(k[0][0]) // 1000 - m0) <= 120:
+                    return float(k[0][1])
+        except Exception:
+            pass
+        try:
+            base = sym[:-4] if sym.endswith("USDT") else sym
+            r = sess.get(f"https://contract.mexc.com/api/v1/contract/kline/{base}_USDT",
+                         params={"interval": "Min1", "start": m0, "end": m0 + 60}, timeout=15)
+            d = (r.json() or {}).get("data") or {}
+            if d.get("open"):
+                return float(d["open"][0])
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _rebase_market(t, px):
+        """Re-grade a call as if entered at `px`: same stop & TP levels, R re-measured
+        from px, banked TPs re-scored, ratcheted stop re-placed. Returns False if px is
+        on the wrong side of the stop (can't be a valid entry)."""
+        long = t.get("side") != "short"
+        stop = float(t["stop"])
+        if (long and not stop < px) or ((not long) and not px < stop):
+            return False
+        hits = list(t.get("tps_hit") or [])
+        tps = list(t.get("tps") or [])
+        if not hits:   # nothing banked yet → drop targets already behind the market fill
+            tps = [x for x in tps if (x["lvl"] > px if long else x["lvl"] < px)]
+            if not tps:
+                return False
+        risk = abs(px - stop) or 1e-9
+        for x in tps:
+            x["rr"] = round(((x["lvl"] - px) if long else (px - x["lvl"])) / risk, 2)
+        raw = [1.0 / (1.0 + 0.5 * max(x.get("rr") or 1.0, 0.1)) for x in tps]
+        tot = sum(raw) or 1.0
+        w = [v / tot for v in raw] if tps else [1.0]
+        ph = min(len(hits), len(tps))
+        realized = sum(w[i] * (tps[i]["rr"] or 0) for i in range(ph))
+        t.update({"entry_orig": t.get("entry"), "entry": px, "px0": px, "tps": tps,
+                  "weights": w, "phase": ph, "realized": realized,
+                  "rr": (tps[0]["rr"] if tps else None), "mode": "market",
+                  "state": "active", "filled_ts": t.get("ts")})
+        if ph == 0:
+            t["cur_stop"], t["cur_stop_r"] = stop, -1.0
+        elif ph == 1:
+            t["cur_stop"], t["cur_stop_r"] = px, 0.0
+        else:
+            t["cur_stop"], t["cur_stop_r"] = tps[ph - 2]["lvl"], tps[ph - 2]["rr"]
+        st = t.get("status")
+        if st in ("win", "loss", "be"):           # already resolved → re-score its R
+            if ph >= len(tps):
+                r = realized
+            elif ph == 0:
+                r = -1.0 if st == "loss" else realized
+            else:
+                r = realized + sum(w[ph:]) * t["cur_stop_r"]
+            t["r"] = round(r, 2)
+            t["status"] = "win" if r > 1e-4 else ("be" if abs(r) <= 1e-4 else "loss")
         return True
+
+    def migrate_calls_to_market(self, sess):
+        TAG = "v63-calls-at-market"
+        if TAG in (self.migrations or []):
+            return
+        with self.lock:
+            calls = [t for t in list(self.open.values()) + self.closed
+                     if t.get("board") == "call" and not t.get("mode")]
+        done = []
+        for t in calls:
+            px = self._hist_price(sess, t.get("symbol", ""), t.get("ts") or time.time())
+            done.append((t, px))
+        with self.lock:
+            for t, px in done:
+                ok = bool(px) and self._rebase_market(t, px)
+                if not ok:
+                    t["mode"] = "entry"            # couldn't price it → leave as booked
+            self.migrations = list(self.migrations or []) + [TAG]
+            self._save()
+        print(f"[migrate] {TAG}: re-based {sum(1 for t, px in done if t.get('mode') == 'market')}/{len(done)} calls", flush=True)
 
     def cooling(self, board, sym, side):
         """True if this exact setup was recently STOPPED OUT (in its loss cooldown) — used
@@ -526,7 +649,7 @@ class Tracker:
             _cf = ("id", "board", "symbol", "side", "entry", "stop", "tps", "rr", "status",
                    "r", "ts", "closed_ts", "tf", "note", "px0", "tps_hit", "state",
                    "phase", "filled_ts", "regime", "ver", "realized", "cur_stop_r",
-                   "entry_tf", "stop_tf")
+                   "entry_tf", "stop_tf", "mode")
             _pk = lambda t: {**{c: t.get(c) for c in _cf}, "cur_r": _cur_r(t),
                              "px_now": prices.get(t.get("symbol"))}
             _open_all = list(self.open.values())
@@ -2160,6 +2283,10 @@ def breakout_watcher(state: State) -> None:
     watched bull flag trades above its breakout level. Cheap: one call per tick."""
     sess = get_session()
     market = state.cfg.get("market", "futures")
+    try:
+        TRACKER.migrate_calls_to_market(sess)    # one-time: old calls → entered at market
+    except Exception as e:
+        print(f"[migrate] failed: {e}", flush=True)
     while True:
         time.sleep(20)
         try:
@@ -2590,6 +2717,9 @@ PAGE = """<!doctype html>
   .trackrow{display:flex;align-items:center;gap:10px;margin:10px 0 2px}
   .trackbtn{padding:7px 14px;border-radius:9px;border:1px solid rgba(63,185,80,.5);background:rgba(63,185,80,.12);color:var(--accent);font-weight:700;font-size:13px;cursor:pointer}
   .trackbtn:hover{background:rgba(63,185,80,.2)}
+  .trackmkt{border-color:rgba(210,153,34,.55)!important;background:rgba(210,153,34,.12)!important;color:#d29922!important}
+  .trackmkt:hover{background:rgba(210,153,34,.22)!important}
+  .mkttag{display:inline-block;margin-left:6px;padding:0 5px;border-radius:5px;font-size:10.5px;font-weight:700;color:#d29922;border:1px solid rgba(210,153,34,.5)}
   .trackmsg{font-size:12.5px;color:var(--dim)}
   .corrbadge{border-radius:6px;padding:0 6px;font-size:10.5px;font-weight:700;border:1px solid var(--line);margin-left:5px;font-variant-numeric:tabular-nums;cursor:help}
   .corr-hi{background:rgba(210,153,34,.16);color:#d29922;border-color:rgba(210,153,34,.45)}
@@ -2873,7 +3003,7 @@ PAGE = """<!doctype html>
 
 <div class="view" id="viewCalls">
 <div class="status">
-  <span>📌 My calls — setups you chose to track (via <b>📌 Track this setup</b> on the Analyze tab). Apex watches the live price and grades each one exactly like the plan: banks each TP, moves the stop to <b>break-even after TP1</b>, and scores the result in R. Their win-rate and per-TP hit rates are kept <b>separate</b> from the auto boards.</span>
+  <span>📌 My calls — setups you chose to track on the Analyze tab: <b>📌 Track this setup</b> waits for the recommended entry to fill before going live; <b>⚡ Track @ market</b> enters immediately at the live price. Apex watches the live price and grades each one exactly like the plan: banks each TP, moves the stop to <b>break-even after TP1</b>, and scores the result in R. Their win-rate and per-TP hit rates are kept <b>separate</b> from the auto boards.</span>
   <span id="callsMeta"></span>
   <span class="wlbtn" style="margin-left:10px;border-color:rgba(248,81,73,.5);color:#f85149" onclick="resetCalls()" data-tip="Delete every tracked call and wipe the scorecard.">🗑 Reset all</span>
 </div>
@@ -3374,27 +3504,37 @@ let azLast=null, azSide=null, azXtfHtml='', azXtfSide=null;   // azXtfSide: null
 let azRec=null;   // the currently-shown MAIN recommended trade
 // Track ANY setup — the main card or any of the cross-timeframe plans. Each card
 // passes its own entry/stop/targets so you choose exactly which setup to track.
-async function trackTrade(sym, side, entry, stop, targetsCsv, tf, msgId){
+// mode 'entry' (📌 Track) = waits for the recommended entry to fill before going live;
+// mode 'market' (⚡ @ market) = you're in NOW at the live price, graded from there.
+async function trackTrade(sym, side, entry, stop, targetsCsv, tf, msgId, ev, mode){
+  if(ev&&ev.stopPropagation) ev.stopPropagation();
+  mode=(mode==='market')?'market':'entry';
   const m=msgId?document.getElementById(msgId):null;
   if(!sym||entry==null||stop==null||!targetsCsv){ if(m) m.textContent='✗ missing levels'; return; }
-  const q=new URLSearchParams({symbol:sym, side:side||'long', entry:entry, stop:stop, targets:targetsCsv, tf:tf||''});
+  const q=new URLSearchParams({symbol:sym, side:side||'long', entry:entry, stop:stop, targets:targetsCsv, tf:tf||'', mode});
   if(m) m.textContent='…';
   try{ const r=await fetch('/track?'+q.toString(),{cache:'no-store'}); const d=await r.json();
-    if(m) m.textContent = d.ok? '✓ Tracking — see 📌 My calls' : '✗ Could not track (entry must sit between stop & target)';
+    if(m) m.textContent = d.ok
+      ? (mode==='market'
+          ? `✓ Live from market @ ${fmtNum(d.entry)} — see 📌 My calls`
+          : (d.state==='active' ? `✓ Entry ${fmtNum(d.entry)} already hit — live now` : `✓ Waiting for entry ${fmtNum(d.entry)} — see 📌 My calls`))
+      : (mode==='market'
+          ? `✗ Can't track at market (${d.why||'price outside stop/targets'})`
+          : '✗ Could not track (entry must sit between stop & target)');
     if(d.ok){ try{ const rr=await fetch('/data',{cache:'no-store'}); lastData=await rr.json(); renderPerf(); renderCalls(); }catch(e){} }
   }catch(e){ if(m) m.textContent='✗ Failed'; }
 }
-function trackSetup(ev){ if(ev) ev.stopPropagation();
+function trackSetup(ev, mode){ if(ev) ev.stopPropagation();
   if(!azRec) return;
-  trackTrade(azRec.symbol, azRec.side, azRec.entry, azRec.stop, (azRec.targets||[]).join(','), azRec.tf, 'trackmsg');
+  trackTrade(azRec.symbol, azRec.side, azRec.entry, azRec.stop, (azRec.targets||[]).join(','), azRec.tf, 'trackmsg', null, mode);
 }
 // Track a specific cross-TF plan card (b = the xtf trade). Builds its own TP ladder.
-function trackXtf(i, ev){ if(ev) ev.stopPropagation();
+function trackXtf(i, ev, mode){ if(ev) ev.stopPropagation();
   const b=(azXtfTop||[])[i]; if(!b||!b.be||!b.rec){ return; }
   const tps=(scaleOutRows(b.be.rt)||[]).map(r=>r.t&&r.t.lvl).filter(x=>x!=null);
   const tgts=tps.length?tps:[b.rec.lvl];
   trackTrade((azLast&&azLast.symbol)||'', b.side, b.be.level, (b.be.rs&&b.be.rs.level),
-             tgts.join(','), b.tf, 'xtftrackmsg'+i);
+             tgts.join(','), b.tf, 'xtftrackmsg'+i, null, mode);
 }
 let azXtfTop=null, azXtfOpen={};   // cached top-3 candidates + which alternatives are expanded
 function toggleXtfTrade(i){ azXtfOpen[i]=!azXtfOpen[i]; if(azXtfTop){ azXtfHtml=xtfRender(azXtfTop); renderAz(); } }
@@ -3511,7 +3651,7 @@ function xtfTradeBody(b,i){
       <span class="xtftf" data-tip="The timeframe whose plan graded highest for this trade — the individual levels below can each come from a different chart.">${tfN} chart</span>
       ${i>0?`<button class="wlbtn xtfexp" onclick="toggleXtfTrade(${i})">${detailed?'− collapse':'+ expand'}</button>`:''}
       ${b.tf!==azTf?`<button class="wlbtn" onclick="setAzTf('${b.tf}')">View on ${tfN} ↗</button>`:`<span class="xtfcur">— viewing this timeframe</span>`}
-      <button class="wlbtn xtftrackbtn" onclick="trackXtf(${i},event)" data-tip="Track THIS ${tfN} plan (its entry, stop & TP ladder) in 📌 My calls — scale-out aware, graded in R.">📌 Track</button><span class="trackmsg" id="xtftrackmsg${i}"></span></div>
+      <button class="wlbtn xtftrackbtn" onclick="trackXtf(${i},event)" data-tip="Track THIS ${tfN} plan (its entry, stop & TP ladder) in 📌 My calls — scale-out aware, graded in R.">📌 Track</button><button class="wlbtn xtftrackbtn trackmkt" onclick="trackXtf(${i},event,'market')" data-tip="Enter NOW at the live market price instead of waiting for the recommended entry. Same stop & TP ladder (targets already behind price are dropped); R is measured from the market fill.">⚡ @ market</button><span class="trackmsg" id="xtftrackmsg${i}"></span></div>
     <div class="xtfrow">
       <span class="xtfi" data-tip="Entry ${fmtNum(be.level)} — the recommended fill: the best value-area pullback that maximises reward:risk while still being a level price is likely to reach. From the ${eTf} chart. Why: ${esc(be.basis||'best value-area level')}."><i>Entry</i>${fmtNum(be.level)}${chip(eTf)}</span>
       <span class="xtfi" data-tip="Stop ${fmtNum(stop.level)} — the level that invalidates the trade, just beyond real structure and clear of the wick/noise range. From the ${sTf} chart. Why: ${esc(stop.basis||'—')}."><i>Stop</i>${fmtNum(stop.level)}${chip(sTf)}</span>
@@ -4087,7 +4227,7 @@ function azCard(d0){
     ${rec.tp!=null?`<div class="azrec" data-tip="Recommended by EXPECTED VALUE, not raw ratio: reward:risk × how reachable the target is. Reachability decays with distance (in ATR units) but stretches out when the trend, momentum and volume back the move — so a far target isn't dismissed if the setup is strong, and a nearby one isn't over-rated if it's weak. Measured from the recommended entry (${fmtNum(recE)}) over the recommended stop (${rstop?fmtNum(rstop.level):'—'}), capped 8:1, and only shown because it clears the 1.5:1 floor. Grade blends R:R and reachability.">⭐ Recommended take-profit: <b>${fmtNum(rec.tp)}</b> <span class="rr">${(d.side||'long')==='short'?'−':'+'}${(rec.move*100).toFixed(1)}% · R:R <b>${rec.rr.toFixed(2)}</b> · ~${Math.round(rec.p*100)}% reach · grade <b>${planGrade}</b></span>${rec.kind?` <span style="color:var(--dim)">— ${esc(rec.kind)}${tgtTf&&/Daily|Weekly/.test(rec.kind||'')?` <span class="tfsrc">${tgtTf} chart</span>`:''}</span>`:''}</div>
     ${rec.tp!=null?dcaPlanHtml(d, recE, rstop?rstop.level:null, rec.tp, d.side||'long', be?be.distATR:null):''}
     ${scaleOutHtml(rtg, recE)}
-    ${(rec.tp!=null&&azRec)?`<div class="trackrow"><button class="trackbtn" onclick="trackSetup(event)" data-tip="Record this exact setup (entry, stop, full TP ladder) into 📌 My calls. Apex then watches the live price and grades it: banks each TP, moves the stop to break-even after TP1, and scores the result in R. Win-rate + per-TP hit rates are on the My calls tab.">📌 Track this setup</button><span id="trackmsg" class="trackmsg"></span></div>`:''}
+    ${(rec.tp!=null&&azRec)?`<div class="trackrow"><button class="trackbtn" onclick="trackSetup(event)" data-tip="Record this exact setup (entry, stop, full TP ladder) into 📌 My calls. It goes live only once price reaches the recommended entry (reaching TP1 first = missed, not a loss). Apex then watches the live price and grades it: banks each TP, moves the stop to break-even after TP1, and scores the result in R. Win-rate + per-TP hit rates are on the My calls tab.">📌 Track this setup</button><button class="trackbtn trackmkt" onclick="trackSetup(event,'market')" data-tip="Enter NOW at the live market price instead of waiting for the recommended entry. Same stop & TP ladder (targets already behind price are dropped); R is measured from the market fill.">⚡ Track @ market</button><span id="trackmsg" class="trackmsg"></span></div>`:''}
     <div class="sidenote" data-tip="How the same trade looks if you enter NOW at the current market price instead of waiting for the 🎯 recommended pullback — same stop and target, worse fill, so a lower R:R. Use it to decide: take it now, or wait for the better entry.">⚡ Enter now at market (CMP ${fmtNum(cmpE)}): ${rrAt(cmpE)!=null?`R:R <b>${rrAt(cmpE).toFixed(2)}</b> to the base target`:'stop is already in the way — no clean entry here'} <span style="color:var(--dim)">vs ${rec.rr.toFixed(2)} waiting for ${fmtNum(recE)}${(rrAt(cmpE)!=null&&rrAt(cmpE)<1.5)?' — under 1.5:1 now, better to wait for the pullback':(cmpE!=null&&recE!=null&&Math.abs(cmpE-recE)/recE<0.005?' — basically at the entry already':'')}</span></div>`
     :`<div class="azrec" style="color:#f0b429" data-tip="No target on the correct side clears a 1.5:1 reward:risk from a sensible stop. In crypto a sub-1.5 R:R trade isn't worth the risk — this is a 'no trade / wait' call, not a setup. Wait for a deeper entry (better R:R), a tighter valid stop level, or a different coin.">⛔ No trade here — best realistic R:R is only <b>${rtg?rtg.bestRR.toFixed(2):'—'}</b>, under the 1.5 minimum. Wait for a better entry or setup.</div>`}
     ${stopsSection(d.stop_levels, d.side||'long', rstop?rstop.level:null)}
@@ -4910,7 +5050,7 @@ function planPanelHtml(p, side, cmp, sym){
      <div class="ptps"><div class="ptpsh">Targets — take profit in stages</div>${tps}</div>
      <div class="pscale">📤 Scale-out: ${scale}</div>
      ${(()=>{const rf=riskPct/100; if(!(rf>0)) return ''; const sizePct=Math.round(1/rf); const lev=Math.max(1,Math.ceil(sizePct/100)); const safeLev=Math.max(1,Math.min(25,Math.floor(0.5/rf))); return `<div class="psize" data-tip="Risking 1% of your account on this trade. Stop is ${riskPct.toFixed(1)}% from entry, so position notional ≈ ${sizePct}% of account (loss if stopped ≈ 1%). It needs ≥${lev}× leverage just to hold that notional; keeping leverage at ≤${safeLev}× (isolated) leaves the liquidation price well beyond the stop. Adjust for your own risk-per-trade %.">💰 Sizing (1% risk): size ≈ <b>${sizePct}%</b> of account · needs ≥${lev}× · keep ≤<b>${safeLev}×</b> lev</div>`;})()}
-     ${sym?`<div class="trackrow" style="margin-top:8px"><button class="trackbtn" onclick="trackTrade('${sym}','${side}',${p.entry},${p.stop},'${(p.tps||[]).map(t=>t.lvl).join(',')}','${p.entry_tf||''}','pptrk_${esc(sym)}_${side}',event)" data-tip="Track this exact ${long?'long':'short'} plan in 📌 My calls — scale-out aware, graded in R.">📌 Track this</button><span class="trackmsg" id="pptrk_${esc(sym)}_${side}"></span></div>`:''}
+     ${sym?`<div class="trackrow" style="margin-top:8px"><button class="trackbtn" onclick="trackTrade('${sym}','${side}',${p.entry},${p.stop},'${(p.tps||[]).map(t=>t.lvl).join(',')}','${p.entry_tf||''}','pptrk_${esc(sym)}_${side}',event)" data-tip="Track this exact ${long?'long':'short'} plan in 📌 My calls — goes live once price reaches the entry; scale-out aware, graded in R.">📌 Track this</button><button class="trackbtn trackmkt" onclick="trackTrade('${sym}','${side}',${p.entry},${p.stop},'${(p.tps||[]).map(t=>t.lvl).join(',')}','${p.entry_tf||''}','pptrk_${esc(sym)}_${side}',event,'market')" data-tip="Enter NOW at the live market price instead of waiting for the recommended entry. Same stop & TP ladder (targets already behind price are dropped); R is measured from the market fill.">⚡ Track @ market</button><span class="trackmsg" id="pptrk_${esc(sym)}_${side}"></span></div>`:''}
    </div>`;
 }
 // Map a setup's timeframe label to a backtest sweep timeframe, and pull its measured edge.
@@ -5952,14 +6092,14 @@ function renderCalls(){
   if(openrows){ openrows.innerHTML='';
     for(const t of opens){
       const when=t.ts?new Date(t.ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
-      const st=(t.state==='pending')?'⏳ waiting for entry':((t.tps_hit&&t.tps_hit.length)?`TP${Math.max.apply(null,t.tps_hit)} hit → stop at ${t.phase>=1?'break-even+':'—'}`:'● live · watching');
+      const st=(t.state==='pending')?`⏳ waiting for entry ${fmtNum(t.entry)}`:((t.tps_hit&&t.tps_hit.length)?`TP${Math.max.apply(null,t.tps_hit)} hit → stop at ${t.phase>=1?'break-even+':'—'}`:'● live · watching');
       const liveR=(t.cur_r!=null)?` · <b style="color:${t.cur_r>=0?'var(--up,#3fb950)':'var(--down,#f85149)'}">${t.cur_r>=0?'+':''}${t.cur_r}R</b>`:'';
       const prog=st+liveR;
       const tr=document.createElement('tr');
       tr.innerHTML=`<td style="color:var(--dim);white-space:nowrap">${when}</td>`
         +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></div></td>`
         +`<td>${leanPill(t.side==='short'?'bearish':'bullish')}</td><td>${t.tf||'—'}</td>`
-        +`<td>${fmtNum(t.entry)}</td>`+pxNowTd(t)+`<td>${fmtNum(t.stop)}</td><td class="whycell">${tgts(t)}</td>`
+        +`<td>${fmtNum(t.entry)}${t.mode==='market'?'<span class="mkttag" data-tip="Entered at market price when tracked">MKT</span>':''}</td>`+pxNowTd(t)+`<td>${fmtNum(t.stop)}</td><td class="whycell">${tgts(t)}</td>`
         +`<td>${prog}</td>`+delCallTd(t);
       openrows.appendChild(tr);
     }
@@ -6366,10 +6506,25 @@ def make_handler(state: State):
             q = parse_qs(urlparse(self.path).query)
             g = lambda k: (q.get(k) or [""])[0]
             sym = normalize_symbol(g("symbol"), state.cfg.get("quote", "USDT"))
-            ok = TRACKER.add_call(sym, g("side") or "long", g("targets") or g("target"),
-                                  g("entry"), g("stop"), g("tf"), g("note"))
-            self._send(200, json.dumps({"ok": bool(ok), "symbol": sym}).encode(),
-                       "application/json")
+            mode = "market" if g("mode") == "market" else "entry"
+            # Live market price right now: the ~20s price map first, else a direct ticker hit.
+            with state.lock:
+                px = (state.live_prices or {}).get(sym)
+            if not px:
+                try:
+                    px = fetch_live_price(get_session(), sym, state.cfg.get("market", "futures"))
+                except Exception:
+                    px = None
+            t = TRACKER.add_call(sym, g("side") or "long", g("targets") or g("target"),
+                                 g("entry"), g("stop"), g("tf"), g("note"), mode=mode, px=px)
+            out = {"ok": bool(t), "symbol": sym, "mode": mode, "px": px}
+            if t:
+                out.update({"entry": t["entry"], "state": t["state"],
+                            "n_tps": len(t["tps"])})
+            elif mode == "market":
+                out["why"] = ("no live price" if not px else
+                              "market price is past the stop or every target")
+            self._send(200, json.dumps(out).encode(), "application/json")
 
         def _analyze(self):
             from urllib.parse import urlparse, parse_qs
