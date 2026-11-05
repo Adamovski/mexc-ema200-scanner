@@ -650,8 +650,17 @@ class Tracker:
                    "r", "ts", "closed_ts", "tf", "note", "px0", "tps_hit", "state",
                    "phase", "filled_ts", "regime", "ver", "realized", "cur_stop_r",
                    "entry_tf", "stop_tf", "mode")
+            def _hold_r(t):
+                """R the WHOLE position would show right now had it never been closed
+                (no scale-out, no stop) — entry → current price, in units of the risk."""
+                p = prices.get(t.get("symbol"))
+                if not p or not t.get("entry") or not t.get("stop"):
+                    return None
+                risk = abs(t["entry"] - t["stop"]) or 1e-9
+                mv = (p - t["entry"]) if t.get("side") != "short" else (t["entry"] - p)
+                return round(mv / risk, 2)
             _pk = lambda t: {**{c: t.get(c) for c in _cf}, "cur_r": _cur_r(t),
-                             "px_now": prices.get(t.get("symbol"))}
+                             "px_now": prices.get(t.get("symbol")), "hold_r": _hold_r(t)}
             _open_all = list(self.open.values())
             # Current-version open only. Old-version open trades keep resolving quietly in
             # the background (so they still score under their own version in by_version),
@@ -3015,7 +3024,7 @@ PAGE = """<!doctype html>
     </tr></thead><tbody id="callsopenrows"></tbody></table>
   <div class="perfsub">Resolved calls</div>
   <table id="callsclosed"><thead><tr>
-      <th>Closed</th><th>Symbol</th><th>Side</th><th>TF</th><th>Entry</th><th>Stop</th><th data-tip="The furthest level price reached before close — highest TP hit, or the stop.">Reached</th><th>Result</th>
+      <th>Closed</th><th>Symbol</th><th>Side</th><th>TF</th><th>Entry</th><th>Stop</th><th data-tip="The furthest level price reached before close — highest TP hit, or the stop.">Reached</th><th>Result</th><th data-tip="Live MEXC price now. % is vs your entry, in your trade's favour.">Price now</th><th data-tip="What the WHOLE position would be worth right now had it never been closed — entry to the current price, in R (no scale-out, no stop).">If still open</th>
     <th></th></tr></thead><tbody id="callsclosedrows"></tbody></table>
   <div class="empty" id="callsempty" style="display:none">No tracked calls yet. Open <b>🔎 Analyze a coin</b>, and on any setup that clears the R:R bar you'll see a <b>📌 Track this setup</b> button — click it to start tracking.</div>
 </div>
@@ -6112,7 +6121,9 @@ function renderCalls(){
         +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></div></td>`
         +`<td>${sideLabel(t)}</td><td>${t.tf||'—'}</td>`
         +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${reachedHtml(t)}</td>`
-        +`<td>${perfStatusHtml(t)}</td>`+delCallTd(t);
+        +`<td>${perfStatusHtml(t)}</td>`+pxNowTd(t)
+        +`<td>${t.hold_r==null?'<span style="color:var(--dim)">—</span>':`<b style="color:${t.hold_r>=0?'var(--up,#3fb950)':'var(--down,#f85149)'}">${t.hold_r>=0?'+':''}${t.hold_r}R</b>`+(t.r!=null?`<span class="rr" style="color:var(--dim)"> (${(t.hold_r-t.r)>=0?'+':''}${(t.hold_r-t.r).toFixed(2)}R vs closing)</span>`:'')}</td>`
+        +delCallTd(t);
       closedrows.appendChild(tr);
     }
   }
