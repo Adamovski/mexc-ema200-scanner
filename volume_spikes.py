@@ -292,12 +292,16 @@ def score_row(r, tf, btc):
             s += 10; why.append(f"+ {'above' if long else 'below'} EMA200 {tf}")
         else:
             s -= 5; why.append(f"− against EMA200 {tf}")
-    oi4 = r.get("oi_chg4")
-    if oi4 is not None:
-        if oi4 > 3:
-            s += 5; why.append(f"+ OI +{oi4:.1f}% 4h (new positions)")
-        elif oi4 < -3 and long:
-            s -= 5; why.append(f"− OI {oi4:.1f}% 4h (short covering?)")
+    od = r.get("oi_div")
+    if od:
+        if long and od in ("real up", "accumulating"):
+            s += 8; why.append(f"+ OI div: {od}")
+        elif long and od == "fake pump":
+            s -= 12; why.append("− OI div: fake pump (price up, OI down = short covering)")
+        elif not long and od == "shorts piling":
+            s += 8; why.append("+ OI div: shorts piling")
+        elif not long and od == "exhausting":
+            s -= 8; why.append("− OI div: exhausting (late short, bounce risk)")
     f = r.get("funding") or 0
     if long and f > 0.0005:
         s -= 10; why.append("− crowded longs (funding)")
@@ -312,6 +316,53 @@ def score_row(r, tf, btc):
         elif (long and rg == "big_up") or (not long and rg == "big_down"):
             s += 5; why.append("+ with BTC")
     return max(0, min(100, round(s))), why
+
+
+def oi_divergence(px4, oi4):
+    """Price vs open-interest over the last 4h."""
+    if px4 is None or oi4 is None:
+        return None
+    if abs(px4) <= 1 and oi4 >= 3:
+        return "accumulating"      # price flat, leverage quietly stacking
+    if px4 > 1 and oi4 >= 2:
+        return "real up"           # new longs backing the move
+    if px4 > 1 and oi4 <= -2:
+        return "fake pump"         # short covering, tends to fade
+    if px4 < -1 and oi4 >= 2:
+        return "shorts piling"     # new shorts backing the drop
+    if px4 < -1 and oi4 <= -2:
+        return "exhausting"        # longs unwinding, bounce risk
+    return "neutral"
+
+
+def recommend(r, tf, btc):
+    """Rule-based call for the best spike. Not advice — a checklist summary."""
+    m = r["tfs"][tf]
+    d, sc = m["dir"], m.get("score") or 0
+    if d == "absorb":
+        return {"call": "wait", "why": ["Big volume but price flat: wait for it to break one way"]}
+    long = d == "long"
+    flags = []
+    od, f, ve = r.get("oi_div"), r.get("funding") or 0, m.get("vs_ema")
+    rg = (btc or {}).get("regime")
+    if long:
+        if od == "fake pump": flags.append("OI falling while price rises (short covering)")
+        if rg == "big_down": flags.append("BTC having a big down day")
+        if f > 0.0005: flags.append("funding high: longs crowded")
+        if ve is not None and ve < 0: flags.append(f"below EMA200 on {tf}")
+    else:
+        if od == "exhausting": flags.append("OI and price both falling: move may be exhausted")
+        if rg == "big_up": flags.append("BTC having a big up day")
+        if f < -0.0005: flags.append("funding negative: shorts crowded")
+        if ve is not None and ve > 0: flags.append(f"above EMA200 on {tf}")
+    sp = r["spot"].get(tf)
+    if sp is not None and sp < 1.5: flags.append("futures-only volume (spot not confirming)")
+    side = "long" if long else "short"
+    if sc >= 65 and not flags:
+        return {"call": side, "why": [f"Score {sc} with no red flags"]}
+    if sc >= 50 and len(flags) <= 1:
+        return {"call": "watch_" + side, "why": [f"Score {sc}"] + (["Red flag: " + flags[0]] if flags else ["Score not high enough yet"])}
+    return {"call": "skip", "why": [f"Score {sc}"] + ["Red flag: " + x for x in flags]}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -368,6 +419,9 @@ class _Tracker:
         with self.lock:
             al = [a for a in self.alerts if a["dir"] != "absorb"]
         groups = [("All directional", al)] + [(tf, [a for a in al if a["tf"] == tf]) for tf in TF_ORDER] + [
+            ("Rec ✅ (long/short)", [a for a in al if a.get("rec") in ("long", "short")]),
+            ("Rec 👀 watch", [a for a in al if str(a.get("rec", "")).startswith("watch")]),
+            ("Rec ✗ skip", [a for a in al if a.get("rec") == "skip"]),
             ("Score ≥ 70", [a for a in al if a["score"] >= 70]),
             ("Spot leads", [a for a in al if a.get("spot_leads")]),
             ("Futures-only", [a for a in al if a.get("spot") is not None and a["spot"] < 1.5]),
@@ -550,6 +604,9 @@ class VolumeSpikeScanner:
                     r["spot"][tf] = self._spot_ratio(r["symbol"], tf, m)
             if r["symbol"] in self.no_spot:
                 r["has_spot"] = False
+            m15 = self.m15.get(r["symbol"]) or []
+            if len(m15) > 17 and m15[-17][4]:
+                r["px_chg4"] = round((r["price"] / m15[-17][4] - 1) * 100, 2)
             ser = self._oi(r["symbol"], now)
             if ser:
                 r["oi_usd"] = ser[-1][1]
@@ -558,6 +615,7 @@ class VolumeSpikeScanner:
                     r["oi_chg4"] = round((ser[-1][1] / ser[-5][1] - 1) * 100, 2) if ser[-5][1] else None
                 if len(ser) >= 25:
                     r["oi_chg24"] = round((ser[-1][1] / ser[-25][1] - 1) * 100, 2) if ser[-25][1] else None
+            r["oi_div"] = oi_divergence(r.get("px_chg4"), r.get("oi_chg4"))
 
         with ThreadPoolExecutor(max_workers=4) as ex:
             list(ex.map(enrich, hot))
@@ -582,9 +640,18 @@ class VolumeSpikeScanner:
                     if self.tracker.add(a):
                         new.append(a)
             r["best_tf"], r["best_score"] = best if best else (None, None)
+            r["rec"] = recommend(r, best[0], btc) if best else None
+            for a in new:
+                if a["symbol"] == r["symbol"]:
+                    a["oi_div"] = r.get("oi_div")
+                    if r["rec"] and a["tf"] == best[0]:
+                        a["rec"] = r["rec"]["call"]
             r["max_ratio"] = max(m["ratio"] for m in r["tfs"].values())
             r["n_spiking"] = sum(1 for m in r["tfs"].values() if m["ratio"] >= SPIKE_RATIO)
 
+        if new:
+            with self.tracker.lock:
+                self.tracker._save()
         if self.notify and TELEGRAM_ON:
             for a in sorted(new, key=lambda x: -x["score"])[:10]:
                 try:
