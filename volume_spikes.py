@@ -371,25 +371,80 @@ def recommend(r, tf, btc):
 # ─────────────────────────────────────────────────────────────────────────────
 # Alert log + forward test
 # ─────────────────────────────────────────────────────────────────────────────
+REDIS_KEY = "vspike_alerts"
+
+
+def _redis():
+    u = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
+    t = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
+    return (u, t) if (u and t) else None
+
+
+def _redis_cmd(*args):
+    up = _redis()
+    if not up:
+        return None
+    r = requests.post(up[0], json=list(args), headers={"Authorization": f"Bearer {up[1]}"}, timeout=15)
+    r.raise_for_status()
+    return r.json().get("result")
+
+
 class _Tracker:
+    """Alert log. Durable in Upstash Redis (survives Render restarts/redeploys),
+    with a local JSON file as fallback. Writes are batched: once per scan cycle."""
+
     def __init__(self):
         self.lock = threading.Lock()
         self.alerts, self.seen = [], set()
+        self.dirty = False
+        self.source = "empty"
+        raw = None
         try:
-            with open(DATA_PATH) as fh:
-                self.alerts = json.load(fh)
-            self.seen = {a["key"] for a in self.alerts}
-        except Exception:
-            pass
+            raw = _redis_cmd("GET", REDIS_KEY)
+            if raw:
+                self.source = "redis"
+        except Exception as e:
+            print(f"[vspike] redis load failed: {e}", flush=True)
+        if not raw:
+            try:
+                with open(DATA_PATH) as fh:
+                    raw = fh.read()
+                self.source = "file"
+            except Exception:
+                raw = None
+        if raw:
+            try:
+                self.alerts = json.loads(raw)
+                self.seen = {a["key"] for a in self.alerts}
+            except Exception:
+                self.alerts, self.source = [], "empty"
+        print(f"[vspike] alert log: {len(self.alerts)} alerts loaded from {self.source}"
+              f" ({'durable: Upstash' if _redis() else 'NOT durable: no Upstash env'})", flush=True)
 
     def _save(self):
+        self.dirty = True                      # actual write happens in flush()
+
+    def flush(self):
+        with self.lock:
+            if not self.dirty:
+                return
+            data = [{k: v for k, v in a.items() if k != "why"} | {"why": (a.get("why") or [])[:4]}
+                    for a in self.alerts[-3000:]]
+            self.dirty = False
+        blob = json.dumps(data, separators=(",", ":"))
+        try:
+            if _redis():
+                _redis_cmd("SET", REDIS_KEY, blob)
+        except Exception as e:
+            self.dirty = True
+            print(f"[vspike] redis save failed: {e}", flush=True)
         try:
             tmp = DATA_PATH + ".tmp"
             with open(tmp, "w") as fh:
-                json.dump(self.alerts[-3000:], fh)
+                fh.write(blob)
             os.replace(tmp, DATA_PATH)
-        except Exception as e:
-            print(f"[vspike] save failed: {e}", flush=True)
+        except Exception:
+            pass
 
     def add(self, a):
         with self.lock:
@@ -547,6 +602,7 @@ class VolumeSpikeScanner:
         tick = fetch_tickers()
         if not tick:
             self._status("Binance ticker request failed — retrying next cycle")
+            self.tracker.flush()
             return
         funding = fetch_funding()
         prices = {s: t["price"] for s, t in tick.items()}
@@ -670,6 +726,7 @@ class VolumeSpikeScanner:
                 except Exception:
                     pass
 
+        self.tracker.flush()
         rows.sort(key=lambda r: (r["best_score"] if r["best_score"] is not None else -1, r["max_ratio"]), reverse=True)
         with self.lock:
             self.snap.update({"rows": rows, "btc": btc, "updated": now, "progress": None, "universe": len(uni),
@@ -694,6 +751,7 @@ class VolumeSpikeScanner:
             snap = dict(self.snap)
         snap["alerts"] = self.tracker.recent()
         snap["stats"] = self.tracker.stats()
+        snap["store"] = "upstash" if _redis() else "local file (resets on restart)"
         snap["cfg"] = {"spike_ratio": SPIKE_RATIO, "alert_min_score": ALERT_MIN_SCORE,
                        "min_turnover": MIN_TURNOVER, "scan_every": SCAN_EVERY, "telegram": TELEGRAM_ON,
                        "long_only": LONG_ONLY}
