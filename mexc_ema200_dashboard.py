@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# build: v66 — volume spikes: level filter, analyze shortcut, OI divergence + Rec, long-only — auto-deploy trigger
+# build: v67 — volume spikes: forward-test analysis (filters, level×TF heatmap, factors, over time) — auto-deploy trigger
 """
 MEXC 200-EMA "cross & retest" LIVE DASHBOARD (4h chart)
 =======================================================
@@ -3032,7 +3032,8 @@ PAGE = """<!doctype html>
   <div class="empty" id="vsEmpty" style="display:none"></div>
 </div>
 <div class="wrap" style="margin-top:22px"><h3 style="margin:0 0 6px;font-size:14px">📡 Alert feed</h3><div class="muted" style="font-size:12px;margin-bottom:6px">Spikes that scored high enough to be logged. One per coin, timeframe and candle.</div><div id="vsFeed" style="overflow-x:auto"></div></div>
-<div class="wrap" style="margin-top:22px;margin-bottom:40px"><h3 style="margin:0 0 6px;font-size:14px">🧪 Forward test: what happened after each alert</h3><div class="muted" style="font-size:12px;margin-bottom:6px">Return measured in the signal's direction (shorts are inverted). Win = moved the right way. Absorption alerts are excluded. Small samples mean little, so give it a couple of weeks.</div><div id="vsStats" style="overflow-x:auto"></div></div>
+<div class="wrap" style="margin-top:26px;margin-bottom:40px"><h3 style="margin:0 0 4px;font-size:15px">🧪 Forward test: how the alerts actually performed</h3><div class="muted" style="font-size:12px;margin-bottom:10px">Every logged long alert is graded on the price 1h, 4h and 24h later. Filter it, then see which spike levels, timeframes and conditions are working.</div>
+<div id="vsFtBar" style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px"></div><div id="vsStats"></div></div>
 </div>
 <div class="view" id="viewAnalyze">
 <div class="wrap">
@@ -6229,7 +6230,7 @@ async function loadSpikes(force){
   const now=Date.now(); if(!force && now-vsLast<15000) { renderSpikes(); return; }
   vsLast=now;
   try{ const r=await fetch('/spikes',{cache:'no-store'}); vsData=await r.json(); }catch(e){}
-  renderSpikes();
+  renderSpikes(); loadFtHist(force);
 }
 function vsSortBy(k){ vsSort={k, d:(vsSort.k===k?-vsSort.d:-1)}; renderSpikes(); }
 function vsUsd(m){ if(m==null) return '—'; return m>=1e9?'$'+(m/1e9).toFixed(2)+'B':m>=1e6?'$'+(m/1e6).toFixed(1)+'M':'$'+(m/1e3).toFixed(0)+'K'; }
@@ -6329,10 +6330,122 @@ function renderSpikes(){
       `<table><thead><tr><th>Time</th><th>Coin</th><th>TF</th><th>Signal</th><th>Vol</th><th>Spot</th><th>Score</th><th>Entry</th><th>+1h</th><th>+4h</th><th>+24h</th></tr></thead><tbody>`+
       al.map(a=>`<tr><td class="muted">${new Date(a.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td><td class="sym"><div class="symbox">${esc(a.symbol.replace(/USDT$/,''))}${analyzeBtn(a.symbol)}</div></td><td>${a.tf}</td><td>${vsSigPill(a.dir)}</td><td>${a.ratio.toFixed(1)}×${a.mode==='live'?'<span class="rr">live</span>':''}</td><td>${a.spot==null?'—':a.spot.toFixed(1)+'×'}</td><td class="score" data-tip="${esc((a.why||[]).join(' · '))}">${a.score}</td><td>${fmtNum(a.price)}</td><td>${oc(a.out['1h'])}</td><td>${oc(a.out['4h'])}</td><td>${oc(a.out['24h'])}</td></tr>`).join('')+`</tbody></table>`;
   }
-  const st=document.getElementById('vsStats');
-  if(st){ const c=x=>x.n?`${x.win}% <span class="rr">avg ${x.avg>0?'+':''}${x.avg}% · n=${x.n}</span>`:'<span class="muted">—</span>';
-    st.innerHTML=`<table><thead><tr><th>Group</th><th>Alerts</th><th>Win% after 1h</th><th>Win% after 4h</th><th>Win% after 24h</th></tr></thead><tbody>`+
-      (d.stats||[]).map(s=>`<tr><td>${esc(s.group)}</td><td>${s.n}</td><td>${c(s['1h'])}</td><td>${c(s['4h'])}</td><td>${c(s['24h'])}</td></tr>`).join('')+`</tbody></table>`; }
+  if(ftHist) renderFt();
+}
+
+// ── Forward-test analysis (Volume spikes tab) ───────────────────────────────
+let ftHist=null, ftLast=0;
+const FTF={tf:'',lvl:0,per:'all',rec:'',h:'4h'};
+const FT_LVL=[[0,'All'],[2,'≥ 2×'],[2.5,'≥ 2.5×'],[3,'≥ 3×'],[5,'≥ 5×'],[10,'≥ 10×'],[20,'≥ 20×']];
+const FT_BUCKETS=[[2,2.5,'2–2.5×'],[2.5,3,'2.5–3×'],[3,5,'3–5×'],[5,10,'5–10×'],[10,20,'10–20×'],[20,1e9,'20×+']];
+const FT_PER=[['24h','24h',86400],['7d','7 days',604800],['30d','30 days',2592000],['all','All time',0]];
+async function loadFtHist(force){
+  if(!force && Date.now()-ftLast<60000){ renderFt(); return; }
+  ftLast=Date.now();
+  try{ const r=await fetch('/spikes-hist',{cache:'no-store'}); const j=await r.json(); ftHist=j.hist||[]; }catch(e){}
+  renderFt();
+}
+function ftSet(k,v){ FTF[k]=v; renderFt(); }
+function ftChip(k,v,label,extra){ const on=FTF[k]===v; return `<span onclick="ftSet('${k}',${typeof v==='string'?`'${v}'`:v})" style="cursor:pointer;padding:4px 10px;border-radius:8px;font-size:12px;font-weight:${on?700:500};border:1px solid ${on?'var(--accent)':'var(--line)'};background:${on?'rgba(63,185,80,.18)':'rgba(21,28,41,.7)'};white-space:nowrap">${label}${extra?' <span class="rr">'+extra+'</span>':''}</span>`; }
+function ftVal(a){ const v=a.out&&a.out[FTF.h]; return (typeof v==='number')?v:null; }
+function ftStat(arr){ const v=arr.map(ftVal).filter(x=>x!=null); if(!v.length) return {n:0,pend:arr.length};
+  const w=v.filter(x=>x>0).length, avg=v.reduce((s,x)=>s+x,0)/v.length, sv=[...v].sort((a,b)=>a-b), med=sv[Math.floor(sv.length/2)];
+  return {n:v.length, win:Math.round(100*w/v.length), avg, med, best:sv[sv.length-1], worst:sv[0], pend:arr.length-v.length}; }
+function ftCell(st,minN){ minN=minN||1;
+  if(!st.n) return `<td class="muted" data-tip="${st.pend?st.pend+' alert(s) not graded yet':'No alerts'}">${st.pend?'⏳ '+st.pend:'—'}</td>`;
+  const a=st.avg, bg=st.n<minN?'transparent':a>=1.5?'rgba(63,185,80,.40)':a>=0.5?'rgba(63,185,80,.24)':a>0?'rgba(63,185,80,.10)':a>-0.5?'rgba(248,81,73,.10)':a>-1.5?'rgba(248,81,73,.22)':'rgba(248,81,73,.36)';
+  return `<td style="background:${bg};white-space:nowrap" data-tip="${esc(st.n+' graded alerts · win '+st.win+'% · avg '+(a>0?'+':'')+a.toFixed(2)+'% · median '+(st.med>0?'+':'')+st.med.toFixed(2)+'% · best '+st.best.toFixed(1)+'% · worst '+st.worst.toFixed(1)+'%'+(st.pend?' · '+st.pend+' still pending':'')+(st.n<minN?' · small sample, treat as noise':''))}"><b>${st.win}%</b> <span class="rr">${a>0?'+':''}${a.toFixed(2)}% · n=${st.n}</span></td>`; }
+function ftFiltered(skip){
+  if(!ftHist) return [];
+  const now=Date.now()/1000, per=(FT_PER.find(p=>p[0]===FTF.per)||[0,0,0])[2];
+  return ftHist.filter(a=>{
+    if(a.dir!=='long') return false;
+    if(per && a.t<now-per) return false;
+    if(skip!=='tf' && FTF.tf && a.tf!==FTF.tf) return false;
+    if(skip!=='lvl' && FTF.lvl && !(a.ratio>=FTF.lvl)) return false;
+    if(FTF.rec==='go' && a.rec!=='long') return false;
+    if(FTF.rec==='watch' && !(a.rec==='long'||a.rec==='watch_long')) return false;
+    if(FTF.rec==='skip' && a.rec!=='skip') return false;
+    return true; });
+}
+function ftSvgBars(days){
+  const W=640,H=120,pad=22, n=days.length, bw=Math.max(6,(W-pad*2)/Math.max(n,1)-6);
+  const mx=Math.max(1,...days.map(d=>Math.abs(d.avg||0)));
+  let g=`<line x1="${pad}" y1="${H/2}" x2="${W-pad}" y2="${H/2}" stroke="var(--line2)" />`;
+  days.forEach((d,i)=>{ const x=pad+i*((W-pad*2)/n)+3; if(d.avg==null){ g+=`<text x="${x+bw/2}" y="${H/2+4}" font-size="9" fill="var(--dim2)" text-anchor="middle">·</text>`; }
+    else { const h=Math.abs(d.avg)/mx*(H/2-14), y=d.avg>=0?H/2-h:H/2; g+=`<rect x="${x}" y="${y}" width="${bw}" height="${Math.max(h,1)}" rx="2" fill="${d.avg>=0?'var(--accent)':'var(--red)'}" opacity=".85"><title>${d.label}: avg ${d.avg>0?'+':''}${d.avg.toFixed(2)}% · win ${d.win}% · n=${d.n}</title></rect>`; }
+    g+=`<text x="${x+bw/2}" y="${H-2}" font-size="9" fill="var(--dim)" text-anchor="middle">${d.short}</text>`; });
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;max-width:${W}px;height:auto;display:block">${g}</svg>`;
+}
+function ftSvgCurve(pts){
+  if(pts.length<2) return '<div class="muted" style="font-size:12px">Needs at least 2 graded alerts.</div>';
+  const W=640,H=110,pad=8, ys=pts.map(p=>p.y), mn=Math.min(0,...ys), mx=Math.max(0,...ys), rg=(mx-mn)||1;
+  const X=i=>pad+i*(W-pad*2)/(pts.length-1), Y=v=>H-pad-(v-mn)/rg*(H-pad*2);
+  const d=pts.map((p,i)=>(i?'L':'M')+X(i).toFixed(1)+' '+Y(p.y).toFixed(1)).join(' '), last=pts[pts.length-1].y;
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;max-width:${W}px;height:auto;display:block"><line x1="${pad}" x2="${W-pad}" y1="${Y(0)}" y2="${Y(0)}" stroke="var(--line2)" stroke-dasharray="3 3"/><path d="${d}" fill="none" stroke="${last>=0?'var(--accent)':'var(--red)'}" stroke-width="2"/></svg>`;
+}
+function renderFt(){
+  const box=document.getElementById('vsStats'); if(!box) return;
+  const bar=document.getElementById('vsFtBar');
+  if(!ftHist){ box.innerHTML='<div class="muted" style="font-size:12px">Loading alert history…</div>'; return; }
+  const all=ftFiltered();
+  const hz=FTF.h;
+  // filter bar with live counts
+  const cTf=t=>ftFiltered('tf').filter(a=>!t||a.tf===t).length, cL=l=>ftFiltered('lvl').filter(a=>!l||a.ratio>=l).length;
+  bar.innerHTML=
+    `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Timeframe</span>${[['','All'],['15m','15m'],['1h','1h'],['4h','4h'],['1d','1D']].map(([v,l])=>ftChip('tf',v,l,cTf(v))).join('')}</div>`+
+    `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Spike level</span>${FT_LVL.map(([v,l])=>ftChip('lvl',v,l,cL(v))).join('')}</div>`+
+    `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Period</span>${FT_PER.map(([v,l])=>ftChip('per',v,l)).join('')}</div>`+
+    `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Rec</span>${[['','All alerts'],['go','✅ Long only'],['watch','✅ + 👀'],['skip','✗ Skipped']].map(([v,l])=>ftChip('rec',v,l)).join('')}</div>`+
+    `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Judge after</span>${[['1h','1 hour'],['4h','4 hours'],['24h','24 hours']].map(([v,l])=>ftChip('h',v,l)).join('')}</div>`;
+  const S=ftStat(all);
+  if(!all.length){ box.innerHTML='<div class="muted" style="font-size:12px">No long alerts match these filters yet.</div>'; return; }
+  let h='';
+  // headline
+  h+=`<div style="display:flex;flex-wrap:wrap;gap:10px;margin:4px 0 14px">`+
+    [['Alerts',all.length,''],['Graded after '+hz,S.n,S.pend?S.pend+' pending':''],['Win rate',S.n?S.win+'%':'—','price higher after '+hz],['Avg move',S.n?(S.avg>0?'+':'')+S.avg.toFixed(2)+'%':'—','per alert'],['Median',S.n?(S.med>0?'+':'')+S.med.toFixed(2)+'%':'—','typical alert']]
+    .map(([k,v,s])=>`<div style="border:1px solid var(--line);border-radius:10px;padding:8px 12px;min-width:110px"><div class="muted" style="font-size:11px">${k}</div><div style="font-size:18px;font-weight:700">${v}</div><div class="muted" style="font-size:11px">${s}</div></div>`).join('')+`</div>`;
+  // verdicts: best / worst slices
+  const slices=[];
+  const dims={tf:a=>a.tf, lvl:a=>(FT_BUCKETS.find(b=>a.ratio>=b[0]&&a.ratio<b[1])||[0,0,'<2×'])[2], spot:a=>a.spot==null?'no spot data':a.spot_leads?'spot leads':a.spot>=2?'spot confirms':a.spot<1.5?'futures-only':'spot weak',
+    oi:a=>a.oi_div?'OI '+a.oi_div:null, ema:a=>a.vs_ema==null?null:a.vs_ema>0?'above EMA200':'below EMA200', multi:a=>a.n_tf>=2?'2+ TFs spiking':'1 TF only', mode:a=>a.mode==='live'?'live (mid-candle)':'closed candle'};
+  const keys=Object.keys(dims);
+  const addSlices=(ks)=>{ const m={}; all.forEach(a=>{ const parts=ks.map(k=>dims[k](a)); if(parts.some(p=>p==null)) return; const key=parts.join(' · '); (m[key]=m[key]||[]).push(a); });
+    Object.entries(m).forEach(([k,arr])=>{ const st=ftStat(arr); if(st.n>=8) slices.push({k,st}); }); };
+  keys.forEach(k=>addSlices([k])); for(let i=0;i<keys.length;i++) for(let j=i+1;j<keys.length;j++) addSlices([keys[i],keys[j]]);
+  const score=s=>s.st.avg*Math.sqrt(s.st.n);
+  slices.sort((a,b)=>score(b)-score(a));
+  const best=slices.filter(s=>s.st.avg>0).slice(0,3), worst=[...slices].reverse().filter(s=>s.st.avg<0).slice(0,3);
+  const line=s=>`<li><b>${esc(s.k)}</b>: ${s.st.win}% win, avg ${s.st.avg>0?'+':''}${s.st.avg.toFixed(2)}% <span class="rr">n=${s.st.n}</span></li>`;
+  h+=`<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-bottom:16px">`+
+    `<div style="border:1px solid rgba(63,185,80,.45);border-radius:10px;padding:10px 12px"><div style="font-weight:700;margin-bottom:4px">🏆 Working best (after ${hz})</div>${best.length?'<ul style="margin:0;padding-left:18px;font-size:12.5px;line-height:1.6">'+best.map(line).join('')+'</ul>':'<div class="muted" style="font-size:12px">Not enough data yet. Each slice needs 8+ graded alerts.</div>'}</div>`+
+    `<div style="border:1px solid rgba(248,81,73,.45);border-radius:10px;padding:10px 12px"><div style="font-weight:700;margin-bottom:4px">⚠️ Working worst (after ${hz})</div>${worst.length?'<ul style="margin:0;padding-left:18px;font-size:12.5px;line-height:1.6">'+worst.map(line).join('')+'</ul>':'<div class="muted" style="font-size:12px">Nothing clearly losing yet (8+ graded alerts needed per slice).</div>'}</div></div>`;
+  // heatmap level × timeframe
+  const tfs=[['15m','15m'],['1h','1h'],['4h','4h'],['1d','1D']];
+  const base=ftFiltered('tf').filter(a=>!FTF.lvl||a.ratio>=FTF.lvl);
+  h+=`<div style="font-weight:700;margin:6px 0 4px">Spike level × timeframe <span class="muted" style="font-weight:400;font-size:12px">win % after ${hz}, colour = average move. Hover for details. Under 8 alerts = uncoloured.</span></div>`;
+  h+=`<div style="overflow-x:auto"><table><thead><tr><th>Spike</th>${tfs.map(t=>`<th>${t[1]}</th>`).join('')}<th>All TFs</th></tr></thead><tbody>`+
+    FT_BUCKETS.map(b=>{ const inB=base.filter(a=>a.ratio>=b[0]&&a.ratio<b[1]); return `<tr><td><b>${b[2]}</b></td>${tfs.map(t=>ftCell(ftStat(inB.filter(a=>a.tf===t[0])),8)).join('')}${ftCell(ftStat(inB),8)}</tr>`; }).join('')+
+    `<tr><td><b>All levels</b></td>${tfs.map(t=>ftCell(ftStat(base.filter(a=>a.tf===t[0])),8)).join('')}${ftCell(ftStat(base),8)}</tr></tbody></table></div>`;
+  // factor breakdowns
+  const groups=[['Recommendation',a=>({long:'✅ Long',watch_long:'👀 Watch',skip:'✗ Skip',wait:'⏳ Wait'})[a.rec]||'(none)'],['Spot vs futures',dims.spot],['OI divergence',a=>a.oi_div||'(not checked)'],
+    ['Score',a=>a.score>=80?'80+':a.score>=65?'65–79':a.score>=50?'50–64':'<50'],['vs EMA200',a=>dims.ema(a)||'(n/a)'],['Timeframes spiking',dims.multi],['Measured on',dims.mode],
+    ['BTC that day',a=>a.btc==='big_down'?'BTC big down day':a.btc==='big_up'?'BTC big up day':'BTC normal'],['Tradeable on MEXC',a=>a.mexc?'on MEXC':'not on MEXC']];
+  h+=`<div style="font-weight:700;margin:16px 0 4px">What makes a difference <span class="muted" style="font-weight:400;font-size:12px">same filters, split by each factor</span></div><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px">`+
+    groups.map(([name,fn])=>{ const m={}; all.forEach(a=>{ const k=fn(a); (m[k]=m[k]||[]).push(a); });
+      return `<div style="border:1px solid var(--line);border-radius:10px;padding:8px 10px"><div style="font-weight:650;font-size:12.5px;margin-bottom:4px">${name}</div><table style="font-size:12px"><tbody>${Object.entries(m).sort((x,y)=>y[1].length-x[1].length).map(([k,arr])=>`<tr><td style="white-space:nowrap">${esc(k)}</td>${ftCell(ftStat(arr),8)}</tr>`).join('')}</tbody></table></div>`; }).join('')+`</div>`;
+  // over time
+  const days=[]; const today=new Date(); today.setUTCHours(0,0,0,0);
+  for(let i=13;i>=0;i--){ const d0=today.getTime()/1000-i*86400, arr=all.filter(a=>a.t>=d0&&a.t<d0+86400), st=ftStat(arr), dt=new Date(d0*1000);
+    days.push({label:dt.toUTCString().slice(0,11), short:(dt.getUTCDate())+'/'+(dt.getUTCMonth()+1), n:st.n, win:st.win, avg:st.n?st.avg:null, total:arr.length}); }
+  const graded=all.filter(a=>ftVal(a)!=null).sort((a,b)=>a.t-b.t); let cum=0; const pts=graded.map(a=>({y:(cum+=ftVal(a))}));
+  const wk=[0,1].map(w=>{ const t1=Date.now()/1000-w*604800, arr=ftHist.filter(a=>a.dir==='long'&&a.t<t1&&a.t>=t1-604800).filter(a=>(!FTF.tf||a.tf===FTF.tf)&&(!FTF.lvl||a.ratio>=FTF.lvl)); return ftStat(arr); });
+  const trend=(wk[0].n>=8&&wk[1].n>=8)?(wk[0].avg>wk[1].avg?`📈 Improving: this week ${wk[0].win}% win / ${wk[0].avg>0?'+':''}${wk[0].avg.toFixed(2)}% vs last week ${wk[1].win}% / ${wk[1].avg>0?'+':''}${wk[1].avg.toFixed(2)}%.`:`📉 Weakening: this week ${wk[0].win}% win / ${wk[0].avg>0?'+':''}${wk[0].avg.toFixed(2)}% vs last week ${wk[1].win}% / ${wk[1].avg>0?'+':''}${wk[1].avg.toFixed(2)}%.`):'Week-on-week comparison appears once both weeks have 8+ graded alerts.';
+  h+=`<div style="font-weight:700;margin:18px 0 4px">Over time <span class="muted" style="font-weight:400;font-size:12px">${trend}</span></div>`+
+    `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px"><div><div class="muted" style="font-size:12px;margin-bottom:4px">Average move after ${hz}, per day (last 14 days, UTC). Hover a bar for detail.</div>${ftSvgBars(days)}</div>`+
+    `<div><div class="muted" style="font-size:12px;margin-bottom:4px">Cumulative: if you'd taken every matching alert with the same size and closed it after ${hz} (no fees). Now <b style="color:${cum>=0?'var(--accent)':'var(--red)'}">${cum>0?'+':''}${cum.toFixed(1)}%</b> over ${graded.length} trades.</div>${ftSvgCurve(pts)}</div></div>`;
+  h+=`<div class="muted" style="font-size:11.5px;margin-top:10px">Longs only. A win = price higher ${hz} after the alert. Moves don't include fees or slippage. Under ~30 alerts, any % is mostly luck.</div>`;
+  box.innerHTML=h;
 }
 async function poll(){
   // Lean build: only the three live tabs (Analyze, Binance Alpha, My calls) are refreshed.
@@ -6666,7 +6779,7 @@ def make_handler(state: State):
             elif self.path.startswith("/spikes"):
                 try:
                     from volume_spikes import VSPIKE
-                    body = json.dumps(VSPIKE.payload(), default=str).encode()
+                    body = json.dumps(VSPIKE.payload(self.path), default=str).encode()
                 except Exception as e:
                     body = json.dumps({"rows": None, "status": f"volume-spike scanner unavailable: {e}"}).encode()
                 self._send(200, body, "application/json")

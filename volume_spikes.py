@@ -442,6 +442,12 @@ class _Tracker:
             out.append(row)
         return out
 
+    def compact(self):
+        keep = ("t", "symbol", "tf", "dir", "ratio", "mode", "score", "price", "chg", "spot", "spot_leads",
+                "btc", "out", "mexc", "vs_ema", "n_tf", "rec", "oi_div")
+        with self.lock:
+            return [{k: a.get(k) for k in keep} for a in self.alerts]
+
     def recent(self, n=80):
         with self.lock:
             return list(reversed(self.alerts[-n:]))
@@ -640,7 +646,8 @@ class VolumeSpikeScanner:
                          "tf": tf, "dir": m["dir"], "ratio": m["ratio"], "mode": m["mode"], "score": sc,
                          "price": r["price"], "chg": m["chg"], "spot": sp,
                          "spot_leads": bool(sp is not None and sp >= m["ratio"]),
-                         "btc": (btc or {}).get("regime"), "why": why, "out": {}}
+                         "btc": (btc or {}).get("regime"), "why": why, "out": {},
+                         "mexc": r.get("mexc"), "vs_ema": m.get("vs_ema"), "n_tf": sum(1 for x in r["tfs"].values() if x["ratio"] >= 2)}
                     if self.tracker.add(a):
                         new.append(a)
             r["best_tf"], r["best_score"] = (best[0], best[1]) if best else (None, None)
@@ -680,7 +687,9 @@ class VolumeSpikeScanner:
                 self._status(f"scan error: {e}")
             time.sleep(max(20, SCAN_EVERY - (time.time() - t0)))
 
-    def payload(self):
+    def payload(self, path=""):
+        if path and "hist" in path:          # full alert history for the forward-test analysis
+            return {"hist": self.tracker.compact(), "now": time.time(), "long_only": LONG_ONLY}
         with self.lock:
             snap = dict(self.snap)
         snap["alerts"] = self.tracker.recent()
