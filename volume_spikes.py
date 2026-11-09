@@ -499,13 +499,128 @@ class _Tracker:
 
     def compact(self):
         keep = ("t", "symbol", "tf", "dir", "ratio", "mode", "score", "price", "chg", "spot", "spot_leads",
-                "btc", "out", "mexc", "vs_ema", "n_tf", "rec", "oi_div")
+                "btc", "out", "mexc", "vs_ema", "n_tf", "rec", "oi_div", "plan", "pstate")
         with self.lock:
-            return [{k: a.get(k) for k in keep} for a in self.alerts]
+            return json.loads(json.dumps([{k: a.get(k) for k in keep} for a in self.alerts]))
 
     def recent(self, n=80):
         with self.lock:
-            return list(reversed(self.alerts[-n:]))
+            return json.loads(json.dumps(list(reversed(self.alerts[-n:]))))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trade plans for alerts: 1 stop + 3-target ladder, tracked candle by candle
+# ─────────────────────────────────────────────────────────────────────────────
+PLAN_EXPIRY = 7 * 86400          # close whatever is left at market after 7 days
+PLAN_MAX_AGE = 1800              # only plan alerts younger than 30 min (levels must fit the entry)
+
+
+def _f(x):
+    try:
+        x = float(x)
+        return x if x > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _atr(c, n=14):
+    if len(c) < n + 1:
+        return None
+    trs = [max(c[i][2] - c[i][3], abs(c[i][2] - c[i - 1][4]), abs(c[i][3] - c[i - 1][4])) for i in range(len(c) - n, len(c))]
+    return sum(trs) / n
+
+
+def plan_from_analyze(az, entry):
+    """Take the Analyze card's LONG plan (stop + targets) and re-measure RR from the alert entry."""
+    if not isinstance(az, dict) or az.get("error"):
+        return None
+    lp = (az.get("plans") or {}).get("long") or (az if az.get("side") == "long" else None)
+    if not lp:
+        return None
+    sl = _f(lp.get("sl_tight"))
+    if not sl or sl >= entry:
+        return None
+    tps, basis = [], []
+    for i in range(1, 6):
+        tp = _f(lp.get(f"tp{i}"))
+        if tp and tp > entry * 1.002 and (not tps or tp > tps[-1] * 1.001):
+            tps.append(tp); basis.append((lp.get(f"tp{i}_basis") or "")[:120])
+        if len(tps) == 3:
+            break
+    return {"sl": sl, "tps": tps, "basis": basis, "sl_basis": (lp.get("sl_tight_basis") or "")[:160], "src": "analyze"}
+
+
+def plan_from_candles(c, entry):
+    """Fallback when the coin can't be analyzed: stop under the recent swing low
+    (ATR-buffered, at least 1.5 ATR away), targets at 1R / 2R / 3R."""
+    if not c or len(c) < 20:
+        return None
+    atr = _atr(c)
+    if not atr:
+        return None
+    swing = min(k[3] for k in c[-12:])
+    sl = min(swing - 0.3 * atr, entry - 1.5 * atr)
+    if sl <= 0 or sl >= entry:
+        return None
+    return {"sl": sl, "tps": [], "basis": [], "sl_basis": "Below the recent swing low (last 12 candles), ATR-buffered, at least 1.5×ATR from entry.",
+            "src": "fallback"}
+
+
+def finish_plan(plan, entry):
+    """Fill the ladder to 3 targets with R-multiples if needed, then compute RR from entry."""
+    risk = entry - plan["sl"]
+    tps, basis = list(plan["tps"]), list(plan["basis"])
+    k = 1.0
+    while len(tps) < 3:
+        nxt = entry + risk * max(k, ((tps[-1] - entry) / risk + 1) if tps else k)
+        tps.append(nxt); basis.append(f"{round((nxt - entry) / risk, 1)}R extension (no resistance level found)")
+        k += 1
+    plan["tps"], plan["basis"] = tps[:3], basis[:3]
+    plan["rr"] = [round((t - entry) / risk, 2) for t in plan["tps"]]
+    plan["sl_pct"] = round((plan["sl"] / entry - 1) * 100, 2)
+    plan["tp_pct"] = [round((t / entry - 1) * 100, 2) for t in plan["tps"]]
+    return plan
+
+
+def step_plan(a, candles, px, now):
+    """Advance one alert's plan through new 15m candles. Thirds off at TP1/2/3,
+    stop to break-even after TP1. Stop is checked first inside a candle (conservative)."""
+    pl, st = a.get("plan"), a.get("pstate")
+    if not pl or not st or st["status"] in ("tp3", "sl", "be", "expired", "invalid"):
+        return False
+    entry, risk = a["price"], a["price"] - pl["sl"]
+    changed = False
+    start = (int(a["t"]) // 900) * 900 + 900          # first candle fully after the alert
+    for k in candles:
+        if k[0] < start or k[0] < st.get("checked", 0):
+            continue
+        hi, lo = k[2], k[3]
+        st["mfe"] = round(max(st.get("mfe", 0), (hi / entry - 1) * 100), 2)
+        st["mae"] = round(min(st.get("mae", 0), (lo / entry - 1) * 100), 2)
+        stop = entry if st["hits"] >= 1 else pl["sl"]
+        if lo <= stop:
+            left = 1 - st["hits"] / 3
+            st["r"] = round(sum(pl["rr"][:st["hits"]]) / 3 + left * ((stop - entry) / risk), 2)
+            st["status"] = "be" if st["hits"] >= 1 else "sl"
+            st["closed_t"] = k[0]; changed = True
+            break
+        while st["hits"] < 3 and hi >= pl["tps"][st["hits"]]:
+            st["hits"] += 1; st["status"] = f"tp{st['hits']}"; changed = True
+            st.setdefault("hit_t", []).append(k[0])
+        if st["hits"] == 3:
+            st["r"] = round(sum(pl["rr"]) / 3, 2); st["closed_t"] = k[0]
+            break
+        if k[0] + 900 <= now:
+            st["checked"] = k[0] + 900                    # only skip fully closed candles next time
+    if px:
+        st["last_px"] = px
+        st["now_pct"] = round((px / entry - 1) * 100, 2)
+        if st["status"] not in ("tp3", "sl", "be"):
+            left = 1 - st["hits"] / 3
+            st["open_r"] = round(sum(pl["rr"][:st["hits"]]) / 3 + left * (px - entry) / risk, 2)
+            if now - a["t"] > PLAN_EXPIRY:
+                st["r"] = st["open_r"]; st["status"] = "expired"; st["closed_t"] = now; changed = True
+    return changed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -523,6 +638,9 @@ class VolumeSpikeScanner:
         self.universe_all, self.universe_t = set(), 0
         self.mexc, self.mexc_t = None, 0
         self.notify = None
+        self.planner = None           # fn(symbol, tf) -> Analyze-card dict (injected by the dashboard)
+        self.plan_q = deque()
+        self.plan_busy = set()
         self.snap = {"rows": [], "btc": None, "status": "warming up — first pass takes ~3 min after boot",
                      "updated": None, "progress": None, "universe": 0}
 
@@ -588,6 +706,52 @@ class VolumeSpikeScanner:
         rg = "big_down" if today <= -1.5 * usual else "big_up" if today >= 1.5 * usual else "normal"
         return {"price": price, "today": round(today, 2), "usual": round(usual, 2),
                 "week": round(week, 2), "regime": rg}
+
+    def _plan_one(self, a):
+        try:
+            entry = a["price"]
+            pl = None
+            if self.planner:
+                try:
+                    pl = plan_from_analyze(self.planner(a["symbol"], a["tf"]), entry)
+                except Exception as e:
+                    print(f"[vspike] analyze failed for {a['symbol']}: {e}", flush=True)
+            if not pl:
+                c = self.hist.get((a["symbol"], a["tf"])) if a["tf"] != "15m" else self.m15.get(a["symbol"])
+                pl = plan_from_candles(c, entry)
+            with self.tracker.lock:
+                if pl:
+                    a["plan"] = finish_plan(pl, entry)
+                    a["pstate"] = {"status": "open", "hits": 0, "mfe": 0, "mae": 0, "checked": 0}
+                else:
+                    a["plan"] = None
+                    a["pstate"] = {"status": "invalid", "hits": 0}
+                self.tracker.dirty = True
+        finally:
+            self.plan_busy.discard(a["key"])
+
+    def plan_worker(self):
+        while True:
+            try:
+                a = self.plan_q.popleft()
+            except IndexError:
+                time.sleep(2)
+                continue
+            self._plan_one(a)
+
+    def track_plans(self, prices, now):
+        with self.tracker.lock:
+            todo = [a for a in self.tracker.alerts if a.get("dir") == "long"]
+        for a in todo:
+            if "pstate" not in a:
+                if now - a["t"] <= PLAN_MAX_AGE and a["key"] not in self.plan_busy:
+                    self.plan_busy.add(a["key"]); self.plan_q.append(a)
+                elif now - a["t"] > PLAN_MAX_AGE and a["key"] not in self.plan_busy:
+                    a["pstate"] = {"status": "invalid", "hits": 0, "why": "logged before plans existed"}
+                    self.tracker.dirty = True
+                continue
+            if step_plan(a, self.m15.get(a["symbol"]) or [], prices.get(a["symbol"]), now):
+                self.tracker.dirty = True
 
     def cycle(self):
         now = time.time()
@@ -726,6 +890,10 @@ class VolumeSpikeScanner:
                 except Exception:
                     pass
 
+        try:
+            self.track_plans(prices, time.time())
+        except Exception as e:
+            print(f"[vspike] plan tracking error: {e}", flush=True)
         self.tracker.flush()
         rows.sort(key=lambda r: (r["best_score"] if r["best_score"] is not None else -1, r["max_ratio"]), reverse=True)
         with self.lock:
@@ -770,7 +938,11 @@ def _tg_text(a, btc):
 VSPIKE = VolumeSpikeScanner()
 
 
-def start(notify=None):
-    """Call once from main(). `notify(text)` = optional Telegram sender."""
+def start(notify=None, planner=None):
+    """Call once from main(). `notify(text)` = optional Telegram sender.
+    `planner(symbol, tf)` = the dashboard's analyze_symbol, used for alert stop/targets."""
     VSPIKE.notify = notify
+    VSPIKE.planner = planner
+    for _ in range(2):
+        threading.Thread(target=VSPIKE.plan_worker, daemon=True, name="vspike-plan").start()
     threading.Thread(target=VSPIKE.loop, daemon=True, name="vspike").start()

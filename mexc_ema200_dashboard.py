@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# build: v67 — volume spikes: forward-test analysis (filters, level×TF heatmap, factors, over time) — auto-deploy trigger
+# build: v69 — volume spikes: trade plans on alerts (stop + 3 TPs, tracked in R) + clearer explanations — auto-deploy trigger
 """
 MEXC 200-EMA "cross & retest" LIVE DASHBOARD (4h chart)
 =======================================================
@@ -3007,23 +3007,32 @@ PAGE = """<!doctype html>
   <span id="vsCount" class="muted" style="font-size:12px"></span>
 </div>
 <div class="wrap" id="vsLevels" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:2px 0 10px;padding-bottom:0"></div>
+<div class="wrap" style="padding-bottom:0;margin:0 0 10px"><details style="border:1px solid var(--line);border-radius:10px;padding:8px 12px;font-size:12.5px"><summary style="cursor:pointer;font-weight:650">ⓘ How to read this table</summary>
+<div style="margin-top:8px;line-height:1.65">
+<b>15m / 1h / 4h / 1D</b>: how much volume the coin is trading compared with normal on that chart. <b>1×</b> = normal, <b>5×</b> = five times its usual volume. Normal = the average of the previous 20 candles (15m → last 5 hours, 1h → last 20 hours, 4h → last ~3 days, 1D → last 20 days). Greener = bigger spike. <b>live</b> = the candle is still forming, so its volume so far is scaled up to a full candle.<br>
+<b>Score</b>: 0–100 quality of the strongest spike. The small label (e.g. <i>4h</i>) is which timeframe it's on. <b>Direction, Spot vol, Spike candle move and Trend</b> all describe <u>that</u> timeframe.<br>
+<b>Direction</b>: did price go up (LONG), down (SHORT) or nowhere (ABSORB) on the spiking candle?<br>
+<b>OI div</b>: are new futures positions backing the move (<i>real up</i>), or is it short covering that tends to fade (<i>fake pump</i>)?<br>
+<b>Rec</b>: the checklist verdict for a long. ✅ = strong and no red flags, 👀 = watch, ✗ = skip. Hover for the reasons.<br>
+<b>Spot vol</b>: the same volume-vs-normal on the spot market. ✅ means spot is leading, so real buyers, not just leverage.<br>
+Hover any cell to see what it means for that coin. Click ⚲ for the full Analyze card.</div></details></div>
 <div class="wrap" style="overflow-x:auto">
   <table id="vsTbl">
     <thead><tr>
       <th onclick="vsSortBy('base')" style="cursor:pointer" data-tip="Binance USDT perpetual. Click to open it on TradingView. mx = also tradeable as a MEXC perp.">Coin</th>
       <th onclick="vsSortBy('best_score')" style="cursor:pointer" data-tip="Quality of the best spike on this coin, from 0 to 100. Built from the volume ratio, how many timeframes are spiking, spot vs futures, EMA200 side, OI change, funding and BTC regime. Hover a cell for the reasons.">Score</th>
-      <th data-tip="Direction of the spike candle versus the coin's typical candle body. ABSORB = huge volume but price barely moved, i.e. someone is absorbing the flow, so there's no direction yet.">Signal</th>
+      <th data-tip="Which way price went on the spiking candle. LONG = it moved up strongly for this coin, SHORT = down, ABSORB = big volume but price stayed flat.">Direction</th>
       <th onclick="vsSortBy('oi_div')" style="cursor:pointer" data-tip="Open-interest divergence over the last 4h: price move vs OI move. real up = price and OI both rising (new longs backing it). fake pump = price up but OI falling (short covering, tends to fade). accumulating = price flat while OI climbs (positions quietly building). shorts piling = price down with OI rising (new shorts). exhausting = price and OI both falling (longs unwinding, bounce risk). Only checked for coins that are spiking.">OI div</th>
       <th onclick="vsSortBy('rec')" style="cursor:pointer" data-tip="Rule-based LONG call (long-only mode: short setups show ✗). ✅ = score ≥ 65 with no red flags. 👀 Watch = score ≥ 50 with at most one red flag. ✗ Skip = low score or several red flags. Red flags: OI divergence against the trade, BTC big move against it, crowded funding, wrong side of EMA200, futures-only volume. ⏳ Wait = absorption, no direction yet. Hover a cell for the reasons. A checklist, not financial advice.">Rec</th>
       <th onclick="vsSortBy('r15m')" style="cursor:pointer" data-tip="15m volume vs the average of the previous 20 closed 15m candles (the last 5 hours). 'live' = the current candle, projected to a full candle from its pace. The higher of last-closed and live is shown.">15m</th>
       <th onclick="vsSortBy('r1h')" style="cursor:pointer" data-tip="1h volume vs the average of the previous 20 closed 1h candles (the last 20 hours). 'live' = the current candle projected from its pace.">1h</th>
       <th onclick="vsSortBy('r4h')" style="cursor:pointer" data-tip="4h volume vs the average of the previous 20 closed 4h candles (the last ~3.3 days). 'live' = the current candle projected from its pace.">4h</th>
       <th onclick="vsSortBy('r1d')" style="cursor:pointer" data-tip="Daily volume vs the average of the previous 20 closed daily candles (the last 20 days). 'live' = today's volume so far (UTC day) projected to a full day, so it's noisier early in the day.">1D</th>
-      <th data-tip="Binance SPOT volume ratio on the spiking timeframe. Spot ≥ futures = real buying/selling. Spot far below = leverage-driven move.">Spot</th>
-      <th data-tip="Price move of the spike candle.">Candle</th>
-      <th data-tip="Price vs EMA200 on the spiking timeframe.">vs EMA200</th>
-      <th onclick="vsSortBy('oi_usd')" style="cursor:pointer" data-tip="Binance open interest in USD, its 4h change and OI as % of 24h volume.">OI</th>
-      <th onclick="vsSortBy('funding')" style="cursor:pointer" data-tip="Current Binance funding rate per 8h. Above +0.05% = crowded longs, below −0.05% = crowded shorts.">Funding</th>
+      <th data-tip="Same volume-vs-normal number, but on the SPOT market (real coins, no leverage). If spot is as high as futures (✅), real buyers are behind it. If spot is low, it's mostly leveraged traders. Hover a cell for the coin's numbers.">Spot vol</th>
+      <th data-tip="How much price moved on the candle that has the volume spike, from that candle's open to its close (or to now if it's still forming). The small label is that candle's timeframe. Hover a cell for a full explanation.">Spike candle move</th>
+      <th data-tip="Where price sits vs its 200-candle moving average on the spiking timeframe (small label). Positive = above it = uptrend on that chart. Negative = below it = downtrend, so a long is counter-trend.">Trend (vs EMA200)</th>
+      <th onclick="vsSortBy('oi_usd')" style="cursor:pointer" data-tip="Open interest = total value of open futures positions on Binance. The small % is how much it changed in the last 4h. Rising OI = new money opening positions.">Open interest</th>
+      <th onclick="vsSortBy('funding')" style="cursor:pointer" data-tip="Fee longs and shorts pay each other every 8h. Around +0.01% = normal. Above +0.05% (orange) = longs crowded, risky to chase. Negative = shorts crowded, can fuel a squeeze up.">Funding</th>
       <th onclick="vsSortBy('turnover24')" style="cursor:pointer" data-tip="24h Binance futures quote volume.">24h vol</th>
       <th onclick="vsSortBy('chg24')" style="cursor:pointer" data-tip="24h price change.">24h</th>
     </tr></thead>
@@ -3031,7 +3040,7 @@ PAGE = """<!doctype html>
   </table>
   <div class="empty" id="vsEmpty" style="display:none"></div>
 </div>
-<div class="wrap" style="margin-top:22px"><h3 style="margin:0 0 6px;font-size:14px">📡 Alert feed</h3><div class="muted" style="font-size:12px;margin-bottom:6px">Spikes that scored high enough to be logged. One per coin, timeframe and candle.</div><div id="vsFeed" style="overflow-x:auto"></div></div>
+<div class="wrap" style="margin-top:22px"><h3 style="margin:0 0 6px;font-size:14px">📡 Alert feed with trade plans</h3><div class="muted" style="font-size:12px;margin-bottom:6px">Every logged long alert gets the Analyze card's long plan (1 stop, 3 targets), measured from the alert price and tracked on 15m highs and lows. ⅓ off at each target, stop to break-even after TP1, closed at market after 7 days. Hover any cell for the reasoning.</div><div id="vsFeed" style="overflow-x:auto"></div></div>
 <div class="wrap" style="margin-top:26px;margin-bottom:40px"><h3 style="margin:0 0 4px;font-size:15px">🧪 Forward test: how the alerts actually performed</h3><div class="muted" style="font-size:12px;margin-bottom:10px">Every logged long alert is graded on the price 1h, 4h and 24h later. Filter it, then see which spike levels, timeframes and conditions are working.</div>
 <div id="vsFtBar" style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px"></div><div id="vsStats"></div></div>
 </div>
@@ -6216,15 +6225,19 @@ const VS_LEVELS=[0,2,2.5,3,5,10,20];
 function vsNextLevel(m){ const i=VS_LEVELS.indexOf(m); return (i>=0&&i<VS_LEVELS.length-1)?VS_LEVELS[i+1]:Infinity; }
 function vsMaxR(r){ const tfs=VSF.tf?[VSF.tf]:Object.keys(r.tfs); let mx=0; for(const t of tfs){ if(r.tfs[t]&&r.tfs[t].ratio>mx) mx=r.tfs[t].ratio; } return mx; }
 function vsSetLevel(m){ VSF.min=m; renderSpikes(); }
-function vsLevelLabel(m){ if(m===0) return 'All pairs'; return VSF.band&&vsNextLevel(m)!==Infinity?(m+'–'+vsNextLevel(m)+'×'):('≥ '+m+'×'); }
+function vsLevelLabel(m){ if(m===0) return 'All coins'; return VSF.band&&vsNextLevel(m)!==Infinity?(m+'–'+vsNextLevel(m)+'×'):(m+'×+'); }
+function vsLevelTip(m,n){ const tfTxt=VSF.tf?('on the '+VSF.tf+' chart'):'on at least one timeframe (15m, 1h, 4h or 1D)';
+  if(m===0) return 'Show every scanned coin ('+n+'), spiking or not.';
+  const rng=VSF.band&&vsNextLevel(m)!==Infinity?('between '+m+'× and '+vsNextLevel(m)+'×'):('at least '+m+'×');
+  return n+' coin'+(n===1?'':'s')+' trading '+rng+' their normal volume '+tfTxt+'. Normal = the average of the previous 20 candles on that timeframe. Example: 5× on the 1h chart = this hour is on pace for 5 times a typical hour.'; }
 function renderVsLevels(rows){
   const el=document.getElementById('vsLevels'); if(!el) return;
   const mrs=rows.map(vsMaxR);
   const cnt=m=>mrs.filter(x=>m===0?true:(x>=m&&(!VSF.band||x<vsNextLevel(m)))).length;
-  el.innerHTML='<span class="muted" style="font-size:12px;margin-right:4px">Volume spike'+(VSF.tf?' ('+VSF.tf+')':'')+':</span>'+
+  el.innerHTML='<span class="muted" style="font-size:12px;margin-right:4px" data-tip="How much more volume than usual a coin is trading. 1× = normal, 3× = three times its usual volume. The number on each button is how many coins qualify right now.">Volume vs normal'+(VSF.tf?' ('+VSF.tf+')':'')+' ⓘ</span>'+
     VS_LEVELS.map(m=>{ const on=VSF.min===m; const heat=m>=10?'rgba(63,185,80,.42)':m>=5?'rgba(63,185,80,.28)':m>=3?'rgba(63,185,80,.16)':'rgba(21,28,41,.7)';
-      return `<span onclick="vsSetLevel(${m})" style="cursor:pointer;padding:5px 11px;border-radius:8px;font-size:12px;font-weight:${on?700:500};border:1px solid ${on?'var(--accent)':'var(--line)'};background:${on?heat:'rgba(21,28,41,.7)'};color:${on?'#eafff0':'var(--txt)'}">${vsLevelLabel(m)} <span class="rr">${cnt(m)}</span></span>`; }).join('')+
-    `<label class="muted" style="font-size:12px;display:flex;gap:5px;align-items:center;margin-left:8px" data-tip="On: each button shows only that band (e.g. 3–5×). Off: each button means that level and above."><input type="checkbox" ${VSF.band?'checked':''} onchange="VSF.band=this.checked;renderSpikes()"> only this band</label>`;
+      return `<span onclick="vsSetLevel(${m})" data-tip="${esc(vsLevelTip(m,cnt(m)))}" style="cursor:pointer;padding:5px 11px;border-radius:8px;font-size:12px;font-weight:${on?700:500};border:1px solid ${on?'var(--accent)':'var(--line)'};background:${on?heat:'rgba(21,28,41,.7)'};color:${on?'#eafff0':'var(--txt)'}">${vsLevelLabel(m)} <span class="rr">${cnt(m)} coin${cnt(m)===1?'':'s'}</span></span>`; }).join('')+
+    `<label class="muted" style="font-size:12px;display:flex;gap:5px;align-items:center;margin-left:8px" data-tip="Off (default): 3×+ means 3× or more, so it includes the 5× and 10× coins too. On: each button shows only its own range, e.g. 3–5× hides anything at 5× or above."><input type="checkbox" ${VSF.band?'checked':''} onchange="VSF.band=this.checked;renderSpikes()"> exact range only</label>`;
 }
 async function loadSpikes(force){
   const now=Date.now(); if(!force && now-vsLast<15000) { renderSpikes(); return; }
@@ -6308,34 +6321,33 @@ function renderSpikes(){
       :`<span style="color:${sp>=(m.ratio||0)?'var(--accent)':sp<1.5?'var(--red)':'var(--txt)'};font-weight:${sp>=(m.ratio||0)?700:500}">${sp.toFixed(1)}×${sp>=(m.ratio||0)?' ✅':''}</span>`;
     const oi=r.oi_usd==null?'—':`${vsUsd(r.oi_usd)}<span class="rr">${r.oi_chg4!=null?(r.oi_chg4>=0?'+':'')+r.oi_chg4.toFixed(1)+'% 4h':''}</span>`;
     const f=r.funding==null?'—':(r.funding*100).toFixed(4)+'%';
+    const tfN={'15m':'15-minute','1h':'1-hour','4h':'4-hour','1d':'daily'}[bt]||bt;
+    const sgn=x=>(x>0?'+':'')+x;
+    const candleTip=m.chg==null?'':`The ${tfN} candle with the biggest volume spike (${(m.ratio||0).toFixed(1)}× normal) ${m.mode==='live'?'is still forming. Price has moved':'closed. Price moved'} ${sgn(m.chg)}% from its open${m.mode==='live'?' so far':''}. Big volume + a strong move up = buyers in control. Big volume + almost no move = absorption (someone is soaking up the orders).`;
+    const emaTip=m.vs_ema==null?'Not enough history for a 200-candle EMA yet.':`Price is ${Math.abs(m.vs_ema)}% ${m.vs_ema>=0?'ABOVE':'BELOW'} the 200-candle moving average on the ${tfN} chart. ${m.vs_ema>=0?'Above = that timeframe is in an uptrend, good for longs.':'Below = that timeframe is still in a downtrend, so a long here is counter-trend.'}${Math.abs(m.vs_ema)>40?' Very far from it = stretched.':''}`;
+    const spotTip=sp==null?(r.has_spot===false?'This coin has no Binance spot market, so only futures volume is available.':'Only checked when futures volume is spiking.'):`Spot market volume is ${sp.toFixed(1)}× normal on the ${tfN} chart, vs ${(m.ratio||0).toFixed(1)}× on futures. ${sp>=(m.ratio||0)?'Spot is leading: real coins are being bought, not just leveraged bets. ✅ Healthier.':sp>=2?'Spot is confirming, but futures is running hotter.':'Spot is barely moving: the spike is mostly leverage, which fades more easily.'}`;
+    const fundTip=r.funding==null?'':`Funding ${(r.funding*100).toFixed(4)}% per 8h. ${r.funding>0.0005?'High: longs are paying a lot, the long side is crowded.':r.funding<-0.0005?'Negative: shorts are paying, the short side is crowded (fuel for a squeeze up).':'Normal level, nobody is overcrowded.'}`;
     const fc=r.funding==null?'':(Math.abs(r.funding)>0.0005?'color:var(--warn);font-weight:650':'');
     return `<tr>`+
       `<td class="sym"><div class="symbox"><a href="${tv}" target="_blank" rel="noopener">${esc(r.base)}</a>${analyzeBtn(r.symbol)}${r.mexc?'<span class="rr" data-tip="Also a MEXC perpetual">mx</span>':''}${r.n_spiking>=2?`<span class="rr" style="color:var(--accent)" data-tip="Spiking on ${r.n_spiking} timeframes">×${r.n_spiking}TF</span>`:''}</div></td>`+
       `<td class="score" data-tip="${esc(why||'No spike above the threshold right now.')}">${m.score!=null?m.score:'—'}<span class="rr">${m.score!=null?bt:''}</span></td>`+
-      `<td>${m.ratio>=minR?vsSigPill(m.dir):'<span class="muted">—</span>'}</td>`+
+      `<td data-tip="${esc(m.dir==='long'?'The spike candle closed (or is running) clearly UP vs this coin’s typical candle: buyers drove the volume.':m.dir==='short'?'The spike candle went clearly DOWN: sellers drove the volume.':'Big volume but price barely moved: absorption, wait for a break.')}">${m.ratio>=minR?vsSigPill(m.dir):'<span class="muted">—</span>'}</td>`+
       `<td data-tip="${esc(r.oi_div?('Last 4h: price '+(r.px_chg4>0?'+':'')+r.px_chg4+'%, open interest '+(r.oi_chg4>0?'+':'')+r.oi_chg4+'%'):'Only checked for spiking coins')}">${r.oi_div?`<span style="color:${VS_OID[r.oi_div]||'var(--dim)'};white-space:nowrap">${r.oi_div}</span>`:'<span class="muted">—</span>'}</td>`+
       `<td data-tip="${esc(r.rec?r.rec.why.join(' · '):'No spike above the threshold')}">${r.rec?`<span style="color:${(VS_REC[r.rec.call]||[])[1]};font-weight:650;white-space:nowrap">${(VS_REC[r.rec.call]||[r.rec.call])[0]}</span>`:'<span class="muted">—</span>'}</td>`+
       ['15m','1h','4h','1d'].map(t=>vsRatioCell(r.tfs[t],minR,t)).join('')+
-      `<td>${spotTxt}</td><td>${vsPct(m.chg)}</td><td>${vsPct(m.vs_ema,1)}</td>`+
+      `<td data-tip="${esc(spotTip)}">${spotTxt}</td><td data-tip="${esc(candleTip)}">${vsPct(m.chg)}<span class="rr">${m.chg!=null?bt:''}</span></td><td data-tip="${esc(emaTip)}">${vsPct(m.vs_ema,1)}<span class="rr">${m.vs_ema!=null?bt:''}</span></td>`+
       `<td data-tip="${esc('OI 24h change: '+(r.oi_chg24==null?'n/a':r.oi_chg24+'%')+' · OI = '+(r.oi_pct_vol==null?'?':r.oi_pct_vol)+'% of 24h volume')}">${oi}</td>`+
-      `<td style="${fc}">${f}</td><td>${vsUsd(r.turnover24)}</td><td>${vsPct(r.chg24,1)}</td></tr>`;
+      `<td style="${fc}" data-tip="${esc(fundTip)}">${f}</td><td>${vsUsd(r.turnover24)}</td><td>${vsPct(r.chg24,1)}</td></tr>`;
   }).join('');
   emp.style.display=rows.length?'none':'block';
   emp.textContent=rows.length?'':'Nothing matches these filters right now. Try a lower spike threshold or "Show all pairs".';
-  // feed
-  const fd=document.getElementById('vsFeed');
-  if(fd){ const al=(d.alerts||[]).slice(0,40);
-    const oc=v=>v==null?'<span class="muted">…</span>':v==='na'?'<span class="muted" data-tip="App was asleep at that time, so it wasn’t graded">n/a</span>':vsPct(v);
-    fd.innerHTML=!al.length?'<div class="muted" style="font-size:12px">No alerts logged yet.</div>':
-      `<table><thead><tr><th>Time</th><th>Coin</th><th>TF</th><th>Signal</th><th>Vol</th><th>Spot</th><th>Score</th><th>Entry</th><th>+1h</th><th>+4h</th><th>+24h</th></tr></thead><tbody>`+
-      al.map(a=>`<tr><td class="muted">${new Date(a.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td><td class="sym"><div class="symbox">${esc(a.symbol.replace(/USDT$/,''))}${analyzeBtn(a.symbol)}</div></td><td>${a.tf}</td><td>${vsSigPill(a.dir)}</td><td>${a.ratio.toFixed(1)}×${a.mode==='live'?'<span class="rr">live</span>':''}</td><td>${a.spot==null?'—':a.spot.toFixed(1)+'×'}</td><td class="score" data-tip="${esc((a.why||[]).join(' · '))}">${a.score}</td><td>${fmtNum(a.price)}</td><td>${oc(a.out['1h'])}</td><td>${oc(a.out['4h'])}</td><td>${oc(a.out['24h'])}</td></tr>`).join('')+`</tbody></table>`;
-  }
+  renderFeed();
   if(ftHist) renderFt();
 }
 
 // ── Forward-test analysis (Volume spikes tab) ───────────────────────────────
 let ftHist=null, ftLast=0;
-const FTF={tf:'',lvl:0,per:'all',rec:'',h:'4h'};
+const FTF={tf:'',lvl:0,per:'all',rec:'',h:'R'};
 const FT_LVL=[[0,'All'],[2,'≥ 2×'],[2.5,'≥ 2.5×'],[3,'≥ 3×'],[5,'≥ 5×'],[10,'≥ 10×'],[20,'≥ 20×']];
 const FT_BUCKETS=[[2,2.5,'2–2.5×'],[2.5,3,'2.5–3×'],[3,5,'3–5×'],[5,10,'5–10×'],[10,20,'10–20×'],[20,1e9,'20×+']];
 const FT_PER=[['24h','24h',86400],['7d','7 days',604800],['30d','30 days',2592000],['all','All time',0]];
@@ -6347,14 +6359,15 @@ async function loadFtHist(force){
 }
 function ftSet(k,v){ FTF[k]=v; renderFt(); }
 function ftChip(k,v,label,extra){ const on=FTF[k]===v; return `<span onclick="ftSet('${k}',${typeof v==='string'?`'${v}'`:v})" style="cursor:pointer;padding:4px 10px;border-radius:8px;font-size:12px;font-weight:${on?700:500};border:1px solid ${on?'var(--accent)':'var(--line)'};background:${on?'rgba(63,185,80,.18)':'rgba(21,28,41,.7)'};white-space:nowrap">${label}${extra?' <span class="rr">'+extra+'</span>':''}</span>`; }
-function ftVal(a){ const v=a.out&&a.out[FTF.h]; return (typeof v==='number')?v:null; }
+function ftVal(a){ if(FTF.h==='R'){ const st=a.pstate; return (st&&plClosed(st)&&typeof st.r==='number')?st.r:null; } const v=a.out&&a.out[FTF.h]; return (typeof v==='number')?v:null; }
+const ftU=()=>FTF.h==='R'?'R':'%';
 function ftStat(arr){ const v=arr.map(ftVal).filter(x=>x!=null); if(!v.length) return {n:0,pend:arr.length};
   const w=v.filter(x=>x>0).length, avg=v.reduce((s,x)=>s+x,0)/v.length, sv=[...v].sort((a,b)=>a-b), med=sv[Math.floor(sv.length/2)];
   return {n:v.length, win:Math.round(100*w/v.length), avg, med, best:sv[sv.length-1], worst:sv[0], pend:arr.length-v.length}; }
 function ftCell(st,minN){ minN=minN||1;
   if(!st.n) return `<td class="muted" data-tip="${st.pend?st.pend+' alert(s) not graded yet':'No alerts'}">${st.pend?'⏳ '+st.pend:'—'}</td>`;
-  const a=st.avg, bg=st.n<minN?'transparent':a>=1.5?'rgba(63,185,80,.40)':a>=0.5?'rgba(63,185,80,.24)':a>0?'rgba(63,185,80,.10)':a>-0.5?'rgba(248,81,73,.10)':a>-1.5?'rgba(248,81,73,.22)':'rgba(248,81,73,.36)';
-  return `<td style="background:${bg};white-space:nowrap" data-tip="${esc(st.n+' graded alerts · win '+st.win+'% · avg '+(a>0?'+':'')+a.toFixed(2)+'% · median '+(st.med>0?'+':'')+st.med.toFixed(2)+'% · best '+st.best.toFixed(1)+'% · worst '+st.worst.toFixed(1)+'%'+(st.pend?' · '+st.pend+' still pending':'')+(st.n<minN?' · small sample, treat as noise':''))}"><b>${st.win}%</b> <span class="rr">${a>0?'+':''}${a.toFixed(2)}% · n=${st.n}</span></td>`; }
+  const u=ftU(), a=st.avg, bg=st.n<minN?'transparent':a>=1.5?'rgba(63,185,80,.40)':a>=0.5?'rgba(63,185,80,.24)':a>0?'rgba(63,185,80,.10)':a>-0.5?'rgba(248,81,73,.10)':a>-1.5?'rgba(248,81,73,.22)':'rgba(248,81,73,.36)';
+  return `<td style="background:${bg};white-space:nowrap" data-tip="${esc(st.n+' graded alerts · win '+st.win+'% · avg '+(a>0?'+':'')+a.toFixed(2)+u+' · median '+(st.med>0?'+':'')+st.med.toFixed(2)+u+' · best '+st.best.toFixed(1)+u+' · worst '+st.worst.toFixed(1)+u+(st.pend?' · '+st.pend+' still pending':'')+(st.n<minN?' · small sample, treat as noise':''))}"><b>${st.win}%</b> <span class="rr">${a>0?'+':''}${a.toFixed(2)}${u} · n=${st.n}</span></td>`; }
 function ftFiltered(skip){
   if(!ftHist) return [];
   const now=Date.now()/1000, per=(FT_PER.find(p=>p[0]===FTF.per)||[0,0,0])[2];
@@ -6373,7 +6386,7 @@ function ftSvgBars(days){
   const mx=Math.max(1,...days.map(d=>Math.abs(d.avg||0)));
   let g=`<line x1="${pad}" y1="${H/2}" x2="${W-pad}" y2="${H/2}" stroke="var(--line2)" />`;
   days.forEach((d,i)=>{ const x=pad+i*((W-pad*2)/n)+3; if(d.avg==null){ g+=`<text x="${x+bw/2}" y="${H/2+4}" font-size="9" fill="var(--dim2)" text-anchor="middle">·</text>`; }
-    else { const h=Math.abs(d.avg)/mx*(H/2-14), y=d.avg>=0?H/2-h:H/2; g+=`<rect x="${x}" y="${y}" width="${bw}" height="${Math.max(h,1)}" rx="2" fill="${d.avg>=0?'var(--accent)':'var(--red)'}" opacity=".85"><title>${d.label}: avg ${d.avg>0?'+':''}${d.avg.toFixed(2)}% · win ${d.win}% · n=${d.n}</title></rect>`; }
+    else { const h=Math.abs(d.avg)/mx*(H/2-14), y=d.avg>=0?H/2-h:H/2; g+=`<rect x="${x}" y="${y}" width="${bw}" height="${Math.max(h,1)}" rx="2" fill="${d.avg>=0?'var(--accent)':'var(--red)'}" opacity=".85"><title>${d.label}: avg ${d.avg>0?'+':''}${d.avg.toFixed(2)}${ftU()} · win ${d.win}% · n=${d.n}</title></rect>`; }
     g+=`<text x="${x+bw/2}" y="${H-2}" font-size="9" fill="var(--dim)" text-anchor="middle">${d.short}</text>`; });
   return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;max-width:${W}px;height:auto;display:block">${g}</svg>`;
 }
@@ -6389,7 +6402,7 @@ function renderFt(){
   const bar=document.getElementById('vsFtBar');
   if(!ftHist){ box.innerHTML='<div class="muted" style="font-size:12px">Loading alert history…</div>'; return; }
   const all=ftFiltered();
-  const hz=FTF.h;
+  const hz=FTF.h==='R'?'plan close':FTF.h, U=ftU();
   // filter bar with live counts
   const cTf=t=>ftFiltered('tf').filter(a=>!t||a.tf===t).length, cL=l=>ftFiltered('lvl').filter(a=>!l||a.ratio>=l).length;
   bar.innerHTML=
@@ -6397,14 +6410,25 @@ function renderFt(){
     `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Spike level</span>${FT_LVL.map(([v,l])=>ftChip('lvl',v,l,cL(v))).join('')}</div>`+
     `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Period</span>${FT_PER.map(([v,l])=>ftChip('per',v,l)).join('')}</div>`+
     `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Rec</span>${[['','All alerts'],['go','✅ Long only'],['watch','✅ + 👀'],['skip','✗ Skipped']].map(([v,l])=>ftChip('rec',v,l)).join('')}</div>`+
-    `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Judge after</span>${[['1h','1 hour'],['4h','4 hours'],['24h','24 hours']].map(([v,l])=>ftChip('h',v,l)).join('')}</div>`;
+    `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Judge after</span>${[['R','🎯 Trade plan (R)'],['1h','1 hour'],['4h','4 hours'],['24h','24 hours']].map(([v,l])=>ftChip('h',v,l)).join('')}</div>`;
   const S=ftStat(all);
   if(!all.length){ box.innerHTML='<div class="muted" style="font-size:12px">No long alerts match these filters yet.</div>'; return; }
   let h='';
   // headline
   h+=`<div style="display:flex;flex-wrap:wrap;gap:10px;margin:4px 0 14px">`+
-    [['Alerts',all.length,''],['Graded after '+hz,S.n,S.pend?S.pend+' pending':''],['Win rate',S.n?S.win+'%':'—','price higher after '+hz],['Avg move',S.n?(S.avg>0?'+':'')+S.avg.toFixed(2)+'%':'—','per alert'],['Median',S.n?(S.med>0?'+':'')+S.med.toFixed(2)+'%':'—','typical alert']]
+    [['Alerts',all.length,''],['Graded after '+hz,S.n,S.pend?S.pend+' pending':''],['Win rate',S.n?S.win+'%':'—',FTF.h==='R'?'closed in profit':'price higher after '+hz],['Avg '+(FTF.h==='R'?'R per trade':'move'),S.n?(S.avg>0?'+':'')+S.avg.toFixed(2)+U:'—',FTF.h==='R'?'expectancy':'per alert'],['Median',S.n?(S.med>0?'+':'')+S.med.toFixed(2)+U:'—','typical alert']]
     .map(([k,v,s])=>`<div style="border:1px solid var(--line);border-radius:10px;padding:8px 12px;min-width:110px"><div class="muted" style="font-size:11px">${k}</div><div style="font-size:18px;font-weight:700">${v}</div><div class="muted" style="font-size:11px">${s}</div></div>`).join('')+`</div>`;
+  // trade-plan ladder stats
+  const planned=all.filter(a=>a.plan&&a.pstate&&a.pstate.status!=='invalid');
+  if(planned.length){ const cl=planned.filter(a=>plClosed(a.pstate)), n=cl.length||1;
+    const pct=f=>Math.round(100*cl.filter(f).length/n);
+    const avgRR=i=>{ const v=planned.map(a=>a.plan.rr[i]).filter(x=>x!=null); return v.length?(v.reduce((s,x)=>s+x,0)/v.length).toFixed(2):'—'; };
+    const totR=cl.reduce((s,a)=>s+(a.pstate.r||0),0), openN=planned.length-cl.length;
+    const avgSL=(planned.reduce((s,a)=>s+a.plan.sl_pct,0)/planned.length).toFixed(1);
+    h+=`<div style="font-weight:700;margin:2px 0 6px">🎯 Trade plans <span class="muted" style="font-weight:400;font-size:12px">${planned.length} plans · ${cl.length} closed · ${openN} open · avg stop ${avgSL}% · avg RR to TP1/TP2/TP3: ${avgRR(0)} / ${avgRR(1)} / ${avgRR(2)}</span></div>`+
+      `<div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px">`+
+      [['TP1 hit',cl.length?pct(a=>a.pstate.hits>=1)+'%':'—'],['TP2 hit',cl.length?pct(a=>a.pstate.hits>=2)+'%':'—'],['TP3 hit',cl.length?pct(a=>a.pstate.hits>=3)+'%':'—'],['Stopped (full loss)',cl.length?pct(a=>a.pstate.status==='sl')+'%':'—'],['Total R (closed)',(totR>0?'+':'')+totR.toFixed(1)+'R'],['Open R now',(planned.filter(a=>!plClosed(a.pstate)).reduce((s,a)=>s+(a.pstate.open_r||0),0)).toFixed(1)+'R']]
+      .map(([k,v])=>`<div style="border:1px solid var(--line);border-radius:10px;padding:8px 12px;min-width:100px"><div class="muted" style="font-size:11px">${k}</div><div style="font-size:17px;font-weight:700">${v}</div></div>`).join('')+`</div>`; }
   // verdicts: best / worst slices
   const slices=[];
   const dims={tf:a=>a.tf, lvl:a=>(FT_BUCKETS.find(b=>a.ratio>=b[0]&&a.ratio<b[1])||[0,0,'<2×'])[2], spot:a=>a.spot==null?'no spot data':a.spot_leads?'spot leads':a.spot>=2?'spot confirms':a.spot<1.5?'futures-only':'spot weak',
@@ -6416,7 +6440,7 @@ function renderFt(){
   const score=s=>s.st.avg*Math.sqrt(s.st.n);
   slices.sort((a,b)=>score(b)-score(a));
   const best=slices.filter(s=>s.st.avg>0).slice(0,3), worst=[...slices].reverse().filter(s=>s.st.avg<0).slice(0,3);
-  const line=s=>`<li><b>${esc(s.k)}</b>: ${s.st.win}% win, avg ${s.st.avg>0?'+':''}${s.st.avg.toFixed(2)}% <span class="rr">n=${s.st.n}</span></li>`;
+  const line=s=>`<li><b>${esc(s.k)}</b>: ${s.st.win}% win, avg ${s.st.avg>0?'+':''}${s.st.avg.toFixed(2)}${U} <span class="rr">n=${s.st.n}</span></li>`;
   h+=`<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-bottom:16px">`+
     `<div style="border:1px solid rgba(63,185,80,.45);border-radius:10px;padding:10px 12px"><div style="font-weight:700;margin-bottom:4px">🏆 Working best (after ${hz})</div>${best.length?'<ul style="margin:0;padding-left:18px;font-size:12.5px;line-height:1.6">'+best.map(line).join('')+'</ul>':'<div class="muted" style="font-size:12px">Not enough data yet. Each slice needs 8+ graded alerts.</div>'}</div>`+
     `<div style="border:1px solid rgba(248,81,73,.45);border-radius:10px;padding:10px 12px"><div style="font-weight:700;margin-bottom:4px">⚠️ Working worst (after ${hz})</div>${worst.length?'<ul style="margin:0;padding-left:18px;font-size:12.5px;line-height:1.6">'+worst.map(line).join('')+'</ul>':'<div class="muted" style="font-size:12px">Nothing clearly losing yet (8+ graded alerts needed per slice).</div>'}</div></div>`;
@@ -6440,13 +6464,47 @@ function renderFt(){
     days.push({label:dt.toUTCString().slice(0,11), short:(dt.getUTCDate())+'/'+(dt.getUTCMonth()+1), n:st.n, win:st.win, avg:st.n?st.avg:null, total:arr.length}); }
   const graded=all.filter(a=>ftVal(a)!=null).sort((a,b)=>a.t-b.t); let cum=0; const pts=graded.map(a=>({y:(cum+=ftVal(a))}));
   const wk=[0,1].map(w=>{ const t1=Date.now()/1000-w*604800, arr=ftHist.filter(a=>a.dir==='long'&&a.t<t1&&a.t>=t1-604800).filter(a=>(!FTF.tf||a.tf===FTF.tf)&&(!FTF.lvl||a.ratio>=FTF.lvl)); return ftStat(arr); });
-  const trend=(wk[0].n>=8&&wk[1].n>=8)?(wk[0].avg>wk[1].avg?`📈 Improving: this week ${wk[0].win}% win / ${wk[0].avg>0?'+':''}${wk[0].avg.toFixed(2)}% vs last week ${wk[1].win}% / ${wk[1].avg>0?'+':''}${wk[1].avg.toFixed(2)}%.`:`📉 Weakening: this week ${wk[0].win}% win / ${wk[0].avg>0?'+':''}${wk[0].avg.toFixed(2)}% vs last week ${wk[1].win}% / ${wk[1].avg>0?'+':''}${wk[1].avg.toFixed(2)}%.`):'Week-on-week comparison appears once both weeks have 8+ graded alerts.';
+  const trend=(wk[0].n>=8&&wk[1].n>=8)?(wk[0].avg>wk[1].avg?`📈 Improving: this week ${wk[0].win}% win / ${wk[0].avg>0?'+':''}${wk[0].avg.toFixed(2)}${U} vs last week ${wk[1].win}% / ${wk[1].avg>0?'+':''}${wk[1].avg.toFixed(2)}${U}.`:`📉 Weakening: this week ${wk[0].win}% win / ${wk[0].avg>0?'+':''}${wk[0].avg.toFixed(2)}${U} vs last week ${wk[1].win}% / ${wk[1].avg>0?'+':''}${wk[1].avg.toFixed(2)}${U}.`):'Week-on-week comparison appears once both weeks have 8+ graded alerts.';
   h+=`<div style="font-weight:700;margin:18px 0 4px">Over time <span class="muted" style="font-weight:400;font-size:12px">${trend}</span></div>`+
-    `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px"><div><div class="muted" style="font-size:12px;margin-bottom:4px">Average move after ${hz}, per day (last 14 days, UTC). Hover a bar for detail.</div>${ftSvgBars(days)}</div>`+
-    `<div><div class="muted" style="font-size:12px;margin-bottom:4px">Cumulative: if you'd taken every matching alert with the same size and closed it after ${hz} (no fees). Now <b style="color:${cum>=0?'var(--accent)':'var(--red)'}">${cum>0?'+':''}${cum.toFixed(1)}%</b> over ${graded.length} trades.</div>${ftSvgCurve(pts)}</div></div>`;
-  h+=`<div class="muted" style="font-size:11.5px;margin-top:10px">Longs only. A win = price higher ${hz} after the alert. Moves don't include fees or slippage. Under ~30 alerts, any % is mostly luck.</div>`;
+    `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px"><div><div class="muted" style="font-size:12px;margin-bottom:4px">Average ${FTF.h==='R'?'R per closed plan':'move after '+hz}, per day (last 14 days, UTC). Hover a bar for detail.</div>${ftSvgBars(days)}</div>`+
+    `<div><div class="muted" style="font-size:12px;margin-bottom:4px">Cumulative: ${FTF.h==='R'?'every matching alert traded with its plan, same risk each (R)':'every matching alert, same size, closed after '+hz} (no fees). Now <b style="color:${cum>=0?'var(--accent)':'var(--red)'}">${cum>0?'+':''}${cum.toFixed(1)}${U}</b> over ${graded.length} trades.</div>${ftSvgCurve(pts)}</div></div>`;
+  h+=`<div class="muted" style="font-size:11.5px;margin-top:10px">Longs only. ${FTF.h==='R'?'Trade plan: ⅓ off at each target, stop to break-even after TP1, closed at market after 7 days; R = multiples of the risk to the stop. A win = closed above 0R.':'A win = price higher '+hz+' after the alert.'} No fees or slippage. Under ~30 alerts, any % is mostly luck.</div>`;
   box.innerHTML=h;
 }
+
+// ── Alert feed with trade plans ───────────────────────────────────────────
+let FEEDF='all';
+const PL_ST={open:['● Open','var(--blue)'],tp1:['TP1 ✓','var(--accent)'],tp2:['TP2 ✓✓','var(--accent)'],tp3:['🏆 TP3','var(--accent)'],sl:['✗ Stop','var(--red)'],be:['⚖ Break-even','var(--dim)'],expired:['⌛ Expired','var(--dim)'],invalid:['— no plan','var(--dim2)']};
+function plClosed(st){ return st&&['tp3','sl','be','expired'].includes(st.status); }
+function renderFeed(){
+  const fd=document.getElementById('vsFeed'); if(!fd||!vsData) return;
+  let al=(vsData.alerts||[]).filter(a=>a.dir==='long');
+  const cnt=f=>al.filter(a=>feedMatch(a,f)).length;
+  const chips=[['all','All'],['open','Open'],['won','Hit a target'],['stopped','Stopped out'],['closed','Closed']].map(([k,l])=>`<span onclick="FEEDF='${k}';renderFeed()" style="cursor:pointer;padding:4px 10px;border-radius:8px;font-size:12px;border:1px solid ${FEEDF===k?'var(--accent)':'var(--line)'};background:${FEEDF===k?'rgba(63,185,80,.18)':'rgba(21,28,41,.7)'};font-weight:${FEEDF===k?700:500}">${l} <span class="rr">${cnt(k)}</span></span>`).join('');
+  al=al.filter(a=>feedMatch(a,FEEDF)).slice(0,60);
+  const pc=(v,d)=>v==null?'—':`<span style="color:${v>0?'var(--accent)':v<0?'var(--red)':'var(--dim)'}">${v>0?'+':''}${(+v).toFixed(d==null?2:d)}%</span>`;
+  const rr=v=>v==null?'':`<span class="rr">${(+v).toFixed(1)}R</span>`;
+  const oc=v=>v==null?'<span class="muted">…</span>':v==='na'?'<span class="muted" data-tip="App was asleep at that time, so it was not graded">n/a</span>':pc(v);
+  const rows=al.map(a=>{
+    const pl=a.plan, st=a.pstate||null;
+    const tpCell=i=>{ if(!pl) return '<td class="muted">—</td>'; const hit=st&&st.hits>i; return `<td style="${hit?'background:rgba(63,185,80,.22);':''}white-space:nowrap" data-tip="${esc('TP'+(i+1)+' '+fmtNum(pl.tps[i])+' ('+(pl.tp_pct[i]>0?'+':'')+pl.tp_pct[i]+'%, '+pl.rr[i]+'R from entry). '+(pl.basis[i]||'')+(hit?' · HIT':''))}">${hit?'✓ ':''}${fmtNum(pl.tps[i])} <span class="rr">+${pl.tp_pct[i].toFixed(1)}%</span>${rr(pl.rr[i])}</td>`; };
+    const stopTxt=pl?`<td style="white-space:nowrap;${st&&st.status==='sl'?'background:rgba(248,81,73,.22);':''}" data-tip="${esc('Stop '+fmtNum(pl.sl)+' ('+pl.sl_pct+'%). '+(pl.sl_basis||'')+' Moves to entry (break-even) once TP1 is hit. Plan source: '+(pl.src==='analyze'?'Analyze card (4h/1D structure for this coin)':'fallback: swing low + ATR, targets at 1R/2R/3R'))}">${fmtNum(pl.sl)} <span class="rr">${pl.sl_pct.toFixed(1)}%</span>${st&&st.hits>=1&&!plClosed(st)?'<span class="rr" style="color:var(--accent)">→ BE</span>':''}</td>`:'<td class="muted">—</td>';
+    const stInfo=!st?['⏳ planning…','var(--dim)']:(PL_ST[st.status]||[st.status,'var(--dim)']);
+    const stTip=st?('Best move since entry +'+(st.mfe||0)+'% · worst '+(st.mae||0)+'%'+(st.why?' · '+st.why:'')):'Fetching the Analyze plan for this coin';
+    const R=st&&st.r!=null?`<b style="color:${st.r>0?'var(--accent)':st.r<0?'var(--red)':'var(--dim)'}">${st.r>0?'+':''}${st.r.toFixed(2)}R</b>`:(st&&st.open_r!=null?`<span class="muted" data-tip="Unrealised, at the current price">${st.open_r>0?'+':''}${st.open_r.toFixed(2)}R open</span>`:'—');
+    const rec=a.rec?({long:'✅',watch_long:'👀',skip:'✗',wait:'⏳'})[a.rec]||'':'';
+    return `<tr><td class="muted" style="white-space:nowrap">${new Date(a.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td>`+
+      `<td class="sym"><div class="symbox">${esc(a.symbol.replace(/USDT$/,''))}${analyzeBtn(a.symbol)}</div></td><td>${a.tf}</td>`+
+      `<td>${a.ratio.toFixed(1)}×${a.mode==='live'?'<span class="rr">live</span>':''}</td><td class="score" data-tip="${esc((a.why||[]).join(' · '))}">${a.score} <span class="rr">${rec}</span></td>`+
+      `<td>${fmtNum(a.price)}</td>${stopTxt}${tpCell(0)}${tpCell(1)}${tpCell(2)}`+
+      `<td data-tip="${esc(stTip)}">${st&&st.now_pct!=null?pc(st.now_pct):'—'}</td>`+
+      `<td style="white-space:nowrap;color:${stInfo[1]};font-weight:650" data-tip="${esc(stTip)}">${stInfo[0]}</td><td style="white-space:nowrap">${R}</td>`+
+      `<td>${oc(a.out['1h'])}</td><td>${oc(a.out['4h'])}</td><td>${oc(a.out['24h'])}</td></tr>`; }).join('');
+  fd.innerHTML=`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">${chips}</div>`+(!al.length?'<div class="muted" style="font-size:12px">No alerts here yet.</div>':
+    `<table><thead><tr><th>Time</th><th>Coin</th><th>TF</th><th>Vol</th><th data-tip="Alert score, with the recommendation at the time">Score</th><th data-tip="Price when the alert fired">Entry</th><th data-tip="Stop loss from the Analyze card (below support, ATR-buffered). Moves to break-even after TP1.">Stop</th><th data-tip="Target 1 with % from entry and reward:risk. A third of the position comes off here.">TP1</th><th>TP2</th><th>TP3</th><th data-tip="Current price vs entry">Now</th><th>Status</th><th data-tip="Result in R (multiples of the risk). 1/3 off at each target, stop to break-even after TP1. Closed = bold; open = unrealised.">Result</th><th>+1h</th><th>+4h</th><th>+24h</th></tr></thead><tbody>${rows}</tbody></table>`);
+}
+function feedMatch(a,f){ const st=a.pstate; if(f==='all') return true; if(!st) return f==='open';
+  if(f==='open') return !plClosed(st)&&st.status!=='invalid'; if(f==='won') return (st.hits||0)>=1; if(f==='stopped') return st.status==='sl'; if(f==='closed') return plClosed(st); return true; }
 async function poll(){
   // Lean build: only the three live tabs (Analyze, Binance Alpha, My calls) are refreshed.
   try{
@@ -6911,7 +6969,8 @@ def main() -> None:
     if APP_MODE != "stocks":
         try:
             import volume_spikes
-            volume_spikes.start(notify=lambda txt: send_telegram(cfg, txt))
+            volume_spikes.start(notify=lambda txt: send_telegram(cfg, txt),
+                                planner=lambda sym, tf: analyze_symbol(get_session(), sym, tf, cfg))
             print("  Volume-spike scanner: ON (Binance, 15m/1h/4h/1D)")
         except Exception as e:
             print(f"  Volume-spike scanner failed to start: {e}")
