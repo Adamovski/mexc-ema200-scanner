@@ -574,7 +574,8 @@ class _Tracker:
 # Trade plans for alerts: 1 stop + 3-target ladder, tracked candle by candle
 # ─────────────────────────────────────────────────────────────────────────────
 PLAN_EXPIRY = 7 * 86400          # close whatever is left at market after 7 days
-PLAN_MAX_AGE = 1800              # only plan alerts younger than 30 min (levels must fit the entry)
+PLAN_MAX_AGE = 86400             # plan alerts up to 24h old; >30 min old = "late" (shown, excluded from stats)
+PLAN_LATE = 1800
 
 
 def _f(x):
@@ -790,6 +791,7 @@ class VolumeSpikeScanner:
             with self.tracker.lock:
                 if pl:
                     a["plan"] = finish_plan(pl, entry)
+                    a["plan"]["late"] = (time.time() - a["t"]) > PLAN_LATE
                     a["pstate"] = {"status": "open", "hits": 0, "mfe": 0, "mae": 0, "checked": 0}
                 else:
                     a["plan"] = None
