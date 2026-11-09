@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# build: v71b — plan levels for alerts up to 24h old (late = excluded from stats) — auto-deploy trigger
+# build: v72 — alert plans: RR rules shared with Analyze; time-since on calls/alerts; reload banner — auto-deploy trigger
 """
 MEXC 200-EMA "cross & retest" LIVE DASHBOARD (4h chart)
 =======================================================
@@ -5651,7 +5651,7 @@ function renderPerf(){
     if(lw.length){ if(lwSub)lwSub.style.display=''; if(lwTbl)lwTbl.style.display='';
       for(const t of lw){
         const hi=(t.tps_hit&&t.tps_hit.length)?Math.max.apply(null,t.tps_hit):0;
-        const when=t.ts?new Date(t.ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
+        const when=t.ts?(new Date(t.ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})+'<br><span class="rr" title="Time since tracked">'+agoTxt(t.ts)+'</span>'):'—';
         const cr=(t.cur_r!=null)?((t.cur_r>0?'+':'')+t.cur_r+'R'):'—';
         const tr=document.createElement('tr');
         tr.innerHTML=`<td class="dim" style="white-space:nowrap">${when}</td>`
@@ -5743,7 +5743,7 @@ function renderPerf(){
   }
   if(trrows){ trrows.innerHTML='';
     for(const t of ((perf&&perf.recent)||[])){
-      const when=t.closed_ts?new Date(t.closed_ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
+      const when=t.closed_ts?(new Date(t.closed_ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})+(t.ts?'<br><span class="rr" title="How long the trade was open">held '+durTxt(t.closed_ts-t.ts)+'</span>':'')):'—';
       const tr=document.createElement('tr');
       tr.innerHTML=`<td style="color:var(--dim);white-space:nowrap">${when}</td>`
         +`<td>${({long:'Long',short:'Short',coil:'Coil',scalp:'Scalp'})[t.board]||t.board} ${regimeBadge(t)}</td>`
@@ -6159,7 +6159,7 @@ function renderCalls(){
   const tgts=t=>((t.tps||[]).map(x=>fmtNum(x.lvl)).join(' · ')||'—');
   if(openrows){ openrows.innerHTML='';
     for(const t of opens){
-      const when=t.ts?new Date(t.ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
+      const when=t.ts?(new Date(t.ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})+'<br><span class="rr" title="Time since tracked">'+agoTxt(t.ts)+'</span>'):'—';
       const st=(t.state==='pending')?`⏳ waiting for entry ${fmtNum(t.entry)}`:((t.tps_hit&&t.tps_hit.length)?`TP${Math.max.apply(null,t.tps_hit)} hit → stop at ${t.phase>=1?'break-even+':'—'}`:'● live · watching');
       const liveR=(t.cur_r!=null)?` · <b style="color:${t.cur_r>=0?'var(--up,#3fb950)':'var(--down,#f85149)'}">${t.cur_r>=0?'+':''}${t.cur_r}R</b>`:'';
       const prog=st+liveR;
@@ -6174,7 +6174,7 @@ function renderCalls(){
   }
   if(closedrows){ closedrows.innerHTML='';
     for(const t of closed){
-      const when=t.closed_ts?new Date(t.closed_ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
+      const when=t.closed_ts?(new Date(t.closed_ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})+(t.ts?'<br><span class="rr" title="How long the trade was open">held '+durTxt(t.closed_ts-t.ts)+'</span>':'')):'—';
       const tr=document.createElement('tr');
       tr.innerHTML=`<td style="color:var(--dim);white-space:nowrap">${when}</td>`
         +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a>${alphaTag(t.symbol)}</div></td>`
@@ -6217,6 +6217,20 @@ function coilSetupCell(h, side){
        + `<span class="rr">${maxR!=null?'R '+(+maxR).toFixed(1):''}</span></td>`;
 }
 
+// ── helpers: elapsed time + new-version banner ─────────────────────────────
+const VS_BUILD='v72';
+function durTxt(sec){ sec=Math.max(0,Math.round(sec)); const d=Math.floor(sec/86400), h=Math.floor(sec%86400/3600), m=Math.floor(sec%3600/60);
+  return d?(d+'d '+h+'h'):h?(h+'h '+m+'m'):(m+'m'); }
+function agoTxt(ts){ return ts?durTxt(Date.now()/1000-ts)+' ago':''; }
+async function vsCheckBuild(){
+  try{ const r=await fetch('/spikes-ver',{cache:'no-store'}); const j=await r.json();
+    if(j.build&&j.build!==VS_BUILD&&!document.getElementById('vsReload')){
+      const b=document.createElement('div'); b.id='vsReload';
+      b.style.cssText='position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:9999;background:var(--accent);color:#04140a;font-weight:700;padding:9px 16px;border-radius:10px;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.4);font-size:13px';
+      b.textContent='🔄 A new version of the dashboard is live: click to reload'; b.onclick=()=>location.reload(); document.body.appendChild(b); }
+  }catch(e){}
+}
+setInterval(vsCheckBuild,120000); setTimeout(vsCheckBuild,15000);
 // ── Binance Alpha badge (used in My calls + Volume spikes) ───────────────────
 let _alphaIdx=null, _alphaSrc=null;
 function alphaInfo(sym){
@@ -6512,7 +6526,7 @@ function renderFeed(){
     const stTip=(st?('Best move since entry +'+(st.mfe||0)+'% · worst '+(st.mae||0)+'%'+(st.why?' · '+st.why:'')):'Fetching the Analyze plan for this coin (runs at the end of each scan)')+(pl&&pl.late?' · LATE PLAN: levels were drawn after the alert, so this trade is tracked but left out of the forward-test stats.':'');
     const R=st&&st.r!=null?`<b style="color:${st.r>0?'var(--accent)':st.r<0?'var(--red)':'var(--dim)'}">${st.r>0?'+':''}${st.r.toFixed(2)}R</b>`:(st&&st.open_r!=null?`<span class="muted" data-tip="Unrealised, at the current price">${st.open_r>0?'+':''}${st.open_r.toFixed(2)}R open</span>`:'—');
     const rec=a.rec?({long:'✅',watch_long:'👀',skip:'✗',wait:'⏳'})[a.rec]||'':'';
-    return `<tr><td class="muted" style="white-space:nowrap">${new Date(a.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td>`+
+    return `<tr><td class="muted" style="white-space:nowrap" data-tip="${esc('Alert fired '+agoTxt(a.t)+(st&&st.closed_t?' · closed after '+durTxt(st.closed_t-a.t):''))}">${new Date(a.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}<br><span class="rr">${st&&st.closed_t?'closed in '+durTxt(st.closed_t-a.t):agoTxt(a.t)}</span></td>`+
       `<td class="sym"><div class="symbox">${esc(a.symbol.replace(/USDT$/,''))}${analyzeBtn(a.symbol)}${alphaTag(a.symbol)}</div></td><td style="white-space:nowrap">${a.tf}${a.setup==='flush'?' <span class="rr" style="color:var(--accent)" data-tip="Liquidation-flush long: bought the dump after leveraged longs were wiped out">↺ flush</span>':''}</td>`+
       `<td>${a.ratio.toFixed(1)}×${a.mode==='live'?'<span class="rr">live</span>':''}</td><td class="score" data-tip="${esc((a.why||[]).join(' · '))}">${a.score} <span class="rr">${rec}</span></td>`+
       `<td>${fmtNum(a.price)}</td>${stopTxt}${tpCell(0)}${tpCell(1)}${tpCell(2)}`+
@@ -6525,6 +6539,17 @@ function renderFeed(){
 function feedMatch(a,f){ const st=a.pstate; if(f==='all') return true; if(!st) return f==='open';
   if(f==='open') return !plClosed(st)&&st.status!=='invalid'; if(f==='won') return (st.hits||0)>=1; if(f==='stopped') return st.status==='sl'; if(f==='closed') return plClosed(st); return true; }
 
+// Same risk/reward rules the alert plans use (mirror of finish_plan in volume_spikes.py)
+function vsPlanRules(entry, sl, tps, atr){
+  if(!entry||!sl||sl>=entry) return null;
+  let cap=entry*0.15; if(atr) cap=Math.min(cap,3*atr);
+  const notes=[]; if(entry-sl>cap){ notes.push('stop tightened from '+fmtNum(sl)+' ('+((1-sl/entry)*100).toFixed(1)+'%)'); sl=entry-cap; }
+  const risk=entry-sl; let src=(tps||[]).filter(x=>x&&x>entry*1.002).sort((a,b)=>a-b); const out=[], tag=[];
+  const dropped=src.filter(t=>t<entry+risk).length; if(dropped) notes.push(dropped+' Analyze target(s) under 1R ignored');
+  for(const need of [1,2,3]){ const fl=entry+need*risk; const i=src.findIndex(t=>t>=fl&&(!out.length||t>out[out.length-1]*1.001));
+    if(i>=0){ out.push(src[i]); tag.push('level'); src.splice(i,1); } else { out.push(Math.max(fl,out.length?out[out.length-1]+risk:fl)); tag.push('R'); } }
+  return {sl, tps:out, tag, rr:out.map(t=>(t-entry)/risk), notes};
+}
 // ── Analyze card: volume & flow context from the Volume spikes scanner ─────────
 async function vsAzInject(){
   const box=document.getElementById('azResult'); if(!box||typeof azLast==='undefined'||!azLast||!azLast.symbol) return;
@@ -6562,6 +6587,13 @@ async function vsAzInject(){
   if(r.rec&&r.rec.why) lines.push(`<div class="muted">Volume-tab checklist: ${(VS_REC[rc]||[rc])[0]}${r.rec.setup==='flush'?' ↺':''}. ${esc((m&&m.why||[]).join(' · '))}</div>`);
   // flush stop vs analyze stop
   if(m&&m.setup==='flush'&&m.lo){ const azStop=azLast.sl_tight; lines.push(`<div><b>Flush stop:</b> just under the flush low ${fmtNum(m.lo*0.995)} (flush low ${fmtNum(m.lo)}).${azStop?(' Analyze tight stop: '+fmtNum(azStop)+(azStop>m.lo?' ⚠️ which sits ABOVE the flush low, so a re-test of the low would stop you out. Use the flush stop.':' (already below the flush low, fine).')):''}</div>`); }
+  // the same RR rules the alert plans use, applied to this Analyze plan
+  if(azSideNow==='long'||!azSideNow){ const lp=(azLast.plans&&azLast.plans.long)||azLast; const px=azLast.price;
+    let stopIn=lp.sl_tight; if(m&&m.setup==='flush'&&m.lo&&stopIn>m.lo*0.997) stopIn=m.lo*0.995;
+    const atr=azLast.atr_pct&&px?px*azLast.atr_pct/100:null;
+    const pr=vsPlanRules(px, stopIn, [lp.tp1,lp.tp2,lp.tp3,lp.tp4,lp.tp5], atr);
+    if(pr){ const pc=x=>((x/px-1)*100).toFixed(1)+'%';
+      lines.push(`<div style="margin-top:4px" data-tip="${esc('The Volume-spikes alert plans use the Analyze stop and resistances, plus two rules: the stop is never more than 3×ATR or 15% from entry, and only targets at least 1R / 2R / 3R away are used (missing ones are filled with R multiples). This is that same plan for an entry at the current price, so both tabs agree.')}"><b>Long plan with the volume-tab RR rules</b> (entry now ${fmtNum(px)}): stop ${fmtNum(pr.sl)} (-${((1-pr.sl/px)*100).toFixed(1)}%) · `+pr.tps.map((t,i)=>`TP${i+1} ${fmtNum(t)} (+${pc(t)}, ${pr.rr[i].toFixed(1)}R${pr.tag[i]==='R'?', R-target':''})`).join(' · ')+(pr.notes.length?` <span class="muted">· ${esc(pr.notes.join('; '))}</span>`:'')+`</div>`); } }
   // recent alerts for this coin
   const hist=(d.alerts||[]).filter(a=>a.symbol===sym).slice(0,3);
   if(hist.length) lines.push('<div style="margin-top:4px"><b>Recent spike alerts:</b> '+hist.map(a=>{ const st=a.pstate||{}; return `${new Date(a.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})} ${a.tf}${a.setup==='flush'?' ↺':''} ${a.ratio.toFixed(1)}× @ ${fmtNum(a.price)} → ${(PL_ST[st.status]||['…'])[0]}${st.r!=null?' '+(st.r>0?'+':'')+st.r+'R':st.open_r!=null?' ('+(st.open_r>0?'+':'')+st.open_r+'R open)':''}`; }).join(' · ')+'</div>');

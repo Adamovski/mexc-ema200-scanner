@@ -40,6 +40,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
+BUILD = "v72"              # bump on every deploy: open pages compare it and offer a reload
 MIN_TURNOVER = float(os.environ.get("VS_MIN_TURNOVER", 5_000_000))
 SPIKE_RATIO = float(os.environ.get("VS_SPIKE_RATIO", 2.5))
 ALERT_MIN_SCORE = int(os.environ.get("VS_ALERT_SCORE", 45))
@@ -629,16 +630,42 @@ def plan_from_candles(c, entry):
             "src": "fallback"}
 
 
-def finish_plan(plan, entry):
-    """Fill the ladder to 3 targets with R-multiples if needed, then compute RR from entry."""
+MAX_STOP_ATR = 3.0      # stop no further than 3×ATR …
+MAX_STOP_PCT = 0.15     # … and no further than 15% from entry
+
+
+def finish_plan(plan, entry, atr=None):
+    """Risk/reward discipline on top of the Analyze levels:
+    stop capped at min(3×ATR, 15%); only resistances ≥ 1R count as targets and the
+    ladder is filled so TP1 ≥ 1R, TP2 ≥ 2R, TP3 ≥ 3R."""
+    notes = []
+    cap = entry * MAX_STOP_PCT
+    if atr:
+        cap = min(cap, MAX_STOP_ATR * atr)
+    if entry - plan["sl"] > cap:
+        old = plan["sl"]
+        plan["sl"] = entry - cap
+        notes.append(f"stop tightened from {old:.6g} (too far: {round((1 - old / entry) * 100, 1)}%) to "
+                     f"{'3×ATR' if atr and cap < entry * MAX_STOP_PCT else '15%'} below entry")
+        plan["sl_basis"] = (plan.get("sl_basis") or "") + " · Adjusted: " + notes[-1] + "."
     risk = entry - plan["sl"]
-    tps, basis = list(plan["tps"]), list(plan["basis"])
-    k = 1.0
-    while len(tps) < 3:
-        nxt = entry + risk * max(k, ((tps[-1] - entry) / risk + 1) if tps else k)
-        tps.append(nxt); basis.append(f"{round((nxt - entry) / risk, 1)}R extension (no resistance level found)")
-        k += 1
-    plan["tps"], plan["basis"] = tps[:3], basis[:3]
+    src_t = list(zip(plan["tps"], plan["basis"]))
+    dropped = [t for t, _ in src_t if t < entry + risk]
+    tps, basis = [], []
+    for need in (1, 2, 3):
+        floor = entry + need * risk
+        cand = [(t, b) for t, b in src_t if t >= floor and (not tps or t > tps[-1] * 1.001)]
+        if cand:
+            t, b = cand[0]
+            src_t.remove(cand[0])
+            tps.append(t); basis.append(b)
+        else:
+            t = max(floor, (tps[-1] + risk) if tps else floor)
+            tps.append(t); basis.append(f"{round((t - entry) / risk, 1)}R target (no resistance at ≥{need}R)")
+    if dropped:
+        notes.append(f"{len(dropped)} Analyze target(s) under 1R ignored (too close to be worth the risk)")
+    plan["tps"], plan["basis"] = tps, basis
+    plan["adj"] = notes
     plan["rr"] = [round((t - entry) / risk, 2) for t in plan["tps"]]
     plan["sl_pct"] = round((plan["sl"] / entry - 1) * 100, 2)
     plan["tp_pct"] = [round((t / entry - 1) * 100, 2) for t in plan["tps"]]
@@ -790,7 +817,8 @@ class VolumeSpikeScanner:
                     pl["sl"] = fl_low * 0.995
             with self.tracker.lock:
                 if pl:
-                    a["plan"] = finish_plan(pl, entry)
+                    cc = self.hist.get((a["symbol"], a["tf"])) if a["tf"] != "15m" else self.m15.get(a["symbol"])
+                    a["plan"] = finish_plan(pl, entry, _atr(cc) if cc else None)
                     a["plan"]["late"] = (time.time() - a["t"]) > PLAN_LATE
                     a["pstate"] = {"status": "open", "hits": 0, "mfe": 0, "mae": 0, "checked": 0}
                 else:
@@ -813,6 +841,10 @@ class VolumeSpikeScanner:
         with self.tracker.lock:
             todo = [a for a in self.tracker.alerts if a.get("dir") == "long"]
         for a in todo:
+            if a.get("plan") and "adj" not in a["plan"] and a.get("pstate", {}).get("hits", 0) == 0 \
+                    and a["key"] not in self.plan_busy:
+                a.pop("plan", None); a.pop("pstate", None)          # re-plan with the RR rules (v72)
+                self.tracker.dirty = True
             if "pstate" not in a:
                 if now - a["t"] <= PLAN_MAX_AGE and a["key"] not in self.plan_busy:
                     self.plan_busy.add(a["key"]); self.plan_q.append(a)
@@ -993,12 +1025,15 @@ class VolumeSpikeScanner:
             time.sleep(max(20, SCAN_EVERY - (time.time() - t0)))
 
     def payload(self, path=""):
+        if path and "ver" in path:
+            return {"build": BUILD}
         if path and "hist" in path:          # full alert history for the forward-test analysis
             return {"hist": self.tracker.compact(), "now": time.time(), "long_only": LONG_ONLY}
         with self.lock:
             snap = dict(self.snap)
         snap["alerts"] = self.tracker.recent()
         snap["stats"] = self.tracker.stats()
+        snap["build"] = BUILD
         snap["store"] = "upstash" if _redis() else "local file (resets on restart)"
         snap["cfg"] = {"spike_ratio": SPIKE_RATIO, "alert_min_score": ALERT_MIN_SCORE,
                        "min_turnover": MIN_TURNOVER, "scan_every": SCAN_EVERY, "telegram": TELEGRAM_ON,
