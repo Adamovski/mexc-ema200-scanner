@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# build: v73 — low-upside filter on TP1 (1h 4%, 4h 10%, 1D 15%) — auto-deploy trigger
+# build: v73b — old pre-RR-rule plans excluded from forward-test stats — auto-deploy trigger
 """
 MEXC 200-EMA "cross & retest" LIVE DASHBOARD (4h chart)
 =======================================================
@@ -6218,7 +6218,7 @@ function coilSetupCell(h, side){
 }
 
 // ── helpers: elapsed time + new-version banner ─────────────────────────────
-const VS_BUILD='v73';
+const VS_BUILD='v73b';
 const VS_MIN_TP1={'15m':0,'1h':4,'4h':10,'1d':15};
 function durTxt(sec){ sec=Math.max(0,Math.round(sec)); const d=Math.floor(sec/86400), h=Math.floor(sec%86400/3600), m=Math.floor(sec%3600/60);
   return d?(d+'d '+h+'h'):h?(h+'h '+m+'m'):(m+'m'); }
@@ -6390,7 +6390,7 @@ async function loadFtHist(force){
 }
 function ftSet(k,v){ FTF[k]=v; renderFt(); }
 function ftChip(k,v,label,extra){ const on=FTF[k]===v; return `<span onclick="ftSet('${k}',${typeof v==='string'?`'${v}'`:v})" style="cursor:pointer;padding:4px 10px;border-radius:8px;font-size:12px;font-weight:${on?700:500};border:1px solid ${on?'var(--accent)':'var(--line)'};background:${on?'rgba(63,185,80,.18)':'rgba(21,28,41,.7)'};white-space:nowrap">${label}${extra?' <span class="rr">'+extra+'</span>':''}</span>`; }
-function ftVal(a){ if(FTF.h==='R'){ const st=a.pstate; if(a.plan&&a.plan.late) return null; return (st&&plClosed(st)&&typeof st.r==='number')?st.r:null; } const v=a.out&&a.out[FTF.h]; return (typeof v==='number')?v:null; }
+function ftVal(a){ if(FTF.h==='R'){ const st=a.pstate; if(a.plan&&(a.plan.late||!a.plan.adj)) return null; return (st&&plClosed(st)&&typeof st.r==='number')?st.r:null; } const v=a.out&&a.out[FTF.h]; return (typeof v==='number')?v:null; }
 const ftU=()=>FTF.h==='R'?'R':'%';
 function ftStat(arr){ const v=arr.map(ftVal).filter(x=>x!=null); if(!v.length) return {n:0,pend:arr.length};
   const w=v.filter(x=>x>0).length, avg=v.reduce((s,x)=>s+x,0)/v.length, sv=[...v].sort((a,b)=>a-b), med=sv[Math.floor(sv.length/2)];
@@ -6453,7 +6453,7 @@ function renderFt(){
     [['Alerts',all.length,''],['Graded after '+hz,S.n,S.pend?S.pend+' pending':''],['Win rate',S.n?S.win+'%':'—',FTF.h==='R'?'closed in profit':'price higher after '+hz],['Avg '+(FTF.h==='R'?'R per trade':'move'),S.n?(S.avg>0?'+':'')+S.avg.toFixed(2)+U:'—',FTF.h==='R'?'expectancy':'per alert'],['Median',S.n?(S.med>0?'+':'')+S.med.toFixed(2)+U:'—','typical alert']]
     .map(([k,v,s])=>`<div style="border:1px solid var(--line);border-radius:10px;padding:8px 12px;min-width:110px"><div class="muted" style="font-size:11px">${k}</div><div style="font-size:18px;font-weight:700">${v}</div><div class="muted" style="font-size:11px">${s}</div></div>`).join('')+`</div>`;
   // trade-plan ladder stats
-  const planned=all.filter(a=>a.plan&&!a.plan.late&&a.pstate&&a.pstate.status!=='invalid');
+  const planned=all.filter(a=>a.plan&&!a.plan.late&&a.plan.adj&&a.pstate&&a.pstate.status!=='invalid');
   if(planned.length){ const cl=planned.filter(a=>plClosed(a.pstate)), n=cl.length||1;
     const pct=f=>Math.round(100*cl.filter(f).length/n);
     const avgRR=i=>{ const v=planned.map(a=>a.plan.rr[i]).filter(x=>x!=null); return v.length?(v.reduce((s,x)=>s+x,0)/v.length).toFixed(2):'—'; };
@@ -6525,7 +6525,7 @@ function renderFeed(){
       return `<td style="${hit?'background:rgba(63,185,80,.22);':low?'background:rgba(210,153,34,.16);':''}white-space:nowrap" data-tip="${esc('TP'+(i+1)+' '+fmtNum(pl.tps[i])+' ('+(pl.tp_pct[i]>0?'+':'')+pl.tp_pct[i]+'%, '+pl.rr[i]+'R from entry). '+(pl.basis[i]||'')+(hit?' · HIT':'')+(low?' · LOW UPSIDE: TP1 is under the '+a.min_tp1+'% minimum for '+a.tf+' alerts, so this alert is marked ✗ Skip (still tracked so the forward test can check the rule).':''))}">${hit?'✓ ':''}${fmtNum(pl.tps[i])} <span class="rr">+${pl.tp_pct[i].toFixed(1)}%</span>${rr(pl.rr[i])}${low?' <span class="rr" style="color:var(--warn)">low</span>':''}</td>`; };
     const stopTxt=pl?`<td style="white-space:nowrap;${st&&st.status==='sl'?'background:rgba(248,81,73,.22);':''}" data-tip="${esc('Stop '+fmtNum(pl.sl)+' ('+pl.sl_pct+'%). '+(pl.sl_basis||'')+' Moves to entry (break-even) once TP1 is hit. Plan source: '+(pl.src==='analyze'?'Analyze card (4h/1D structure for this coin)':'fallback: swing low + ATR, targets at 1R/2R/3R'))}">${fmtNum(pl.sl)} <span class="rr">${pl.sl_pct.toFixed(1)}%</span>${st&&st.hits>=1&&!plClosed(st)?'<span class="rr" style="color:var(--accent)">→ BE</span>':''}</td>`:'<td class="muted">—</td>';
     const stInfo=!st?['⏳ planning…','var(--dim)']:(PL_ST[st.status]||[st.status,'var(--dim)']);
-    const stTip=(st?('Best move since entry +'+(st.mfe||0)+'% · worst '+(st.mae||0)+'%'+(st.why?' · '+st.why:'')):'Fetching the Analyze plan for this coin (runs at the end of each scan)')+(pl&&pl.late?' · LATE PLAN: levels were drawn after the alert, so this trade is tracked but left out of the forward-test stats.':'');
+    const stTip=(st?('Best move since entry +'+(st.mfe||0)+'% · worst '+(st.mae||0)+'%'+(st.why?' · '+st.why:'')):'Fetching the Analyze plan for this coin (runs at the end of each scan)')+(pl&&pl.late?' · LATE PLAN: levels were drawn after the alert, so this trade is tracked but left out of the forward-test stats.':'')+(pl&&!pl.adj?' · OLD PLAN: made before the risk/reward rules (TP1 could be under 1R), so it is excluded from the forward-test stats.':'');
     const R=st&&st.r!=null?`<b style="color:${st.r>0?'var(--accent)':st.r<0?'var(--red)':'var(--dim)'}">${st.r>0?'+':''}${st.r.toFixed(2)}R</b>`:(st&&st.open_r!=null?`<span class="muted" data-tip="Unrealised, at the current price">${st.open_r>0?'+':''}${st.open_r.toFixed(2)}R open</span>`:'—');
     const rec=a.rec?({long:'✅',watch_long:'👀',skip:'✗',wait:'⏳'})[a.rec]||'':'';
     return `<tr><td class="muted" style="white-space:nowrap" data-tip="${esc('Alert fired '+agoTxt(a.t)+(st&&st.closed_t?' · closed after '+durTxt(st.closed_t-a.t):''))}">${new Date(a.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}<br><span class="rr">${st&&st.closed_t?'closed in '+durTxt(st.closed_t-a.t):agoTxt(a.t)}</span></td>`+
@@ -6533,7 +6533,7 @@ function renderFeed(){
       `<td>${a.ratio.toFixed(1)}×${a.mode==='live'?'<span class="rr">live</span>':''}</td><td class="score" data-tip="${esc((a.why||[]).join(' · '))}">${a.score} <span class="rr">${rec}</span></td>`+
       `<td>${fmtNum(a.price)}</td>${stopTxt}${tpCell(0)}${tpCell(1)}${tpCell(2)}`+
       `<td data-tip="${esc(stTip)}">${st&&st.now_pct!=null?pc(st.now_pct):'—'}</td>`+
-      `<td style="white-space:nowrap;color:${stInfo[1]};font-weight:650" data-tip="${esc(stTip)}">${stInfo[0]}${pl&&pl.late?' <span class="rr">late</span>':''}</td><td style="white-space:nowrap">${R}</td>`+
+      `<td style="white-space:nowrap;color:${stInfo[1]};font-weight:650" data-tip="${esc(stTip)}">${stInfo[0]}${pl&&pl.late?' <span class="rr">late</span>':''}${pl&&!pl.adj?' <span class="rr">old rules</span>':''}</td><td style="white-space:nowrap">${R}</td>`+
       `<td>${oc(a.out['1h'])}</td><td>${oc(a.out['4h'])}</td><td>${oc(a.out['24h'])}</td></tr>`; }).join('');
   fd.innerHTML=`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">${chips}</div>`+(!al.length?'<div class="muted" style="font-size:12px">No alerts here yet.</div>':
     `<table><thead><tr><th>Time</th><th>Coin</th><th>TF</th><th>Vol</th><th data-tip="Alert score, with the recommendation at the time">Score</th><th data-tip="Price when the alert fired">Entry</th><th data-tip="Stop loss from the Analyze card (below support, ATR-buffered). Moves to break-even after TP1.">Stop</th><th data-tip="Target 1 with % from entry and reward:risk. A third of the position comes off here.">TP1</th><th>TP2</th><th>TP3</th><th data-tip="Current price vs entry">Now</th><th>Status</th><th data-tip="Result in R (multiples of the risk). 1/3 off at each target, stop to break-even after TP1. Closed = bold; open = unrealised.">Result</th><th>+1h</th><th>+4h</th><th>+24h</th></tr></thead><tbody>${rows}</tbody></table>`);

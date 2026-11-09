@@ -40,7 +40,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-BUILD = "v73"              # bump on every deploy: open pages compare it and offer a reload
+BUILD = "v73b"              # bump on every deploy: open pages compare it and offer a reload
 MIN_TURNOVER = float(os.environ.get("VS_MIN_TURNOVER", 5_000_000))
 SPIKE_RATIO = float(os.environ.get("VS_SPIKE_RATIO", 2.5))
 ALERT_MIN_SCORE = int(os.environ.get("VS_ALERT_SCORE", 45))
