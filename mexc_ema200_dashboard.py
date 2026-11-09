@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# build: v70b — liquidation-flush longs + Binance Alpha tag on My calls / Volume spikes — auto-deploy trigger
+# build: v71 — Analyze card shows volume & flow context (spikes, flush, spot, OI, verdict) — auto-deploy trigger
 """
 MEXC 200-EMA "cross & retest" LIVE DASHBOARD (4h chart)
 =======================================================
@@ -6524,6 +6524,51 @@ function renderFeed(){
 }
 function feedMatch(a,f){ const st=a.pstate; if(f==='all') return true; if(!st) return f==='open';
   if(f==='open') return !plClosed(st)&&st.status!=='invalid'; if(f==='won') return (st.hits||0)>=1; if(f==='stopped') return st.status==='sl'; if(f==='closed') return plClosed(st); return true; }
+
+// ── Analyze card: volume & flow context from the Volume spikes scanner ─────────
+async function vsAzInject(){
+  const box=document.getElementById('azResult'); if(!box||typeof azLast==='undefined'||!azLast||!azLast.symbol) return;
+  if(!vsData){ try{ const r=await fetch('/spikes',{cache:'no-store'}); vsData=await r.json(); }catch(e){} }
+  const old=document.getElementById('azVolPanel'); if(old) old.remove();
+  const sym=String(azLast.symbol).toUpperCase(), d=vsData||{};
+  const r=(d.rows||[]).find(x=>x.symbol===sym);
+  const el=document.createElement('div'); el.id='azVolPanel';
+  el.style.cssText='border:1px solid var(--line);border-radius:12px;padding:10px 14px;margin:0 0 12px;font-size:12.5px;line-height:1.6';
+  const head='<div style="font-weight:700;margin-bottom:4px">🔊 Volume &amp; flow <span class="muted" style="font-weight:400">(from the Volume spikes scanner, Binance data)</span> '+alphaTag(sym)+'</div>';
+  if(!r){ el.innerHTML=head+`<div class="muted">${!d.rows||!d.updated?'Volume scanner is still on its first pass. Re-run in a few minutes.':'Not in the volume scanner: it only covers Binance USDT perps with 24h volume over $1M.'}</div>`; box.prepend(el); return; }
+  const tfs=['15m','1h','4h','1d'];
+  const chip=t=>{ const m=r.tfs[t]; if(!m) return ''; const v=m.ratio, bg=v>=6?'rgba(63,185,80,.42)':v>=4?'rgba(63,185,80,.30)':v>=2.5?'rgba(63,185,80,.18)':v>=1.5?'rgba(210,153,34,.14)':'rgba(21,28,41,.7)';
+    return `<span data-tip="${esc(t+' volume is '+v.toFixed(2)+'× its 20-candle average'+(m.mode==='live'?' (current candle, projected)':' (last closed candle)')+'. Candle move '+(m.chg>0?'+':'')+m.chg+'%. '+(m.vs_ema!=null?'Price '+(m.vs_ema>=0?'above':'below')+' EMA200 on '+t+' by '+Math.abs(m.vs_ema)+'%.':''))}" style="display:inline-block;padding:3px 9px;border-radius:7px;border:1px solid var(--line);background:${bg};margin:0 4px 4px 0;white-space:nowrap"><b>${t}</b> ${v.toFixed(1)}×${m.mode==='live'?' <span class="rr">live</span>':''}${m.setup==='flush'?' ↺':''}</span>`; };
+  const bt=r.best_tf, m=bt?r.tfs[bt]:null, sp=bt?r.spot[bt]:null;
+  const lines=[];
+  if(m){
+    lines.push(`<b>Strongest spike:</b> ${bt}, ${m.ratio.toFixed(1)}× normal, ${m.setup==='flush'?'<b style="color:var(--accent)">liquidation flush ↺</b> (dropped '+m.low_pct+'%, OI '+((m.flush||{}).oi)+'%'+((m.flush||{}).reclaimed?', reclaimed':', not reclaimed yet')+')':m.dir==='long'?'<b style="color:var(--accent)">buyers in control</b> (candle '+(m.chg>0?'+':'')+m.chg+'%)':m.dir==='short'?'<b style="color:var(--red)">sellers in control</b> (candle '+m.chg+'%)':'<b>absorption</b> (big volume, flat price)'}.`);
+    lines.push(`<b>Spot:</b> ${sp==null?(r.has_spot===false?'no Binance spot market':'n/a'):sp.toFixed(1)+'× '+(sp>=m.ratio?'✅ leading (real buying/selling)':sp>=2?'confirming':'⚠️ weak, mostly leverage')} · <b>OI div:</b> ${r.oi_div||'—'}${r.oi_chg4!=null?' (OI '+(r.oi_chg4>0?'+':'')+r.oi_chg4+'% 4h)':''} · <b>Funding:</b> ${r.funding==null?'—':(r.funding*100).toFixed(4)+'%'}`);
+  } else lines.push('<span class="muted">No volume spike on any timeframe right now: volume is normal.</span>');
+  // combined verdict vs the Analyze plan
+  const azSideNow=(typeof azSide!=='undefined'&&azSide)||azLast.side||azLast.auto_side;
+  const rc=r.rec&&r.rec.call;
+  let verdict='', col='var(--dim)';
+  if(!m){ verdict='Volume is quiet: the Analyze plan stands on price structure alone, with no volume confirmation yet.'; }
+  else if(azSideNow==='long'){
+    if(rc==='long'){ verdict='✅ Volume CONFIRMS the long: the spike checklist agrees with this plan.'; col='var(--accent)'; }
+    else if(rc==='watch_long'){ verdict='👀 Volume is supportive but not clean yet: '+((r.rec.why||[]).slice(1).join(' · ')||'see reasons'); col='var(--warn)'; }
+    else if(m.dir==='short'&&m.setup!=='flush'||r.oi_div==='fake pump'){ verdict='⚠️ Volume DISAGREES with the long: '+(r.oi_div==='fake pump'?'price up but OI falling (short covering, tends to fade)':'the volume spike is on selling, not a flush'); col='var(--red)'; }
+    else { verdict='✗ Volume checklist says skip: '+((r.rec&&r.rec.why)||[]).join(' · '); col='var(--warn)'; }
+  } else {
+    verdict=(m.setup==='flush'?'↺ Volume shows a liquidation flush: that is a LONG setup, against this '+(azSideNow||'')+' read.':m.dir==='long'?'⚠️ Volume shows buyers in control, against a '+(azSideNow||'')+' read.':'Volume leans the same way as this read.'); col=m.setup==='flush'||m.dir==='long'?'var(--warn)':'var(--dim)';
+  }
+  lines.push(`<div style="margin-top:4px;color:${col};font-weight:650">${verdict}</div>`);
+  if(r.rec&&r.rec.why) lines.push(`<div class="muted">Volume-tab checklist: ${(VS_REC[rc]||[rc])[0]}${r.rec.setup==='flush'?' ↺':''}. ${esc((m&&m.why||[]).join(' · '))}</div>`);
+  // flush stop vs analyze stop
+  if(m&&m.setup==='flush'&&m.lo){ const azStop=azLast.sl_tight; lines.push(`<div><b>Flush stop:</b> just under the flush low ${fmtNum(m.lo*0.995)} (flush low ${fmtNum(m.lo)}).${azStop?(' Analyze tight stop: '+fmtNum(azStop)+(azStop>m.lo?' ⚠️ which sits ABOVE the flush low, so a re-test of the low would stop you out. Use the flush stop.':' (already below the flush low, fine).')):''}</div>`); }
+  // recent alerts for this coin
+  const hist=(d.alerts||[]).filter(a=>a.symbol===sym).slice(0,3);
+  if(hist.length) lines.push('<div style="margin-top:4px"><b>Recent spike alerts:</b> '+hist.map(a=>{ const st=a.pstate||{}; return `${new Date(a.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})} ${a.tf}${a.setup==='flush'?' ↺':''} ${a.ratio.toFixed(1)}× @ ${fmtNum(a.price)} → ${(PL_ST[st.status]||['…'])[0]}${st.r!=null?' '+(st.r>0?'+':'')+st.r+'R':st.open_r!=null?' ('+(st.open_r>0?'+':'')+st.open_r+'R open)':''}`; }).join(' · ')+'</div>');
+  el.innerHTML=head+`<div style="margin-bottom:4px">${tfs.map(chip).join('')}</div>`+lines.join('');
+  box.prepend(el);
+}
+if(typeof renderAz==='function'){ const _vsOrigRenderAz=renderAz; renderAz=function(){ const out=_vsOrigRenderAz.apply(this,arguments); try{ vsAzInject(); }catch(e){} return out; }; }
 async function poll(){
   // Lean build: only the three live tabs (Analyze, Binance Alpha, My calls) are refreshed.
   try{
