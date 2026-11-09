@@ -40,7 +40,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-BUILD = "v73b"              # bump on every deploy: open pages compare it and offer a reload
+BUILD = "v74"              # bump on every deploy: open pages compare it and offer a reload
 MIN_TURNOVER = float(os.environ.get("VS_MIN_TURNOVER", 5_000_000))
 SPIKE_RATIO = float(os.environ.get("VS_SPIKE_RATIO", 2.5))
 ALERT_MIN_SCORE = int(os.environ.get("VS_ALERT_SCORE", 45))
@@ -64,7 +64,7 @@ HIST_CANDLES = 260          # 1h/4h/1d: EMA200 + baseline (weight 2 per call)
 M15_CANDLES = 400           # 15m: EMA200 + covers the forming 1D candle (weight 2)
 LIVE_MIN_FRAC = 0.20
 HORIZONS = [("1h", 3600), ("4h", 14400), ("24h", 86400)]
-DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "volume_spikes_alerts.json")
+DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "volume_spikes_alerts_v74.json")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -434,7 +434,7 @@ def recommend(r, tf, btc):
 # ─────────────────────────────────────────────────────────────────────────────
 # Alert log + forward test
 # ─────────────────────────────────────────────────────────────────────────────
-REDIS_KEY = "vspike_alerts"
+REDIS_KEY = "vspike_alerts_v74"      # v74: fresh log (older alerts used older plan rules)
 
 
 def _redis():
@@ -630,6 +630,7 @@ def plan_from_candles(c, entry):
             "src": "fallback"}
 
 
+PLAN_TF = {"15m": "4h", "1h": "4h", "4h": "4h", "1d": "1d"}   # low-TF spikes = early signal, trade the higher-TF move
 MIN_TP1_PCT = {"15m": 0.0, "1h": 4.0, "4h": 10.0, "1d": 15.0}   # TP1 must be at least this far (manual trading)
 MAX_STOP_ATR = 3.0      # stop no further than 3×ATR …
 MAX_STOP_PCT = 0.15     # … and no further than 15% from entry
@@ -804,7 +805,7 @@ class VolumeSpikeScanner:
             pl = None
             if self.planner:
                 try:
-                    pl = plan_from_analyze(self.planner(a["symbol"], a["tf"]), entry)
+                    pl = plan_from_analyze(self.planner(a["symbol"], PLAN_TF.get(a["tf"], a["tf"])), entry)
                 except Exception as e:
                     print(f"[vspike] analyze failed for {a['symbol']}: {e}", flush=True)
             fl_low = a.get("flush_low")
@@ -812,23 +813,25 @@ class VolumeSpikeScanner:
                 pl["sl"] = fl_low * 0.995
                 pl["sl_basis"] = "Just under the liquidation-flush low (" + format(fl_low, ".6g") + "): if price loses it, the flush was not the bottom."
             if not pl:
-                c = self.hist.get((a["symbol"], a["tf"])) if a["tf"] != "15m" else self.m15.get(a["symbol"])
+                c = self.hist.get((a["symbol"], PLAN_TF.get(a["tf"], a["tf"])))
                 pl = plan_from_candles(c, entry)
                 if pl and fl_low and pl["sl"] > fl_low * 0.997:
                     pl["sl"] = fl_low * 0.995
             with self.tracker.lock:
                 if pl:
-                    cc = self.hist.get((a["symbol"], a["tf"])) if a["tf"] != "15m" else self.m15.get(a["symbol"])
+                    ptf = PLAN_TF.get(a["tf"], a["tf"])
+                    cc = self.hist.get((a["symbol"], ptf))
                     a["plan"] = finish_plan(pl, entry, _atr(cc) if cc else None)
+                    a["plan"]["tf"] = ptf
                     a["plan"]["late"] = (time.time() - a["t"]) > PLAN_LATE
-                    need = MIN_TP1_PCT.get(a["tf"], 0.0)
+                    need = MIN_TP1_PCT.get(ptf, 0.0)
                     a["upside"] = a["plan"]["tp_pct"][0]
                     a["low_upside"] = a["upside"] < need
                     a["min_tp1"] = need
                     if a["low_upside"]:
                         a["rec_orig"] = a.get("rec")
                         a["rec"] = "skip"
-                        a["why"] = (a.get("why") or []) + [f"− low upside: TP1 only +{a['upside']}% (needs ≥{need:g}% on {a['tf']})"]
+                        a["why"] = (a.get("why") or []) + [f"− low upside: TP1 only +{a['upside']}% on the {ptf} plan (needs ≥{need:g}%)"]
                     a["pstate"] = {"status": "open", "hits": 0, "mfe": 0, "mae": 0, "checked": 0}
                 else:
                     a["plan"] = None
@@ -850,12 +853,21 @@ class VolumeSpikeScanner:
         with self.tracker.lock:
             todo = [a for a in self.tracker.alerts if a.get("dir") == "long"]
         for a in todo:
+            ptf_want = PLAN_TF.get(a.get("tf"), a.get("tf"))
+            if a.get("plan") and a["plan"].get("adj") is not None and a["plan"].get("tf", a["tf"]) != ptf_want \
+                    and a.get("pstate", {}).get("hits", 0) == 0 and a["key"] not in self.plan_busy:
+                if a.get("rec_orig"):
+                    a["rec"] = a.pop("rec_orig")
+                a["why"] = [w for w in (a.get("why") or []) if not w.startswith("− low upside")]
+                for k in ("plan", "pstate", "upside", "low_upside", "min_tp1"):
+                    a.pop(k, None)
+                self.tracker.dirty = True                            # re-plan on the higher timeframe (v74)
             if a.get("plan") and "adj" not in a["plan"] and a.get("pstate", {}).get("hits", 0) == 0 \
                     and a["key"] not in self.plan_busy:
                 a.pop("plan", None); a.pop("pstate", None)          # re-plan with the RR rules (v72)
                 self.tracker.dirty = True
             if a.get("plan") and "low_upside" not in a and a["plan"].get("tp_pct"):
-                need = MIN_TP1_PCT.get(a["tf"], 0.0)
+                need = MIN_TP1_PCT.get(a["plan"].get("tf", ptf_want), 0.0)
                 a["upside"] = a["plan"]["tp_pct"][0]; a["min_tp1"] = need
                 a["low_upside"] = a["upside"] < need
                 if a["low_upside"] and a.get("rec") in ("long", "watch_long"):
@@ -1017,8 +1029,9 @@ class VolumeSpikeScanner:
             for a in new:
                 if a["symbol"] == r["symbol"]:
                     a["oi_div"] = r.get("oi_div")
-                    if r["rec"] and a["tf"] == best[0]:
-                        a["rec"] = r["rec"]["call"]
+                    rc = recommend(r, a["tf"], btc)          # every alert gets the call for ITS timeframe
+                    a["rec"] = rc["call"] if rc else None
+                    a["rec_why"] = (rc or {}).get("why")
             r["max_ratio"] = max(m["ratio"] for m in r["tfs"].values())
             r["n_spiking"] = sum(1 for m in r["tfs"].values() if m["ratio"] >= SPIKE_RATIO)
 

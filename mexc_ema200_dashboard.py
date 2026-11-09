@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# build: v73c — pre-RR plans excluded from stats; Alpha tab OI/volume labels say Binance — auto-deploy trigger
+# build: v74 — low-TF spikes planned on the 4h chart; feed shows recommended alerts only; fresh alert log — auto-deploy trigger
 """
 MEXC 200-EMA "cross & retest" LIVE DASHBOARD (4h chart)
 =======================================================
@@ -3014,7 +3014,7 @@ PAGE = """<!doctype html>
 <b>Direction</b>: did price go up (LONG), down (SHORT) or nowhere (ABSORB) on the spiking candle?<br>
 <b>🟢 FLUSH ↺</b>: a long setup from a DUMP. Price crashed on huge volume while open interest fell, meaning leveraged longs were liquidated (force-closed), not new shorts opening. When price then reclaims the upper half of that candle (long lower wick), the selling is usually exhausted and a bounce is likely. The stop goes just under the flush low.<br>
 <b>OI div</b>: are new futures positions backing the move (<i>real up</i>), or is it short covering that tends to fade (<i>fake pump</i>)?<br>
-<b>Rec</b>: the checklist verdict for a long. ✅ = strong and no red flags, 👀 = watch, ✗ = skip. Hover for the reasons. <b>✗ Low upside</b> = the first target (TP1) is too close to be worth a manual trade: it must be at least <b>4%</b> on 1h, <b>10%</b> on 4h and <b>15%</b> on 1D alerts.<br>
+<b>Rec</b>: the checklist verdict for a long. ✅ = strong and no red flags, 👀 = watch, ✗ = skip. Hover for the reasons. <b>✗ Low upside</b> = the first target (TP1) is too close to be worth a manual trade. 15m and 1h spikes are treated as an <b>early signal for a 4h move</b>: their stop and targets come from the 4h chart and TP1 must be at least <b>10%</b>. 4h spikes also need <b>10%</b>, daily spikes <b>15%</b>.<br>
 <b>Spot vol</b>: the same volume-vs-normal on the spot market. ✅ means spot is leading, so real buyers, not just leverage.<br>
 Hover any cell to see what it means for that coin. Click ⚲ for the full Analyze card.</div></details></div>
 <div class="wrap" style="overflow-x:auto">
@@ -6218,7 +6218,7 @@ function coilSetupCell(h, side){
 }
 
 // ── helpers: elapsed time + new-version banner ─────────────────────────────
-const VS_BUILD='v73b';
+const VS_BUILD='v74';
 const VS_MIN_TP1={'15m':0,'1h':4,'4h':10,'1d':15};
 function durTxt(sec){ sec=Math.max(0,Math.round(sec)); const d=Math.floor(sec/86400), h=Math.floor(sec%86400/3600), m=Math.floor(sec%3600/60);
   return d?(d+'d '+h+'h'):h?(h+'h '+m+'m'):(m+'m'); }
@@ -6507,12 +6507,14 @@ function renderFt(){
 }
 
 // ── Alert feed with trade plans ───────────────────────────────────────────
-let FEEDF='all';
+let FEEDF='all', FEED_SKIPPED=false;
+const feedRecOk=a=>a.rec==='long'||a.rec==='watch_long';
 const PL_ST={open:['● Open','var(--blue)'],tp1:['TP1 ✓','var(--accent)'],tp2:['TP2 ✓✓','var(--accent)'],tp3:['🏆 TP3','var(--accent)'],sl:['✗ Stop','var(--red)'],be:['⚖ Break-even','var(--dim)'],expired:['⌛ Expired','var(--dim)'],invalid:['— no plan','var(--dim2)']};
 function plClosed(st){ return st&&['tp3','sl','be','expired'].includes(st.status); }
 function renderFeed(){
   const fd=document.getElementById('vsFeed'); if(!fd||!vsData) return;
-  let al=(vsData.alerts||[]).filter(a=>a.dir==='long');
+  const allLong=(vsData.alerts||[]).filter(a=>a.dir==='long'); const nSkipped=allLong.filter(a=>!feedRecOk(a)).length;
+  let al=FEED_SKIPPED?allLong:allLong.filter(feedRecOk);
   const cnt=f=>al.filter(a=>feedMatch(a,f)).length;
   const chips=[['all','All'],['open','Open'],['won','Hit a target'],['stopped','Stopped out'],['closed','Closed']].map(([k,l])=>`<span onclick="FEEDF='${k}';renderFeed()" style="cursor:pointer;padding:4px 10px;border-radius:8px;font-size:12px;border:1px solid ${FEEDF===k?'var(--accent)':'var(--line)'};background:${FEEDF===k?'rgba(63,185,80,.18)':'rgba(21,28,41,.7)'};font-weight:${FEEDF===k?700:500}">${l} <span class="rr">${cnt(k)}</span></span>`).join('');
   al=al.filter(a=>feedMatch(a,FEEDF)).slice(0,60);
@@ -6522,20 +6524,21 @@ function renderFeed(){
   const rows=al.map(a=>{
     const pl=a.plan, st=a.pstate||null;
     const tpCell=i=>{ if(!pl) return '<td class="muted">—</td>'; const hit=st&&st.hits>i; const low=i===0&&a.low_upside;
-      return `<td style="${hit?'background:rgba(63,185,80,.22);':low?'background:rgba(210,153,34,.16);':''}white-space:nowrap" data-tip="${esc('TP'+(i+1)+' '+fmtNum(pl.tps[i])+' ('+(pl.tp_pct[i]>0?'+':'')+pl.tp_pct[i]+'%, '+pl.rr[i]+'R from entry). '+(pl.basis[i]||'')+(hit?' · HIT':'')+(low?' · LOW UPSIDE: TP1 is under the '+a.min_tp1+'% minimum for '+a.tf+' alerts, so this alert is marked ✗ Skip (still tracked so the forward test can check the rule).':''))}">${hit?'✓ ':''}${fmtNum(pl.tps[i])} <span class="rr">+${pl.tp_pct[i].toFixed(1)}%</span>${rr(pl.rr[i])}${low?' <span class="rr" style="color:var(--warn)">low</span>':''}</td>`; };
+      return `<td style="${hit?'background:rgba(63,185,80,.22);':low?'background:rgba(210,153,34,.16);':''}white-space:nowrap" data-tip="${esc('TP'+(i+1)+' '+fmtNum(pl.tps[i])+' ('+(pl.tp_pct[i]>0?'+':'')+pl.tp_pct[i]+'%, '+pl.rr[i]+'R from entry). '+(pl.basis[i]||'')+(hit?' · HIT':'')+(low?' · LOW UPSIDE: TP1 is under the '+a.min_tp1+'% minimum for a '+((pl&&pl.tf)||a.tf)+' trade, so this alert is marked ✗ Skip (still tracked so the forward test can check the rule).':''))}">${hit?'✓ ':''}${fmtNum(pl.tps[i])} <span class="rr">+${pl.tp_pct[i].toFixed(1)}%</span>${rr(pl.rr[i])}${low?' <span class="rr" style="color:var(--warn)">low</span>':''}</td>`; };
     const stopTxt=pl?`<td style="white-space:nowrap;${st&&st.status==='sl'?'background:rgba(248,81,73,.22);':''}" data-tip="${esc('Stop '+fmtNum(pl.sl)+' ('+pl.sl_pct+'%). '+(pl.sl_basis||'')+' Moves to entry (break-even) once TP1 is hit. Plan source: '+(pl.src==='analyze'?'Analyze card (4h/1D structure for this coin)':'fallback: swing low + ATR, targets at 1R/2R/3R'))}">${fmtNum(pl.sl)} <span class="rr">${pl.sl_pct.toFixed(1)}%</span>${st&&st.hits>=1&&!plClosed(st)?'<span class="rr" style="color:var(--accent)">→ BE</span>':''}</td>`:'<td class="muted">—</td>';
     const stInfo=!st?['⏳ planning…','var(--dim)']:(PL_ST[st.status]||[st.status,'var(--dim)']);
     const stTip=(st?('Best move since entry +'+(st.mfe||0)+'% · worst '+(st.mae||0)+'%'+(st.why?' · '+st.why:'')):'Fetching the Analyze plan for this coin (runs at the end of each scan)')+(pl&&pl.late?' · LATE PLAN: levels were drawn after the alert, so this trade is tracked but left out of the forward-test stats.':'')+(pl&&!pl.adj?' · OLD PLAN: made before the risk/reward rules (TP1 could be under 1R), so it is excluded from the forward-test stats.':'');
     const R=st&&st.r!=null?`<b style="color:${st.r>0?'var(--accent)':st.r<0?'var(--red)':'var(--dim)'}">${st.r>0?'+':''}${st.r.toFixed(2)}R</b>`:(st&&st.open_r!=null?`<span class="muted" data-tip="Unrealised, at the current price">${st.open_r>0?'+':''}${st.open_r.toFixed(2)}R open</span>`:'—');
-    const rec=a.rec?({long:'✅',watch_long:'👀',skip:'✗',wait:'⏳'})[a.rec]||'':'';
+    const rec=a.rec?({long:'✅ Long',watch_long:'👀 Watch',skip:(a.low_upside?'✗ low upside':'✗ Skip'),wait:'⏳ Wait'})[a.rec]||'':'';
     return `<tr><td class="muted" style="white-space:nowrap" data-tip="${esc('Alert fired '+agoTxt(a.t)+(st&&st.closed_t?' · closed after '+durTxt(st.closed_t-a.t):''))}">${new Date(a.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}<br><span class="rr">${st&&st.closed_t?'closed in '+durTxt(st.closed_t-a.t):agoTxt(a.t)}</span></td>`+
-      `<td class="sym"><div class="symbox">${esc(a.symbol.replace(/USDT$/,''))}${analyzeBtn(a.symbol)}${alphaTag(a.symbol)}</div></td><td style="white-space:nowrap">${a.tf}${a.setup==='flush'?' <span class="rr" style="color:var(--accent)" data-tip="Liquidation-flush long: bought the dump after leveraged longs were wiped out">↺ flush</span>':''}</td>`+
+      `<td class="sym"><div class="symbox">${esc(a.symbol.replace(/USDT$/,''))}${analyzeBtn(a.symbol)}${alphaTag(a.symbol)}</div></td><td style="white-space:nowrap" data-tip="${esc('Spike seen on the '+a.tf+' chart.'+(pl&&pl.tf&&pl.tf!==a.tf?' Lower-timeframe spikes are treated as an early signal: the stop and targets come from the '+pl.tf+' chart, because only the higher-timeframe move is worth trading.':''))}">${a.tf}${pl&&pl.tf&&pl.tf!==a.tf?' <span class="rr">→ '+pl.tf+' plan</span>':''}${a.setup==='flush'?' <span class="rr" style="color:var(--accent)" data-tip="Liquidation-flush long: bought the dump after leveraged longs were wiped out">↺ flush</span>':''}</td>`+
       `<td>${a.ratio.toFixed(1)}×${a.mode==='live'?'<span class="rr">live</span>':''}</td><td class="score" data-tip="${esc((a.why||[]).join(' · '))}">${a.score} <span class="rr">${rec}</span></td>`+
       `<td>${fmtNum(a.price)}</td>${stopTxt}${tpCell(0)}${tpCell(1)}${tpCell(2)}`+
       `<td data-tip="${esc(stTip)}">${st&&st.now_pct!=null?pc(st.now_pct):'—'}</td>`+
       `<td style="white-space:nowrap;color:${stInfo[1]};font-weight:650" data-tip="${esc(stTip)}">${stInfo[0]}${pl&&pl.late?' <span class="rr">late</span>':''}${pl&&!pl.adj?' <span class="rr">old rules</span>':''}</td><td style="white-space:nowrap">${R}</td>`+
       `<td>${oc(a.out['1h'])}</td><td>${oc(a.out['4h'])}</td><td>${oc(a.out['24h'])}</td></tr>`; }).join('');
-  fd.innerHTML=`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">${chips}</div>`+(!al.length?'<div class="muted" style="font-size:12px">No alerts here yet.</div>':
+  const skipToggle=`<label class="muted" style="font-size:12px;display:flex;gap:5px;align-items:center;margin-left:8px" data-tip="By default the feed only lists alerts the checklist recommends (✅ Long or 👀 Watch long). Skipped ones (weak score, red flags or low upside) are still tracked for the forward test; tick this to see them."><input type="checkbox" ${FEED_SKIPPED?'checked':''} onchange="FEED_SKIPPED=this.checked;renderFeed()"> show skipped (${nSkipped})</label>`;
+  fd.innerHTML=`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;align-items:center">${chips}${skipToggle}</div>`+(!al.length?'<div class="muted" style="font-size:12px">No recommended (✅ / 👀) long alerts here yet. Skipped alerts are hidden: tick "show skipped" to see them.</div>':
     `<table><thead><tr><th>Time</th><th>Coin</th><th>TF</th><th>Vol</th><th data-tip="Alert score, with the recommendation at the time">Score</th><th data-tip="Price when the alert fired">Entry</th><th data-tip="Stop loss from the Analyze card (below support, ATR-buffered). Moves to break-even after TP1.">Stop</th><th data-tip="Target 1 with % from entry and reward:risk. A third of the position comes off here.">TP1</th><th>TP2</th><th>TP3</th><th data-tip="Current price vs entry">Now</th><th>Status</th><th data-tip="Result in R (multiples of the risk). 1/3 off at each target, stop to break-even after TP1. Closed = bold; open = unrealised.">Result</th><th>+1h</th><th>+4h</th><th>+24h</th></tr></thead><tbody>${rows}</tbody></table>`);
 }
 function feedMatch(a,f){ const st=a.pstate; if(f==='all') return true; if(!st) return f==='open';
