@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# build: v70 — volume spikes: liquidation-flush long setup — auto-deploy trigger
+# build: v70b — liquidation-flush longs + Binance Alpha tag on My calls / Volume spikes — auto-deploy trigger
 """
 MEXC 200-EMA "cross & retest" LIVE DASHBOARD (4h chart)
 =======================================================
@@ -5747,7 +5747,7 @@ function renderPerf(){
       const tr=document.createElement('tr');
       tr.innerHTML=`<td style="color:var(--dim);white-space:nowrap">${when}</td>`
         +`<td>${({long:'Long',short:'Short',coil:'Coil',scalp:'Scalp'})[t.board]||t.board} ${regimeBadge(t)}</td>`
-        +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></div></td>`
+        +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a>${alphaTag(t.symbol)}</div></td>`
         +`<td>${sideLabel(t)}</td>`
         +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${reachedHtml(t)}</td>`
         +`<td>${perfStatusHtml(t)}</td>`;
@@ -6165,7 +6165,7 @@ function renderCalls(){
       const prog=st+liveR;
       const tr=document.createElement('tr');
       tr.innerHTML=`<td style="color:var(--dim);white-space:nowrap">${when}</td>`
-        +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></div></td>`
+        +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a>${alphaTag(t.symbol)}</div></td>`
         +`<td>${leanPill(t.side==='short'?'bearish':'bullish')}</td><td>${t.tf||'—'}</td>`
         +`<td>${fmtNum(t.entry)}${t.mode==='market'?'<span class="mkttag" data-tip="Entered at market price when tracked">MKT</span>':''}</td>`+pxNowTd(t)+`<td>${fmtNum(t.stop)}</td><td class="whycell">${tgts(t)}</td>`
         +`<td>${prog}</td>`+delCallTd(t);
@@ -6177,7 +6177,7 @@ function renderCalls(){
       const when=t.closed_ts?new Date(t.closed_ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
       const tr=document.createElement('tr');
       tr.innerHTML=`<td style="color:var(--dim);white-space:nowrap">${when}</td>`
-        +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a></div></td>`
+        +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a>${alphaTag(t.symbol)}</div></td>`
         +`<td>${sideLabel(t)}</td><td>${t.tf||'—'}</td>`
         +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${reachedHtml(t)}</td>`
         +`<td>${perfStatusHtml(t)}</td>`+pxNowTd(t)
@@ -6217,6 +6217,21 @@ function coilSetupCell(h, side){
        + `<span class="rr">${maxR!=null?'R '+(+maxR).toFixed(1):''}</span></td>`;
 }
 
+// ── Binance Alpha badge (used in My calls + Volume spikes) ───────────────────
+let _alphaIdx=null, _alphaSrc=null;
+function alphaInfo(sym){
+  const src=(typeof watch2latest!=='undefined'&&watch2latest&&watch2latest.rows)?watch2latest.rows:null;
+  if(!src) return null;
+  if(src!==_alphaSrc){ _alphaSrc=src; _alphaIdx={}; for(const r of src){ const k=String(r.symbol||((r.token||'')+'USDT')).toUpperCase(); _alphaIdx[k]=r; } }
+  const k=String(sym||'').toUpperCase().replace('_',''); return _alphaIdx[k.endsWith('USDT')?k:k+'USDT']||false;
+}
+function alphaTag(sym){
+  const a=alphaInfo(sym);
+  if(a===null) return '<span class="rr" data-tip="Binance Alpha list still loading">α ?</span>';
+  if(!a) return '<span class="rr" style="opacity:.6" data-tip="Not a Binance Alpha token">not α</span>';
+  const age=a.age_days!=null?(' · listed on Alpha '+Math.round(a.age_days)+' days ago'):'';
+  return `<span class="rr" style="color:#f0b90b;font-weight:700" data-tip="${esc('Binance Alpha token'+(a.on_binance?', and it has graduated to the main Binance exchange':' (Alpha only, not on Binance main yet)')+age)}">🅰️ Alpha${a.on_binance?'→BN':''}</span>`;
+}
 // ── 🔊 Volume spikes tab (Binance data, served by /spikes) ──────────────────
 let vsData=null, vsSort={k:'best_score',d:-1}, vsLast=0;
 const VSF={q:'',tf:'',min:2.5,dir:'long',spot:'',score:0,mx:'',multi:false,band:false,rec:'',oid:''};
@@ -6330,7 +6345,7 @@ function renderSpikes(){
     const fundTip=r.funding==null?'':`Funding ${(r.funding*100).toFixed(4)}% per 8h. ${r.funding>0.0005?'High: longs are paying a lot, the long side is crowded.':r.funding<-0.0005?'Negative: shorts are paying, the short side is crowded (fuel for a squeeze up).':'Normal level, nobody is overcrowded.'}`;
     const fc=r.funding==null?'':(Math.abs(r.funding)>0.0005?'color:var(--warn);font-weight:650':'');
     return `<tr>`+
-      `<td class="sym"><div class="symbox"><a href="${tv}" target="_blank" rel="noopener">${esc(r.base)}</a>${analyzeBtn(r.symbol)}${r.mexc?'<span class="rr" data-tip="Also a MEXC perpetual">mx</span>':''}${r.n_spiking>=2?`<span class="rr" style="color:var(--accent)" data-tip="Spiking on ${r.n_spiking} timeframes">×${r.n_spiking}TF</span>`:''}</div></td>`+
+      `<td class="sym"><div class="symbox"><a href="${tv}" target="_blank" rel="noopener">${esc(r.base)}</a>${analyzeBtn(r.symbol)}${alphaTag(r.symbol)}${r.mexc?'<span class="rr" data-tip="Also a MEXC perpetual">mx</span>':''}${r.n_spiking>=2?`<span class="rr" style="color:var(--accent)" data-tip="Spiking on ${r.n_spiking} timeframes">×${r.n_spiking}TF</span>`:''}</div></td>`+
       `<td class="score" data-tip="${esc(why||'No spike above the threshold right now.')}">${m.score!=null?m.score:'—'}<span class="rr">${m.score!=null?bt:''}</span></td>`+
       `<td data-tip="${esc(m.setup==='flush'?('Liquidation flush: price dumped '+m.low_pct+'% on '+(m.ratio||0).toFixed(1)+'× volume while open interest FELL '+((m.flush||{}).oi)+'%, so leveraged longs were force-closed rather than new shorts opening. '+((m.flush||{}).reclaimed?'Buyers have already pushed it back into the upper half of the candle (long lower wick): the classic bounce long.':'It has NOT reclaimed yet; a long is safer once it closes back above the candle midpoint.')):m.dir==='long'?'The spike candle closed (or is running) clearly UP vs this coin’s typical candle: buyers drove the volume.':m.dir==='short'?'The spike candle went clearly DOWN: sellers drove the volume.':'Big volume but price barely moved: absorption, wait for a break.')}">${m.ratio>=minR?(m.setup==='flush'?'<span style="color:var(--accent);font-weight:650;white-space:nowrap">🟢 FLUSH ↺</span>':vsSigPill(m.dir)):'<span class="muted">—</span>'}</td>`+
       `<td data-tip="${esc(r.oi_div?('Last 4h: price '+(r.px_chg4>0?'+':'')+r.px_chg4+'%, open interest '+(r.oi_chg4>0?'+':'')+r.oi_chg4+'%'):'Only checked for spiking coins')}">${r.oi_div?`<span style="color:${VS_OID[r.oi_div]||'var(--dim)'};white-space:nowrap">${r.oi_div}</span>`:'<span class="muted">—</span>'}</td>`+
@@ -6498,7 +6513,7 @@ function renderFeed(){
     const R=st&&st.r!=null?`<b style="color:${st.r>0?'var(--accent)':st.r<0?'var(--red)':'var(--dim)'}">${st.r>0?'+':''}${st.r.toFixed(2)}R</b>`:(st&&st.open_r!=null?`<span class="muted" data-tip="Unrealised, at the current price">${st.open_r>0?'+':''}${st.open_r.toFixed(2)}R open</span>`:'—');
     const rec=a.rec?({long:'✅',watch_long:'👀',skip:'✗',wait:'⏳'})[a.rec]||'':'';
     return `<tr><td class="muted" style="white-space:nowrap">${new Date(a.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td>`+
-      `<td class="sym"><div class="symbox">${esc(a.symbol.replace(/USDT$/,''))}${analyzeBtn(a.symbol)}</div></td><td style="white-space:nowrap">${a.tf}${a.setup==='flush'?' <span class="rr" style="color:var(--accent)" data-tip="Liquidation-flush long: bought the dump after leveraged longs were wiped out">↺ flush</span>':''}</td>`+
+      `<td class="sym"><div class="symbox">${esc(a.symbol.replace(/USDT$/,''))}${analyzeBtn(a.symbol)}${alphaTag(a.symbol)}</div></td><td style="white-space:nowrap">${a.tf}${a.setup==='flush'?' <span class="rr" style="color:var(--accent)" data-tip="Liquidation-flush long: bought the dump after leveraged longs were wiped out">↺ flush</span>':''}</td>`+
       `<td>${a.ratio.toFixed(1)}×${a.mode==='live'?'<span class="rr">live</span>':''}</td><td class="score" data-tip="${esc((a.why||[]).join(' · '))}">${a.score} <span class="rr">${rec}</span></td>`+
       `<td>${fmtNum(a.price)}</td>${stopTxt}${tpCell(0)}${tpCell(1)}${tpCell(2)}`+
       `<td data-tip="${esc(stTip)}">${st&&st.now_pct!=null?pc(st.now_pct):'—'}</td>`+
