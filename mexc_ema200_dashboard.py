@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# build: v69 — volume spikes: trade plans on alerts (stop + 3 TPs, tracked in R) + clearer explanations — auto-deploy trigger
+# build: v70 — volume spikes: liquidation-flush long setup — auto-deploy trigger
 """
 MEXC 200-EMA "cross & retest" LIVE DASHBOARD (4h chart)
 =======================================================
@@ -2997,7 +2997,7 @@ PAGE = """<!doctype html>
 <div class="wrap" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0;padding-bottom:0">
   <input id="vsSearch" type="text" placeholder="🔍 Search coin…" oninput="VSF.q=this.value;renderSpikes()" style="padding:7px 10px;border-radius:8px;border:1px solid var(--line);background:rgba(21,28,41,.7);color:var(--txt);min-width:150px">
   <select class="wlsel" onchange="VSF.tf=this.value;renderSpikes()"><option value="">Timeframe: any</option><option value="15m">15m</option><option value="1h">1h</option><option value="4h">4h</option><option value="1d">1D</option></select>
-  <select class="wlsel" onchange="VSF.dir=this.value;renderSpikes()"><option value="long" selected>🟢 Longs only</option><option value="">Direction: any</option><option value="absorb">⚪ Absorption (pre-move)</option><option value="short">🔴 Short bias</option></select>
+  <select class="wlsel" onchange="VSF.dir=this.value;renderSpikes()"><option value="long" selected>🟢 Longs (incl. flushes)</option><option value="flush">↺ Liquidation flushes only</option><option value="">Direction: any</option><option value="absorb">⚪ Absorption (pre-move)</option><option value="short">🔴 Short bias</option></select>
   <select class="wlsel" onchange="VSF.spot=this.value;renderSpikes()"><option value="">Spot: any</option><option value="lead">Spot leads futures</option><option value="conf">Spot ≥ 2×</option><option value="futonly">Futures-only</option></select>
   <select class="wlsel" onchange="VSF.rec=this.value;renderSpikes()"><option value="">Rec: any</option><option value="long">✅ Long recommended</option><option value="watch">👀 Watch long or better</option></select>
   <select class="wlsel" onchange="VSF.oid=this.value;renderSpikes()"><option value="">OI div: any</option><option value="real up">real up</option><option value="accumulating">accumulating</option><option value="fake pump">fake pump</option><option value="shorts piling">shorts piling</option><option value="exhausting">exhausting</option></select>
@@ -3012,6 +3012,7 @@ PAGE = """<!doctype html>
 <b>15m / 1h / 4h / 1D</b>: how much volume the coin is trading compared with normal on that chart. <b>1×</b> = normal, <b>5×</b> = five times its usual volume. Normal = the average of the previous 20 candles (15m → last 5 hours, 1h → last 20 hours, 4h → last ~3 days, 1D → last 20 days). Greener = bigger spike. <b>live</b> = the candle is still forming, so its volume so far is scaled up to a full candle.<br>
 <b>Score</b>: 0–100 quality of the strongest spike. The small label (e.g. <i>4h</i>) is which timeframe it's on. <b>Direction, Spot vol, Spike candle move and Trend</b> all describe <u>that</u> timeframe.<br>
 <b>Direction</b>: did price go up (LONG), down (SHORT) or nowhere (ABSORB) on the spiking candle?<br>
+<b>🟢 FLUSH ↺</b>: a long setup from a DUMP. Price crashed on huge volume while open interest fell, meaning leveraged longs were liquidated (force-closed), not new shorts opening. When price then reclaims the upper half of that candle (long lower wick), the selling is usually exhausted and a bounce is likely. The stop goes just under the flush low.<br>
 <b>OI div</b>: are new futures positions backing the move (<i>real up</i>), or is it short covering that tends to fade (<i>fake pump</i>)?<br>
 <b>Rec</b>: the checklist verdict for a long. ✅ = strong and no red flags, 👀 = watch, ✗ = skip. Hover for the reasons.<br>
 <b>Spot vol</b>: the same volume-vs-normal on the spot market. ✅ means spot is leading, so real buyers, not just leverage.<br>
@@ -6248,7 +6249,7 @@ async function loadSpikes(force){
 function vsSortBy(k){ vsSort={k, d:(vsSort.k===k?-vsSort.d:-1)}; renderSpikes(); }
 function vsUsd(m){ if(m==null) return '—'; return m>=1e9?'$'+(m/1e9).toFixed(2)+'B':m>=1e6?'$'+(m/1e6).toFixed(1)+'M':'$'+(m/1e3).toFixed(0)+'K'; }
 function vsPct(v,d){ if(v==null) return '—'; const c=v>0?'var(--accent)':v<0?'var(--red)':'var(--dim)'; return `<span style="color:${c}">${v>0?'+':''}${(+v).toFixed(d==null?2:d)}%</span>`; }
-function vsBestTf(r){ if(VSF.tf) return VSF.tf; if(VSF.dir==='long'){ const lt=Object.keys(r.tfs).filter(t=>r.tfs[t].dir==='long').sort((a,b)=>r.tfs[b].ratio-r.tfs[a].ratio)[0]; if(lt) return lt; } return r.best_tf || Object.keys(r.tfs).sort((a,b)=>r.tfs[b].ratio-r.tfs[a].ratio)[0]; }
+function vsBestTf(r){ if(VSF.tf) return VSF.tf; if(VSF.dir==='flush'){ const ft=Object.keys(r.tfs).filter(t=>r.tfs[t].setup==='flush')[0]; if(ft) return ft; } if(VSF.dir==='long'){ const lt=Object.keys(r.tfs).filter(t=>(r.tfs[t].dir==='long'||r.tfs[t].setup==='flush')).sort((a,b)=>r.tfs[b].ratio-r.tfs[a].ratio)[0]; if(lt) return lt; } return r.best_tf || Object.keys(r.tfs).sort((a,b)=>r.tfs[b].ratio-r.tfs[a].ratio)[0]; }
 const VS_WIN={'15m':'last 5 hours','1h':'last 20 hours','4h':'last ~3.3 days','1d':'last 20 days'};
 function vsRatioCell(m, minR, tf){
   if(!m) return '<td class="muted">—</td>';
@@ -6287,7 +6288,7 @@ function renderSpikes(){
     const mr=vsMaxR(r);
     if(lvl && VSF.min>0 && !(mr>=VSF.min && (!VSF.band || mr<vsNextLevel(VSF.min)))) return false;
     const bt=vsBestTf(r), m=r.tfs[bt]; if(!m) return false;
-    if(VSF.dir && m.dir!==VSF.dir) return false;
+    if(VSF.dir==='long'){ if(!(m.dir==='long'||m.setup==='flush')) return false; } else if(VSF.dir==='flush'){ if(m.setup!=='flush') return false; } else if(VSF.dir && m.dir!==VSF.dir) return false;
     const sp=r.spot[bt];
     if(VSF.spot==='lead' && !(sp!=null && sp>=m.ratio)) return false;
     if(VSF.spot==='conf' && !(sp!=null && sp>=2)) return false;
@@ -6331,9 +6332,9 @@ function renderSpikes(){
     return `<tr>`+
       `<td class="sym"><div class="symbox"><a href="${tv}" target="_blank" rel="noopener">${esc(r.base)}</a>${analyzeBtn(r.symbol)}${r.mexc?'<span class="rr" data-tip="Also a MEXC perpetual">mx</span>':''}${r.n_spiking>=2?`<span class="rr" style="color:var(--accent)" data-tip="Spiking on ${r.n_spiking} timeframes">×${r.n_spiking}TF</span>`:''}</div></td>`+
       `<td class="score" data-tip="${esc(why||'No spike above the threshold right now.')}">${m.score!=null?m.score:'—'}<span class="rr">${m.score!=null?bt:''}</span></td>`+
-      `<td data-tip="${esc(m.dir==='long'?'The spike candle closed (or is running) clearly UP vs this coin’s typical candle: buyers drove the volume.':m.dir==='short'?'The spike candle went clearly DOWN: sellers drove the volume.':'Big volume but price barely moved: absorption, wait for a break.')}">${m.ratio>=minR?vsSigPill(m.dir):'<span class="muted">—</span>'}</td>`+
+      `<td data-tip="${esc(m.setup==='flush'?('Liquidation flush: price dumped '+m.low_pct+'% on '+(m.ratio||0).toFixed(1)+'× volume while open interest FELL '+((m.flush||{}).oi)+'%, so leveraged longs were force-closed rather than new shorts opening. '+((m.flush||{}).reclaimed?'Buyers have already pushed it back into the upper half of the candle (long lower wick): the classic bounce long.':'It has NOT reclaimed yet; a long is safer once it closes back above the candle midpoint.')):m.dir==='long'?'The spike candle closed (or is running) clearly UP vs this coin’s typical candle: buyers drove the volume.':m.dir==='short'?'The spike candle went clearly DOWN: sellers drove the volume.':'Big volume but price barely moved: absorption, wait for a break.')}">${m.ratio>=minR?(m.setup==='flush'?'<span style="color:var(--accent);font-weight:650;white-space:nowrap">🟢 FLUSH ↺</span>':vsSigPill(m.dir)):'<span class="muted">—</span>'}</td>`+
       `<td data-tip="${esc(r.oi_div?('Last 4h: price '+(r.px_chg4>0?'+':'')+r.px_chg4+'%, open interest '+(r.oi_chg4>0?'+':'')+r.oi_chg4+'%'):'Only checked for spiking coins')}">${r.oi_div?`<span style="color:${VS_OID[r.oi_div]||'var(--dim)'};white-space:nowrap">${r.oi_div}</span>`:'<span class="muted">—</span>'}</td>`+
-      `<td data-tip="${esc(r.rec?r.rec.why.join(' · '):'No spike above the threshold')}">${r.rec?`<span style="color:${(VS_REC[r.rec.call]||[])[1]};font-weight:650;white-space:nowrap">${(VS_REC[r.rec.call]||[r.rec.call])[0]}</span>`:'<span class="muted">—</span>'}</td>`+
+      `<td data-tip="${esc(r.rec?r.rec.why.join(' · '):'No spike above the threshold')}">${r.rec?`<span style="color:${(VS_REC[r.rec.call]||[])[1]};font-weight:650;white-space:nowrap">${(VS_REC[r.rec.call]||[r.rec.call])[0]}${r.rec.setup==='flush'?' ↺':''}</span>`:'<span class="muted">—</span>'}</td>`+
       ['15m','1h','4h','1d'].map(t=>vsRatioCell(r.tfs[t],minR,t)).join('')+
       `<td data-tip="${esc(spotTip)}">${spotTxt}</td><td data-tip="${esc(candleTip)}">${vsPct(m.chg)}<span class="rr">${m.chg!=null?bt:''}</span></td><td data-tip="${esc(emaTip)}">${vsPct(m.vs_ema,1)}<span class="rr">${m.vs_ema!=null?bt:''}</span></td>`+
       `<td data-tip="${esc('OI 24h change: '+(r.oi_chg24==null?'n/a':r.oi_chg24+'%')+' · OI = '+(r.oi_pct_vol==null?'?':r.oi_pct_vol)+'% of 24h volume')}">${oi}</td>`+
@@ -6347,7 +6348,7 @@ function renderSpikes(){
 
 // ── Forward-test analysis (Volume spikes tab) ───────────────────────────────
 let ftHist=null, ftLast=0;
-const FTF={tf:'',lvl:0,per:'all',rec:'',h:'R'};
+const FTF={tf:'',lvl:0,per:'all',rec:'',h:'R',setup:''};
 const FT_LVL=[[0,'All'],[2,'≥ 2×'],[2.5,'≥ 2.5×'],[3,'≥ 3×'],[5,'≥ 5×'],[10,'≥ 10×'],[20,'≥ 20×']];
 const FT_BUCKETS=[[2,2.5,'2–2.5×'],[2.5,3,'2.5–3×'],[3,5,'3–5×'],[5,10,'5–10×'],[10,20,'10–20×'],[20,1e9,'20×+']];
 const FT_PER=[['24h','24h',86400],['7d','7 days',604800],['30d','30 days',2592000],['all','All time',0]];
@@ -6376,6 +6377,8 @@ function ftFiltered(skip){
     if(per && a.t<now-per) return false;
     if(skip!=='tf' && FTF.tf && a.tf!==FTF.tf) return false;
     if(skip!=='lvl' && FTF.lvl && !(a.ratio>=FTF.lvl)) return false;
+    if(FTF.setup==='flush' && a.setup!=='flush') return false;
+    if(FTF.setup==='mom' && a.setup==='flush') return false;
     if(FTF.rec==='go' && a.rec!=='long') return false;
     if(FTF.rec==='watch' && !(a.rec==='long'||a.rec==='watch_long')) return false;
     if(FTF.rec==='skip' && a.rec!=='skip') return false;
@@ -6410,6 +6413,7 @@ function renderFt(){
     `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Spike level</span>${FT_LVL.map(([v,l])=>ftChip('lvl',v,l,cL(v))).join('')}</div>`+
     `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Period</span>${FT_PER.map(([v,l])=>ftChip('per',v,l)).join('')}</div>`+
     `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Rec</span>${[['','All alerts'],['go','✅ Long only'],['watch','✅ + 👀'],['skip','✗ Skipped']].map(([v,l])=>ftChip('rec',v,l)).join('')}</div>`+
+    `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Setup</span>${[['','All'],['mom','📈 Momentum spike'],['flush','↺ Liquidation flush']].map(([v,l])=>ftChip('setup',v,l)).join('')}</div>`+
     `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Judge after</span>${[['R','🎯 Trade plan (R)'],['1h','1 hour'],['4h','4 hours'],['24h','24 hours']].map(([v,l])=>ftChip('h',v,l)).join('')}</div>`;
   const S=ftStat(all);
   if(!all.length){ box.innerHTML='<div class="muted" style="font-size:12px">No long alerts match these filters yet.</div>'; return; }
@@ -6432,7 +6436,7 @@ function renderFt(){
   // verdicts: best / worst slices
   const slices=[];
   const dims={tf:a=>a.tf, lvl:a=>(FT_BUCKETS.find(b=>a.ratio>=b[0]&&a.ratio<b[1])||[0,0,'<2×'])[2], spot:a=>a.spot==null?'no spot data':a.spot_leads?'spot leads':a.spot>=2?'spot confirms':a.spot<1.5?'futures-only':'spot weak',
-    oi:a=>a.oi_div?'OI '+a.oi_div:null, ema:a=>a.vs_ema==null?null:a.vs_ema>0?'above EMA200':'below EMA200', multi:a=>a.n_tf>=2?'2+ TFs spiking':'1 TF only', mode:a=>a.mode==='live'?'live (mid-candle)':'closed candle'};
+    oi:a=>a.oi_div?'OI '+a.oi_div:null, setup:a=>a.setup==='flush'?'flush':'momentum', ema:a=>a.vs_ema==null?null:a.vs_ema>0?'above EMA200':'below EMA200', multi:a=>a.n_tf>=2?'2+ TFs spiking':'1 TF only', mode:a=>a.mode==='live'?'live (mid-candle)':'closed candle'};
   const keys=Object.keys(dims);
   const addSlices=(ks)=>{ const m={}; all.forEach(a=>{ const parts=ks.map(k=>dims[k](a)); if(parts.some(p=>p==null)) return; const key=parts.join(' · '); (m[key]=m[key]||[]).push(a); });
     Object.entries(m).forEach(([k,arr])=>{ const st=ftStat(arr); if(st.n>=8) slices.push({k,st}); }); };
@@ -6452,7 +6456,7 @@ function renderFt(){
     FT_BUCKETS.map(b=>{ const inB=base.filter(a=>a.ratio>=b[0]&&a.ratio<b[1]); return `<tr><td><b>${b[2]}</b></td>${tfs.map(t=>ftCell(ftStat(inB.filter(a=>a.tf===t[0])),8)).join('')}${ftCell(ftStat(inB),8)}</tr>`; }).join('')+
     `<tr><td><b>All levels</b></td>${tfs.map(t=>ftCell(ftStat(base.filter(a=>a.tf===t[0])),8)).join('')}${ftCell(ftStat(base),8)}</tr></tbody></table></div>`;
   // factor breakdowns
-  const groups=[['Recommendation',a=>({long:'✅ Long',watch_long:'👀 Watch',skip:'✗ Skip',wait:'⏳ Wait'})[a.rec]||'(none)'],['Spot vs futures',dims.spot],['OI divergence',a=>a.oi_div||'(not checked)'],
+  const groups=[['Setup type',a=>a.setup==='flush'?'↺ Liquidation flush':'📈 Momentum spike'],['Recommendation',a=>({long:'✅ Long',watch_long:'👀 Watch',skip:'✗ Skip',wait:'⏳ Wait'})[a.rec]||'(none)'],['Spot vs futures',dims.spot],['OI divergence',a=>a.oi_div||'(not checked)'],
     ['Score',a=>a.score>=80?'80+':a.score>=65?'65–79':a.score>=50?'50–64':'<50'],['vs EMA200',a=>dims.ema(a)||'(n/a)'],['Timeframes spiking',dims.multi],['Measured on',dims.mode],
     ['BTC that day',a=>a.btc==='big_down'?'BTC big down day':a.btc==='big_up'?'BTC big up day':'BTC normal'],['Tradeable on MEXC',a=>a.mexc?'on MEXC':'not on MEXC']];
   h+=`<div style="font-weight:700;margin:16px 0 4px">What makes a difference <span class="muted" style="font-weight:400;font-size:12px">same filters, split by each factor</span></div><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px">`+
@@ -6494,7 +6498,7 @@ function renderFeed(){
     const R=st&&st.r!=null?`<b style="color:${st.r>0?'var(--accent)':st.r<0?'var(--red)':'var(--dim)'}">${st.r>0?'+':''}${st.r.toFixed(2)}R</b>`:(st&&st.open_r!=null?`<span class="muted" data-tip="Unrealised, at the current price">${st.open_r>0?'+':''}${st.open_r.toFixed(2)}R open</span>`:'—');
     const rec=a.rec?({long:'✅',watch_long:'👀',skip:'✗',wait:'⏳'})[a.rec]||'':'';
     return `<tr><td class="muted" style="white-space:nowrap">${new Date(a.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td>`+
-      `<td class="sym"><div class="symbox">${esc(a.symbol.replace(/USDT$/,''))}${analyzeBtn(a.symbol)}</div></td><td>${a.tf}</td>`+
+      `<td class="sym"><div class="symbox">${esc(a.symbol.replace(/USDT$/,''))}${analyzeBtn(a.symbol)}</div></td><td style="white-space:nowrap">${a.tf}${a.setup==='flush'?' <span class="rr" style="color:var(--accent)" data-tip="Liquidation-flush long: bought the dump after leveraged longs were wiped out">↺ flush</span>':''}</td>`+
       `<td>${a.ratio.toFixed(1)}×${a.mode==='live'?'<span class="rr">live</span>':''}</td><td class="score" data-tip="${esc((a.why||[]).join(' · '))}">${a.score} <span class="rr">${rec}</span></td>`+
       `<td>${fmtNum(a.price)}</td>${stopTxt}${tpCell(0)}${tpCell(1)}${tpCell(2)}`+
       `<td data-tip="${esc(stTip)}">${st&&st.now_pct!=null?pc(st.now_pct):'—'}</td>`+

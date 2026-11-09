@@ -252,16 +252,70 @@ def tf_metrics(closed, forming, secs, now, price):
             live_chg = (forming[4] / forming[1] - 1) if forming[1] else 0
 
     if live_ratio is not None and live_ratio >= closed_ratio:
-        ratio, chg, mode, c_open = live_ratio, live_chg, "live", forming[0]
+        ratio, chg, mode, c_open, ck = live_ratio, live_chg, "live", forming[0], forming
     else:
-        ratio, chg, mode, c_open = closed_ratio, closed_chg, "closed", last[0]
+        ratio, chg, mode, c_open, ck = closed_ratio, closed_chg, "closed", last[0], last
+    o_, h_, l_, c_ = ck[1], ck[2], ck[3], ck[4]
+    rng = (h_ - l_) or 1e-12
+    shape = {"low_pct": round((l_ / o_ - 1) * 100, 2) if o_ else None,       # deepest point vs candle open
+             "cpos": round((c_ - l_) / rng, 2),                              # 0 = closed at low, 1 = at high
+             "lwick": round((min(o_, c_) - l_) / rng, 2),                    # lower wick share of the range
+             "body_x": round(abs(c_ / o_ - 1) / avg_body, 1) if avg_body and o_ else None,
+             "drop_x": round(abs(l_ / o_ - 1) / avg_body, 1) if avg_body and o_ else None,
+             "lo": l_}
     thr = max(avg_body * 0.5, 0.0015)
     direction = "long" if chg >= thr else "short" if chg <= -thr else "absorb"
     return {"ratio": round(ratio, 2), "mode": mode, "chg": round(chg * 100, 2), "dir": direction,
             "candle": c_open, "closed_ratio": round(closed_ratio, 2),
             "live_ratio": round(live_ratio, 2) if live_ratio is not None else None,
             "frac": round(frac, 2) if frac is not None else None,
-            "vs_ema": round((price / e200 - 1) * 100, 2) if e200 and price else None}
+            "vs_ema": round((price / e200 - 1) * 100, 2) if e200 and price else None, **shape}
+
+
+def detect_flush(r, tf):
+    """Liquidation flush: big volume + a drop far beyond this coin's normal candle +
+    open interest falling (positions force-closed, not opened). 'reclaimed' = price
+    clawed back into the upper half of the candle (long lower wick)."""
+    m = r["tfs"][tf]
+    if m["ratio"] < SPIKE_RATIO or m.get("drop_x") is None or m.get("low_pct") is None:
+        return None
+    deep = m["drop_x"] >= 2.5 and m["low_pct"] <= -1.5
+    oi = r.get("oi_chg1") if tf in ("15m", "1h") else r.get("oi_chg4")
+    if oi is None:
+        oi = r.get("oi_chg4")
+    if not deep or oi is None or oi > -1.5:
+        return None
+    return {"oi": oi, "reclaimed": m["cpos"] >= 0.5, "wick": m["lwick"], "low_pct": m["low_pct"]}
+
+
+def score_flush(r, tf, btc, fl):
+    m = r["tfs"][tf]
+    why = [f"↺ liquidation flush on {tf}: vol {m['ratio']:.1f}×, dropped {m['low_pct']}% then "
+           + (f"reclaimed (closed in top {round((1 - m['cpos']) * 100)}% of the candle)" if fl["reclaimed"] else "still near the lows")]
+    s = min(35.0, (m["ratio"] - 1) * 8)
+    s += min(20, abs(fl["oi"]) * 3); why.append(f"+ OI {fl['oi']:+.1f}%: positions were force-closed")
+    if fl["reclaimed"]:
+        s += 15; why.append(f"+ buyers stepped in: lower wick {round(fl['wick'] * 100)}% of the candle")
+    else:
+        s -= 10; why.append("− no reclaim yet: wait for a wick / close back above the midpoint")
+    f = r.get("funding")
+    if f is not None:
+        if f <= 0:
+            s += 10; why.append("+ funding ≤ 0: shorts now crowded (squeeze fuel)")
+        elif f > 0.0005:
+            s -= 10; why.append("− funding still high: longs not fully flushed")
+    htf = r["tfs"].get("1d") or r["tfs"].get("4h")
+    if htf and htf.get("vs_ema") is not None:
+        if htf["vs_ema"] > 0:
+            s += 10; why.append("+ higher-timeframe uptrend (dip in an uptrend)")
+        else:
+            s -= 5; why.append("− higher timeframe is a downtrend (catching a knife)")
+    sp = r["spot"].get(tf)
+    if sp is not None and sp >= 2:
+        s += 5; why.append(f"+ spot volume {sp:.1f}× too: real capitulation")
+    if btc and btc.get("regime") == "big_down":
+        s -= 10; why.append("− BTC still having a big down day")
+    return max(0, min(100, round(s))), why
 
 
 def score_row(r, tf, btc):
@@ -340,6 +394,14 @@ def recommend(r, tf, btc):
     """Rule-based call for the best spike. Not advice — a checklist summary."""
     m = r["tfs"][tf]
     d, sc = m["dir"], m.get("score") or 0
+    if m.get("setup") == "flush":
+        fl = m.get("flush") or {}
+        if fl.get("reclaimed") and sc >= 60:
+            return {"call": "long", "setup": "flush", "why": [f"Liquidation flush + reclaim, score {sc}", "Long the bounce; stop under the flush low"]}
+        if sc >= 45:
+            return {"call": "watch_long", "setup": "flush", "why": [f"Liquidation flush, score {sc}",
+                    "Wait for a reclaim (close back above the candle midpoint)" if not fl.get("reclaimed") else "Reclaimed, but score not high enough yet"]}
+        return {"call": "skip", "setup": "flush", "why": [f"Flush but weak, score {sc}"]}
     if d == "absorb":
         return {"call": "wait", "why": ["Big volume but price flat: wait for it to break one way"]}
     long = d == "long"
@@ -499,7 +561,7 @@ class _Tracker:
 
     def compact(self):
         keep = ("t", "symbol", "tf", "dir", "ratio", "mode", "score", "price", "chg", "spot", "spot_leads",
-                "btc", "out", "mexc", "vs_ema", "n_tf", "rec", "oi_div", "plan", "pstate")
+                "btc", "out", "mexc", "vs_ema", "n_tf", "rec", "oi_div", "plan", "pstate", "setup")
         with self.lock:
             return json.loads(json.dumps([{k: a.get(k) for k in keep} for a in self.alerts]))
 
@@ -716,9 +778,15 @@ class VolumeSpikeScanner:
                     pl = plan_from_analyze(self.planner(a["symbol"], a["tf"]), entry)
                 except Exception as e:
                     print(f"[vspike] analyze failed for {a['symbol']}: {e}", flush=True)
+            fl_low = a.get("flush_low")
+            if pl and fl_low and pl["sl"] > fl_low * 0.997:
+                pl["sl"] = fl_low * 0.995
+                pl["sl_basis"] = "Just under the liquidation-flush low (" + format(fl_low, ".6g") + "): if price loses it, the flush was not the bottom."
             if not pl:
                 c = self.hist.get((a["symbol"], a["tf"])) if a["tf"] != "15m" else self.m15.get(a["symbol"])
                 pl = plan_from_candles(c, entry)
+                if pl and fl_low and pl["sl"] > fl_low * 0.997:
+                    pl["sl"] = fl_low * 0.995
             with self.tracker.lock:
                 if pl:
                     a["plan"] = finish_plan(pl, entry)
@@ -840,6 +908,8 @@ class VolumeSpikeScanner:
             if ser:
                 r["oi_usd"] = ser[-1][1]
                 r["oi_pct_vol"] = round(100 * ser[-1][1] / r["turnover24"], 1) if r["turnover24"] else None
+                if len(ser) >= 2 and ser[-2][1]:
+                    r["oi_chg1"] = round((ser[-1][1] / ser[-2][1] - 1) * 100, 2)
                 if len(ser) >= 5:
                     r["oi_chg4"] = round((ser[-1][1] / ser[-5][1] - 1) * 100, 2) if ser[-5][1] else None
                 if len(ser) >= 25:
@@ -855,18 +925,26 @@ class VolumeSpikeScanner:
             for tf, m in r["tfs"].items():
                 if m["ratio"] < SPIKE_RATIO:
                     continue
-                sc, why = score_row(r, tf, btc)
+                fl = detect_flush(r, tf) if m["dir"] != "long" else None
+                if fl:
+                    m["setup"], m["flush"] = "flush", fl
+                    sc, why = score_flush(r, tf, btc, fl)
+                else:
+                    sc, why = score_row(r, tf, btc)
                 m["score"], m["why"] = sc, why
-                rank = sc + (1000 if (not LONG_ONLY or m["dir"] == "long") else 0)
+                is_long = m["dir"] == "long" or m.get("setup") == "flush"
+                rank = sc + (1000 if (not LONG_ONLY or is_long) else 0)
                 if best is None or rank > best[2]:
                     best = (tf, sc, rank)
-                if sc >= ALERT_MIN_SCORE and (m["dir"] == "long" or not LONG_ONLY):
+                if sc >= ALERT_MIN_SCORE and (is_long or not LONG_ONLY):
                     sp = r["spot"].get(tf)
                     a = {"key": f"{r['symbol']}|{tf}|{m['candle']}", "t": now, "symbol": r["symbol"],
-                         "tf": tf, "dir": m["dir"], "ratio": m["ratio"], "mode": m["mode"], "score": sc,
+                         "tf": tf, "dir": "long" if is_long else m["dir"], "setup": m.get("setup") or "momentum",
+                         "ratio": m["ratio"], "mode": m["mode"], "score": sc,
                          "price": r["price"], "chg": m["chg"], "spot": sp,
                          "spot_leads": bool(sp is not None and sp >= m["ratio"]),
                          "btc": (btc or {}).get("regime"), "why": why, "out": {},
+                         "flush_low": m.get("lo") if m.get("setup") == "flush" else None,
                          "mexc": r.get("mexc"), "vs_ema": m.get("vs_ema"), "n_tf": sum(1 for x in r["tfs"].values() if x["ratio"] >= 2)}
                     if self.tracker.add(a):
                         new.append(a)
