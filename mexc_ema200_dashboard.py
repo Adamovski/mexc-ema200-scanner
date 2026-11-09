@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# build: v66 — volume spikes: level filter, analyze shortcut, OI divergence + Rec — auto-deploy trigger
+# build: v66 — volume spikes: level filter, analyze shortcut, OI divergence + Rec, long-only — auto-deploy trigger
 """
 MEXC 200-EMA "cross & retest" LIVE DASHBOARD (4h chart)
 =======================================================
@@ -2997,9 +2997,9 @@ PAGE = """<!doctype html>
 <div class="wrap" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0;padding-bottom:0">
   <input id="vsSearch" type="text" placeholder="🔍 Search coin…" oninput="VSF.q=this.value;renderSpikes()" style="padding:7px 10px;border-radius:8px;border:1px solid var(--line);background:rgba(21,28,41,.7);color:var(--txt);min-width:150px">
   <select class="wlsel" onchange="VSF.tf=this.value;renderSpikes()"><option value="">Timeframe: any</option><option value="15m">15m</option><option value="1h">1h</option><option value="4h">4h</option><option value="1d">1D</option></select>
-  <select class="wlsel" onchange="VSF.dir=this.value;renderSpikes()"><option value="">Direction: any</option><option value="long">🟢 Long bias</option><option value="short">🔴 Short bias</option><option value="absorb">⚪ Absorption</option></select>
+  <select class="wlsel" onchange="VSF.dir=this.value;renderSpikes()"><option value="long" selected>🟢 Longs only</option><option value="">Direction: any</option><option value="absorb">⚪ Absorption (pre-move)</option><option value="short">🔴 Short bias</option></select>
   <select class="wlsel" onchange="VSF.spot=this.value;renderSpikes()"><option value="">Spot: any</option><option value="lead">Spot leads futures</option><option value="conf">Spot ≥ 2×</option><option value="futonly">Futures-only</option></select>
-  <select class="wlsel" onchange="VSF.rec=this.value;renderSpikes()"><option value="">Rec: any</option><option value="go">✅ Recommended (long or short)</option><option value="long">✅ Long only</option><option value="short">✅ Short only</option><option value="watch">👀 Watch or better</option></select>
+  <select class="wlsel" onchange="VSF.rec=this.value;renderSpikes()"><option value="">Rec: any</option><option value="long">✅ Long recommended</option><option value="watch">👀 Watch long or better</option></select>
   <select class="wlsel" onchange="VSF.oid=this.value;renderSpikes()"><option value="">OI div: any</option><option value="real up">real up</option><option value="accumulating">accumulating</option><option value="fake pump">fake pump</option><option value="shorts piling">shorts piling</option><option value="exhausting">exhausting</option></select>
   <select class="wlsel" onchange="VSF.score=+this.value;renderSpikes()"><option value="0">Score: any</option><option value="50">≥ 50</option><option value="70">≥ 70</option></select>
   <select class="wlsel" onchange="VSF.mx=this.value;renderSpikes()"><option value="">MEXC: any</option><option value="yes">On MEXC perps</option><option value="no">Not on MEXC</option></select>
@@ -3014,7 +3014,7 @@ PAGE = """<!doctype html>
       <th onclick="vsSortBy('best_score')" style="cursor:pointer" data-tip="Quality of the best spike on this coin, from 0 to 100. Built from the volume ratio, how many timeframes are spiking, spot vs futures, EMA200 side, OI change, funding and BTC regime. Hover a cell for the reasons.">Score</th>
       <th data-tip="Direction of the spike candle versus the coin's typical candle body. ABSORB = huge volume but price barely moved, i.e. someone is absorbing the flow, so there's no direction yet.">Signal</th>
       <th onclick="vsSortBy('oi_div')" style="cursor:pointer" data-tip="Open-interest divergence over the last 4h: price move vs OI move. real up = price and OI both rising (new longs backing it). fake pump = price up but OI falling (short covering, tends to fade). accumulating = price flat while OI climbs (positions quietly building). shorts piling = price down with OI rising (new shorts). exhausting = price and OI both falling (longs unwinding, bounce risk). Only checked for coins that are spiking.">OI div</th>
-      <th onclick="vsSortBy('rec')" style="cursor:pointer" data-tip="Rule-based call on the best spike. ✅ = score ≥ 65 with no red flags. 👀 Watch = score ≥ 50 with at most one red flag. ✗ Skip = low score or several red flags. Red flags: OI divergence against the trade, BTC big move against it, crowded funding, wrong side of EMA200, futures-only volume. ⏳ Wait = absorption, no direction yet. Hover a cell for the reasons. A checklist, not financial advice.">Rec</th>
+      <th onclick="vsSortBy('rec')" style="cursor:pointer" data-tip="Rule-based LONG call (long-only mode: short setups show ✗). ✅ = score ≥ 65 with no red flags. 👀 Watch = score ≥ 50 with at most one red flag. ✗ Skip = low score or several red flags. Red flags: OI divergence against the trade, BTC big move against it, crowded funding, wrong side of EMA200, futures-only volume. ⏳ Wait = absorption, no direction yet. Hover a cell for the reasons. A checklist, not financial advice.">Rec</th>
       <th onclick="vsSortBy('r15m')" style="cursor:pointer" data-tip="15m volume vs the average of the previous 20 closed 15m candles (the last 5 hours). 'live' = the current candle, projected to a full candle from its pace. The higher of last-closed and live is shown.">15m</th>
       <th onclick="vsSortBy('r1h')" style="cursor:pointer" data-tip="1h volume vs the average of the previous 20 closed 1h candles (the last 20 hours). 'live' = the current candle projected from its pace.">1h</th>
       <th onclick="vsSortBy('r4h')" style="cursor:pointer" data-tip="4h volume vs the average of the previous 20 closed 4h candles (the last ~3.3 days). 'live' = the current candle projected from its pace.">4h</th>
@@ -6208,7 +6208,7 @@ function coilSetupCell(h, side){
 
 // ── 🔊 Volume spikes tab (Binance data, served by /spikes) ──────────────────
 let vsData=null, vsSort={k:'best_score',d:-1}, vsLast=0;
-const VSF={q:'',tf:'',min:2.5,dir:'',spot:'',score:0,mx:'',multi:false,band:false,rec:'',oid:''};
+const VSF={q:'',tf:'',min:2.5,dir:'long',spot:'',score:0,mx:'',multi:false,band:false,rec:'',oid:''};
 const VS_REC={long:['✅ LONG','var(--accent)',5],short:['✅ SHORT','var(--red)',5],watch_long:['👀 Watch long','var(--warn)',3],watch_short:['👀 Watch short','var(--warn)',3],wait:['⏳ Wait','var(--dim)',1],skip:['✗ Skip','var(--dim2)',0]};
 const VS_OID={'real up':'var(--accent)','accumulating':'var(--accent)','shorts piling':'var(--red)','fake pump':'var(--warn)','exhausting':'var(--warn)','neutral':'var(--dim)'};
 const VS_LEVELS=[0,2,2.5,3,5,10,20];
@@ -6234,7 +6234,7 @@ async function loadSpikes(force){
 function vsSortBy(k){ vsSort={k, d:(vsSort.k===k?-vsSort.d:-1)}; renderSpikes(); }
 function vsUsd(m){ if(m==null) return '—'; return m>=1e9?'$'+(m/1e9).toFixed(2)+'B':m>=1e6?'$'+(m/1e6).toFixed(1)+'M':'$'+(m/1e3).toFixed(0)+'K'; }
 function vsPct(v,d){ if(v==null) return '—'; const c=v>0?'var(--accent)':v<0?'var(--red)':'var(--dim)'; return `<span style="color:${c}">${v>0?'+':''}${(+v).toFixed(d==null?2:d)}%</span>`; }
-function vsBestTf(r){ if(VSF.tf) return VSF.tf; return r.best_tf || Object.keys(r.tfs).sort((a,b)=>r.tfs[b].ratio-r.tfs[a].ratio)[0]; }
+function vsBestTf(r){ if(VSF.tf) return VSF.tf; if(VSF.dir==='long'){ const lt=Object.keys(r.tfs).filter(t=>r.tfs[t].dir==='long').sort((a,b)=>r.tfs[b].ratio-r.tfs[a].ratio)[0]; if(lt) return lt; } return r.best_tf || Object.keys(r.tfs).sort((a,b)=>r.tfs[b].ratio-r.tfs[a].ratio)[0]; }
 const VS_WIN={'15m':'last 5 hours','1h':'last 20 hours','4h':'last ~3.3 days','1d':'last 20 days'};
 function vsRatioCell(m, minR, tf){
   if(!m) return '<td class="muted">—</td>';
@@ -6267,12 +6267,11 @@ function renderSpikes(){
   }
   if(!d || !d.rows || (!d.updated && !d.rows.length)){ tb.innerHTML=''; emp.style.display='block'; renderVsLevels([]);
     emp.textContent='First scan running'+(d&&d.progress!=null?' ('+d.progress+'%)':'')+'. The table fills in when it finishes, usually 5–6 minutes after a restart.'; return; }
-  renderVsLevels(d.rows);
   const q=VSF.q.trim().toUpperCase();
-  let rows=d.rows.filter(r=>{
+  const vsPass=(r,lvl)=>{
     if(q && !r.base.includes(q)) return false;
     const mr=vsMaxR(r);
-    if(VSF.min>0 && !(mr>=VSF.min && (!VSF.band || mr<vsNextLevel(VSF.min)))) return false;
+    if(lvl && VSF.min>0 && !(mr>=VSF.min && (!VSF.band || mr<vsNextLevel(VSF.min)))) return false;
     const bt=vsBestTf(r), m=r.tfs[bt]; if(!m) return false;
     if(VSF.dir && m.dir!==VSF.dir) return false;
     const sp=r.spot[bt];
@@ -6290,7 +6289,9 @@ function renderSpikes(){
     if(VSF.rec==='watch' && !(rc&&rc!=='skip'&&rc!=='wait')) return false;
     if(VSF.oid && r.oi_div!==VSF.oid) return false;
     return true;
-  });
+  };
+  renderVsLevels(d.rows.filter(r=>vsPass(r,false)));
+  let rows=d.rows.filter(r=>vsPass(r,true));
   const key=(r)=>{ const k=vsSort.k; if(k[0]==='r'&&r.tfs[k.slice(1)]) return r.tfs[k.slice(1)].ratio; if(k[0]==='r'&&['r15m','r1h','r4h','r1d'].includes(k)) return -1;
     if(k==='rec') return r.rec?(VS_REC[r.rec.call]||[0,0,0])[2]*1000+(r.best_score||0):null;
     if(k==='oi_div') return r.oi_div||null;

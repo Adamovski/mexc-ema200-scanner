@@ -46,6 +46,7 @@ ALERT_MIN_SCORE = int(os.environ.get("VS_ALERT_SCORE", 45))
 SCAN_EVERY = int(os.environ.get("VS_SCAN_EVERY", 300))
 REQ_PER_SEC = float(os.environ.get("VS_REQ_PER_SEC", 6))
 TELEGRAM_ON = os.environ.get("VS_TELEGRAM", "").strip() in ("1", "true", "yes", "on")
+LONG_ONLY = os.environ.get("VS_LONG_ONLY", "1").strip() not in ("0", "false", "no", "off")   # only log/recommend longs
 
 # Binance geo-blocks fapi./api. from US cloud IPs; www.binance.com proxies the same
 # public endpoints (the Alpha tab already relies on this). Hosts are tried in order and
@@ -342,6 +343,8 @@ def recommend(r, tf, btc):
     if d == "absorb":
         return {"call": "wait", "why": ["Big volume but price flat: wait for it to break one way"]}
     long = d == "long"
+    if LONG_ONLY and not long:
+        return {"call": "skip", "why": ["Short-side spike: long-only mode"]}
     flags = []
     od, f, ve = r.get("oi_div"), r.get("funding") or 0, m.get("vs_ema")
     rg = (btc or {}).get("regime")
@@ -628,9 +631,10 @@ class VolumeSpikeScanner:
                     continue
                 sc, why = score_row(r, tf, btc)
                 m["score"], m["why"] = sc, why
-                if best is None or sc > best[1]:
-                    best = (tf, sc)
-                if sc >= ALERT_MIN_SCORE:
+                rank = sc + (1000 if (not LONG_ONLY or m["dir"] == "long") else 0)
+                if best is None or rank > best[2]:
+                    best = (tf, sc, rank)
+                if sc >= ALERT_MIN_SCORE and (m["dir"] == "long" or not LONG_ONLY):
                     sp = r["spot"].get(tf)
                     a = {"key": f"{r['symbol']}|{tf}|{m['candle']}", "t": now, "symbol": r["symbol"],
                          "tf": tf, "dir": m["dir"], "ratio": m["ratio"], "mode": m["mode"], "score": sc,
@@ -639,7 +643,7 @@ class VolumeSpikeScanner:
                          "btc": (btc or {}).get("regime"), "why": why, "out": {}}
                     if self.tracker.add(a):
                         new.append(a)
-            r["best_tf"], r["best_score"] = best if best else (None, None)
+            r["best_tf"], r["best_score"] = (best[0], best[1]) if best else (None, None)
             r["rec"] = recommend(r, best[0], btc) if best else None
             for a in new:
                 if a["symbol"] == r["symbol"]:
@@ -682,7 +686,8 @@ class VolumeSpikeScanner:
         snap["alerts"] = self.tracker.recent()
         snap["stats"] = self.tracker.stats()
         snap["cfg"] = {"spike_ratio": SPIKE_RATIO, "alert_min_score": ALERT_MIN_SCORE,
-                       "min_turnover": MIN_TURNOVER, "scan_every": SCAN_EVERY, "telegram": TELEGRAM_ON}
+                       "min_turnover": MIN_TURNOVER, "scan_every": SCAN_EVERY, "telegram": TELEGRAM_ON,
+                       "long_only": LONG_ONLY}
         return snap
 
 
