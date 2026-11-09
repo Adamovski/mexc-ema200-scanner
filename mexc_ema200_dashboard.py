@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# build: v72 — alert plans: RR rules shared with Analyze; time-since on calls/alerts; reload banner — auto-deploy trigger
+# build: v73 — low-upside filter on TP1 (1h 4%, 4h 10%, 1D 15%) — auto-deploy trigger
 """
 MEXC 200-EMA "cross & retest" LIVE DASHBOARD (4h chart)
 =======================================================
@@ -3014,7 +3014,7 @@ PAGE = """<!doctype html>
 <b>Direction</b>: did price go up (LONG), down (SHORT) or nowhere (ABSORB) on the spiking candle?<br>
 <b>🟢 FLUSH ↺</b>: a long setup from a DUMP. Price crashed on huge volume while open interest fell, meaning leveraged longs were liquidated (force-closed), not new shorts opening. When price then reclaims the upper half of that candle (long lower wick), the selling is usually exhausted and a bounce is likely. The stop goes just under the flush low.<br>
 <b>OI div</b>: are new futures positions backing the move (<i>real up</i>), or is it short covering that tends to fade (<i>fake pump</i>)?<br>
-<b>Rec</b>: the checklist verdict for a long. ✅ = strong and no red flags, 👀 = watch, ✗ = skip. Hover for the reasons.<br>
+<b>Rec</b>: the checklist verdict for a long. ✅ = strong and no red flags, 👀 = watch, ✗ = skip. Hover for the reasons. <b>✗ Low upside</b> = the first target (TP1) is too close to be worth a manual trade: it must be at least <b>4%</b> on 1h, <b>10%</b> on 4h and <b>15%</b> on 1D alerts.<br>
 <b>Spot vol</b>: the same volume-vs-normal on the spot market. ✅ means spot is leading, so real buyers, not just leverage.<br>
 Hover any cell to see what it means for that coin. Click ⚲ for the full Analyze card.</div></details></div>
 <div class="wrap" style="overflow-x:auto">
@@ -6218,7 +6218,8 @@ function coilSetupCell(h, side){
 }
 
 // ── helpers: elapsed time + new-version banner ─────────────────────────────
-const VS_BUILD='v72';
+const VS_BUILD='v73';
+const VS_MIN_TP1={'15m':0,'1h':4,'4h':10,'1d':15};
 function durTxt(sec){ sec=Math.max(0,Math.round(sec)); const d=Math.floor(sec/86400), h=Math.floor(sec%86400/3600), m=Math.floor(sec%3600/60);
   return d?(d+'d '+h+'h'):h?(h+'h '+m+'m'):(m+'m'); }
 function agoTxt(ts){ return ts?durTxt(Date.now()/1000-ts)+' ago':''; }
@@ -6363,7 +6364,7 @@ function renderSpikes(){
       `<td class="score" data-tip="${esc(why||'No spike above the threshold right now.')}">${m.score!=null?m.score:'—'}<span class="rr">${m.score!=null?bt:''}</span></td>`+
       `<td data-tip="${esc(m.setup==='flush'?('Liquidation flush: price dumped '+m.low_pct+'% on '+(m.ratio||0).toFixed(1)+'× volume while open interest FELL '+((m.flush||{}).oi)+'%, so leveraged longs were force-closed rather than new shorts opening. '+((m.flush||{}).reclaimed?'Buyers have already pushed it back into the upper half of the candle (long lower wick): the classic bounce long.':'It has NOT reclaimed yet; a long is safer once it closes back above the candle midpoint.')):m.dir==='long'?'The spike candle closed (or is running) clearly UP vs this coin’s typical candle: buyers drove the volume.':m.dir==='short'?'The spike candle went clearly DOWN: sellers drove the volume.':'Big volume but price barely moved: absorption, wait for a break.')}">${m.ratio>=minR?(m.setup==='flush'?'<span style="color:var(--accent);font-weight:650;white-space:nowrap">🟢 FLUSH ↺</span>':vsSigPill(m.dir)):'<span class="muted">—</span>'}</td>`+
       `<td data-tip="${esc(r.oi_div?('Last 4h: price '+(r.px_chg4>0?'+':'')+r.px_chg4+'%, open interest '+(r.oi_chg4>0?'+':'')+r.oi_chg4+'%'):'Only checked for spiking coins')}">${r.oi_div?`<span style="color:${VS_OID[r.oi_div]||'var(--dim)'};white-space:nowrap">${r.oi_div}</span>`:'<span class="muted">—</span>'}</td>`+
-      `<td data-tip="${esc(r.rec?r.rec.why.join(' · '):'No spike above the threshold')}">${r.rec?`<span style="color:${(VS_REC[r.rec.call]||[])[1]};font-weight:650;white-space:nowrap">${(VS_REC[r.rec.call]||[r.rec.call])[0]}${r.rec.setup==='flush'?' ↺':''}</span>`:'<span class="muted">—</span>'}</td>`+
+      `<td data-tip="${esc(r.rec?r.rec.why.join(' · '):'No spike above the threshold')}">${r.rec?`<span style="color:${(VS_REC[r.rec.call]||[])[1]};font-weight:650;white-space:nowrap">${r.rec.low_upside?'✗ Low upside':(VS_REC[r.rec.call]||[r.rec.call])[0]}${r.rec.setup==='flush'?' ↺':''}</span>`:'<span class="muted">—</span>'}</td>`+
       ['15m','1h','4h','1d'].map(t=>vsRatioCell(r.tfs[t],minR,t)).join('')+
       `<td data-tip="${esc(spotTip)}">${spotTxt}</td><td data-tip="${esc(candleTip)}">${vsPct(m.chg)}<span class="rr">${m.chg!=null?bt:''}</span></td><td data-tip="${esc(emaTip)}">${vsPct(m.vs_ema,1)}<span class="rr">${m.vs_ema!=null?bt:''}</span></td>`+
       `<td data-tip="${esc('OI 24h change: '+(r.oi_chg24==null?'n/a':r.oi_chg24+'%')+' · OI = '+(r.oi_pct_vol==null?'?':r.oi_pct_vol)+'% of 24h volume')}">${oi}</td>`+
@@ -6465,7 +6466,7 @@ function renderFt(){
   // verdicts: best / worst slices
   const slices=[];
   const dims={tf:a=>a.tf, lvl:a=>(FT_BUCKETS.find(b=>a.ratio>=b[0]&&a.ratio<b[1])||[0,0,'<2×'])[2], spot:a=>a.spot==null?'no spot data':a.spot_leads?'spot leads':a.spot>=2?'spot confirms':a.spot<1.5?'futures-only':'spot weak',
-    oi:a=>a.oi_div?'OI '+a.oi_div:null, setup:a=>a.setup==='flush'?'flush':'momentum', ema:a=>a.vs_ema==null?null:a.vs_ema>0?'above EMA200':'below EMA200', multi:a=>a.n_tf>=2?'2+ TFs spiking':'1 TF only', mode:a=>a.mode==='live'?'live (mid-candle)':'closed candle'};
+    oi:a=>a.oi_div?'OI '+a.oi_div:null, up:a=>a.low_upside==null?null:a.low_upside?'low upside':'enough upside', setup:a=>a.setup==='flush'?'flush':'momentum', ema:a=>a.vs_ema==null?null:a.vs_ema>0?'above EMA200':'below EMA200', multi:a=>a.n_tf>=2?'2+ TFs spiking':'1 TF only', mode:a=>a.mode==='live'?'live (mid-candle)':'closed candle'};
   const keys=Object.keys(dims);
   const addSlices=(ks)=>{ const m={}; all.forEach(a=>{ const parts=ks.map(k=>dims[k](a)); if(parts.some(p=>p==null)) return; const key=parts.join(' · '); (m[key]=m[key]||[]).push(a); });
     Object.entries(m).forEach(([k,arr])=>{ const st=ftStat(arr); if(st.n>=8) slices.push({k,st}); }); };
@@ -6485,7 +6486,7 @@ function renderFt(){
     FT_BUCKETS.map(b=>{ const inB=base.filter(a=>a.ratio>=b[0]&&a.ratio<b[1]); return `<tr><td><b>${b[2]}</b></td>${tfs.map(t=>ftCell(ftStat(inB.filter(a=>a.tf===t[0])),8)).join('')}${ftCell(ftStat(inB),8)}</tr>`; }).join('')+
     `<tr><td><b>All levels</b></td>${tfs.map(t=>ftCell(ftStat(base.filter(a=>a.tf===t[0])),8)).join('')}${ftCell(ftStat(base),8)}</tr></tbody></table></div>`;
   // factor breakdowns
-  const groups=[['Setup type',a=>a.setup==='flush'?'↺ Liquidation flush':'📈 Momentum spike'],['Recommendation',a=>({long:'✅ Long',watch_long:'👀 Watch',skip:'✗ Skip',wait:'⏳ Wait'})[a.rec]||'(none)'],['Spot vs futures',dims.spot],['OI divergence',a=>a.oi_div||'(not checked)'],
+  const groups=[['Upside to TP1 (minimum: 1h 4%, 4h 10%, 1D 15%)',a=>a.low_upside==null?'(no plan yet)':a.low_upside?'✗ below minimum':'✓ meets minimum'],['Setup type',a=>a.setup==='flush'?'↺ Liquidation flush':'📈 Momentum spike'],['Recommendation',a=>({long:'✅ Long',watch_long:'👀 Watch',skip:'✗ Skip',wait:'⏳ Wait'})[a.rec]||'(none)'],['Spot vs futures',dims.spot],['OI divergence',a=>a.oi_div||'(not checked)'],
     ['Score',a=>a.score>=80?'80+':a.score>=65?'65–79':a.score>=50?'50–64':'<50'],['vs EMA200',a=>dims.ema(a)||'(n/a)'],['Timeframes spiking',dims.multi],['Measured on',dims.mode],
     ['BTC that day',a=>a.btc==='big_down'?'BTC big down day':a.btc==='big_up'?'BTC big up day':'BTC normal'],['Tradeable on MEXC',a=>a.mexc?'on MEXC':'not on MEXC']];
   h+=`<div style="font-weight:700;margin:16px 0 4px">What makes a difference <span class="muted" style="font-weight:400;font-size:12px">same filters, split by each factor</span></div><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px">`+
@@ -6520,7 +6521,8 @@ function renderFeed(){
   const oc=v=>v==null?'<span class="muted">…</span>':v==='na'?'<span class="muted" data-tip="App was asleep at that time, so it was not graded">n/a</span>':pc(v);
   const rows=al.map(a=>{
     const pl=a.plan, st=a.pstate||null;
-    const tpCell=i=>{ if(!pl) return '<td class="muted">—</td>'; const hit=st&&st.hits>i; return `<td style="${hit?'background:rgba(63,185,80,.22);':''}white-space:nowrap" data-tip="${esc('TP'+(i+1)+' '+fmtNum(pl.tps[i])+' ('+(pl.tp_pct[i]>0?'+':'')+pl.tp_pct[i]+'%, '+pl.rr[i]+'R from entry). '+(pl.basis[i]||'')+(hit?' · HIT':''))}">${hit?'✓ ':''}${fmtNum(pl.tps[i])} <span class="rr">+${pl.tp_pct[i].toFixed(1)}%</span>${rr(pl.rr[i])}</td>`; };
+    const tpCell=i=>{ if(!pl) return '<td class="muted">—</td>'; const hit=st&&st.hits>i; const low=i===0&&a.low_upside;
+      return `<td style="${hit?'background:rgba(63,185,80,.22);':low?'background:rgba(210,153,34,.16);':''}white-space:nowrap" data-tip="${esc('TP'+(i+1)+' '+fmtNum(pl.tps[i])+' ('+(pl.tp_pct[i]>0?'+':'')+pl.tp_pct[i]+'%, '+pl.rr[i]+'R from entry). '+(pl.basis[i]||'')+(hit?' · HIT':'')+(low?' · LOW UPSIDE: TP1 is under the '+a.min_tp1+'% minimum for '+a.tf+' alerts, so this alert is marked ✗ Skip (still tracked so the forward test can check the rule).':''))}">${hit?'✓ ':''}${fmtNum(pl.tps[i])} <span class="rr">+${pl.tp_pct[i].toFixed(1)}%</span>${rr(pl.rr[i])}${low?' <span class="rr" style="color:var(--warn)">low</span>':''}</td>`; };
     const stopTxt=pl?`<td style="white-space:nowrap;${st&&st.status==='sl'?'background:rgba(248,81,73,.22);':''}" data-tip="${esc('Stop '+fmtNum(pl.sl)+' ('+pl.sl_pct+'%). '+(pl.sl_basis||'')+' Moves to entry (break-even) once TP1 is hit. Plan source: '+(pl.src==='analyze'?'Analyze card (4h/1D structure for this coin)':'fallback: swing low + ATR, targets at 1R/2R/3R'))}">${fmtNum(pl.sl)} <span class="rr">${pl.sl_pct.toFixed(1)}%</span>${st&&st.hits>=1&&!plClosed(st)?'<span class="rr" style="color:var(--accent)">→ BE</span>':''}</td>`:'<td class="muted">—</td>';
     const stInfo=!st?['⏳ planning…','var(--dim)']:(PL_ST[st.status]||[st.status,'var(--dim)']);
     const stTip=(st?('Best move since entry +'+(st.mfe||0)+'% · worst '+(st.mae||0)+'%'+(st.why?' · '+st.why:'')):'Fetching the Analyze plan for this coin (runs at the end of each scan)')+(pl&&pl.late?' · LATE PLAN: levels were drawn after the alert, so this trade is tracked but left out of the forward-test stats.':'');
@@ -6593,7 +6595,9 @@ async function vsAzInject(){
     const atr=azLast.atr_pct&&px?px*azLast.atr_pct/100:null;
     const pr=vsPlanRules(px, stopIn, [lp.tp1,lp.tp2,lp.tp3,lp.tp4,lp.tp5], atr);
     if(pr){ const pc=x=>((x/px-1)*100).toFixed(1)+'%';
-      lines.push(`<div style="margin-top:4px" data-tip="${esc('The Volume-spikes alert plans use the Analyze stop and resistances, plus two rules: the stop is never more than 3×ATR or 15% from entry, and only targets at least 1R / 2R / 3R away are used (missing ones are filled with R multiples). This is that same plan for an entry at the current price, so both tabs agree.')}"><b>Long plan with the volume-tab RR rules</b> (entry now ${fmtNum(px)}): stop ${fmtNum(pr.sl)} (-${((1-pr.sl/px)*100).toFixed(1)}%) · `+pr.tps.map((t,i)=>`TP${i+1} ${fmtNum(t)} (+${pc(t)}, ${pr.rr[i].toFixed(1)}R${pr.tag[i]==='R'?', R-target':''})`).join(' · ')+(pr.notes.length?` <span class="muted">· ${esc(pr.notes.join('; '))}</span>`:'')+`</div>`); } }
+      lines.push(`<div style="margin-top:4px" data-tip="${esc('The Volume-spikes alert plans use the Analyze stop and resistances, plus two rules: the stop is never more than 3×ATR or 15% from entry, and only targets at least 1R / 2R / 3R away are used (missing ones are filled with R multiples). This is that same plan for an entry at the current price, so both tabs agree.')}"><b>Long plan with the volume-tab RR rules</b> (entry now ${fmtNum(px)}): stop ${fmtNum(pr.sl)} (-${((1-pr.sl/px)*100).toFixed(1)}%) · `+pr.tps.map((t,i)=>`TP${i+1} ${fmtNum(t)} (+${pc(t)}, ${pr.rr[i].toFixed(1)}R${pr.tag[i]==='R'?', R-target':''})`).join(' · ')+(pr.notes.length?` <span class="muted">· ${esc(pr.notes.join('; '))}</span>`:'')+`</div>`);
+      const tfk=(azLast.interval||azTf||'').toLowerCase(), need=VS_MIN_TP1[tfk]; const up1=(pr.tps[0]/px-1)*100;
+      if(need) lines.push(`<div style="color:${up1<need?'var(--warn)':'var(--accent)'};font-weight:650">${up1<need?'✗ Low upside: TP1 is only +'+up1.toFixed(1)+'%, under the '+need+'% minimum for a '+tfk+' trade. Not worth taking manually.':'✓ TP1 +'+up1.toFixed(1)+'% clears the '+need+'% minimum for a '+tfk+' trade.'}</div>`); } }
   // recent alerts for this coin
   const hist=(d.alerts||[]).filter(a=>a.symbol===sym).slice(0,3);
   if(hist.length) lines.push('<div style="margin-top:4px"><b>Recent spike alerts:</b> '+hist.map(a=>{ const st=a.pstate||{}; return `${new Date(a.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})} ${a.tf}${a.setup==='flush'?' ↺':''} ${a.ratio.toFixed(1)}× @ ${fmtNum(a.price)} → ${(PL_ST[st.status]||['…'])[0]}${st.r!=null?' '+(st.r>0?'+':'')+st.r+'R':st.open_r!=null?' ('+(st.open_r>0?'+':'')+st.open_r+'R open)':''}`; }).join(' · ')+'</div>');

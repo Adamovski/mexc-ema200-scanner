@@ -40,7 +40,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-BUILD = "v72"              # bump on every deploy: open pages compare it and offer a reload
+BUILD = "v73"              # bump on every deploy: open pages compare it and offer a reload
 MIN_TURNOVER = float(os.environ.get("VS_MIN_TURNOVER", 5_000_000))
 SPIKE_RATIO = float(os.environ.get("VS_SPIKE_RATIO", 2.5))
 ALERT_MIN_SCORE = int(os.environ.get("VS_ALERT_SCORE", 45))
@@ -562,7 +562,7 @@ class _Tracker:
 
     def compact(self):
         keep = ("t", "symbol", "tf", "dir", "ratio", "mode", "score", "price", "chg", "spot", "spot_leads",
-                "btc", "out", "mexc", "vs_ema", "n_tf", "rec", "oi_div", "plan", "pstate", "setup")
+                "btc", "out", "mexc", "vs_ema", "n_tf", "rec", "oi_div", "plan", "pstate", "setup", "upside", "low_upside", "min_tp1", "rec_orig")
         with self.lock:
             return json.loads(json.dumps([{k: a.get(k) for k in keep} for a in self.alerts]))
 
@@ -630,6 +630,7 @@ def plan_from_candles(c, entry):
             "src": "fallback"}
 
 
+MIN_TP1_PCT = {"15m": 0.0, "1h": 4.0, "4h": 10.0, "1d": 15.0}   # TP1 must be at least this far (manual trading)
 MAX_STOP_ATR = 3.0      # stop no further than 3×ATR …
 MAX_STOP_PCT = 0.15     # … and no further than 15% from entry
 
@@ -820,6 +821,14 @@ class VolumeSpikeScanner:
                     cc = self.hist.get((a["symbol"], a["tf"])) if a["tf"] != "15m" else self.m15.get(a["symbol"])
                     a["plan"] = finish_plan(pl, entry, _atr(cc) if cc else None)
                     a["plan"]["late"] = (time.time() - a["t"]) > PLAN_LATE
+                    need = MIN_TP1_PCT.get(a["tf"], 0.0)
+                    a["upside"] = a["plan"]["tp_pct"][0]
+                    a["low_upside"] = a["upside"] < need
+                    a["min_tp1"] = need
+                    if a["low_upside"]:
+                        a["rec_orig"] = a.get("rec")
+                        a["rec"] = "skip"
+                        a["why"] = (a.get("why") or []) + [f"− low upside: TP1 only +{a['upside']}% (needs ≥{need:g}% on {a['tf']})"]
                     a["pstate"] = {"status": "open", "hits": 0, "mfe": 0, "mae": 0, "checked": 0}
                 else:
                     a["plan"] = None
@@ -844,6 +853,14 @@ class VolumeSpikeScanner:
             if a.get("plan") and "adj" not in a["plan"] and a.get("pstate", {}).get("hits", 0) == 0 \
                     and a["key"] not in self.plan_busy:
                 a.pop("plan", None); a.pop("pstate", None)          # re-plan with the RR rules (v72)
+                self.tracker.dirty = True
+            if a.get("plan") and "low_upside" not in a and a["plan"].get("tp_pct"):
+                need = MIN_TP1_PCT.get(a["tf"], 0.0)
+                a["upside"] = a["plan"]["tp_pct"][0]; a["min_tp1"] = need
+                a["low_upside"] = a["upside"] < need
+                if a["low_upside"] and a.get("rec") in ("long", "watch_long"):
+                    a["rec_orig"] = a["rec"]; a["rec"] = "skip"
+                    a["why"] = (a.get("why") or []) + [f"− low upside: TP1 only +{a['upside']}% (needs ≥{need:g}% on {a['tf']})"]
                 self.tracker.dirty = True
             if "pstate" not in a:
                 if now - a["t"] <= PLAN_MAX_AGE and a["key"] not in self.plan_busy:
@@ -954,6 +971,11 @@ class VolumeSpikeScanner:
             list(ex.map(enrich, hot))
 
         new = []
+        with self.tracker.lock:
+            latest_plan = {}
+            for a in self.tracker.alerts:
+                if a.get("plan") and "low_upside" in a:
+                    latest_plan[(a["symbol"], a["tf"])] = a
         for r in rows:
             best = None
             for tf, m in r["tfs"].items():
@@ -984,6 +1006,14 @@ class VolumeSpikeScanner:
                         new.append(a)
             r["best_tf"], r["best_score"] = (best[0], best[1]) if best else (None, None)
             r["rec"] = recommend(r, best[0], btc) if best else None
+            lp = latest_plan.get((r["symbol"], best[0])) if best else None
+            if r["rec"] and lp and lp.get("low_upside") and r["rec"]["call"] in ("long", "watch_long") \
+                    and now - lp["t"] < 2 * TFS[best[0]]:
+                r["rec"] = {"call": "skip", "setup": r["rec"].get("setup"), "low_upside": True,
+                            "why": [f"Low upside: TP1 only +{lp['upside']}% (needs ≥{lp['min_tp1']:g}% on {best[0]})",
+                                    "Next resistance is too close to be worth a manual trade"] + r["rec"]["why"]}
+            if r["rec"] and lp and "upside" in lp:
+                r["upside"] = lp["upside"]; r["min_tp1"] = lp["min_tp1"]
             for a in new:
                 if a["symbol"] == r["symbol"]:
                     a["oi_div"] = r.get("oi_div")
