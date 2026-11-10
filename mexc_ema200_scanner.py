@@ -533,6 +533,15 @@ def resistances_above(highs: list[float], upto: int, price: float,
     return out
 
 
+# v78: wide, timeframe-scaled stops for the Analyze card (same rules as the alert plans).
+# 60-day Binance backtest: tight stops were hit before TP1 most of the time; 5×ATR(4h) and
+# 2×ATR(1D) stops cut that sharply and improved expectancy. (k × ATR, minimum %, cap %)
+import threading as _thr
+_STOP_CTX = _thr.local()
+STOP_RULES_TF = {"5m": (4.0, 0.03, 0.10), "15m": (4.0, 0.03, 0.10), "1h": (4.0, 0.05, 0.15),
+                 "4h": (5.0, 0.08, 0.25), "1d": (2.0, 0.12, 0.35), "1w": (1.5, 0.20, 0.50)}
+
+
 def _apply_stop_floor(entry: float, sl_tight: float, sl_wide: float, atr=None,
                       plan_entry: float = None):
     """Enforce a volatility floor so a stop never sits inside normal noise.
@@ -558,6 +567,18 @@ def _apply_stop_floor(entry: float, sl_tight: float, sl_wide: float, atr=None,
     ref = entry
     if plan_entry and plan_entry > 0:
         ref = min(entry, plan_entry) if long_side else max(entry, plan_entry)
+    rule = STOP_RULES_TF.get(getattr(_STOP_CTX, "tf", None) or "")
+    if rule:                               # Analyze card: wide, timeframe-scaled (v78)
+        k, mn, cap = rule
+        floor_dist = max(mn * ref, k * atr if atr else 0.0)
+        cap_dist = cap * ref
+        if long_side:
+            sl_tight = max(min(sl_tight, ref - floor_dist), ref - cap_dist)
+            sl_wide = sl_tight if sl_wide is None else max(min(sl_wide, sl_tight), ref - min(cap_dist * 1.4, 0.9 * ref))
+        else:
+            sl_tight = min(max(sl_tight, ref + floor_dist), ref + cap_dist)
+            sl_wide = sl_tight if sl_wide is None else min(max(sl_wide, sl_tight), ref + cap_dist * 1.4)
+        return round(sl_tight, 10), round(sl_wide, 10)
     floor_dist = 0.025 * ref               # 2.5% hard minimum
     if atr:
         floor_dist = max(floor_dist, 1.5 * atr)
@@ -7946,6 +7967,7 @@ def analyze_symbol(sess: requests.Session, symbol: str, interval: str,
     """On-demand technical read of one coin on the 4h chart: trend vs the 200 EMA,
     support/resistance, a suggested entry / stop / three targets with R:R, and
     whether it currently matches either scan. Technical estimate, NOT advice."""
+    _STOP_CTX.tf = str(interval or "").lower()     # timeframe-scaled stops for this read (v78)
     mkt = cfg.get("market", "futures")
     raw = fetch_candles(sess, symbol, interval, cfg.get("kline_limit", 1000), mkt)
     if not raw or len(raw) < EMA_PERIOD + 2:
