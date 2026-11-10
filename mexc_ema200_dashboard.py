@@ -447,7 +447,7 @@ class Tracker:
 
     def resolve(self, prices):
         """Scale-out-aware resolution. Bank each TP by its weight as price reaches it,
-        ratcheting the stop up (break-even after TP1, TP1 after TP2 …). A stop-out
+        ratcheting the stop up (halfway after TP1, break-even after TP2, TP1 after TP3 …). A stop-out
         BEFORE any TP = full −1R loss; after TP1 the trade closes at the banked R (≥0)
         — never a full loss. R = weighted realised R across the scaled-out position."""
         if not prices:
@@ -499,11 +499,16 @@ class Tracker:
                         t["phase"] = ph + 1
                         if t["phase"] >= len(tps):
                             done.append((k, "win", round(t["realized"], 3))); closed = True; break
+                        # v78 (backtest): give it room. TP1 → stop halfway to entry, TP2 → break-even,
+                        # TP3+ → two levels behind (TP1 after TP3 …) so runners survive normal pullbacks.
                         if t["phase"] == 1:
+                            if t.get("stop") is not None:
+                                t["cur_stop"] = (t["stop"] + t["entry"]) / 2; t["cur_stop_r"] = -0.5
+                        elif t["phase"] == 2:
                             t["cur_stop"], t["cur_stop_r"] = t["entry"], 0.0
                         else:
-                            t["cur_stop"] = tps[t["phase"] - 2]["lvl"]
-                            t["cur_stop_r"] = tps[t["phase"] - 2]["rr"]
+                            t["cur_stop"] = tps[t["phase"] - 3]["lvl"]
+                            t["cur_stop_r"] = tps[t["phase"] - 3]["rr"]
                         continue
                     break
                 if not closed and now - (t.get("filled_ts") or t["ts"]) > 7 * 86400:
@@ -3194,7 +3199,7 @@ Hover any cell to see what it means for that coin. Click ⚲ for the full Analyz
   </table>
   <div class="empty" id="vsEmpty" style="display:none"></div>
 </div>
-<div class="wrap" style="margin-top:22px"><h3 style="margin:0 0 6px;font-size:14px">📡 Alert feed with trade plans</h3><div class="muted" style="font-size:12px;margin-bottom:6px">Every logged long alert gets a long plan: the Analyze card's stop and 3 targets taken from real resistance (1h/4h/Daily/Weekly swing highs and range highs, merged into zones; TP1 = first real level past the minimum), measured from the alert price and tracked on 15m highs and lows. ⅓ off at each target, stop to break-even after TP1, closed at market after 7 days. Hover any cell for the reasoning.</div><div id="vsFeed" style="overflow-x:auto"></div></div>
+<div class="wrap" style="margin-top:22px"><h3 style="margin:0 0 6px;font-size:14px">📡 Alert feed with trade plans</h3><div class="muted" style="font-size:12px;margin-bottom:6px">Every logged long alert gets a long plan: the Analyze card's stop and 3 targets taken from real resistance (1h/4h/Daily/Weekly swing highs and range highs, merged into zones; TP1 = first real level past the minimum), measured from the alert price and tracked on 15m highs and lows. Stops are wide on purpose (4h: ≥5×ATR / 8%, cap 25%; Daily: ≥2×ATR / 12%, cap 35%). ⅓ off at TP1, ⅓ at TP2, the last ⅓ is a runner: stop goes halfway to entry after TP1, to break-even after TP2, then trails 3×ATR(4h) under the high. Closed at market after 7 days. Hover any cell for the reasoning.</div><div id="vsFeed" style="overflow-x:auto"></div></div>
 <div class="wrap" style="margin-top:26px;margin-bottom:40px"><h3 style="margin:0 0 4px;font-size:15px">🧪 Forward test: how the alerts actually performed</h3><div class="muted" style="font-size:12px;margin-bottom:10px">Every logged long alert is graded on the price 1h, 4h and 24h later. Filter it, then see which spike levels, timeframes and conditions are working.</div>
 <div id="vsFtBar" style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px"></div><div id="vsStats"></div></div>
 </div>
@@ -3223,7 +3228,7 @@ Hover any cell to see what it means for that coin. Click ⚲ for the full Analyz
 
 <div class="view" id="viewCalls">
 <div class="status">
-  <span>📌 My calls — setups you chose to track on the Analyze tab: <b>📌 Track this setup</b> waits for the recommended entry to fill before going live; <b>⚡ Track @ market</b> enters immediately at the live price. Apex watches the live price and grades each one exactly like the plan: banks each TP, moves the stop to <b>break-even after TP1</b>, and scores the result in R. Their win-rate and per-TP hit rates are kept <b>separate</b> from the auto boards.</span>
+  <span>📌 My calls — setups you chose to track on the Analyze tab: <b>📌 Track this setup</b> waits for the recommended entry to fill before going live; <b>⚡ Track @ market</b> enters immediately at the live price. Apex watches the live price and grades each one exactly like the plan: banks each TP, moves the stop <b>halfway to entry after TP1</b>, to <b>break-even after TP2</b>, and scores the result in R. Their win-rate and per-TP hit rates are kept <b>separate</b> from the auto boards.</span>
   <span id="callsMeta"></span>
   <span class="wlbtn" style="margin-left:10px;border-color:rgba(248,81,73,.5);color:#f85149" onclick="resetCalls()" data-tip="Delete every tracked call and wipe the scorecard.">🗑 Reset all</span>
 </div>
@@ -4477,7 +4482,7 @@ function azCard(d0){
     ${rec.tp!=null?`<div class="azrec" data-tip="Recommended by EXPECTED VALUE, not raw ratio: reward:risk × how reachable the target is. Reachability decays with distance (in ATR units) but stretches out when the trend, momentum and volume back the move — so a far target isn't dismissed if the setup is strong, and a nearby one isn't over-rated if it's weak. Measured from the recommended entry (${fmtNum(recE)}) over the recommended stop (${rstop?fmtNum(rstop.level):'—'}), capped 8:1, and only shown because it clears the 1.5:1 floor. Grade blends R:R and reachability.">⭐ Recommended take-profit: <b>${fmtNum(rec.tp)}</b> <span class="rr">${(d.side||'long')==='short'?'−':'+'}${(rec.move*100).toFixed(1)}% · R:R <b>${rec.rr.toFixed(2)}</b> · ~${Math.round(rec.p*100)}% reach · grade <b>${planGrade}</b></span>${rec.kind?` <span style="color:var(--dim)">— ${esc(rec.kind)}${tgtTf&&/Daily|Weekly/.test(rec.kind||'')?` <span class="tfsrc">${tgtTf} chart</span>`:''}</span>`:''}</div>
     ${rec.tp!=null?dcaPlanHtml(d, recE, rstop?rstop.level:null, rec.tp, d.side||'long', be?be.distATR:null):''}
     ${scaleOutHtml(rtg, recE)}
-    ${(rec.tp!=null&&azRec)?`<div class="trackrow"><button class="trackbtn" onclick="trackSetup(event)" data-tip="Record this exact setup (entry, stop, full TP ladder) into 📌 My calls. It goes live only once price reaches the recommended entry (reaching TP1 first = missed, not a loss). Apex then watches the live price and grades it: banks each TP, moves the stop to break-even after TP1, and scores the result in R. Win-rate + per-TP hit rates are on the My calls tab.">📌 Track this setup</button><button class="trackbtn trackmkt" onclick="trackSetup(event,'market')" data-tip="Enter NOW at the live market price instead of waiting for the recommended entry. Same stop & TP ladder (targets already behind price are dropped); R is measured from the market fill.">⚡ Track @ market</button><span id="trackmsg" class="trackmsg"></span></div>`:''}
+    ${(rec.tp!=null&&azRec)?`<div class="trackrow"><button class="trackbtn" onclick="trackSetup(event)" data-tip="Record this exact setup (entry, stop, full TP ladder) into 📌 My calls. It goes live only once price reaches the recommended entry (reaching TP1 first = missed, not a loss). Apex then watches the live price and grades it: banks each TP, moves the stop halfway after TP1 and to break-even after TP2, and scores the result in R. Win-rate + per-TP hit rates are on the My calls tab.">📌 Track this setup</button><button class="trackbtn trackmkt" onclick="trackSetup(event,'market')" data-tip="Enter NOW at the live market price instead of waiting for the recommended entry. Same stop & TP ladder (targets already behind price are dropped); R is measured from the market fill.">⚡ Track @ market</button><span id="trackmsg" class="trackmsg"></span></div>`:''}
     <div class="sidenote" data-tip="How the same trade looks if you enter NOW at the current market price instead of waiting for the 🎯 recommended pullback — same stop and target, worse fill, so a lower R:R. Use it to decide: take it now, or wait for the better entry.">⚡ Enter now at market (CMP ${fmtNum(cmpE)}): ${rrAt(cmpE)!=null?`R:R <b>${rrAt(cmpE).toFixed(2)}</b> to the base target`:'stop is already in the way — no clean entry here'} <span style="color:var(--dim)">vs ${rec.rr.toFixed(2)} waiting for ${fmtNum(recE)}${(rrAt(cmpE)!=null&&rrAt(cmpE)<1.5)?' — under 1.5:1 now, better to wait for the pullback':(cmpE!=null&&recE!=null&&Math.abs(cmpE-recE)/recE<0.005?' — basically at the entry already':'')}</span></div>`
     :`<div class="azrec" style="color:#f0b429" data-tip="No target on the correct side clears a 1.5:1 reward:risk from a sensible stop. In crypto a sub-1.5 R:R trade isn't worth the risk — this is a 'no trade / wait' call, not a setup. Wait for a deeper entry (better R:R), a tighter valid stop level, or a different coin.">⛔ No trade here — best realistic R:R is only <b>${rtg?rtg.bestRR.toFixed(2):'—'}</b>, under the 1.5 minimum. Wait for a better entry or setup.</div>`}
     ${stopsSection(d.stop_levels, d.side||'long', rstop?rstop.level:null)}
@@ -6606,7 +6611,8 @@ function renderSpikes(){
     const tv=`https://www.tradingview.com/chart/?symbol=BINANCE:${r.symbol}.P`;
     const spotTxt=sp==null?(r.has_spot===false?'<span class="muted" data-tip="No Binance spot market">n/a</span>':'—')
       :`<span style="color:${sp>=(m.ratio||0)?'var(--accent)':sp<1.5?'var(--red)':'var(--txt)'};font-weight:${sp>=(m.ratio||0)?700:500}">${sp.toFixed(1)}×${sp>=(m.ratio||0)?' ✅':''}</span>`;
-    const oi=r.oi_usd==null?'—':`${vsUsd(r.oi_usd)}<span class="rr">${r.oi_chg4!=null?(r.oi_chg4>=0?'+':'')+r.oi_chg4.toFixed(1)+'% 4h':''}</span>`;
+    const om=r.oi_mcap_pct, omC=om==null?'':om>=30?'var(--red)':om>=15?'var(--warn)':om<5?'var(--dim)':'';
+    const oi=r.oi_usd==null?'—':`${vsUsd(r.oi_usd)}<span class="rr">${r.oi_chg4!=null?(r.oi_chg4>=0?'+':'')+r.oi_chg4.toFixed(1)+'% 4h':''}</span>${om!=null?`<span class="rr" style="${omC?'color:'+omC+';':''}font-weight:650"> · ${om<1?om.toFixed(1):Math.round(om)}% mcap</span>`:''}`;
     const f=r.funding==null?'—':(r.funding*100).toFixed(4)+'%';
     const tfN={'15m':'15-minute','1h':'1-hour','4h':'4-hour','1d':'daily'}[bt]||bt;
     const sgn=x=>(x>0?'+':'')+x;
@@ -6623,7 +6629,7 @@ function renderSpikes(){
       `<td data-tip="${esc(r.rec?r.rec.why.join(' · '):'No spike above the threshold')}">${r.rec?`<span style="color:${(VS_REC[r.rec.call]||[])[1]};font-weight:650;white-space:nowrap">${r.rec.low_upside?'✗ Low upside':(VS_REC[r.rec.call]||[r.rec.call])[0]}${r.rec.setup==='flush'?' ↺':''}</span>`:'<span class="muted">—</span>'}</td>`+
       ['15m','1h','4h','1d'].map(t=>vsRatioCell(r.tfs[t],minR,t)).join('')+
       `<td data-tip="${esc(spotTip)}">${spotTxt}</td><td data-tip="${esc(candleTip)}">${vsPct(m.chg)}<span class="rr">${m.chg!=null?bt:''}</span></td><td data-tip="${esc(emaTip)}">${vsPct(m.vs_ema,1)}<span class="rr">${m.vs_ema!=null?bt:''}</span></td>`+
-      `<td data-tip="${esc('OI 24h change: '+(r.oi_chg24==null?'n/a':r.oi_chg24+'%')+' · OI = '+(r.oi_pct_vol==null?'?':r.oi_pct_vol)+'% of 24h volume')}">${oi}</td>`+
+      `<td data-tip="${esc('OI 24h change: '+(r.oi_chg24==null?'n/a':r.oi_chg24+'%')+' · OI = '+(r.oi_pct_vol==null?'?':r.oi_pct_vol)+'% of 24h volume'+(r.oi_mcap_pct!=null?' · OI = '+r.oi_mcap_pct+'% of market cap ('+vsUsd(r.mcap)+', '+(r.mcap_src||'Binance')+'). Over ~15% = heavily leveraged: moves are fast both ways and squeezes/flushes are likely; over ~30% = crowded, a liquidation cascade can dominate price.':' · no Binance market cap for this coin'))}">${oi}</td>`+
       `<td style="${fc}" data-tip="${esc(fundTip)}">${f}</td><td>${vsUsd(r.turnover24)}</td><td>${vsPct(r.chg24,1)}</td></tr>`;
   }).join('');
   emp.style.display=rows.length?'none':'block';
@@ -6634,7 +6640,8 @@ function renderSpikes(){
 
 // ── Forward-test analysis (Volume spikes tab) ───────────────────────────────
 let ftHist=null, ftLast=0;
-const FTF={tf:'',lvl:0,per:'all',rec:'',h:'R',setup:''};
+const FTF={tf:'',lvl:0,per:'all',rec:'watch',h:'R',setup:''};   // default: only alerts the checklist says to take (✅ Long + 👀 Watch long)
+try{ const _fr=localStorage.getItem('ftRec'); if(_fr!==null) FTF.rec=_fr; }catch(e){}
 const FT_LVL=[[0,'All'],[2,'≥ 2×'],[2.5,'≥ 2.5×'],[3,'≥ 3×'],[5,'≥ 5×'],[10,'≥ 10×'],[20,'≥ 20×']];
 const FT_BUCKETS=[[2,2.5,'2–2.5×'],[2.5,3,'2.5–3×'],[3,5,'3–5×'],[5,10,'5–10×'],[10,20,'10–20×'],[20,1e9,'20×+']];
 const FT_PER=[['24h','24h',86400],['7d','7 days',604800],['30d','30 days',2592000],['all','All time',0]];
@@ -6644,7 +6651,7 @@ async function loadFtHist(force){
   try{ const r=await fetch('/spikes-hist',{cache:'no-store'}); const j=await r.json(); ftHist=j.hist||[]; }catch(e){}
   renderFt();
 }
-function ftSet(k,v){ FTF[k]=v; renderFt(); }
+function ftSet(k,v){ FTF[k]=v; if(k==='rec'){ try{ localStorage.setItem('ftRec',v); }catch(e){} } renderFt(); }
 function ftChip(k,v,label,extra){ const on=FTF[k]===v; return `<span onclick="ftSet('${k}',${typeof v==='string'?`'${v}'`:v})" style="cursor:pointer;padding:4px 10px;border-radius:8px;font-size:12px;font-weight:${on?700:500};border:1px solid ${on?'var(--accent)':'var(--line)'};background:${on?'rgba(63,185,80,.18)':'rgba(21,28,41,.7)'};white-space:nowrap">${label}${extra?' <span class="rr">'+extra+'</span>':''}</span>`; }
 function ftVal(a){ if(FTF.h==='R'){ const st=a.pstate; if(a.plan&&(a.plan.late||!a.plan.adj)) return null; return (st&&plClosed(st)&&typeof st.r==='number')?st.r:null; } const v=a.out&&a.out[FTF.h]; return (typeof v==='number')?v:null; }
 const ftU=()=>FTF.h==='R'?'R':'%';
@@ -6698,7 +6705,7 @@ function renderFt(){
     `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Timeframe</span>${[['','All'],['15m','15m'],['1h','1h'],['4h','4h'],['1d','1D']].map(([v,l])=>ftChip('tf',v,l,cTf(v))).join('')}</div>`+
     `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Spike level</span>${FT_LVL.map(([v,l])=>ftChip('lvl',v,l,cL(v))).join('')}</div>`+
     `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Period</span>${FT_PER.map(([v,l])=>ftChip('per',v,l)).join('')}</div>`+
-    `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Rec</span>${[['','All alerts'],['go','✅ Long only'],['watch','✅ + 👀'],['skip','✗ Skipped']].map(([v,l])=>ftChip('rec',v,l)).join('')}</div>`+
+    `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Rec</span>${[['watch','✅ Long + 👀 Watch long'],['go','✅ Long only'],['skip','✗ Skipped (comparison)'],['','All alerts']].map(([v,l])=>ftChip('rec',v,l)).join('')}<span class="muted" style="font-size:11px" data-tip="By default the forward test only counts alerts the checklist told you to take (✅ Long and 👀 Watch long), so the stats show how the calls you'd actually trade perform. ✗ Skipped shows the ones it rejected, so you can check it is filtering out the losers.">ⓘ</span></div>`+
     `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Setup</span>${[['','All'],['mom','📈 Momentum spike'],['flush','↺ Liquidation flush']].map(([v,l])=>ftChip('setup',v,l)).join('')}</div>`+
     `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><span class="muted" style="font-size:12px;width:92px">Judge after</span>${[['R','🎯 Trade plan (R)'],['1h','1 hour'],['4h','4 hours'],['24h','24 hours']].map(([v,l])=>ftChip('h',v,l)).join('')}</div>`;
   const S=ftStat(all);
@@ -6758,15 +6765,15 @@ function renderFt(){
   h+=`<div style="font-weight:700;margin:18px 0 4px">Over time <span class="muted" style="font-weight:400;font-size:12px">${trend}</span></div>`+
     `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px"><div><div class="muted" style="font-size:12px;margin-bottom:4px">Average ${FTF.h==='R'?'R per closed plan':'move after '+hz}, per day (last 14 days, UTC). Hover a bar for detail.</div>${ftSvgBars(days)}</div>`+
     `<div><div class="muted" style="font-size:12px;margin-bottom:4px">Cumulative: ${FTF.h==='R'?'every matching alert traded with its plan, same risk each (R)':'every matching alert, same size, closed after '+hz} (no fees). Now <b style="color:${cum>=0?'var(--accent)':'var(--red)'}">${cum>0?'+':''}${cum.toFixed(1)}${U}</b> over ${graded.length} trades.</div>${ftSvgCurve(pts)}</div></div>`;
-  h+=`<div class="muted" style="font-size:11.5px;margin-top:10px">Longs only. ${FTF.h==='R'?'Trade plan: ⅓ off at each target, stop to break-even after TP1, closed at market after 7 days; R = multiples of the risk to the stop. A win = closed above 0R.':'A win = price higher '+hz+' after the alert.'} No fees or slippage. Under ~30 alerts, any % is mostly luck.</div>`;
+  h+=`<div class="muted" style="font-size:11.5px;margin-top:10px">Longs only. ${FTF.h==='R'?'Trade plan: ⅓ off at TP1, ⅓ at TP2, last ⅓ runs (stop halfway after TP1, break-even after TP2, then a 3×ATR(4h) trail), closed at market after 7 days; R = multiples of the risk to the stop. A win = closed above 0R. Log restarted at v78 (wide stops).':'A win = price higher '+hz+' after the alert.'} No fees or slippage. Under ~30 alerts, any % is mostly luck.</div>`;
   box.innerHTML=h;
 }
 
 // ── Alert feed with trade plans ───────────────────────────────────────────
 let FEEDF='all', FEED_SKIPPED=false;
 const feedRecOk=a=>a.rec==='long'||a.rec==='watch_long';
-const PL_ST={open:['● Open','var(--blue)'],tp1:['TP1 ✓','var(--accent)'],tp2:['TP2 ✓✓','var(--accent)'],tp3:['🏆 TP3','var(--accent)'],sl:['✗ Stop','var(--red)'],be:['⚖ Break-even','var(--dim)'],expired:['⌛ Expired','var(--dim)'],invalid:['— no plan','var(--dim2)']};
-function plClosed(st){ return st&&['tp3','sl','be','expired'].includes(st.status); }
+const PL_ST={open:['● Open','var(--blue)'],tp1:['TP1 ✓','var(--accent)'],tp2:['TP2 ✓✓','var(--accent)'],tp3:['🏆 TP3 · runner on','var(--accent)'],sl:['✗ Stop','var(--red)'],be:['⚖ Break-even','var(--dim)'],trail:['🏃 Trailed out','var(--accent)'],expired:['⌛ Expired','var(--dim)'],invalid:['— no plan','var(--dim2)']};
+function plClosed(st){ return st&&(['sl','be','trail','expired'].includes(st.status)||(st.status==='tp3'&&st.closed_t!=null)); }
 function renderFeed(){
   const fd=document.getElementById('vsFeed'); if(!fd||!vsData) return;
   const allLong=(vsData.alerts||[]).filter(a=>a.dir==='long'); const nSkipped=allLong.filter(a=>!feedRecOk(a)).length;
@@ -6804,8 +6811,11 @@ function feedMatch(a,f){ const st=a.pstate; if(f==='all') return true; if(!st) r
 // Same risk/reward rules the alert plans use (mirror of finish_plan in volume_spikes.py)
 function vsPlanRules(entry, sl, tps, atr, levels, minPct){
   if(!entry||!sl||sl>=entry) return null;
-  let cap=entry*0.15; if(atr) cap=Math.min(cap,3*atr);
-  const notes=[]; if(entry-sl>cap){ notes.push('stop tightened from '+fmtNum(sl)+' ('+((1-sl/entry)*100).toFixed(1)+'%)'); sl=entry-cap; }
+  // v78 wide, timeframe-scaled stop (same rule as the alert engine): ≥ k×ATR and a minimum %, capped
+  const RULE={'5m':[4,.03,.10],'15m':[4,.03,.10],'1h':[4,.05,.15],'4h':[5,.08,.25],'1d':[2,.12,.35],'1w':[1.5,.20,.50]}[String((typeof azLast!=='undefined'&&azLast&&azLast.interval)||'4h').toLowerCase()]||[5,.08,.25];
+  const notes=[]; const fl=Math.max(RULE[1]*entry, atr?RULE[0]*atr:0), cp=RULE[2]*entry;
+  if(entry-sl<fl){ notes.push('stop widened from '+fmtNum(sl)+' ('+((1-sl/entry)*100).toFixed(1)+'%) to sit outside normal noise'); sl=entry-fl; }
+  if(entry-sl>cp){ notes.push('stop capped at '+(RULE[2]*100)+'%'); sl=entry-cp; }
   const risk=entry-sl, floor1=entry*(1+(minPct||10)/100), GAP=1.06, FR=0.996;
   const lv=[...(tps||[]).map(t=>[t,'Analyze target',1]),...(levels||[])].filter(x=>x[0]&&x[0]>entry*1.002).sort((a,b)=>a[0]-b[0]);
   const zones=[]; for(const [p,lab,w] of lv){ const z=zones[zones.length-1]; if(z&&p<=z.lo*1.015){ z.hits.push([p,lab,w]); z.hi=Math.max(z.hi,p); } else zones.push({lo:p,hi:p,hits:[[p,lab,w]]}); }
@@ -7381,7 +7391,10 @@ def main() -> None:
         try:
             import volume_spikes
             volume_spikes.start(notify=lambda txt: send_telegram(cfg, txt),
-                                planner=lambda sym, tf: analyze_symbol(get_session(), sym, tf, cfg))
+                                planner=lambda sym, tf: analyze_symbol(get_session(), sym, tf, cfg),
+                                mcap_extra=lambda: {r.get("token"): r.get("mcap")
+                                                    for r in ((state.watchlist_mon or {}).get("rows") or [])
+                                                    if r.get("token") and r.get("mcap")})
             print("  Volume-spike scanner: ON (Binance, 15m/1h/4h/1D)")
         except Exception as e:
             print(f"  Volume-spike scanner failed to start: {e}")
