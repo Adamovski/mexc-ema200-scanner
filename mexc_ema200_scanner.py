@@ -631,6 +631,21 @@ def level_bundle(entry: float, sl_tight: float, sl_wide: float,
         else:
             lvl, basis, is_ema = t, None, False
         norm.append((lvl, basis, is_ema))
+    # v80: FRONT-RUN every target on the Analyze card. Sellers fill just UNDER an obvious level
+    # (ONE stalled 0.9% below its TP1 high), so place each TP a volatility buffer inside it:
+    # max(0.4%, 0.25×ATR), capped at 2%.
+    if getattr(_STOP_CTX, "tf", None) and entry and sl_tight is not None:
+        long_side = sl_tight < entry
+        fr = []
+        for lvl, basis, is_ema in norm:
+            if lvl:
+                buf = min(0.02 * lvl, max(0.004 * lvl, 0.25 * atr if atr else 0.0))
+                nl = lvl - buf if long_side else lvl + buf
+                if (long_side and nl > entry) or ((not long_side) and nl < entry):
+                    lvl = round(nl, 10)
+                    basis = (basis + " · " if basis else "") + f"front-run by {buf / (lvl + buf if long_side else lvl - buf) * 100:.1f}% so it fills before sellers at the level"
+            fr.append((lvl, basis, is_ema))
+        norm = fr
     padded = norm + [(None, None, False)] * (5 - len(norm))
     for i, (tp, basis, is_ema) in enumerate(padded, 1):
         out[f"tp{i}"] = tp
