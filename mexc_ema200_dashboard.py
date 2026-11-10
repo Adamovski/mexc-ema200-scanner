@@ -279,6 +279,14 @@ class Tracker:
                 self._save()
         return hit
 
+    def reset_hc(self):
+        """Wipe only the ⭐ high-conviction calls (open + resolved)."""
+        with self.lock:
+            self.open = {k: t for k, t in self.open.items() if not (t.get("board") == "call" and t.get("hc"))}
+            self.closed = [t for t in self.closed if not (t.get("board") == "call" and t.get("hc"))]
+            self._save()
+        return True
+
     def reset_all(self):
         """Wipe every tracked trade and its history - a clean scorecard."""
         with self.lock:
@@ -286,7 +294,7 @@ class Tracker:
             self._save()
         return True
 
-    def add_call(self, symbol, side, targets, entry, stop, tf="", note="", mode="entry", px=None):
+    def add_call(self, symbol, side, targets, entry, stop, tf="", note="", mode="entry", px=None, hc=False):
         """Manually track a curated 'call' (from the Analyze tab), with its full TP
         ladder. `targets` is a comma-separated string of TP levels. Recorded with a
         unique key so the same coin can be called more than once.
@@ -343,6 +351,8 @@ class Tracker:
             t = self._mk("call", symbol, side, entry, stop, tps, px, now, tf,
                          (note or "")[:120], state=state)
             t["mode"] = "market" if market else "entry"
+            if hc:
+                t["hc"] = True                     # ⭐ high-conviction call: own tab + own scorecard
             self.open[f"call:{symbol}:{int(now)}:{t['id'][:4]}"] = t
             self._save()
         return t
@@ -651,7 +661,7 @@ class Tracker:
             _cf = ("id", "board", "symbol", "side", "entry", "stop", "tps", "rr", "status",
                    "r", "ts", "closed_ts", "tf", "note", "px0", "tps_hit", "state",
                    "phase", "filled_ts", "regime", "ver", "realized", "cur_stop_r",
-                   "entry_tf", "stop_tf", "mode")
+                   "entry_tf", "stop_tf", "mode", "hc")
             def _hold_r(t):
                 """R the WHOLE position would show right now had it never been closed
                 (no scale-out, no stop) — entry → current price, in units of the risk."""
@@ -723,7 +733,8 @@ class Tracker:
                     # user's own CALLS are never version-scoped — they span every version.
                     "by_board": {**{b: agg([t for t in res if t["board"] == b])
                                     for b in ("long", "short")},
-                                 "call": agg([t for t in res_all if t.get("board") == "call"])},
+                                 "call": agg([t for t in res_all if t.get("board") == "call" and not t.get("hc")]),
+                                 "hc": agg([t for t in res_all if t.get("board") == "call" and t.get("hc")])},
                     "by_regime": by_regime,
                     "by_version": by_version,
                     "board_rows": board_rows,
@@ -733,7 +744,9 @@ class Tracker:
                     "recent": [_pk(t) for t in _closed_cur[:80]],
                     "calls_open": [_pk(t) for t in _calls_all],
                     "calls_closed": [_pk(t) for t in _closed_rev
-                                     if t.get("board") == "call"][:60]}
+                                     if t.get("board") == "call" and not t.get("hc")][:60]
+                                    + [_pk(t) for t in _closed_rev
+                                       if t.get("board") == "call" and t.get("hc")][:60]}
 
 
 TRACKER = Tracker()
@@ -3112,6 +3125,7 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabWatch2" onclick="showTab('watch2')">🅰️ Binance Alpha</div>
   <div class="tab" id="tabSpikes" onclick="showTab('spikes')">🔊 Volume spikes</div>
   <div class="tab" id="tabCalls" onclick="showTab('calls')">📌 My calls</div>
+  <div class="tab" id="tabCallsHC" onclick="showTab('callshc')" data-tip="Your ⭐ high-conviction calls only, with their own scorecard. Choose ⭐ High conviction next to any Track button on the Analyze tab.">⭐ High conviction</div>
 </div>
 <div class="filterbar" id="filterbar"></div>
 
@@ -3225,6 +3239,7 @@ Hover any cell to see what it means for that coin. Click ⚲ for the full Analyz
 
 <div class="view" id="viewCalls">
 <div class="status">
+  <span id="callsHead" style="display:block;margin-bottom:4px"></span>
   <span>📌 My calls — setups you chose to track on the Analyze tab: <b>📌 Track this setup</b> waits for the recommended entry to fill before going live; <b>⚡ Track @ market</b> enters immediately at the live price. Apex watches the live price and grades each one exactly like the plan: banks each TP, moves the stop to <b>break-even after TP1</b>, keeps a runner (stop trails two targets behind from TP3), and scores the result in R. Their win-rate and per-TP hit rates are kept <b>separate</b> from the auto boards.</span>
   <span id="callsMeta"></span>
   <span class="wlbtn" style="margin-left:10px;border-color:rgba(248,81,73,.5);color:#f85149" onclick="resetCalls()" data-tip="Delete every tracked call and wipe the scorecard.">🗑 Reset all</span>
@@ -3736,6 +3751,8 @@ function showTab(which){
   if(which==="accum") renderAccum();
   if(which==="backtest") loadBacktest();
   if(which==="calls") renderCalls();
+  { const hb=document.getElementById('tabCallsHC'); if(hb) hb.classList.toggle('active', which==='callshc'); }
+  if(which==="callshc"){ const vc=document.getElementById('viewCalls'); if(vc) vc.classList.add('active'); renderCalls(); }
   if(which==="watch2") renderWatch2();
   if(which==="spikes") loadSpikes(true);
   if(which==="watch3") renderWatch3();
@@ -3758,18 +3775,26 @@ let azRec=null;   // the currently-shown MAIN recommended trade
 // passes its own entry/stop/targets so you choose exactly which setup to track.
 // mode 'entry' (📌 Track) = waits for the recommended entry to fill before going live;
 // mode 'market' (⚡ @ market) = you're in NOW at the live price, graded from there.
+// Conviction switch shown next to every Track button: Normal → 📌 My calls, ⭐ → High-conviction tab.
+let trackHC=false; try{ trackHC=localStorage.getItem('trackHC')==='1'; }catch(e){}
+function setTrackHC(v){ trackHC=!!v; try{ localStorage.setItem('trackHC',trackHC?'1':'0'); }catch(e){}
+  document.querySelectorAll('.convsw button').forEach(b=>b.classList.toggle('on', (b.dataset.hc==='1')===trackHC)); }
+function convSwitch(){ return `<span class="convsw" data-tip="Choose where Track sends this call: Normal → 📌 My calls, ⭐ High conviction → its own tab and scorecard." style="display:inline-flex;gap:0;margin-right:8px;border:1px solid var(--line);border-radius:8px;overflow:hidden;vertical-align:middle">`
+  +`<button data-hc="0" class="${trackHC?'':'on'}" onclick="setTrackHC(false);event.stopPropagation()" style="border:0;padding:4px 9px;font-size:12px;cursor:pointer;background:${trackHC?'transparent':'rgba(63,185,80,.18)'};color:inherit">Normal</button>`
+  +`<button data-hc="1" class="${trackHC?'on':''}" onclick="setTrackHC(true);event.stopPropagation()" style="border:0;padding:4px 9px;font-size:12px;cursor:pointer;background:${trackHC?'rgba(210,153,34,.25)':'transparent'};color:inherit">⭐ High conviction</button></span>`; }
 async function trackTrade(sym, side, entry, stop, targetsCsv, tf, msgId, ev, mode){
   if(ev&&ev.stopPropagation) ev.stopPropagation();
   mode=(mode==='market')?'market':'entry';
+  const hc=trackHC, dest=hc?'⭐ High conviction':'📌 My calls';
   const m=msgId?document.getElementById(msgId):null;
   if(!sym||entry==null||stop==null||!targetsCsv){ if(m) m.textContent='✗ missing levels'; return; }
-  const q=new URLSearchParams({symbol:sym, side:side||'long', entry:entry, stop:stop, targets:targetsCsv, tf:tf||'', mode});
+  const q=new URLSearchParams({symbol:sym, side:side||'long', entry:entry, stop:stop, targets:targetsCsv, tf:tf||'', mode, hc:hc?'1':'0'});
   if(m) m.textContent='…';
   try{ const r=await fetch('/track?'+q.toString(),{cache:'no-store'}); const d=await r.json();
     if(m) m.textContent = d.ok
       ? (mode==='market'
-          ? `✓ Live from market @ ${fmtNum(d.entry)} — see 📌 My calls`
-          : (d.state==='active' ? `✓ Entry ${fmtNum(d.entry)} already hit — live now` : `✓ Waiting for entry ${fmtNum(d.entry)} — see 📌 My calls`))
+          ? `✓ Live from market @ ${fmtNum(d.entry)} — see ${dest}`
+          : (d.state==='active' ? `✓ Entry ${fmtNum(d.entry)} already hit — live now in ${dest}` : `✓ Waiting for entry ${fmtNum(d.entry)} — see ${dest}`))
       : (mode==='market'
           ? `✗ Can't track at market (${d.why||'price outside stop/targets'})`
           : '✗ Could not track (entry must sit between stop & target)');
@@ -3903,7 +3928,7 @@ function xtfTradeBody(b,i){
       <span class="xtftf" data-tip="The timeframe whose plan graded highest for this trade — the individual levels below can each come from a different chart.">${tfN} chart</span>
       ${i>0?`<button class="wlbtn xtfexp" onclick="toggleXtfTrade(${i})">${detailed?'− collapse':'+ expand'}</button>`:''}
       ${b.tf!==azTf?`<button class="wlbtn" onclick="setAzTf('${b.tf}')">View on ${tfN} ↗</button>`:`<span class="xtfcur">— viewing this timeframe</span>`}
-      <button class="wlbtn xtftrackbtn" onclick="trackXtf(${i},event)" data-tip="Track THIS ${tfN} plan (its entry, stop & TP ladder) in 📌 My calls — scale-out aware, graded in R.">📌 Track</button><button class="wlbtn xtftrackbtn trackmkt" onclick="trackXtf(${i},event,'market')" data-tip="Enter NOW at the live market price instead of waiting for the recommended entry. Same stop & TP ladder (targets already behind price are dropped); R is measured from the market fill.">⚡ @ market</button><span class="trackmsg" id="xtftrackmsg${i}"></span></div>
+      ${convSwitch()}<button class="wlbtn xtftrackbtn" onclick="trackXtf(${i},event)" data-tip="Track THIS ${tfN} plan (its entry, stop & TP ladder) in 📌 My calls — scale-out aware, graded in R.">📌 Track</button><button class="wlbtn xtftrackbtn trackmkt" onclick="trackXtf(${i},event,'market')" data-tip="Enter NOW at the live market price instead of waiting for the recommended entry. Same stop & TP ladder (targets already behind price are dropped); R is measured from the market fill.">⚡ @ market</button><span class="trackmsg" id="xtftrackmsg${i}"></span></div>
     <div class="xtfrow">
       <span class="xtfi" data-tip="Entry ${fmtNum(be.level)} — the recommended fill: the best value-area pullback that maximises reward:risk while still being a level price is likely to reach. From the ${eTf} chart. Why: ${esc(be.basis||'best value-area level')}."><i>Entry</i>${fmtNum(be.level)}${chip(eTf)}</span>
       <span class="xtfi" data-tip="Stop ${fmtNum(stop.level)} — the level that invalidates the trade, just beyond real structure and clear of the wick/noise range. From the ${sTf} chart. Why: ${esc(stop.basis||'—')}."><i>Stop</i>${fmtNum(stop.level)}${chip(sTf)}</span>
@@ -4479,7 +4504,7 @@ function azCard(d0){
     ${rec.tp!=null?`<div class="azrec" data-tip="Recommended by EXPECTED VALUE, not raw ratio: reward:risk × how reachable the target is. Reachability decays with distance (in ATR units) but stretches out when the trend, momentum and volume back the move — so a far target isn't dismissed if the setup is strong, and a nearby one isn't over-rated if it's weak. Measured from the recommended entry (${fmtNum(recE)}) over the recommended stop (${rstop?fmtNum(rstop.level):'—'}), capped 8:1, and only shown because it clears the 1.5:1 floor. Grade blends R:R and reachability.">⭐ Recommended take-profit: <b>${fmtNum(rec.tp)}</b> <span class="rr">${(d.side||'long')==='short'?'−':'+'}${(rec.move*100).toFixed(1)}% · R:R <b>${rec.rr.toFixed(2)}</b> · ~${Math.round(rec.p*100)}% reach · grade <b>${planGrade}</b></span>${rec.kind?` <span style="color:var(--dim)">— ${esc(rec.kind)}${tgtTf&&/Daily|Weekly/.test(rec.kind||'')?` <span class="tfsrc">${tgtTf} chart</span>`:''}</span>`:''}</div>
     ${rec.tp!=null?dcaPlanHtml(d, recE, rstop?rstop.level:null, rec.tp, d.side||'long', be?be.distATR:null):''}
     ${scaleOutHtml(rtg, recE)}
-    ${(rec.tp!=null&&azRec)?`<div class="trackrow"><button class="trackbtn" onclick="trackSetup(event)" data-tip="Record this exact setup (entry, stop, full TP ladder) into 📌 My calls. It goes live only once price reaches the recommended entry (reaching TP1 first = missed, not a loss). Apex then watches the live price and grades it: banks each TP, moves the stop to break-even after TP1, keeps a runner, and scores the result in R. Win-rate + per-TP hit rates are on the My calls tab.">📌 Track this setup</button><button class="trackbtn trackmkt" onclick="trackSetup(event,'market')" data-tip="Enter NOW at the live market price instead of waiting for the recommended entry. Same stop & TP ladder (targets already behind price are dropped); R is measured from the market fill.">⚡ Track @ market</button><span id="trackmsg" class="trackmsg"></span></div>`:''}
+    ${(rec.tp!=null&&azRec)?`<div class="trackrow">${convSwitch()}<button class="trackbtn" onclick="trackSetup(event)" data-tip="Record this exact setup (entry, stop, full TP ladder) into 📌 My calls. It goes live only once price reaches the recommended entry (reaching TP1 first = missed, not a loss). Apex then watches the live price and grades it: banks each TP, moves the stop to break-even after TP1, keeps a runner, and scores the result in R. Win-rate + per-TP hit rates are on the My calls tab.">📌 Track this setup</button><button class="trackbtn trackmkt" onclick="trackSetup(event,'market')" data-tip="Enter NOW at the live market price instead of waiting for the recommended entry. Same stop & TP ladder (targets already behind price are dropped); R is measured from the market fill.">⚡ Track @ market</button><span id="trackmsg" class="trackmsg"></span></div>`:''}
     <div class="sidenote" data-tip="How the same trade looks if you enter NOW at the current market price instead of waiting for the 🎯 recommended pullback — same stop and target, worse fill, so a lower R:R. Use it to decide: take it now, or wait for the better entry.">⚡ Enter now at market (CMP ${fmtNum(cmpE)}): ${rrAt(cmpE)!=null?`R:R <b>${rrAt(cmpE).toFixed(2)}</b> to the base target`:'stop is already in the way — no clean entry here'} <span style="color:var(--dim)">vs ${rec.rr.toFixed(2)} waiting for ${fmtNum(recE)}${(rrAt(cmpE)!=null&&rrAt(cmpE)<1.5)?' — under 1.5:1 now, better to wait for the pullback':(cmpE!=null&&recE!=null&&Math.abs(cmpE-recE)/recE<0.005?' — basically at the entry already':'')}</span></div>`
     :`<div class="azrec" style="color:#f0b429" data-tip="No target on the correct side clears a 1.5:1 reward:risk from a sensible stop. In crypto a sub-1.5 R:R trade isn't worth the risk — this is a 'no trade / wait' call, not a setup. Wait for a deeper entry (better R:R), a tighter valid stop level, or a different coin.">⛔ No trade here — best realistic R:R is only <b>${rtg?rtg.bestRR.toFixed(2):'—'}</b>, under the 1.5 minimum. Wait for a better entry or setup.</div>`}
     ${stopsSection(d.stop_levels, d.side||'long', rstop?rstop.level:null)}
@@ -5302,7 +5327,7 @@ function planPanelHtml(p, side, cmp, sym){
      <div class="ptps"><div class="ptpsh">Targets — take profit in stages</div>${tps}</div>
      <div class="pscale">📤 Scale-out: ${scale}</div>
      ${(()=>{const rf=riskPct/100; if(!(rf>0)) return ''; const sizePct=Math.round(1/rf); const lev=Math.max(1,Math.ceil(sizePct/100)); const safeLev=Math.max(1,Math.min(25,Math.floor(0.5/rf))); return `<div class="psize" data-tip="Risking 1% of your account on this trade. Stop is ${riskPct.toFixed(1)}% from entry, so position notional ≈ ${sizePct}% of account (loss if stopped ≈ 1%). It needs ≥${lev}× leverage just to hold that notional; keeping leverage at ≤${safeLev}× (isolated) leaves the liquidation price well beyond the stop. Adjust for your own risk-per-trade %.">💰 Sizing (1% risk): size ≈ <b>${sizePct}%</b> of account · needs ≥${lev}× · keep ≤<b>${safeLev}×</b> lev</div>`;})()}
-     ${sym?`<div class="trackrow" style="margin-top:8px"><button class="trackbtn" onclick="trackTrade('${sym}','${side}',${p.entry},${p.stop},'${(p.tps||[]).map(t=>t.lvl).join(',')}','${p.entry_tf||''}','pptrk_${esc(sym)}_${side}',event)" data-tip="Track this exact ${long?'long':'short'} plan in 📌 My calls — goes live once price reaches the entry; scale-out aware, graded in R.">📌 Track this</button><button class="trackbtn trackmkt" onclick="trackTrade('${sym}','${side}',${p.entry},${p.stop},'${(p.tps||[]).map(t=>t.lvl).join(',')}','${p.entry_tf||''}','pptrk_${esc(sym)}_${side}',event,'market')" data-tip="Enter NOW at the live market price instead of waiting for the recommended entry. Same stop & TP ladder (targets already behind price are dropped); R is measured from the market fill.">⚡ Track @ market</button><span class="trackmsg" id="pptrk_${esc(sym)}_${side}"></span></div>`:''}
+     ${sym?`<div class="trackrow" style="margin-top:8px">${convSwitch()}<button class="trackbtn" onclick="trackTrade('${sym}','${side}',${p.entry},${p.stop},'${(p.tps||[]).map(t=>t.lvl).join(',')}','${p.entry_tf||''}','pptrk_${esc(sym)}_${side}',event)" data-tip="Track this exact ${long?'long':'short'} plan in 📌 My calls — goes live once price reaches the entry; scale-out aware, graded in R.">📌 Track this</button><button class="trackbtn trackmkt" onclick="trackTrade('${sym}','${side}',${p.entry},${p.stop},'${(p.tps||[]).map(t=>t.lvl).join(',')}','${p.entry_tf||''}','pptrk_${esc(sym)}_${side}',event,'market')" data-tip="Enter NOW at the live market price instead of waiting for the recommended entry. Same stop & TP ladder (targets already behind price are dropped); R is measured from the market fill.">⚡ Track @ market</button><span class="trackmsg" id="pptrk_${esc(sym)}_${side}"></span></div>`:''}
    </div>`;
 }
 // Map a setup's timeframe label to a backtest sweep timeframe, and pull its measured edge.
@@ -6322,8 +6347,9 @@ async function deleteCall(id,ev){ if(ev) ev.stopPropagation();
   try{ await fetch('/calls/delete?id='+encodeURIComponent(id),{cache:'no-store'}); }catch(e){}
   poll(); }
 async function resetCalls(){
-  if(!confirmSafe('Delete ALL tracked calls and reset the scorecard? This cannot be undone.')) return;
-  try{ await fetch('/calls/reset',{cache:'no-store'}); }catch(e){}
+  const HC=activeTab==='callshc';
+  if(!confirmSafe(HC?'Delete all ⭐ high-conviction calls and reset their scorecard? This cannot be undone.':'Delete ALL tracked calls and reset the scorecard? This cannot be undone.')) return;
+  try{ await fetch('/calls/reset'+(HC?'?hc=1':''),{cache:'no-store'}); }catch(e){}
   poll(); }
 function confirmSafe(msg){ try{ return window.confirm(msg); }catch(e){ return true; } }
 let callSort={o:{k:'ts',d:-1},c:{k:'ts',d:-1}};
@@ -6400,12 +6426,14 @@ function renderCalls(){
   const cards=document.getElementById('callsCards'); if(!cards) return;
   const openrows=document.getElementById('callsopenrows'), closedrows=document.getElementById('callsclosedrows');
   const meta=document.getElementById('callsMeta'), emp=document.getElementById('callsempty');
-  const a=((perf&&perf.by_board)||{}).call||{};
-  const opens=(perf&&perf.calls_open)||[], closed=(perf&&perf.calls_closed)||[];
-  if(activeTab==='calls'&&opens.length) loadCallFlows(opens);
+  const HC=activeTab==='callshc';
+  const a=((perf&&perf.by_board)||{})[HC?'hc':'call']||{};
+  const opens=((perf&&perf.calls_open)||[]).filter(t=>!!t.hc===HC), closed=((perf&&perf.calls_closed)||[]).filter(t=>!!t.hc===HC);
+  { const hd=document.getElementById('callsHead'); if(hd&&hd.nextElementSibling) hd.nextElementSibling.style.display=HC?'none':''; if(hd) hd.style.display=HC?'block':'none'; if(hd) hd.innerHTML=HC?'⭐ <b>High-conviction calls</b>: the setups you marked ⭐ when tracking on the Analyze tab, scored separately from 📌 My calls. Same grading: banks each TP, stop to <b>break-even after TP1</b>, runner trails from TP3.':'📌 My calls: setups you chose to track on the Analyze tab (normal conviction). ⭐ High-conviction calls live in their own tab.'; }
+  if((activeTab==='calls'||HC)&&opens.length) loadCallFlows(opens);
   const has=opens.length||closed.length;
   if(emp) emp.style.display=has?'none':'block';
-  if(meta) meta.textContent=`${opens.length} open · ${a.n||0} resolved`;
+  if(meta) meta.textContent=`${HC?'⭐ ':''}${opens.length} open · ${a.n||0} resolved`;
   cards.innerHTML=
      perfCard('Win rate', a.winrate==null?'—':a.winrate+'%', a.winrate==null?'':(a.winrate>=50?'pcg':a.winrate>=40?'':'pcb'))
     +perfCard('Expectancy', a.exp==null?'—':(a.exp>0?'+':'')+a.exp+'R', a.exp==null?'':(a.exp>0?'pcg':'pcb'))
@@ -7259,7 +7287,7 @@ def make_handler(state: State):
                 ok = TRACKER.delete_call(cid)
                 self._send(200, json.dumps({"ok": ok}).encode(), "application/json")
             elif self.path.startswith("/calls/reset"):
-                ok = TRACKER.reset_all()
+                ok = TRACKER.reset_hc() if "hc=1" in self.path else TRACKER.reset_all()
                 self._send(200, json.dumps({"ok": ok}).encode(), "application/json")
             elif self.path.startswith("/track"):
                 self._track()
@@ -7300,8 +7328,9 @@ def make_handler(state: State):
                 except Exception:
                     px = None
             t = TRACKER.add_call(sym, g("side") or "long", g("targets") or g("target"),
-                                 g("entry"), g("stop"), g("tf"), g("note"), mode=mode, px=px)
-            out = {"ok": bool(t), "symbol": sym, "mode": mode, "px": px}
+                                 g("entry"), g("stop"), g("tf"), g("note"), mode=mode, px=px,
+                                 hc=(g("hc") == "1"))
+            out = {"ok": bool(t), "symbol": sym, "mode": mode, "px": px, "hc": g("hc") == "1"}
             if t:
                 out.update({"entry": t["entry"], "state": t["state"],
                             "n_tps": len(t["tps"])})
