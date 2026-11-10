@@ -3041,7 +3041,7 @@ Hover any cell to see what it means for that coin. Click ⚲ for the full Analyz
   </table>
   <div class="empty" id="vsEmpty" style="display:none"></div>
 </div>
-<div class="wrap" style="margin-top:22px"><h3 style="margin:0 0 6px;font-size:14px">📡 Alert feed with trade plans</h3><div class="muted" style="font-size:12px;margin-bottom:6px">Every logged long alert gets the Analyze card's long plan (1 stop, 3 targets), measured from the alert price and tracked on 15m highs and lows. ⅓ off at each target, stop to break-even after TP1, closed at market after 7 days. Hover any cell for the reasoning.</div><div id="vsFeed" style="overflow-x:auto"></div></div>
+<div class="wrap" style="margin-top:22px"><h3 style="margin:0 0 6px;font-size:14px">📡 Alert feed with trade plans</h3><div class="muted" style="font-size:12px;margin-bottom:6px">Every logged long alert gets a long plan: the Analyze card's stop and 3 targets taken from real resistance (1h/4h/Daily/Weekly swing highs and range highs, merged into zones; TP1 = first real level past the minimum), measured from the alert price and tracked on 15m highs and lows. ⅓ off at each target, stop to break-even after TP1, closed at market after 7 days. Hover any cell for the reasoning.</div><div id="vsFeed" style="overflow-x:auto"></div></div>
 <div class="wrap" style="margin-top:26px;margin-bottom:40px"><h3 style="margin:0 0 4px;font-size:15px">🧪 Forward test: how the alerts actually performed</h3><div class="muted" style="font-size:12px;margin-bottom:10px">Every logged long alert is graded on the price 1h, 4h and 24h later. Filter it, then see which spike levels, timeframes and conditions are working.</div>
 <div id="vsFtBar" style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px"></div><div id="vsStats"></div></div>
 </div>
@@ -6525,7 +6525,7 @@ function renderFeed(){
     const pl=a.plan, st=a.pstate||null;
     const tpCell=i=>{ if(!pl) return '<td class="muted">—</td>'; const hit=st&&st.hits>i; const low=i===0&&a.low_upside;
       return `<td style="${hit?'background:rgba(63,185,80,.22);':low?'background:rgba(210,153,34,.16);':''}white-space:nowrap" data-tip="${esc('TP'+(i+1)+' '+fmtNum(pl.tps[i])+' ('+(pl.tp_pct[i]>0?'+':'')+pl.tp_pct[i]+'%, '+pl.rr[i]+'R from entry). '+(pl.basis[i]||'')+(hit?' · HIT':'')+(low?' · LOW UPSIDE: TP1 is under the '+a.min_tp1+'% minimum for a '+((pl&&pl.tf)||a.tf)+' trade, so this alert is marked ✗ Skip (still tracked so the forward test can check the rule).':''))}">${hit?'✓ ':''}${fmtNum(pl.tps[i])} <span class="rr">+${pl.tp_pct[i].toFixed(1)}%</span>${rr(pl.rr[i])}${low?' <span class="rr" style="color:var(--warn)">low</span>':''}</td>`; };
-    const stopTxt=pl?`<td style="white-space:nowrap;${st&&st.status==='sl'?'background:rgba(248,81,73,.22);':''}" data-tip="${esc('Stop '+fmtNum(pl.sl)+' ('+pl.sl_pct+'%). '+(pl.sl_basis||'')+' Moves to entry (break-even) once TP1 is hit. Plan source: '+(pl.src==='analyze'?'Analyze card (4h/1D structure for this coin)':'fallback: swing low + ATR, targets at 1R/2R/3R'))}">${fmtNum(pl.sl)} <span class="rr">${pl.sl_pct.toFixed(1)}%</span>${st&&st.hits>=1&&!plClosed(st)?'<span class="rr" style="color:var(--accent)">→ BE</span>':''}</td>`:'<td class="muted">—</td>';
+    const stopTxt=pl?`<td style="white-space:nowrap;${st&&st.status==='sl'?'background:rgba(248,81,73,.22);':''}" data-tip="${esc('Stop '+fmtNum(pl.sl)+' ('+pl.sl_pct+'%). '+(pl.sl_basis||'')+' Moves to entry (break-even) once TP1 is hit. Plan source: '+(pl.src==='analyze'?'Analyze card (4h/1D structure for this coin)':'fallback: swing low + ATR, targets from candle swing highs'))}">${fmtNum(pl.sl)} <span class="rr">${pl.sl_pct.toFixed(1)}%</span>${st&&st.hits>=1&&!plClosed(st)?'<span class="rr" style="color:var(--accent)">→ BE</span>':''}</td>`:'<td class="muted">—</td>';
     const stInfo=!st?['⏳ planning…','var(--dim)']:(PL_ST[st.status]||[st.status,'var(--dim)']);
     const stTip=(st?('Best move since entry +'+(st.mfe||0)+'% · worst '+(st.mae||0)+'%'+(st.why?' · '+st.why:'')):'Fetching the Analyze plan for this coin (runs at the end of each scan)')+(pl&&pl.late?' · LATE PLAN: levels were drawn after the alert, so this trade is tracked but left out of the forward-test stats.':'')+(pl&&!pl.adj?' · OLD PLAN: made before the risk/reward rules (TP1 could be under 1R), so it is excluded from the forward-test stats.':'');
     const R=st&&st.r!=null?`<b style="color:${st.r>0?'var(--accent)':st.r<0?'var(--red)':'var(--dim)'}">${st.r>0?'+':''}${st.r.toFixed(2)}R</b>`:(st&&st.open_r!=null?`<span class="muted" data-tip="Unrealised, at the current price">${st.open_r>0?'+':''}${st.open_r.toFixed(2)}R open</span>`:'—');
@@ -6545,15 +6545,24 @@ function feedMatch(a,f){ const st=a.pstate; if(f==='all') return true; if(!st) r
   if(f==='open') return !plClosed(st)&&st.status!=='invalid'; if(f==='won') return (st.hits||0)>=1; if(f==='stopped') return st.status==='sl'; if(f==='closed') return plClosed(st); return true; }
 
 // Same risk/reward rules the alert plans use (mirror of finish_plan in volume_spikes.py)
-function vsPlanRules(entry, sl, tps, atr){
+function vsPlanRules(entry, sl, tps, atr, levels, minPct){
   if(!entry||!sl||sl>=entry) return null;
   let cap=entry*0.15; if(atr) cap=Math.min(cap,3*atr);
   const notes=[]; if(entry-sl>cap){ notes.push('stop tightened from '+fmtNum(sl)+' ('+((1-sl/entry)*100).toFixed(1)+'%)'); sl=entry-cap; }
-  const risk=entry-sl; let src=(tps||[]).filter(x=>x&&x>entry*1.002).sort((a,b)=>a-b); const out=[], tag=[];
-  const dropped=src.filter(t=>t<entry+risk).length; if(dropped) notes.push(dropped+' Analyze target(s) under 1R ignored');
-  for(const need of [1,2,3]){ const fl=entry+need*risk; const i=src.findIndex(t=>t>=fl&&(!out.length||t>out[out.length-1]*1.001));
-    if(i>=0){ out.push(src[i]); tag.push('level'); src.splice(i,1); } else { out.push(Math.max(fl,out.length?out[out.length-1]+risk:fl)); tag.push('R'); } }
-  return {sl, tps:out, tag, rr:out.map(t=>(t-entry)/risk), notes};
+  const risk=entry-sl, floor1=entry*(1+(minPct||10)/100), GAP=1.06, FR=0.996;
+  const lv=[...(tps||[]).map(t=>[t,'Analyze target',1]),...(levels||[])].filter(x=>x[0]&&x[0]>entry*1.002).sort((a,b)=>a[0]-b[0]);
+  const zones=[]; for(const [p,lab,w] of lv){ const z=zones[zones.length-1]; if(z&&p<=z.lo*1.015){ z.hits.push([p,lab,w]); z.hi=Math.max(z.hi,p); } else zones.push({lo:p,hi:p,hits:[[p,lab,w]]}); }
+  zones.forEach(z=>{ const m={}; z.hits.forEach(([,l,w])=>m[l]=Math.max(m[l]||0,w)); z.labels=Object.keys(m).sort((a,b)=>m[b]-m[a]); z.score=Object.values(m).reduce((a,b)=>a+b,0)+0.5*Math.max(0,z.hits.length-z.labels.length); });
+  const tpOf=z=>{ let t=z.lo*FR; if(t<floor1&&floor1<=z.hi*FR) t=z.hi*FR; return t; };
+  let out=[], tag=[], why=[];
+  for(const ms of [1.5,0.5]){ out=[]; tag=[]; why=[];
+    for(const z of zones){ const t=tpOf(z); if(z.score<ms||t<floor1) continue; if(out.length&&t<out[out.length-1]*GAP) continue;
+      out.push(t); tag.push('level'); why.push(z.labels.slice(0,3).join(' + ')); if(out.length===3) break; }
+    if(out.length) break; }
+  while(out.length<3){ const b=out.length?out[out.length-1]:entry; out.push(Math.max(b+risk,b*GAP,floor1)); tag.push('R'); why.push('projection, no level above'); }
+  const minor=zones.find(z=>tpOf(z)<floor1&&z.score>=1.5&&z.lo>entry*1.01);
+  if(minor) notes.push('first hurdle '+fmtNum(minor.lo)+' (+'+((minor.lo/entry-1)*100).toFixed(1)+'%, '+minor.labels[0]+') is under the '+(minPct||10)+'% minimum');
+  return {sl, tps:out, tag, why, rr:out.map(t=>(t-entry)/risk), notes};
 }
 // ── Analyze card: volume & flow context from the Volume spikes scanner ─────────
 async function vsAzInject(){
@@ -6596,9 +6605,10 @@ async function vsAzInject(){
   if(azSideNow==='long'||!azSideNow){ const lp=(azLast.plans&&azLast.plans.long)||azLast; const px=azLast.price;
     let stopIn=lp.sl_tight; if(m&&m.setup==='flush'&&m.lo&&stopIn>m.lo*0.997) stopIn=m.lo*0.995;
     const atr=azLast.atr_pct&&px?px*azLast.atr_pct/100:null;
-    const pr=vsPlanRules(px, stopIn, [lp.tp1,lp.tp2,lp.tp3,lp.tp4,lp.tp5], atr);
+    const _lv=[...(azLast.resistances||[]).map(r=>[r,'swing-high resistance',1]),[azLast.res_4h,'4h swing high',1],[azLast.res_1d,'Daily swing high',2],[azLast.res_1w,'Weekly swing high',3]];
+    const pr=vsPlanRules(px, stopIn, [lp.tp1,lp.tp2,lp.tp3,lp.tp4,lp.tp5], atr, _lv, VS_MIN_TP1[(azLast.interval||azTf||'').toLowerCase()]||10);
     if(pr){ const pc=x=>((x/px-1)*100).toFixed(1)+'%';
-      lines.push(`<div style="margin-top:4px" data-tip="${esc('The Volume-spikes alert plans use the Analyze stop and resistances, plus two rules: the stop is never more than 3×ATR or 15% from entry, and only targets at least 1R / 2R / 3R away are used (missing ones are filled with R multiples). This is that same plan for an entry at the current price, so both tabs agree.')}"><b>Long plan with the volume-tab RR rules</b> (entry now ${fmtNum(px)}): stop ${fmtNum(pr.sl)} (-${((1-pr.sl/px)*100).toFixed(1)}%) · `+pr.tps.map((t,i)=>`TP${i+1} ${fmtNum(t)} (+${pc(t)}, ${pr.rr[i].toFixed(1)}R${pr.tag[i]==='R'?', R-target':''})`).join(' · ')+(pr.notes.length?` <span class="muted">· ${esc(pr.notes.join('; '))}</span>`:'')+`</div>`);
+      lines.push(`<div style="margin-top:4px" data-tip="${esc('The Volume-spikes alert plans use the Analyze stop (never more than 3×ATR or 15% from entry) and targets taken from REAL levels: swing highs on 1h/4h/Daily/Weekly, merged into zones. TP1 is the first real level past the minimum (10% on 4h), each next TP at least 6% higher, each front-running its level by 0.4%. R multiples only fill in when there is no level overhead. This is the same plan for an entry at the current price (the alert engine also uses 1h/4h/Daily candle pivots and range highs).')}"><b>Long plan with the volume-tab RR rules</b> (entry now ${fmtNum(px)}): stop ${fmtNum(pr.sl)} (-${((1-pr.sl/px)*100).toFixed(1)}%) · `+pr.tps.map((t,i)=>`TP${i+1} ${fmtNum(t)} (+${pc(t)}, ${pr.rr[i].toFixed(1)}R, ${esc(pr.why[i])})`).join(' · ')+(pr.notes.length?` <span class="muted">· ${esc(pr.notes.join('; '))}</span>`:'')+`</div>`);
       const tfk=(azLast.interval||azTf||'').toLowerCase(), need=VS_MIN_TP1[tfk]; const up1=(pr.tps[0]/px-1)*100;
       if(need) lines.push(`<div style="color:${up1<need?'var(--warn)':'var(--accent)'};font-weight:650">${up1<need?'✗ Low upside: TP1 is only +'+up1.toFixed(1)+'%, under the '+need+'% minimum for a '+tfk+' trade. Not worth taking manually.':'✓ TP1 +'+up1.toFixed(1)+'% clears the '+need+'% minimum for a '+tfk+' trade.'}</div>`); } }
   // recent alerts for this coin
