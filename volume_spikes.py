@@ -611,7 +611,20 @@ def plan_from_analyze(az, entry):
             tps.append(tp); basis.append((lp.get(f"tp{i}_basis") or "")[:120])
         if len(tps) == 3:
             break
-    return {"sl": sl, "tps": tps, "basis": basis, "sl_basis": (lp.get("sl_tight_basis") or "")[:160], "src": "analyze"}
+    lv = []
+    for i in range(1, 6):
+        tp = _f(lp.get(f"tp{i}"))
+        if tp and tp > entry:
+            lv.append((tp, (lp.get(f"tp{i}_basis") or "Analyze target")[:80], 1))
+    for r in (az.get("resistances") or []):
+        if _f(r) and _f(r) > entry:
+            lv.append((_f(r), "swing-high resistance", 1))
+    for k, lab, w in (("res_4h", "4h swing high", 1), ("res_1d", "Daily swing high", 2), ("res_1w", "Weekly swing high", 3)):
+        v = _f(az.get(k))
+        if v and v > entry:
+            lv.append((v, lab, w))
+    return {"sl": sl, "tps": tps, "basis": basis, "sl_basis": (lp.get("sl_tight_basis") or "")[:160], "src": "analyze",
+            "levels": lv}
 
 
 def plan_from_candles(c, entry):
@@ -636,10 +649,80 @@ MAX_STOP_ATR = 3.0      # stop no further than 3×ATR …
 MAX_STOP_PCT = 0.15     # … and no further than 15% from entry
 
 
-def finish_plan(plan, entry, atr=None):
-    """Risk/reward discipline on top of the Analyze levels:
-    stop capped at min(3×ATR, 15%); only resistances ≥ 1R count as targets and the
-    ladder is filled so TP1 ≥ 1R, TP2 ≥ 2R, TP3 ≥ 3R."""
+PLAN_VER = 2            # v75: targets from real levels (TP1 = first real level past the minimum, not 1R)
+TP_GAP_PCT = 6.0        # each TP at least this % above the previous one
+ZONE_PCT = 1.5          # levels within this % of each other merge into one zone
+FRONT_RUN = 0.004       # sit just under the zone: sellers fill below resistance, not at it
+
+
+def _pivot_highs(c, k):
+    H = [x[2] for x in c]
+    out = []
+    for i in range(k, len(H) - k):
+        if all(H[i] > H[i - d] for d in range(1, k + 1)) and all(H[i] >= H[i + d] for d in range(1, k + 1)):
+            out.append(H[i])
+    return out
+
+
+def candle_levels(entry, c1h=None, c4h=None, c1d=None):
+    """Resistance candidates above entry straight from the candles: swing-high pivots on
+    1h / 4h / Daily, the 30-day high and the high of the whole loaded history."""
+    lv = []
+    if c1h and len(c1h) > 20:
+        lv += [(h, "1h swing high", 0.5) for h in _pivot_highs(c1h[-120:], 3) if h > entry]
+    if c4h and len(c4h) > 20:
+        lv += [(h, "4h swing high", 1) for h in _pivot_highs(c4h, 3) if h > entry]
+    if c1d and len(c1d) > 10:
+        lv += [(h, "Daily swing high", 2) for h in _pivot_highs(c1d, 2) if h > entry]
+        hi30 = max(x[2] for x in c1d[-31:-1]) if len(c1d) > 31 else None
+        if hi30 and hi30 > entry:
+            lv.append((hi30, "30-day high", 2))
+        hiall = max(x[2] for x in c1d[:-1])
+        if hiall > entry:
+            lv.append((hiall, f"{len(c1d)}-day high (top of range)", 3))
+    return lv
+
+
+def _zones(levels, entry):
+    lv = sorted((p, lab, w) for p, lab, w in levels if p and p > entry * 1.002)
+    zones = []
+    for p, lab, w in lv:
+        z = zones[-1] if zones else None
+        if z and p <= z["lo"] * (1 + ZONE_PCT / 100):
+            z["hits"].append((p, lab, w)); z["hi"] = max(z["hi"], p)
+        else:
+            zones.append({"lo": p, "hi": p, "hits": [(p, lab, w)]})
+    for z in zones:
+        labs = {}
+        for _, lab, w in z["hits"]:
+            labs[lab] = max(labs.get(lab, 0), w)
+        n = len(z["hits"])
+        z["score"] = round(sum(labs.values()) + 0.5 * max(0, n - len(labs)), 1)   # extra touches add a little
+        z["labels"] = sorted(labs, key=lambda k: -labs[k])
+        z["touches"] = n
+    return zones
+
+
+def _fib_ext(c4h, entry):
+    """Fallback when nothing sits overhead: extensions of the last 4h impulse leg."""
+    if not c4h or len(c4h) < 30:
+        return []
+    seg = c4h[-90:]
+    i_lo = min(range(len(seg)), key=lambda i: seg[i][3])
+    lo = seg[i_lo][3]
+    hi = max(x[2] for x in seg[i_lo:])
+    if hi <= lo * 1.03:
+        return []
+    return [(lo + (hi - lo) * f, f"{f} Fib extension of the last 4h leg", 0) for f in (1.272, 1.618, 2.0, 2.618)
+            if lo + (hi - lo) * f > entry]
+
+
+def finish_plan(plan, entry, atr=None, min_tp1_pct=10.0, c1h=None, c4h=None, c1d=None):
+    """Stop capped at min(3×ATR, 15%). Targets come from REAL levels: Analyze resistances,
+    1h/4h/Daily swing highs, 30-day and range highs, merged into zones and scored.
+    TP1 = the first real zone at least min_tp1_pct above entry (the minimum is a floor,
+    not the target). TP2/TP3 = the next zones, each ≥ TP_GAP_PCT higher. Each target
+    front-runs its zone by 0.4%. Fib extensions fill gaps; R multiples only as last resort."""
     notes = []
     cap = entry * MAX_STOP_PCT
     if atr:
@@ -651,26 +734,68 @@ def finish_plan(plan, entry, atr=None):
                      f"{'3×ATR' if atr and cap < entry * MAX_STOP_PCT else '15%'} below entry")
         plan["sl_basis"] = (plan.get("sl_basis") or "") + " · Adjusted: " + notes[-1] + "."
     risk = entry - plan["sl"]
-    src_t = list(zip(plan["tps"], plan["basis"]))
-    dropped = [t for t, _ in src_t if t < entry + risk]
+
+    levels = list(plan.get("levels") or [])
+    levels += [(t, b or "Analyze target", 1) for t, b in zip(plan.get("tps") or [], plan.get("basis") or [])]
+    levels += candle_levels(entry, c1h, c4h, c1d)
+    zones = _zones(levels, entry)
+    floor1 = entry * (1 + min_tp1_pct / 100)
+
+    def tp_of(z):
+        t = z["lo"] * (1 - FRONT_RUN)
+        if t < floor1 <= z["hi"] * (1 - FRONT_RUN):      # zone straddles the minimum: use its upper edge
+            t = z["hi"] * (1 - FRONT_RUN)
+        return t
+
+    def why(z, tp):
+        lab = " + ".join(z["labels"][:3])
+        tch = f", {z['touches']} touches" if z["touches"] > 1 else ""
+        return f"{lab} at {z['lo']:.6g}{tch} (score {z['score']}), target front-runs it by 0.4%"
+
     tps, basis = [], []
-    for need in (1, 2, 3):
-        floor = entry + need * risk
-        cand = [(t, b) for t, b in src_t if t >= floor and (not tps or t > tps[-1] * 1.001)]
-        if cand:
-            t, b = cand[0]
-            src_t.remove(cand[0])
-            tps.append(t); basis.append(b)
-        else:
-            t = max(floor, (tps[-1] + risk) if tps else floor)
-            tps.append(t); basis.append(f"{round((t - entry) / risk, 1)}R target (no resistance at ≥{need}R)")
-    if dropped:
-        notes.append(f"{len(dropped)} Analyze target(s) under 1R ignored (too close to be worth the risk)")
+    # minor levels between entry and TP1: worth knowing, too close to be a target
+    minor = [z for z in zones if tp_of(z) < floor1 and z["score"] >= 1.5 and z["lo"] > entry * 1.01]
+    # prefer zones with real weight (HTF or confluence); single 1h wicks only if nothing else
+    for min_score in (1.5, 0.5):
+        tps, basis = [], []
+        for z in zones:
+            t = tp_of(z)
+            if z["score"] < min_score or t < floor1:
+                continue
+            if tps and t < tps[-1] * (1 + TP_GAP_PCT / 100):
+                continue
+            tps.append(t); basis.append(why(z, t))
+            if len(tps) == 3:
+                break
+        if tps:
+            break
+    if len(tps) < 3:
+        for t, lab, _ in sorted(_fib_ext(c4h, entry)):
+            lo_ok = tps[-1] * (1 + TP_GAP_PCT / 100) if tps else floor1
+            if t >= lo_ok:
+                tps.append(t); basis.append(f"{lab} at {t:.6g} (no swing high overhead)")
+            if len(tps) == 3:
+                break
+    while len(tps) < 3:
+        base = tps[-1] if tps else entry
+        t = max(base + risk, base * (1 + TP_GAP_PCT / 100), floor1)
+        tps.append(t); basis.append(f"{round((t - entry) / risk, 1)}R projection (price discovery: no level or Fib above)")
+    for i, t in enumerate(tps):
+        r = (t - entry) / risk
+        if r < 1:
+            basis[i] += f" · only {r:.1f}R, under 1:1"
+    if minor:
+        m = minor[0]
+        notes.append(f"minor resistance at {m['lo']:.6g} (+{(m['lo'] / entry - 1) * 100:.1f}%, {m['labels'][0]}) "
+                     f"sits below the {min_tp1_pct:g}% minimum, so it is not a target; expect a reaction there")
+        basis[0] += f" · first hurdle: {m['labels'][0]} at {m['lo']:.6g} (+{(m['lo'] / entry - 1) * 100:.1f}%)"
     plan["tps"], plan["basis"] = tps, basis
     plan["adj"] = notes
+    plan["v"] = PLAN_VER
     plan["rr"] = [round((t - entry) / risk, 2) for t in plan["tps"]]
     plan["sl_pct"] = round((plan["sl"] / entry - 1) * 100, 2)
     plan["tp_pct"] = [round((t / entry - 1) * 100, 2) for t in plan["tps"]]
+    plan.pop("levels", None)
     return plan
 
 
@@ -821,7 +946,11 @@ class VolumeSpikeScanner:
                 if pl:
                     ptf = PLAN_TF.get(a["tf"], a["tf"])
                     cc = self.hist.get((a["symbol"], ptf))
-                    a["plan"] = finish_plan(pl, entry, _atr(cc) if cc else None)
+                    sym = a["symbol"]
+                    a["plan"] = finish_plan(pl, entry, _atr(cc) if cc else None,
+                                            min_tp1_pct=MIN_TP1_PCT.get(ptf, 0.0) or 10.0,
+                                            c1h=self.hist.get((sym, "1h")), c4h=self.hist.get((sym, "4h")),
+                                            c1d=self.hist.get((sym, "1d")))
                     a["plan"]["tf"] = ptf
                     a["plan"]["late"] = (time.time() - a["t"]) > PLAN_LATE
                     need = MIN_TP1_PCT.get(ptf, 0.0)
@@ -862,6 +991,14 @@ class VolumeSpikeScanner:
                 for k in ("plan", "pstate", "upside", "low_upside", "min_tp1"):
                     a.pop(k, None)
                 self.tracker.dirty = True                            # re-plan on the higher timeframe (v74)
+            if a.get("plan") and a["plan"].get("v", 1) < PLAN_VER and a.get("pstate", {}).get("hits", 0) == 0 \
+                    and a.get("pstate", {}).get("status") == "open" and a["key"] not in self.plan_busy:
+                if a.get("rec_orig"):
+                    a["rec"] = a.pop("rec_orig")
+                a["why"] = [w for w in (a.get("why") or []) if not w.startswith("− low upside")]
+                for k in ("plan", "pstate", "upside", "low_upside", "min_tp1"):
+                    a.pop(k, None)
+                self.tracker.dirty = True                            # re-plan with real-level targets (v75)
             if a.get("plan") and "adj" not in a["plan"] and a.get("pstate", {}).get("hits", 0) == 0 \
                     and a["key"] not in self.plan_busy:
                 a.pop("plan", None); a.pop("pstate", None)          # re-plan with the RR rules (v72)
