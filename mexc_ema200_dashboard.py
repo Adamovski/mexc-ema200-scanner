@@ -2065,7 +2065,8 @@ def _af_tf(rows, tf, now_ms):
             pick, mode, ratio = forming, "live", live
     o, c, v = f(pick, 1), f(pick, 4), f(pick, 5)
     tb = f(pick, 9)
-    buy = round(tb / v * 100, 1) if tb is not None and v else None
+    # Alpha candles often repeat total volume in this field: only trust a real fraction
+    buy = round(tb / v * 100, 1) if tb is not None and v and 0 < tb < v * 0.995 else None
     return {"ratio": round(ratio, 2), "chg": round((c / o - 1) * 100, 2) if o else None,
             "mode": mode, "buy_pct": buy}
 
