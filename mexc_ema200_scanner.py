@@ -7482,7 +7482,7 @@ def fetch_binance_alpha_tokens(sess):
                          "mcap": _f("marketCap"), "fdv": _f("fdv"), "liquidity": _f("liquidity"),
                          "holders": _f("holders"), "on_binance": bool(x.get("listingCex")),
                          "chain": x.get("chainName"), "name": x.get("name"),
-                         "raw_symbol": x.get("symbol")}
+                         "raw_symbol": x.get("symbol"), "contract": x.get("contractAddress")}
     if len(out) < 50:                       # implausibly small -> treat as a bad response
         raise ValueError("binance alpha list too small: %d" % len(out))
     return out, listed, meta
