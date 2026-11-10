@@ -759,17 +759,19 @@ def finish_plan(plan, entry, atr=None, min_tp1_pct=10.0, c1h=None, c4h=None, c1d
     levels += candle_levels(entry, c1h, c4h, c1d)
     zones = _zones(levels, entry)
     floor1 = entry * (1 + min_tp1_pct / 100)
+    _a4 = _atr(c4h) if c4h else atr
+    fr = min(0.02, max(FRONT_RUN, 0.25 * _a4 / entry)) if _a4 else FRONT_RUN   # v80: volatility front-run
 
     def tp_of(z):
-        t = z["lo"] * (1 - FRONT_RUN)
-        if t < floor1 <= z["hi"] * (1 - FRONT_RUN):      # zone straddles the minimum: use its upper edge
-            t = z["hi"] * (1 - FRONT_RUN)
+        t = z["lo"] * (1 - fr)
+        if t < floor1 <= z["hi"] * (1 - fr):      # zone straddles the minimum: use its upper edge
+            t = z["hi"] * (1 - fr)
         return t
 
     def why(z, tp):
         lab = " + ".join(z["labels"][:3])
         tch = f", {z['touches']} touches" if z["touches"] > 1 else ""
-        return f"{lab} at {z['lo']:.6g}{tch} (score {z['score']}), target front-runs it by 0.4%"
+        return f"{lab} at {z['lo']:.6g}{tch} (score {z['score']}), target front-runs it by {fr * 100:.1f}%"
 
     tps, basis = [], []
     # minor levels between entry and TP1: worth knowing, too close to be a target
