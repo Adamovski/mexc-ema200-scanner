@@ -3778,10 +3778,14 @@ let azRec=null;   // the currently-shown MAIN recommended trade
 // Conviction switch shown next to every Track button: Normal → 📌 My calls, ⭐ → High-conviction tab.
 let trackHC=false; try{ trackHC=localStorage.getItem('trackHC')==='1'; }catch(e){}
 function setTrackHC(v){ trackHC=!!v; try{ localStorage.setItem('trackHC',trackHC?'1':'0'); }catch(e){}
-  document.querySelectorAll('.convsw button').forEach(b=>b.classList.toggle('on', (b.dataset.hc==='1')===trackHC)); }
+  document.querySelectorAll('.convsw button').forEach(b=>{ const on=(b.dataset.hc==='1')===trackHC; b.classList.toggle('on',on);
+    b.style.background=on?(b.dataset.hc==='1'?'rgba(210,153,34,.30)':'rgba(63,185,80,.22)'):'transparent'; b.style.fontWeight=on?'700':'400'; b.style.opacity=on?'1':'.6'; });
+  document.querySelectorAll('.trackrow .trackbtn:not(.trackmkt), .xtftrackbtn:not(.trackmkt)').forEach(b=>{ b.textContent=b.textContent.replace(/^(📌|⭐) /, trackHC?'⭐ ':'📌 '); }); }
 function convSwitch(){ return `<span class="convsw" data-tip="Choose where Track sends this call: Normal → 📌 My calls, ⭐ High conviction → its own tab and scorecard." style="display:inline-flex;gap:0;margin-right:8px;border:1px solid var(--line);border-radius:8px;overflow:hidden;vertical-align:middle">`
-  +`<button data-hc="0" class="${trackHC?'':'on'}" onclick="setTrackHC(false);event.stopPropagation()" style="border:0;padding:4px 9px;font-size:12px;cursor:pointer;background:${trackHC?'transparent':'rgba(63,185,80,.18)'};color:inherit">Normal</button>`
-  +`<button data-hc="1" class="${trackHC?'on':''}" onclick="setTrackHC(true);event.stopPropagation()" style="border:0;padding:4px 9px;font-size:12px;cursor:pointer;background:${trackHC?'rgba(210,153,34,.25)':'transparent'};color:inherit">⭐ High conviction</button></span>`; }
+  +`<button data-hc="0" class="${trackHC?'':'on'}" onclick="setTrackHC(false);event.stopPropagation()" style="border:0;padding:4px 9px;font-size:12px;cursor:pointer;background:${trackHC?'transparent':'rgba(63,185,80,.22)'};font-weight:${trackHC?400:700};opacity:${trackHC?.6:1};color:inherit">Normal</button>`
+  +`<button data-hc="1" class="${trackHC?'on':''}" onclick="setTrackHC(true);event.stopPropagation()" style="border:0;padding:4px 9px;font-size:12px;cursor:pointer;background:${trackHC?'rgba(210,153,34,.30)':'transparent'};font-weight:${trackHC?700:400};opacity:${trackHC?1:.6};color:inherit">⭐ High conviction</button></span>`; }
+// keep Track button labels in sync with the switch after every Analyze re-render
+setInterval(()=>{ if(document.querySelector('.convsw')) document.querySelectorAll('.trackrow .trackbtn:not(.trackmkt), .xtftrackbtn:not(.trackmkt)').forEach(b=>{ const want=trackHC?'⭐ ':'📌 '; if(/^(📌|⭐) /.test(b.textContent)&&!b.textContent.startsWith(want)) b.textContent=b.textContent.replace(/^(📌|⭐) /,want); }); },700);
 async function trackTrade(sym, side, entry, stop, targetsCsv, tf, msgId, ev, mode){
   if(ev&&ev.stopPropagation) ev.stopPropagation();
   mode=(mode==='market')?'market':'entry';
