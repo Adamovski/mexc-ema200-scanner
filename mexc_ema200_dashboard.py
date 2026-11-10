@@ -447,7 +447,7 @@ class Tracker:
 
     def resolve(self, prices):
         """Scale-out-aware resolution. Bank each TP by its weight as price reaches it,
-        ratcheting the stop up (halfway after TP1, break-even after TP2, TP1 after TP3 …). A stop-out
+        ratcheting the stop up (break-even after TP1, TP1 after TP3 …). A stop-out
         BEFORE any TP = full −1R loss; after TP1 the trade closes at the banked R (≥0)
         — never a full loss. R = weighted realised R across the scaled-out position."""
         if not prices:
@@ -499,12 +499,9 @@ class Tracker:
                         t["phase"] = ph + 1
                         if t["phase"] >= len(tps):
                             done.append((k, "win", round(t["realized"], 3))); closed = True; break
-                        # v78 (backtest): give it room. TP1 → stop halfway to entry, TP2 → break-even,
-                        # TP3+ → two levels behind (TP1 after TP3 …) so runners survive normal pullbacks.
-                        if t["phase"] == 1:
-                            if t.get("stop") is not None:
-                                t["cur_stop"] = (t["stop"] + t["entry"]) / 2; t["cur_stop_r"] = -0.5
-                        elif t["phase"] == 2:
+                        # v79: break-even at TP1 (wide stops make BE ~10% under price, not a tight stop),
+                        # still BE after TP2, TP3+ → two levels behind (TP1 after TP3 …) for the runner.
+                        if t["phase"] in (1, 2):
                             t["cur_stop"], t["cur_stop_r"] = t["entry"], 0.0
                         else:
                             t["cur_stop"] = tps[t["phase"] - 3]["lvl"]
@@ -3199,7 +3196,7 @@ Hover any cell to see what it means for that coin. Click ⚲ for the full Analyz
   </table>
   <div class="empty" id="vsEmpty" style="display:none"></div>
 </div>
-<div class="wrap" style="margin-top:22px"><h3 style="margin:0 0 6px;font-size:14px">📡 Alert feed with trade plans</h3><div class="muted" style="font-size:12px;margin-bottom:6px">Every logged long alert gets a long plan: the Analyze card's stop and 3 targets taken from real resistance (1h/4h/Daily/Weekly swing highs and range highs, merged into zones; TP1 = first real level past the minimum), measured from the alert price and tracked on 15m highs and lows. Stops are wide on purpose (4h: ≥5×ATR / 8%, cap 25%; Daily: ≥2×ATR / 12%, cap 35%). ⅓ off at TP1, ⅓ at TP2, the last ⅓ is a runner: stop goes halfway to entry after TP1, to break-even after TP2, then trails 3×ATR(4h) under the high. Closed at market after 7 days. Hover any cell for the reasoning.</div><div id="vsFeed" style="overflow-x:auto"></div></div>
+<div class="wrap" style="margin-top:22px"><h3 style="margin:0 0 6px;font-size:14px">📡 Alert feed with trade plans</h3><div class="muted" style="font-size:12px;margin-bottom:6px">Every logged long alert gets a long plan: the Analyze card's stop and 3 targets taken from real resistance (1h/4h/Daily/Weekly swing highs and range highs, merged into zones; TP1 = first real level past the minimum), measured from the alert price and tracked on 15m highs and lows. Stops are wide on purpose (4h: ≥5×ATR / 8%, cap 25%; Daily: ≥2×ATR / 12%, cap 35%). ⅓ off at TP1, ⅓ at TP2, the last ⅓ is a runner: stop goes to break-even after TP1, and after TP2 the runner also trails 3×ATR(4h) under the high. Closed at market after 7 days. Hover any cell for the reasoning.</div><div id="vsFeed" style="overflow-x:auto"></div></div>
 <div class="wrap" style="margin-top:26px;margin-bottom:40px"><h3 style="margin:0 0 4px;font-size:15px">🧪 Forward test: how the alerts actually performed</h3><div class="muted" style="font-size:12px;margin-bottom:10px">Every logged long alert is graded on the price 1h, 4h and 24h later. Filter it, then see which spike levels, timeframes and conditions are working.</div>
 <div id="vsFtBar" style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px"></div><div id="vsStats"></div></div>
 </div>
@@ -3228,7 +3225,7 @@ Hover any cell to see what it means for that coin. Click ⚲ for the full Analyz
 
 <div class="view" id="viewCalls">
 <div class="status">
-  <span>📌 My calls — setups you chose to track on the Analyze tab: <b>📌 Track this setup</b> waits for the recommended entry to fill before going live; <b>⚡ Track @ market</b> enters immediately at the live price. Apex watches the live price and grades each one exactly like the plan: banks each TP, moves the stop <b>halfway to entry after TP1</b>, to <b>break-even after TP2</b>, and scores the result in R. Their win-rate and per-TP hit rates are kept <b>separate</b> from the auto boards.</span>
+  <span>📌 My calls — setups you chose to track on the Analyze tab: <b>📌 Track this setup</b> waits for the recommended entry to fill before going live; <b>⚡ Track @ market</b> enters immediately at the live price. Apex watches the live price and grades each one exactly like the plan: banks each TP, moves the stop to <b>break-even after TP1</b>, keeps a runner (stop trails two targets behind from TP3), and scores the result in R. Their win-rate and per-TP hit rates are kept <b>separate</b> from the auto boards.</span>
   <span id="callsMeta"></span>
   <span class="wlbtn" style="margin-left:10px;border-color:rgba(248,81,73,.5);color:#f85149" onclick="resetCalls()" data-tip="Delete every tracked call and wipe the scorecard.">🗑 Reset all</span>
 </div>
@@ -4482,7 +4479,7 @@ function azCard(d0){
     ${rec.tp!=null?`<div class="azrec" data-tip="Recommended by EXPECTED VALUE, not raw ratio: reward:risk × how reachable the target is. Reachability decays with distance (in ATR units) but stretches out when the trend, momentum and volume back the move — so a far target isn't dismissed if the setup is strong, and a nearby one isn't over-rated if it's weak. Measured from the recommended entry (${fmtNum(recE)}) over the recommended stop (${rstop?fmtNum(rstop.level):'—'}), capped 8:1, and only shown because it clears the 1.5:1 floor. Grade blends R:R and reachability.">⭐ Recommended take-profit: <b>${fmtNum(rec.tp)}</b> <span class="rr">${(d.side||'long')==='short'?'−':'+'}${(rec.move*100).toFixed(1)}% · R:R <b>${rec.rr.toFixed(2)}</b> · ~${Math.round(rec.p*100)}% reach · grade <b>${planGrade}</b></span>${rec.kind?` <span style="color:var(--dim)">— ${esc(rec.kind)}${tgtTf&&/Daily|Weekly/.test(rec.kind||'')?` <span class="tfsrc">${tgtTf} chart</span>`:''}</span>`:''}</div>
     ${rec.tp!=null?dcaPlanHtml(d, recE, rstop?rstop.level:null, rec.tp, d.side||'long', be?be.distATR:null):''}
     ${scaleOutHtml(rtg, recE)}
-    ${(rec.tp!=null&&azRec)?`<div class="trackrow"><button class="trackbtn" onclick="trackSetup(event)" data-tip="Record this exact setup (entry, stop, full TP ladder) into 📌 My calls. It goes live only once price reaches the recommended entry (reaching TP1 first = missed, not a loss). Apex then watches the live price and grades it: banks each TP, moves the stop halfway after TP1 and to break-even after TP2, and scores the result in R. Win-rate + per-TP hit rates are on the My calls tab.">📌 Track this setup</button><button class="trackbtn trackmkt" onclick="trackSetup(event,'market')" data-tip="Enter NOW at the live market price instead of waiting for the recommended entry. Same stop & TP ladder (targets already behind price are dropped); R is measured from the market fill.">⚡ Track @ market</button><span id="trackmsg" class="trackmsg"></span></div>`:''}
+    ${(rec.tp!=null&&azRec)?`<div class="trackrow"><button class="trackbtn" onclick="trackSetup(event)" data-tip="Record this exact setup (entry, stop, full TP ladder) into 📌 My calls. It goes live only once price reaches the recommended entry (reaching TP1 first = missed, not a loss). Apex then watches the live price and grades it: banks each TP, moves the stop to break-even after TP1, keeps a runner, and scores the result in R. Win-rate + per-TP hit rates are on the My calls tab.">📌 Track this setup</button><button class="trackbtn trackmkt" onclick="trackSetup(event,'market')" data-tip="Enter NOW at the live market price instead of waiting for the recommended entry. Same stop & TP ladder (targets already behind price are dropped); R is measured from the market fill.">⚡ Track @ market</button><span id="trackmsg" class="trackmsg"></span></div>`:''}
     <div class="sidenote" data-tip="How the same trade looks if you enter NOW at the current market price instead of waiting for the 🎯 recommended pullback — same stop and target, worse fill, so a lower R:R. Use it to decide: take it now, or wait for the better entry.">⚡ Enter now at market (CMP ${fmtNum(cmpE)}): ${rrAt(cmpE)!=null?`R:R <b>${rrAt(cmpE).toFixed(2)}</b> to the base target`:'stop is already in the way — no clean entry here'} <span style="color:var(--dim)">vs ${rec.rr.toFixed(2)} waiting for ${fmtNum(recE)}${(rrAt(cmpE)!=null&&rrAt(cmpE)<1.5)?' — under 1.5:1 now, better to wait for the pullback':(cmpE!=null&&recE!=null&&Math.abs(cmpE-recE)/recE<0.005?' — basically at the entry already':'')}</span></div>`
     :`<div class="azrec" style="color:#f0b429" data-tip="No target on the correct side clears a 1.5:1 reward:risk from a sensible stop. In crypto a sub-1.5 R:R trade isn't worth the risk — this is a 'no trade / wait' call, not a setup. Wait for a deeper entry (better R:R), a tighter valid stop level, or a different coin.">⛔ No trade here — best realistic R:R is only <b>${rtg?rtg.bestRR.toFixed(2):'—'}</b>, under the 1.5 minimum. Wait for a better entry or setup.</div>`}
     ${stopsSection(d.stop_levels, d.side||'long', rstop?rstop.level:null)}
@@ -6309,7 +6306,7 @@ function perfStatusHtml(t){
   const s=t.status, r=(t.r!=null)?(+t.r):null;
   if(s==='win')   return `<b class="pf-good">WIN ${r!=null?(r>0?'+':'')+r.toFixed(1)+'R'+pctTag(t,r):''}</b>`;
   if(s==='be')    return `<b class="pf-be">BREAK-EVEN ${r!=null?(r>0?'+':'')+r.toFixed(2)+'R'+pctTag(t,r):''}</b>`;
-  if(s==='loss')  return `<b class="pf-bad">LOSS −1R${pctTag(t,-1)}</b>`;
+  if(s==='loss'){ const rl=(r!=null&&r>-0.999)?r:-1; return `<b class="pf-bad">LOSS ${rl<=-0.999?'−1R':rl.toFixed(2)+'R'}${pctTag(t,rl)}</b>`; }
   if(s==='missed')return `<span class="pf-miss" data-tip="Price never filled the recommended entry, then ran to target without us — no trade taken.">MISSED (no fill)</span>`;
   if(s==='expired')return `<span class="pf-miss" data-tip="Entry never filled in the allotted window — cancelled, counts as no trade.">EXPIRED</span>`;
   return `<span class="rr">${s||'—'}</span>`;
@@ -6612,7 +6609,7 @@ function renderSpikes(){
     const spotTxt=sp==null?(r.has_spot===false?'<span class="muted" data-tip="No Binance spot market">n/a</span>':'—')
       :`<span style="color:${sp>=(m.ratio||0)?'var(--accent)':sp<1.5?'var(--red)':'var(--txt)'};font-weight:${sp>=(m.ratio||0)?700:500}">${sp.toFixed(1)}×${sp>=(m.ratio||0)?' ✅':''}</span>`;
     const om=r.oi_mcap_pct, omC=om==null?'':om>=30?'var(--red)':om>=15?'var(--warn)':om<5?'var(--dim)':'';
-    const oi=r.oi_usd==null?'—':`${vsUsd(r.oi_usd)}<span class="rr">${r.oi_chg4!=null?(r.oi_chg4>=0?'+':'')+r.oi_chg4.toFixed(1)+'% 4h':''}</span>${om!=null?`<span class="rr" style="${omC?'color:'+omC+';':''}font-weight:650"> · ${om<1?om.toFixed(1):Math.round(om)}% mcap</span>`:''}`;
+    const oi=r.oi_usd==null?'—':`${vsUsd(r.oi_usd)}<span class="rr">${r.oi_chg4!=null?(r.oi_chg4>=0?'+':'')+r.oi_chg4.toFixed(1)+'% 4h':''}</span>${om!=null?(om>100?`<span class="rr" style="color:var(--dim)" data-tip="OI is ${Math.round(om)}% of the market cap Binance reports. That is not realistic leverage: Binance's circulating-supply figure for this coin is probably stale, so the ratio is unreliable."> · mcap ?</span>`:`<span class="rr" style="${omC?'color:'+omC+';':''}font-weight:650"> · ${om<1?om.toFixed(1):Math.round(om)}% mcap</span>`):''}`;
     const f=r.funding==null?'—':(r.funding*100).toFixed(4)+'%';
     const tfN={'15m':'15-minute','1h':'1-hour','4h':'4-hour','1d':'daily'}[bt]||bt;
     const sgn=x=>(x>0?'+':'')+x;
@@ -6765,7 +6762,7 @@ function renderFt(){
   h+=`<div style="font-weight:700;margin:18px 0 4px">Over time <span class="muted" style="font-weight:400;font-size:12px">${trend}</span></div>`+
     `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px"><div><div class="muted" style="font-size:12px;margin-bottom:4px">Average ${FTF.h==='R'?'R per closed plan':'move after '+hz}, per day (last 14 days, UTC). Hover a bar for detail.</div>${ftSvgBars(days)}</div>`+
     `<div><div class="muted" style="font-size:12px;margin-bottom:4px">Cumulative: ${FTF.h==='R'?'every matching alert traded with its plan, same risk each (R)':'every matching alert, same size, closed after '+hz} (no fees). Now <b style="color:${cum>=0?'var(--accent)':'var(--red)'}">${cum>0?'+':''}${cum.toFixed(1)}${U}</b> over ${graded.length} trades.</div>${ftSvgCurve(pts)}</div></div>`;
-  h+=`<div class="muted" style="font-size:11.5px;margin-top:10px">Longs only. ${FTF.h==='R'?'Trade plan: ⅓ off at TP1, ⅓ at TP2, last ⅓ runs (stop halfway after TP1, break-even after TP2, then a 3×ATR(4h) trail), closed at market after 7 days; R = multiples of the risk to the stop. A win = closed above 0R. Log restarted at v78 (wide stops).':'A win = price higher '+hz+' after the alert.'} No fees or slippage. Under ~30 alerts, any % is mostly luck.</div>`;
+  h+=`<div class="muted" style="font-size:11.5px;margin-top:10px">Longs only. ${FTF.h==='R'?'Trade plan: ⅓ off at TP1, ⅓ at TP2, last ⅓ runs (stop to break-even after TP1, then a 3×ATR(4h) trail after TP2), closed at market after 7 days; R = multiples of the risk to the stop. A win = closed above 0R. Log restarted at v79 (wide stops, BE at TP1).':'A win = price higher '+hz+' after the alert.'} No fees or slippage. Under ~30 alerts, any % is mostly luck.</div>`;
   box.innerHTML=h;
 }
 
