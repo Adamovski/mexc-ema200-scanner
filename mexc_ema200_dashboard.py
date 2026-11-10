@@ -2067,8 +2067,9 @@ def _af_tf(rows, tf, now_ms):
     tb = f(pick, 9)
     # Alpha candles often repeat total volume in this field: only trust a real fraction
     buy = round(tb / v * 100, 1) if tb is not None and v and 0 < tb < v * 0.995 else None
+    lc = f(last, 4) or 0
     return {"ratio": round(ratio, 2), "chg": round((c / o - 1) * 100, 2) if o else None,
-            "mode": mode, "buy_pct": buy}
+            "mode": mode, "buy_pct": buy, "base_usd": round(avg * lc, 2)}
 
 
 def _af_dex(sess, contract):
@@ -3534,10 +3535,14 @@ function _wlSpikeSrc(r){
 function _wlAugment(rows){
   for(const r of rows){ const S=_wlSpikeSrc(r); r._vs=S; r.vs_15m=r.vs_1h=r.vs_4h=r.vs_1d=null; r.vs_best=null; r.vs_max=null; r.vs_move=null;
     if(!S) continue; let mx=0;
-    for(const t of ['15m','1h','4h','1d']){ const m=S.tfs[t]; if(!m||m.ratio==null) continue; r['vs_'+t]=m.ratio; if(m.ratio>mx){ mx=m.ratio; r.vs_best=t; r.vs_move=m.chg!=null?+(+m.chg).toFixed(2):null; } }
+    for(const t of ['15m','1h','4h','1d']){ const m=S.tfs[t]; if(!m||m.ratio==null||_wlThin(m,t)) continue; r['vs_'+t]=m.ratio; if(m.ratio>mx){ mx=m.ratio; r.vs_best=t; r.vs_move=m.chg!=null?+(+m.chg).toFixed(2):null; } }
     r.vs_max=mx||null; } }
+// A spike on near-zero normal volume is noise: need a real USD baseline per candle.
+const _WL_MIN_BASE={'15m':500,'1h':2000,'4h':8000,'1d':50000};
+function _wlThin(m,t){ return m&&m.base_usd!=null&&m.base_usd<(_WL_MIN_BASE[t]||0); }
 function _wlSpikeTd(r,t){
   const S=r._vs, m=S&&S.tfs[t]; if(!m||m.ratio==null) return '<td class="muted">—</td>';
+  if(_wlThin(m,t)) return `<td class="muted" style="opacity:.55" data-tip="${esc(t+' '+m.ratio.toFixed(1)+'× normal, but normal volume is only about $'+Math.round(m.base_usd).toLocaleString()+' per '+t+' candle, so the ratio is noise. Ignored for sorting.')}">${m.ratio.toFixed(1)}× <span class="rr">thin</span></td>`;
   const v=m.ratio, bg=v>=6?'rgba(63,185,80,.42)':v>=4?'rgba(63,185,80,.30)':v>=2.5?'rgba(63,185,80,.18)':v>=1.5?'rgba(210,153,34,.14)':'';
   let tip=t+' volume = '+v.toFixed(2)+'× the average of the previous 20 closed '+t+' candles'+(m.mode==='live'?' (current candle, projected from its pace)':' (last closed candle)')+'. Candle move '+(m.chg>0?'+':'')+m.chg+'%.';
   if(S.src==='perp'){ const sp=S.spot&&S.spot[t]; tip+=' Source: Binance USDT perp (Volume-spikes scanner).'+(sp!=null?' Spot '+(+sp).toFixed(1)+'×'+(sp>=v?' (leading: real buying).':' (futures-driven).'):'')+(S.oi?' OI divergence: '+S.oi+'.':'')+(m.setup==='flush'?' Liquidation flush.':''); }
