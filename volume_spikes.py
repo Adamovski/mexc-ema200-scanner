@@ -64,7 +64,7 @@ HIST_CANDLES = 260          # 1h/4h/1d: EMA200 + baseline (weight 2 per call)
 M15_CANDLES = 400           # 15m: EMA200 + covers the forming 1D candle (weight 2)
 LIVE_MIN_FRAC = 0.20
 HORIZONS = [("1h", 3600), ("4h", 14400), ("24h", 86400)]
-DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "volume_spikes_alerts_v78.json")
+DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "volume_spikes_alerts_v79.json")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -434,7 +434,7 @@ def recommend(r, tf, btc):
 # ─────────────────────────────────────────────────────────────────────────────
 # Alert log + forward test
 # ─────────────────────────────────────────────────────────────────────────────
-REDIS_KEY = "vspike_alerts_v78"      # v78: fresh log - wide timeframe-scaled stops + step-up/trail exits
+REDIS_KEY = "vspike_alerts_v79"      # v79: fresh log - wide stops, BE at TP1, trailed runner
 
 
 def _redis():
@@ -821,7 +821,7 @@ def finish_plan(plan, entry, atr=None, min_tp1_pct=10.0, c1h=None, c4h=None, c1d
 def step_plan(a, candles, px, now):
     """Advance one alert's plan through new 15m candles (v78 management, from the backtest):
     ⅓ off at TP1, ⅓ at TP2, the last ⅓ is a RUNNER (TP3 is only its reference target).
-    Stop: original until TP1 → halfway to entry after TP1 → break-even after TP2 → then trails
+    Stop: original until TP1 → break-even after TP1 (v79) → after TP2 the runner also trails
     3×ATR(4h) under the highest high. Stop is checked first inside a candle (conservative)."""
     pl, st = a.get("plan"), a.get("pstate")
     if not pl or not st or st["status"] in ("sl", "be", "trail", "expired", "invalid"):
@@ -856,9 +856,8 @@ def step_plan(a, candles, px, now):
         if k[0] + 900 <= now:                              # ratchet only on CLOSED candles
             hh = max(hh, hi)
             if st["hits"] >= 1:
-                stop = max(stop, (pl["sl"] + entry) / 2)
+                stop = max(stop, entry)                    # break-even once TP1 is banked (v79)
             if st["hits"] >= 2:
-                stop = max(stop, entry)
                 if ta:
                     stop = max(stop, hh - TRAIL_ATR * ta)
             st["stop"] = stop; st["hh"] = hh
