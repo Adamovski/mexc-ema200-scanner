@@ -2015,6 +2015,126 @@ def watchlist_all_loop(state: State) -> None:
         time.sleep(30 * 60)
 
 
+# ---------------------------------------------------------------------------
+# Volume & flow for coins the perp volume scanner can't see (Binance Alpha-only):
+# Binance Alpha candles (volume spike ratio + taker-buy share per timeframe) and
+# on-chain DEX flow from DexScreener (buys vs sells, liquidity). Cached briefly.
+# ---------------------------------------------------------------------------
+_AF_META = {"t": 0.0, "meta": {}, "pairs": {}}
+_AF_CACHE: dict = {}
+_AF_TF_MS = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
+
+
+def _af_lookup(sess):
+    from mexc_ema200_scanner import fetch_binance_alpha_tokens, fetch_alpha_pairs
+    if time.time() - _AF_META["t"] > 1200 or not _AF_META["meta"]:
+        _, _, meta = fetch_binance_alpha_tokens(sess)
+        try:
+            pairs = fetch_alpha_pairs(sess)
+        except Exception:
+            pairs = _AF_META["pairs"]
+        _AF_META.update(t=time.time(), meta=meta, pairs=pairs)
+    return _AF_META["meta"], _AF_META["pairs"]
+
+
+def _af_klines(sess, pair, tf):
+    from mexc_ema200_scanner import ALPHA_KLINES_URL
+    r = sess.get(ALPHA_KLINES_URL, timeout=15, params={"symbol": pair, "interval": tf, "limit": 60},
+                 headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+    r.raise_for_status()
+    return r.json().get("data") or []
+
+
+def _af_tf(rows, tf, now_ms):
+    """Spike ratio of the last closed (or projected forming) candle vs the 20 before it,
+    the candle's % move and the taker-buy share of its volume (Binance kline field 9)."""
+    if len(rows) < 23:
+        return None
+    f = lambda x, i: float(x[i]) if len(x) > i and x[i] not in (None, "") else None
+    closed, forming = rows[:-1], rows[-1]
+    base = [f(x, 5) or 0 for x in closed[-21:-1]]
+    avg = sum(base) / len(base) if base else 0
+    if avg <= 0:
+        return None
+    last = closed[-1]
+    pick, mode, ratio = last, "closed", (f(last, 5) or 0) / avg
+    frac = (now_ms - float(forming[0])) / _AF_TF_MS[tf]
+    if 0.2 <= frac < 1:
+        live = (f(forming, 5) or 0) / frac / avg
+        if live > ratio:
+            pick, mode, ratio = forming, "live", live
+    o, c, v = f(pick, 1), f(pick, 4), f(pick, 5)
+    tb = f(pick, 9)
+    buy = round(tb / v * 100, 1) if tb is not None and v else None
+    return {"ratio": round(ratio, 2), "chg": round((c / o - 1) * 100, 2) if o else None,
+            "mode": mode, "buy_pct": buy}
+
+
+def _af_dex(sess, contract):
+    r = sess.get(f"https://api.dexscreener.com/latest/dex/tokens/{contract}", timeout=15,
+                 headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+    r.raise_for_status()
+    pairs = [p for p in (r.json().get("pairs") or []) if p]
+    if not pairs:
+        return None
+    pairs.sort(key=lambda p: -float((p.get("liquidity") or {}).get("usd") or 0))
+    out = {"pools": len(pairs), "liq": 0.0, "vol24": 0.0, "h1": [0, 0], "h6": [0, 0], "h24": [0, 0]}
+    for p in pairs:
+        out["liq"] += float((p.get("liquidity") or {}).get("usd") or 0)
+        out["vol24"] += float((p.get("volume") or {}).get("h24") or 0)
+        for w in ("h1", "h6", "h24"):
+            t = (p.get("txns") or {}).get(w) or {}
+            out[w][0] += int(t.get("buys") or 0); out[w][1] += int(t.get("sells") or 0)
+    top = pairs[0]
+    out.update(dex=top.get("dexId"), chain=top.get("chainId"), url=top.get("url"),
+               pc_h1=(top.get("priceChange") or {}).get("h1"), pc_h24=(top.get("priceChange") or {}).get("h24"))
+    out["liq"] = round(out["liq"]); out["vol24"] = round(out["vol24"])
+    return out
+
+
+def alpha_flow(symbol: str) -> dict:
+    tok = str(symbol or "").upper().replace("_", "").replace("/", "")
+    for q in ("USDT", "USDC"):
+        if tok.endswith(q) and len(tok) > len(q):
+            tok = tok[:-len(q)]
+    if not tok:
+        return {"error": "no symbol"}
+    hit = _AF_CACHE.get(tok)
+    if hit and time.time() - hit[0] < 60:
+        return hit[1]
+    sess = get_session()
+    meta, pairs = _af_lookup(sess)
+    m = meta.get(tok)
+    if not m:
+        out = {"error": "not a Binance Alpha token", "token": tok}
+        _AF_CACHE[tok] = (time.time(), out)
+        return out
+    aid = m.get("alpha_id")
+    pair = pairs.get(aid) or (aid + "USDT" if aid else None)
+    now_ms = time.time() * 1000
+    tfs = {}
+    for tf in ("15m", "1h", "4h", "1d"):
+        try:
+            res = _af_tf(_af_klines(sess, pair, tf), tf, now_ms) if pair else None
+        except Exception:
+            res = None
+        if res:
+            tfs[tf] = res
+        time.sleep(0.05)
+    dex, dex_err = None, None
+    if m.get("contract"):
+        try:
+            dex = _af_dex(sess, m["contract"])
+        except Exception as e:
+            dex_err = str(e)[:120]
+    out = {"token": tok, "pair": pair, "tfs": tfs, "dex": dex, "dex_err": dex_err,
+           "vol24_alpha": m.get("vol24_alpha"), "liquidity": m.get("liquidity"),
+           "holders": m.get("holders"), "mcap": m.get("mcap"), "chain": m.get("chain"),
+           "on_binance": m.get("on_binance"), "ts": time.time()}
+    _AF_CACHE[tok] = (time.time(), out)
+    return out
+
+
 def watchlist_loop(state: State) -> None:
     """Binance Alpha monitor. Universe = every live Binance Alpha token. All market data comes from
     BINANCE: Alpha candles (4h for indicators, daily for true ATH/ATL since listing), Alpha list
@@ -3078,11 +3198,11 @@ Hover any cell to see what it means for that coin. Click ⚲ for the full Analyz
   <div id="callsCards" class="perfcards"></div>
   <div class="perfsub">Open calls</div>
   <table id="callsopen"><thead><tr>
-      <th>Added</th><th>Symbol</th><th>Side</th><th>TF</th><th>Entry</th><th>Price</th><th>Stop</th><th>Targets</th><th>Progress</th><th></th>
+      <th class="csort" data-ck="o:ts" onclick="callSortBy('o','ts')">Added <span class="carr"></span></th><th class="csort" data-ck="o:sym" onclick="callSortBy('o','sym')">Symbol <span class="carr"></span></th><th class="csort" data-ck="o:age" onclick="callSortBy('o','age')" data-tip="Coin age: days since the token listed on Binance Alpha (— if it is not an Alpha token).">Age <span class="carr"></span></th><th class="csort" data-ck="o:side" onclick="callSortBy('o','side')">Side <span class="carr"></span></th><th class="csort" data-ck="o:tf" onclick="callSortBy('o','tf')">TF <span class="carr"></span></th><th class="csort" data-ck="o:entry" onclick="callSortBy('o','entry')">Entry <span class="carr"></span></th><th class="csort" data-ck="o:pct" onclick="callSortBy('o','pct')" data-tip="Live price and % move vs your entry (in your trade's favour). Click to sort by the %.">Price % <span class="carr"></span></th><th class="csort" data-ck="o:stop" onclick="callSortBy('o','stop')" data-tip="Stop. Sorts by how far the live price is from the stop (closest to being stopped first).">Stop <span class="carr"></span></th><th class="csort" data-ck="o:tp1" onclick="callSortBy('o','tp1')" data-tip="Targets. Sorts by how far the live price still is from the next unhit TP (closest first).">Targets <span class="carr"></span></th><th class="csort" data-ck="o:vol" onclick="callSortBy('o','vol')" data-tip="Volume & flow right now. Binance perps: the Volume-spikes scanner (biggest spike across 15m/1h/4h/1D, spot vs futures, OI divergence, its checklist call). Alpha-only coins: Binance Alpha candles (spike + taker-buy share) and on-chain DEX buys vs sells. Hover a cell for detail. Sorts by the biggest spike.">Volume <span class="carr"></span></th><th class="csort" data-ck="o:r" onclick="callSortBy('o','r')" data-tip="Progress. Sorts by the live result in R.">Progress <span class="carr"></span></th><th></th>
     </tr></thead><tbody id="callsopenrows"></tbody></table>
   <div class="perfsub">Resolved calls</div>
   <table id="callsclosed"><thead><tr>
-      <th>Closed</th><th>Symbol</th><th>Side</th><th>TF</th><th>Entry</th><th>Stop</th><th data-tip="The furthest level price reached before close — highest TP hit, or the stop.">Reached</th><th>Result</th><th data-tip="Live MEXC price now. % is vs your entry, in your trade's favour.">Price now</th><th data-tip="What the WHOLE position would be worth right now had it never been closed — entry to the current price, in R (no scale-out, no stop).">If still open</th>
+      <th class="csort" data-ck="c:ts" onclick="callSortBy('c','ts')">Closed <span class="carr"></span></th><th class="csort" data-ck="c:sym" onclick="callSortBy('c','sym')">Symbol <span class="carr"></span></th><th class="csort" data-ck="c:age" onclick="callSortBy('c','age')" data-tip="Coin age: days since the token listed on Binance Alpha.">Age <span class="carr"></span></th><th class="csort" data-ck="c:side" onclick="callSortBy('c','side')">Side <span class="carr"></span></th><th class="csort" data-ck="c:tf" onclick="callSortBy('c','tf')">TF <span class="carr"></span></th><th class="csort" data-ck="c:entry" onclick="callSortBy('c','entry')">Entry <span class="carr"></span></th><th>Stop</th><th data-tip="The furthest level price reached before close — highest TP hit, or the stop.">Reached</th><th class="csort" data-ck="c:res" onclick="callSortBy('c','res')">Result <span class="carr"></span></th><th class="csort" data-ck="c:pct" onclick="callSortBy('c','pct')" data-tip="Live MEXC price now. % is vs your entry, in your trade's favour.">Price now % <span class="carr"></span></th><th class="csort" data-ck="c:hold" onclick="callSortBy('c','hold')" data-tip="What the WHOLE position would be worth right now had it never been closed — entry to the current price, in R (no scale-out, no stop).">If still open <span class="carr"></span></th>
     <th></th></tr></thead><tbody id="callsclosedrows"></tbody></table>
   <div class="empty" id="callsempty" style="display:none">No tracked calls yet. Open <b>🔎 Analyze a coin</b>, and on any setup that clears the R:R bar you'll see a <b>📌 Track this setup</b> button — click it to start tracking.</div>
 </div>
@@ -6115,11 +6235,14 @@ function regimeBadge(t){
   if(r==='against') return `<span class="rgb rgb-a" data-tip="Taken AGAINST the market regime (fighting the tape) — historically the weaker bucket.">✗ against regime</span>`;
   return '';
 }
+// R → % of the position: R × the initial risk (entry→stop distance as % of entry).
+function rPct(t,r){ if(r==null||!t||!t.entry||!t.stop) return null; return (+r)*Math.abs(t.entry-t.stop)/t.entry*100; }
+function pctTag(t,r){ const p=rPct(t,r); return p==null?'':` <span class="rr" style="color:inherit;opacity:.85" data-tip="${esc('Same result as % of the position: '+(+r).toFixed(2)+'R × '+(Math.abs(t.entry-t.stop)/t.entry*100).toFixed(1)+'% risk (entry to stop).')}">(${p>=0?'+':''}${p.toFixed(1)}%)</span>`; }
 function perfStatusHtml(t){
   const s=t.status, r=(t.r!=null)?(+t.r):null;
-  if(s==='win')   return `<b class="pf-good">WIN ${r!=null?(r>0?'+':'')+r.toFixed(1)+'R':''}</b>`;
-  if(s==='be')    return `<b class="pf-be">BREAK-EVEN ${r!=null?(r>0?'+':'')+r.toFixed(2)+'R':''}</b>`;
-  if(s==='loss')  return `<b class="pf-bad">LOSS −1R</b>`;
+  if(s==='win')   return `<b class="pf-good">WIN ${r!=null?(r>0?'+':'')+r.toFixed(1)+'R'+pctTag(t,r):''}</b>`;
+  if(s==='be')    return `<b class="pf-be">BREAK-EVEN ${r!=null?(r>0?'+':'')+r.toFixed(2)+'R'+pctTag(t,r):''}</b>`;
+  if(s==='loss')  return `<b class="pf-bad">LOSS −1R${pctTag(t,-1)}</b>`;
   if(s==='missed')return `<span class="pf-miss" data-tip="Price never filled the recommended entry, then ran to target without us — no trade taken.">MISSED (no fill)</span>`;
   if(s==='expired')return `<span class="pf-miss" data-tip="Entry never filled in the allotted window — cancelled, counts as no trade.">EXPIRED</span>`;
   return `<span class="rr">${s||'—'}</span>`;
@@ -6139,6 +6262,75 @@ async function resetCalls(){
   try{ await fetch('/calls/reset',{cache:'no-store'}); }catch(e){}
   poll(); }
 function confirmSafe(msg){ try{ return window.confirm(msg); }catch(e){ return true; } }
+let callSort={o:{k:'ts',d:-1},c:{k:'ts',d:-1}};
+try{ const _cs=JSON.parse(localStorage.getItem('callSort')||'null'); if(_cs&&_cs.o&&_cs.c) callSort=_cs; }catch(e){}
+function callSortBy(tb,k){ const s=callSort[tb]; if(s.k===k) s.d*=-1; else { s.k=k; s.d=(k==='sym'||k==='side'||k==='tf'||k==='stop'||k==='tp1')?1:-1; }
+  try{ localStorage.setItem('callSort',JSON.stringify(callSort)); }catch(e){} renderCalls(); }
+const TF_ORDER={'1m':1,'5m':5,'15m':15,'30m':30,'1h':60,'4h':240,'1d':1440,'1w':10080};
+function callAge(t){ const a=alphaInfo(t.symbol); return a&&a.age_days!=null?a.age_days:null; }
+function callPct(t){ const p=t.px_now; if(p==null||!t.entry) return null; return (p/t.entry-1)*100*(t.side==='short'?-1:1); }
+function callVal(t,k,closed){
+  const sh=t.side==='short', p=t.px_now;
+  switch(k){
+    case 'ts': return closed?(t.closed_ts||0):(t.ts||0);
+    case 'sym': return dispSym(t.symbol);
+    case 'age': return callAge(t);
+    case 'side': return t.side||'';
+    case 'tf': return TF_ORDER[String(t.tf||'').toLowerCase()]||null;
+    case 'entry': return t.entry;
+    case 'pct': return callPct(t);
+    case 'stop': return (p!=null&&t.stop)?Math.abs(p/t.stop-1)*100:null;
+    case 'tp1': { const hit=(t.tps_hit||[]).length; const nx=(t.tps||[])[hit]; return (p!=null&&nx&&nx.lvl)?(sh?(p/nx.lvl-1):(nx.lvl/p-1))*100:null; }
+    case 'vol': { const f=callFlow(t.symbol); return f?f.max:null; }
+    case 'r': return t.cur_r;
+    case 'res': return t.r;
+    case 'hold': return t.hold_r;
+  } return null; }
+function sortCalls(arr,tb){ const s=callSort[tb], closed=tb==='c';
+  return arr.slice().sort((a,b)=>{ const va=callVal(a,s.k,closed), vb=callVal(b,s.k,closed);
+    if(va==null&&vb==null) return 0; if(va==null) return 1; if(vb==null) return -1;
+    const c=(typeof va==='string')?va.localeCompare(vb):(va-vb); return c*s.d; }); }
+function callArrows(){ document.querySelectorAll('th.csort').forEach(th=>{ const [tb,k]=th.dataset.ck.split(':'); const s=callSort[tb];
+  const ar=th.querySelector('.carr'); if(ar) ar.textContent=s.k===k?(s.d>0?'▲':'▼'):''; th.style.cursor='pointer'; th.style.color=s.k===k?'var(--accent)':''; }); }
+function ageTd(t){ const a=callAge(t); return a==null?'<td><span style="color:var(--dim)">—</span></td>':`<td style="${a<60?'color:var(--accent);font-weight:650':''}" data-tip="Listed on Binance Alpha ${Math.round(a)} days ago${a<60?' (under 60 days: still fresh)':''}">${a<1?'<1':Math.round(a)}d</td>`; }
+// ── Volume & flow per open call: Binance perps from the spike scanner, Alpha-only coins from /alphaflow (Binance Alpha + on-chain).
+const _afC={}; let _afBusy=false, _vsCallsT=0;
+function _symKey(s){ return String(s||'').toUpperCase().replace('_',''); }
+function callFlow(sym){
+  const k=_symKey(sym), r=((vsData&&vsData.rows)||[]).find(x=>x.symbol===k);
+  if(r&&r.tfs){ let bt=null,mx=0; for(const t of ['15m','1h','4h','1d']){ const m=r.tfs[t]; if(m&&m.ratio>mx){ mx=m.ratio; bt=t; } }
+    return {src:'perp', max:mx, tf:bt, m:bt?r.tfs[bt]:null, spot:bt&&r.spot?r.spot[bt]:null, oi:r.oi_div, rec:r.rec&&r.rec.call}; }
+  const a=_afC[k]; if(a&&a.d&&!a.d.error&&a.d.tfs){ let bt=null,mx=0; for(const t of ['15m','1h','4h','1d']){ const m=a.d.tfs[t]; if(m&&m.ratio>mx){ mx=m.ratio; bt=t; } }
+    const x=a.d.dex; const h1=x&&(x.h1[0]+x.h1[1])?x.h1[0]/(x.h1[0]+x.h1[1]):null;
+    return {src:'alpha', max:mx, tf:bt, m:bt?a.d.tfs[bt]:null, buy1h:h1, liq:x?x.liq:null}; }
+  return null; }
+async function loadCallFlows(opens){
+  if(Date.now()-_vsCallsT>60000){ _vsCallsT=Date.now(); try{ vsData=await fetch('/spikes',{cache:'no-store'}).then(r=>r.json()); }catch(e){} }
+  if(_afBusy) return; _afBusy=true;
+  try{ const perp=new Set(((vsData&&vsData.rows)||[]).map(x=>x.symbol));
+    for(const t of opens){ const k=_symKey(t.symbol); if(perp.has(k)) continue; const a=_afC[k];
+      if(a&&Date.now()-a.t<300000) continue;
+      if(alphaInfo(t.symbol)===false){ _afC[k]={t:Date.now(),d:{error:'not Alpha'}}; continue; }
+      try{ _afC[k]={t:Date.now(), d:await fetch('/alphaflow?symbol='+encodeURIComponent(k),{cache:'no-store'}).then(r=>r.json())}; }catch(e){ _afC[k]={t:Date.now(),d:{error:'fetch failed'}}; } }
+  } finally { _afBusy=false; } }
+function volTd(t){
+  const f=callFlow(t.symbol);
+  if(!f||!f.m){ const k=_symKey(t.symbol), pend=!_afC[k]&&!(((vsData&&vsData.rows)||[]).length);
+    return `<td><span style="color:var(--dim)" data-tip="${pend?'Loading volume data…':'No Binance volume data for this coin: no Binance perp and not on Binance Alpha (or not loaded yet).'}">${pend?'…':'—'}</span></td>`; }
+  const v=f.max, bg=v>=6?'rgba(63,185,80,.42)':v>=4?'rgba(63,185,80,.30)':v>=2.5?'rgba(63,185,80,.18)':v>=1.5?'rgba(210,153,34,.14)':'transparent';
+  const up=f.m.chg>0, side=t.side==='short'?-1:1, with_=(up?1:-1)*side>0;
+  let extra='', tip='';
+  if(f.src==='perp'){
+    const recTxt=(typeof VS_REC!=='undefined'&&VS_REC[f.rec])?VS_REC[f.rec][0]:(f.rec||'');
+    extra=(f.spot!=null?` <span class="rr">spot ${f.spot.toFixed(1)}×${f.spot>=f.max?' ✅':''}</span>`:'');
+    tip=`Binance perp, Volume-spikes scanner. Biggest spike: ${f.tf} at ${v.toFixed(2)}× its 20-candle average${f.m.mode==='live'?' (current candle, projected)':''}, candle ${f.m.chg>0?'+':''}${f.m.chg}%`+(f.m.setup==='flush'?' (liquidation flush)':'')+`. `+(f.spot!=null?`Spot ${f.spot.toFixed(1)}×${f.spot>=v?' (leading: real buying)':' (futures-driven)'}. `:'')+(f.oi?`OI divergence: ${f.oi}. `:'')+(recTxt?`Scanner call now: ${recTxt}.`:'');
+  } else {
+    extra=(f.m.buy_pct!=null?` <span class="rr">${f.m.buy_pct}% buy</span>`:'')+(f.buy1h!=null?` <span class="rr">⛓ ${Math.round(f.buy1h*100)}%</span>`:'');
+    tip=`Binance Alpha candles. Biggest spike: ${f.tf} at ${v.toFixed(2)}× its 20-candle average${f.m.mode==='live'?' (current candle, projected)':''}, candle ${f.m.chg>0?'+':''}${f.m.chg}%.`+(f.m.buy_pct!=null?` Taker buys ${f.m.buy_pct}% of that volume.`:'')+(f.buy1h!=null?` On-chain: ${Math.round(f.buy1h*100)}% of DEX trades in the last hour were buys.`:'')+(f.liq!=null?` DEX liquidity $${Math.round(f.liq).toLocaleString()}.`:'')+' No perp, so no OI or funding.';
+  }
+  const flag=v>=2.5?(with_?' <span style="color:var(--accent)">▲ with you</span>':' <span style="color:var(--red)">▼ against</span>'):'';
+  if(v>=2.5) tip+=with_?' The spike candle moves in your trade\\'s direction.':' ⚠️ The spike candle moves AGAINST your trade.';
+  return `<td style="white-space:nowrap;background:${bg}" data-tip="${esc(tip)}"><b>${f.tf}</b> ${v.toFixed(1)}×${f.m.mode==='live'?' <span class="rr">live</span>':''}${extra}${flag}</td>`; }
 function renderCalls(){
   const perf=(lastData&&lastData.perf)||null;
   const cards=document.getElementById('callsCards'); if(!cards) return;
@@ -6146,6 +6338,7 @@ function renderCalls(){
   const meta=document.getElementById('callsMeta'), emp=document.getElementById('callsempty');
   const a=((perf&&perf.by_board)||{}).call||{};
   const opens=(perf&&perf.calls_open)||[], closed=(perf&&perf.calls_closed)||[];
+  if(activeTab==='calls'&&opens.length) loadCallFlows(opens);
   const has=opens.length||closed.length;
   if(emp) emp.style.display=has?'none':'block';
   if(meta) meta.textContent=`${opens.length} open · ${a.n||0} resolved`;
@@ -6158,30 +6351,31 @@ function renderCalls(){
     +`<div class="perfcard" style="flex:2"><div class="pclab" style="margin:0 0 6px">TP hit rates</div><div class="tprcell">${tpRatesHtml(a.tp_rates)}</div></div>`;
   const tgts=t=>((t.tps||[]).map(x=>fmtNum(x.lvl)).join(' · ')||'—');
   if(openrows){ openrows.innerHTML='';
-    for(const t of opens){
+    callArrows();
+    for(const t of sortCalls(opens,'o')){
       const when=t.ts?(new Date(t.ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})+'<br><span class="rr" title="Time since tracked">'+agoTxt(t.ts)+'</span>'):'—';
       const st=(t.state==='pending')?`⏳ waiting for entry ${fmtNum(t.entry)}`:((t.tps_hit&&t.tps_hit.length)?`TP${Math.max.apply(null,t.tps_hit)} hit → stop at ${t.phase>=1?'break-even+':'—'}`:'● live · watching');
-      const liveR=(t.cur_r!=null)?` · <b style="color:${t.cur_r>=0?'var(--up,#3fb950)':'var(--down,#f85149)'}">${t.cur_r>=0?'+':''}${t.cur_r}R</b>`:'';
+      const liveR=(t.cur_r!=null)?` · <b style="color:${t.cur_r>=0?'var(--up,#3fb950)':'var(--down,#f85149)'}">${t.cur_r>=0?'+':''}${t.cur_r}R${pctTag(t,t.cur_r)}</b>`:'';
       const prog=st+liveR;
       const tr=document.createElement('tr');
       tr.innerHTML=`<td style="color:var(--dim);white-space:nowrap">${when}</td>`
-        +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a>${alphaTag(t.symbol)}</div></td>`
+        +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a>${alphaTag(t.symbol)}</div></td>`+ageTd(t)
         +`<td>${leanPill(t.side==='short'?'bearish':'bullish')}</td><td>${t.tf||'—'}</td>`
         +`<td>${fmtNum(t.entry)}${t.mode==='market'?'<span class="mkttag" data-tip="Entered at market price when tracked">MKT</span>':''}</td>`+pxNowTd(t)+`<td>${fmtNum(t.stop)}</td><td class="whycell">${tgts(t)}</td>`
-        +`<td>${prog}</td>`+delCallTd(t);
+        +volTd(t)+`<td>${prog}</td>`+delCallTd(t);
       openrows.appendChild(tr);
     }
   }
   if(closedrows){ closedrows.innerHTML='';
-    for(const t of closed){
+    for(const t of sortCalls(closed,'c')){
       const when=t.closed_ts?(new Date(t.closed_ts*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})+(t.ts?'<br><span class="rr" title="How long the trade was open">held '+durTxt(t.closed_ts-t.ts)+'</span>':'')):'—';
       const tr=document.createElement('tr');
       tr.innerHTML=`<td style="color:var(--dim);white-space:nowrap">${when}</td>`
-        +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a>${alphaTag(t.symbol)}</div></td>`
+        +`<td class="sym"><div class="symbox"><a href="${tvLink(t.symbol)}" target="_blank" rel="noopener">${dispSym(t.symbol)}</a>${alphaTag(t.symbol)}</div></td>`+ageTd(t)
         +`<td>${sideLabel(t)}</td><td>${t.tf||'—'}</td>`
         +`<td>${fmtNum(t.entry)}</td><td>${fmtNum(t.stop)}</td><td>${reachedHtml(t)}</td>`
         +`<td>${perfStatusHtml(t)}</td>`+pxNowTd(t)
-        +`<td>${t.hold_r==null?'<span style="color:var(--dim)">—</span>':`<b style="color:${t.hold_r>=0?'var(--up,#3fb950)':'var(--down,#f85149)'}">${t.hold_r>=0?'+':''}${t.hold_r}R</b>`+(t.r!=null?`<span class="rr" style="color:var(--dim)"> (${(t.hold_r-t.r)>=0?'+':''}${(t.hold_r-t.r).toFixed(2)}R vs closing)</span>`:'')}</td>`
+        +`<td>${t.hold_r==null?'<span style="color:var(--dim)">—</span>':`<b style="color:${t.hold_r>=0?'var(--up,#3fb950)':'var(--down,#f85149)'}">${t.hold_r>=0?'+':''}${t.hold_r}R${pctTag(t,t.hold_r)}</b>`+(t.r!=null?`<span class="rr" style="color:var(--dim)"> (${(t.hold_r-t.r)>=0?'+':''}${(t.hold_r-t.r).toFixed(2)}R vs closing)</span>`:'')}</td>`
         +delCallTd(t);
       closedrows.appendChild(tr);
     }
@@ -6528,7 +6722,8 @@ function renderFeed(){
     const stopTxt=pl?`<td style="white-space:nowrap;${st&&st.status==='sl'?'background:rgba(248,81,73,.22);':''}" data-tip="${esc('Stop '+fmtNum(pl.sl)+' ('+pl.sl_pct+'%). '+(pl.sl_basis||'')+' Moves to entry (break-even) once TP1 is hit. Plan source: '+(pl.src==='analyze'?'Analyze card (4h/1D structure for this coin)':'fallback: swing low + ATR, targets from candle swing highs'))}">${fmtNum(pl.sl)} <span class="rr">${pl.sl_pct.toFixed(1)}%</span>${st&&st.hits>=1&&!plClosed(st)?'<span class="rr" style="color:var(--accent)">→ BE</span>':''}</td>`:'<td class="muted">—</td>';
     const stInfo=!st?['⏳ planning…','var(--dim)']:(PL_ST[st.status]||[st.status,'var(--dim)']);
     const stTip=(st?('Best move since entry +'+(st.mfe||0)+'% · worst '+(st.mae||0)+'%'+(st.why?' · '+st.why:'')):'Fetching the Analyze plan for this coin (runs at the end of each scan)')+(pl&&pl.late?' · LATE PLAN: levels were drawn after the alert, so this trade is tracked but left out of the forward-test stats.':'')+(pl&&!pl.adj?' · OLD PLAN: made before the risk/reward rules (TP1 could be under 1R), so it is excluded from the forward-test stats.':'');
-    const R=st&&st.r!=null?`<b style="color:${st.r>0?'var(--accent)':st.r<0?'var(--red)':'var(--dim)'}">${st.r>0?'+':''}${st.r.toFixed(2)}R</b>`:(st&&st.open_r!=null?`<span class="muted" data-tip="Unrealised, at the current price">${st.open_r>0?'+':''}${st.open_r.toFixed(2)}R open</span>`:'—');
+    const _rp=x=>(pl&&pl.sl_pct!=null)?` <span class="rr">(${x*Math.abs(pl.sl_pct)>=0?'+':''}${(x*Math.abs(pl.sl_pct)).toFixed(1)}%)</span>`:'';
+    const R=st&&st.r!=null?`<b style="color:${st.r>0?'var(--accent)':st.r<0?'var(--red)':'var(--dim)'}">${st.r>0?'+':''}${st.r.toFixed(2)}R${_rp(st.r)}</b>`:(st&&st.open_r!=null?`<span class="muted" data-tip="Unrealised, at the current price">${st.open_r>0?'+':''}${st.open_r.toFixed(2)}R${_rp(st.open_r)} open</span>`:'—');
     const rec=a.rec?({long:'✅ Long',watch_long:'👀 Watch',skip:(a.low_upside?'✗ low upside':'✗ Skip'),wait:'⏳ Wait'})[a.rec]||'':'';
     return `<tr><td class="muted" style="white-space:nowrap" data-tip="${esc('Alert fired '+agoTxt(a.t)+(st&&st.closed_t?' · closed after '+durTxt(st.closed_t-a.t):''))}">${new Date(a.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}<br><span class="rr">${st&&st.closed_t?'closed in '+durTxt(st.closed_t-a.t):agoTxt(a.t)}</span></td>`+
       `<td class="sym"><div class="symbox">${esc(a.symbol.replace(/USDT$/,''))}${analyzeBtn(a.symbol)}${alphaTag(a.symbol)}</div></td><td style="white-space:nowrap" data-tip="${esc('Spike seen on the '+a.tf+' chart.'+(pl&&pl.tf&&pl.tf!==a.tf?' Lower-timeframe spikes are treated as an early signal: the stop and targets come from the '+pl.tf+' chart, because only the higher-timeframe move is worth trading.':''))}">${a.tf}${pl&&pl.tf&&pl.tf!==a.tf?' <span class="rr">→ '+pl.tf+' plan</span>':''}${a.setup==='flush'?' <span class="rr" style="color:var(--accent)" data-tip="Liquidation-flush long: bought the dump after leveraged longs were wiped out">↺ flush</span>':''}</td>`+
@@ -6564,6 +6759,34 @@ function vsPlanRules(entry, sl, tps, atr, levels, minPct){
   if(minor) notes.push('first hurdle '+fmtNum(minor.lo)+' (+'+((minor.lo/entry-1)*100).toFixed(1)+'%, '+minor.labels[0]+') is under the '+(minPct||10)+'% minimum');
   return {sl, tps:out, tag, why, rr:out.map(t=>(t-entry)/risk), notes};
 }
+// Volume & flow for Alpha-only coins (no Binance perp): Alpha candles + DexScreener on-chain flow.
+function alphaFlowHtml(af){
+  if(!af||af.error) return `<div class="muted">${esc((af&&af.error)||'Could not load Alpha data')}. The volume scanner only covers Binance USDT perps with 24h volume over $1M.</div>`;
+  const usd=v=>v==null?'—':'$'+(v>=1e9?(v/1e9).toFixed(2)+'B':v>=1e6?(v/1e6).toFixed(2)+'M':v>=1e3?(v/1e3).toFixed(0)+'K':Math.round(v));
+  const tfs=['15m','1h','4h','1d'];
+  const chip=t=>{ const m=(af.tfs||{})[t]; if(!m) return ''; const v=m.ratio, bg=v>=6?'rgba(63,185,80,.42)':v>=4?'rgba(63,185,80,.30)':v>=2.5?'rgba(63,185,80,.18)':v>=1.5?'rgba(210,153,34,.14)':'rgba(21,28,41,.7)';
+    const bp=m.buy_pct!=null?` · ${m.buy_pct}% buy`:'';
+    return `<span data-tip="${esc(t+' Binance Alpha volume is '+v.toFixed(2)+'× its 20-candle average'+(m.mode==='live'?' (current candle, projected)':' (last closed candle)')+'. Candle move '+(m.chg>0?'+':'')+m.chg+'%.'+(m.buy_pct!=null?' Taker buys were '+m.buy_pct+'% of that volume (over 55% = buyers lifting offers).':''))}" style="display:inline-block;padding:3px 9px;border-radius:7px;border:1px solid var(--line);background:${bg};margin:0 4px 4px 0;white-space:nowrap"><b>${t}</b> ${v.toFixed(1)}×${m.mode==='live'?' <span class="rr">live</span>':''}<span class="rr">${m.chg>0?'+':''}${m.chg}%${bp}</span></span>`; };
+  let best=null; for(const t of tfs){ const m=(af.tfs||{})[t]; if(m&&(!best||m.ratio>best[1].ratio)) best=[t,m]; }
+  const lines=[`<div style="margin-bottom:4px"><span class="muted">Binance Alpha candles (${esc(af.pair||'')}):</span> ${tfs.map(chip).join('')||'<span class="muted">no Alpha candles</span>'}</div>`];
+  const x=af.dex;
+  if(x){ const br=(w)=>{ const [b,sl]=x[w]; const tot=b+sl; return tot?`${b}/${sl} (${Math.round(b/tot*100)}% buys)`:'—'; };
+    const ratio24=x.h24[0]+x.h24[1]?x.h24[0]/(x.h24[0]+x.h24[1]):null, ratio1=x.h1[0]+x.h1[1]?x.h1[0]/(x.h1[0]+x.h1[1]):null;
+    lines.push(`<div data-tip="${esc('On-chain DEX trades from DexScreener, summed over '+x.pools+' pool(s). Buys/sells are trade COUNTS, not size, so one whale can be outnumbered by many small sells. Liquidity = USD in the pools: under ~$200K a $2,500 order will move the price.')}"><b>On-chain (${esc(x.chain||af.chain||'')}, ${x.pools} pool${x.pools>1?'s':''}):</b> buys/sells 1h ${br('h1')} · 6h ${br('h6')} · 24h ${br('h24')} · liquidity <b>${usd(x.liq)}</b> · DEX vol 24h ${usd(x.vol24)}${x.url?` · <a href="${x.url}" target="_blank" rel="noopener">DexScreener ↗</a>`:''}</div>`);
+    if(x.liq&&x.liq<200000) lines.push(`<div style="color:var(--warn)">⚠️ Thin liquidity (${usd(x.liq)}): size down, a market order will slip.</div>`);
+    x._r1=ratio1; x._r24=ratio24;
+  } else lines.push(`<div class="muted">On-chain flow unavailable${af.dex_err?' ('+esc(af.dex_err)+')':''}.</div>`);
+  lines.push(`<div class="muted">Alpha 24h vol ${usd(af.vol24_alpha)} · holders ${af.holders!=null?Math.round(af.holders).toLocaleString():'—'} · mcap ${usd(af.mcap)}${af.on_binance?' · graduated to Binance main':''} · no perp, so no OI or funding to read.</div>`);
+  // verdict
+  let v='', col='var(--dim)';
+  if(best){ const [t,m]=best, buyOk=m.buy_pct==null||m.buy_pct>=55, chainOk=!x||x._r1==null||x._r1>=0.5;
+    if(m.ratio>=2.5&&m.chg>0&&buyOk&&chainOk){ v=`✅ Buyers in control: ${t} volume ${m.ratio.toFixed(1)}× normal on a green candle`+(m.buy_pct!=null?`, ${m.buy_pct}% taker buys`:'')+(x&&x._r1!=null?`, ${Math.round(x._r1*100)}% of on-chain trades in the last hour were buys`:'')+'.'; col='var(--accent)'; }
+    else if(m.ratio>=2.5&&m.chg<0){ v=`⚠️ Volume spike on SELLING: ${t} ${m.ratio.toFixed(1)}× normal on a ${m.chg}% candle.`; col='var(--red)'; }
+    else if(m.ratio>=2.5){ v=`👀 Volume is up (${t} ${m.ratio.toFixed(1)}×) but the buy side is not clearly in control yet.`; col='var(--warn)'; }
+    else v='Volume is normal on every timeframe: the plan stands on price structure alone, with no volume confirmation yet.'; }
+  lines.push(`<div style="margin-top:4px;color:${col};font-weight:650">${v}</div>`);
+  return lines.join('');
+}
 // ── Analyze card: volume & flow context from the Volume spikes scanner ─────────
 async function vsAzInject(){
   const box=document.getElementById('azResult'); if(!box||typeof azLast==='undefined'||!azLast||!azLast.symbol) return;
@@ -6574,7 +6797,12 @@ async function vsAzInject(){
   const el=document.createElement('div'); el.id='azVolPanel';
   el.style.cssText='border:1px solid var(--line);border-radius:12px;padding:10px 14px;margin:0 0 12px;font-size:12.5px;line-height:1.6';
   const head='<div style="font-weight:700;margin-bottom:4px">🔊 Volume &amp; flow <span class="muted" style="font-weight:400">(from the Volume spikes scanner, Binance data)</span> '+alphaTag(sym)+'</div>';
-  if(!r){ el.innerHTML=head+`<div class="muted">${!d.rows||!d.updated?'Volume scanner is still on its first pass. Re-run in a few minutes.':'Not in the volume scanner: it only covers Binance USDT perps with 24h volume over $1M.'}</div>`; box.prepend(el); return; }
+  if(!r){
+    if(!d.rows||!d.updated){ el.innerHTML=head+'<div class="muted">Volume scanner is still on its first pass. Re-run in a few minutes.</div>'; box.prepend(el); return; }
+    el.innerHTML=head+'<div class="muted">No Binance perp for this coin, so loading Binance Alpha candles and on-chain DEX flow…</div>'; box.prepend(el);
+    let af=null; try{ af=await fetch('/alphaflow?symbol='+encodeURIComponent(sym),{cache:'no-store'}).then(x=>x.json()); }catch(e){}
+    if(!document.body.contains(el)) return;
+    el.innerHTML=head+alphaFlowHtml(af); return; }
   const tfs=['15m','1h','4h','1d'];
   const chip=t=>{ const m=r.tfs[t]; if(!m) return ''; const v=m.ratio, bg=v>=6?'rgba(63,185,80,.42)':v>=4?'rgba(63,185,80,.30)':v>=2.5?'rgba(63,185,80,.18)':v>=1.5?'rgba(210,153,34,.14)':'rgba(21,28,41,.7)';
     return `<span data-tip="${esc(t+' volume is '+v.toFixed(2)+'× its 20-candle average'+(m.mode==='live'?' (current candle, projected)':' (last closed candle)')+'. Candle move '+(m.chg>0?'+':'')+m.chg+'%. '+(m.vs_ema!=null?'Price '+(m.vs_ema>=0?'above':'below')+' EMA200 on '+t+' by '+Math.abs(m.vs_ema)+'%.':''))}" style="display:inline-block;padding:3px 9px;border-radius:7px;border:1px solid var(--line);background:${bg};margin:0 4px 4px 0;white-space:nowrap"><b>${t}</b> ${v.toFixed(1)}×${m.mode==='live'?' <span class="rr">live</span>':''}${m.setup==='flush'?' ↺':''}</span>`; };
@@ -6966,6 +7194,14 @@ def make_handler(state: State):
                 self._send(200, json.dumps({"ok": ok}).encode(), "application/json")
             elif self.path.startswith("/track"):
                 self._track()
+            elif self.path.startswith("/alphaflow"):
+                from urllib.parse import urlparse, parse_qs
+                sym = (parse_qs(urlparse(self.path).query).get("symbol") or [""])[0]
+                try:
+                    out = alpha_flow(sym)
+                except Exception as e:
+                    out = {"error": f"alpha flow failed: {e}"}
+                self._send(200, json.dumps(out, default=str).encode(), "application/json")
             elif self.path.startswith("/analyze"):
                 self._analyze()
             elif self.path in ("/", "/index.html"):
