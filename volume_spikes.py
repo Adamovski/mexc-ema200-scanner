@@ -64,7 +64,7 @@ HIST_CANDLES = 260          # 1h/4h/1d: EMA200 + baseline (weight 2 per call)
 M15_CANDLES = 400           # 15m: EMA200 + covers the forming 1D candle (weight 2)
 LIVE_MIN_FRAC = 0.20
 HORIZONS = [("1h", 3600), ("4h", 14400), ("24h", 86400)]
-DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "volume_spikes_alerts_v74.json")
+DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "volume_spikes_alerts_v78.json")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -434,7 +434,7 @@ def recommend(r, tf, btc):
 # ─────────────────────────────────────────────────────────────────────────────
 # Alert log + forward test
 # ─────────────────────────────────────────────────────────────────────────────
-REDIS_KEY = "vspike_alerts_v74"      # v74: fresh log (older alerts used older plan rules)
+REDIS_KEY = "vspike_alerts_v78"      # v78: fresh log - wide timeframe-scaled stops + step-up/trail exits
 
 
 def _redis():
@@ -645,8 +645,28 @@ def plan_from_candles(c, entry):
 
 PLAN_TF = {"15m": "4h", "1h": "4h", "4h": "4h", "1d": "1d"}   # low-TF spikes = early signal, trade the higher-TF move
 MIN_TP1_PCT = {"15m": 0.0, "1h": 4.0, "4h": 10.0, "1d": 15.0}   # TP1 must be at least this far (manual trading)
-MAX_STOP_ATR = 3.0      # stop no further than 3×ATR …
-MAX_STOP_PCT = 0.15     # … and no further than 15% from entry
+MAX_STOP_ATR = 3.0      # (legacy, unused since v78)
+MAX_STOP_PCT = 0.15     # (legacy, unused since v78)
+# v78: WIDE, timeframe-scaled stops. 60-day Binance backtest (2,568 green 3×+ spikes, 172 perps):
+# a 3×ATR(4h)/15% stop was hit before TP1 52% of the time; 5×ATR(4h)/25% cut that to 28% and
+# lifted expectancy at every slice; daily plans did best on 2×ATR(1D). (k × ATR, minimum %, cap %)
+STOP_RULES = {"5m": (4.0, 0.03, 0.10), "15m": (4.0, 0.03, 0.10), "1h": (4.0, 0.05, 0.15),
+              "4h": (5.0, 0.08, 0.25), "1d": (2.0, 0.12, 0.35), "1w": (1.5, 0.20, 0.50)}
+TRAIL_ATR = 3.0         # runner trails 3×ATR(4h) under the highest high once TP2 is banked
+
+
+def wide_stop(entry, tf, atr, structural=None):
+    """Long stop at least k×ATR(tf) and a minimum % away; a deeper structural stop is kept
+    (up to the cap). Returns (stop, reason)."""
+    k, mn, cap = STOP_RULES.get(tf, STOP_RULES["4h"])
+    dist = max(k * atr if atr else 0.0, mn * entry)
+    sl = entry - dist
+    why = f"{k:g}×ATR({tf})" if atr and k * atr >= mn * entry else f"{mn * 100:g}% minimum for {tf}"
+    if structural is not None and 0 < structural < sl:
+        sl, why = structural, "Analyze structural level (deeper than the volatility floor)"
+    if sl < entry * (1 - cap):
+        sl, why = entry * (1 - cap), f"{cap * 100:g}% cap for {tf}"
+    return sl, why
 
 
 PLAN_VER = 2            # v75: targets from real levels (TP1 = first real level past the minimum, not 1R)
@@ -717,22 +737,21 @@ def _fib_ext(c4h, entry):
             if lo + (hi - lo) * f > entry]
 
 
-def finish_plan(plan, entry, atr=None, min_tp1_pct=10.0, c1h=None, c4h=None, c1d=None):
+def finish_plan(plan, entry, atr=None, min_tp1_pct=10.0, c1h=None, c4h=None, c1d=None, tf="4h"):
     """Stop capped at min(3×ATR, 15%). Targets come from REAL levels: Analyze resistances,
     1h/4h/Daily swing highs, 30-day and range highs, merged into zones and scored.
     TP1 = the first real zone at least min_tp1_pct above entry (the minimum is a floor,
     not the target). TP2/TP3 = the next zones, each ≥ TP_GAP_PCT higher. Each target
     front-runs its zone by 0.4%. Fib extensions fill gaps; R multiples only as last resort."""
     notes = []
-    cap = entry * MAX_STOP_PCT
-    if atr:
-        cap = min(cap, MAX_STOP_ATR * atr)
-    if entry - plan["sl"] > cap:
-        old = plan["sl"]
-        plan["sl"] = entry - cap
-        notes.append(f"stop tightened from {old:.6g} (too far: {round((1 - old / entry) * 100, 1)}%) to "
-                     f"{'3×ATR' if atr and cap < entry * MAX_STOP_PCT else '15%'} below entry")
-        plan["sl_basis"] = (plan.get("sl_basis") or "") + " · Adjusted: " + notes[-1] + "."
+    old = plan.get("sl")
+    sl, why = wide_stop(entry, tf, atr, old if old and old < entry else None)
+    plan["sl"] = sl
+    plan["sl_basis"] = (f"{round((1 - sl / entry) * 100, 1)}% below entry: {why}. Wide on purpose: we trade "
+                        f"the bigger move, so the stop sits outside normal {tf} noise.")
+    if old and abs(old - sl) > entry * 1e-6:
+        plan["sl_basis"] += f" (Analyze stop was {old:.6g}, {round((1 - old / entry) * 100, 1)}%.)"
+    plan["trail_atr"] = _atr(c4h) if c4h else atr
     risk = entry - plan["sl"]
 
     levels = list(plan.get("levels") or [])
@@ -800,41 +819,56 @@ def finish_plan(plan, entry, atr=None, min_tp1_pct=10.0, c1h=None, c4h=None, c1d
 
 
 def step_plan(a, candles, px, now):
-    """Advance one alert's plan through new 15m candles. Thirds off at TP1/2/3,
-    stop to break-even after TP1. Stop is checked first inside a candle (conservative)."""
+    """Advance one alert's plan through new 15m candles (v78 management, from the backtest):
+    ⅓ off at TP1, ⅓ at TP2, the last ⅓ is a RUNNER (TP3 is only its reference target).
+    Stop: original until TP1 → halfway to entry after TP1 → break-even after TP2 → then trails
+    3×ATR(4h) under the highest high. Stop is checked first inside a candle (conservative)."""
     pl, st = a.get("plan"), a.get("pstate")
-    if not pl or not st or st["status"] in ("tp3", "sl", "be", "expired", "invalid"):
+    if not pl or not st or st["status"] in ("sl", "be", "trail", "expired", "invalid"):
         return False
     entry, risk = a["price"], a["price"] - pl["sl"]
+    if risk <= 0:
+        return False
     changed = False
+    stop = st.get("stop", pl["sl"]); hh = st.get("hh", entry)
+    ta = pl.get("trail_atr")
     start = (int(a["t"]) // 900) * 900 + 900          # first candle fully after the alert
+
+    def banked(h):
+        return sum(pl["rr"][:min(h, 2)]) / 3
+
     for k in candles:
         if k[0] < start or k[0] < st.get("checked", 0):
             continue
         hi, lo = k[2], k[3]
         st["mfe"] = round(max(st.get("mfe", 0), (hi / entry - 1) * 100), 2)
         st["mae"] = round(min(st.get("mae", 0), (lo / entry - 1) * 100), 2)
-        stop = entry if st["hits"] >= 1 else pl["sl"]
         if lo <= stop:
-            left = 1 - st["hits"] / 3
-            st["r"] = round(sum(pl["rr"][:st["hits"]]) / 3 + left * ((stop - entry) / risk), 2)
-            st["status"] = "be" if st["hits"] >= 1 else "sl"
+            left = 1 - min(st["hits"], 2) / 3
+            st["r"] = round(banked(st["hits"]) + left * (stop - entry) / risk, 2)
+            st["status"] = "sl" if st["hits"] == 0 else ("be" if abs(stop - entry) <= entry * 1e-9 else "trail")
+            st["exit_px"] = stop
             st["closed_t"] = k[0]; changed = True
             break
         while st["hits"] < 3 and hi >= pl["tps"][st["hits"]]:
             st["hits"] += 1; st["status"] = f"tp{st['hits']}"; changed = True
             st.setdefault("hit_t", []).append(k[0])
-        if st["hits"] == 3:
-            st["r"] = round(sum(pl["rr"]) / 3, 2); st["closed_t"] = k[0]
-            break
-        if k[0] + 900 <= now:
+        if k[0] + 900 <= now:                              # ratchet only on CLOSED candles
+            hh = max(hh, hi)
+            if st["hits"] >= 1:
+                stop = max(stop, (pl["sl"] + entry) / 2)
+            if st["hits"] >= 2:
+                stop = max(stop, entry)
+                if ta:
+                    stop = max(stop, hh - TRAIL_ATR * ta)
+            st["stop"] = stop; st["hh"] = hh
             st["checked"] = k[0] + 900                    # only skip fully closed candles next time
     if px:
         st["last_px"] = px
         st["now_pct"] = round((px / entry - 1) * 100, 2)
-        if st["status"] not in ("tp3", "sl", "be"):
-            left = 1 - st["hits"] / 3
-            st["open_r"] = round(sum(pl["rr"][:st["hits"]]) / 3 + left * (px - entry) / risk, 2)
+        if st["status"] not in ("sl", "be", "trail", "expired"):
+            left = 1 - min(st["hits"], 2) / 3
+            st["open_r"] = round(banked(st["hits"]) + left * (px - entry) / risk, 2)
             if now - a["t"] > PLAN_EXPIRY:
                 st["r"] = st["open_r"]; st["status"] = "expired"; st["closed_t"] = now; changed = True
     return changed
@@ -858,6 +892,8 @@ class VolumeSpikeScanner:
         self.planner = None           # fn(symbol, tf) -> Analyze-card dict (injected by the dashboard)
         self.plan_q = deque()
         self.plan_busy = set()
+        self.mcap, self.mcap_t = {}, 0
+        self.mcap_extra = None        # fn() -> {TOKEN: mcap} for Binance Alpha tokens (injected by the dashboard)
         self.snap = {"rows": [], "btc": None, "status": "warming up — first pass takes ~3 min after boot",
                      "updated": None, "progress": None, "universe": 0}
 
@@ -905,6 +941,44 @@ class VolumeSpikeScanner:
         self.spot_cache[key] = val
         return val
 
+    def _mcaps(self, now):
+        """Market caps from BINANCE: circulating supply × spot price (Binance product feed),
+        refreshed every 30 min. Alpha-only tokens fall back to the Binance Alpha list's mcap."""
+        if now - self.mcap_t > 1800 or not self.mcap:
+            try:
+                r = requests.get("https://www.binance.com/bapi/asset/v2/public/asset-service/product/get-products",
+                                 params={"includeEtf": "true"}, timeout=20, headers=UA)
+                r.raise_for_status()
+                m = {}
+                for d in r.json().get("data") or []:
+                    if d.get("q") != "USDT" or not d.get("cs"):
+                        continue
+                    try:
+                        m[d["b"]] = float(d["cs"]) * float(d["c"])
+                    except Exception:
+                        pass
+                if m:
+                    self.mcap = m
+                self.mcap_t = now
+            except Exception as e:
+                self.mcap_t = now - 1500                 # retry in ~5 min
+                print(f"[vspike] mcap fetch failed: {e}", flush=True)
+        return self.mcap
+
+    def mcap_for(self, sym, now):
+        base = sym[:-4] if sym.endswith("USDT") else sym
+        for pre in ("1000000", "1000", "1M"):
+            if base.startswith(pre) and len(base) > len(pre) + 1:
+                base = base[len(pre):]; break
+        mc = self._mcaps(now).get(base)
+        src = "Binance (circulating supply × price)"
+        if not mc and self.mcap_extra:
+            try:
+                mc = (self.mcap_extra() or {}).get(base); src = "Binance Alpha"
+            except Exception:
+                mc = None
+        return (mc, src) if mc else (None, None)
+
     def _oi(self, sym, now):
         c = self.oi_cache.get(sym)
         if c and now - c[0] < 900:
@@ -950,7 +1024,7 @@ class VolumeSpikeScanner:
                     a["plan"] = finish_plan(pl, entry, _atr(cc) if cc else None,
                                             min_tp1_pct=MIN_TP1_PCT.get(ptf, 0.0) or 10.0,
                                             c1h=self.hist.get((sym, "1h")), c4h=self.hist.get((sym, "4h")),
-                                            c1d=self.hist.get((sym, "1d")))
+                                            c1d=self.hist.get((sym, "1d")), tf=ptf)
                     a["plan"]["tf"] = ptf
                     a["plan"]["late"] = (time.time() - a["t"]) > PLAN_LATE
                     need = MIN_TP1_PCT.get(ptf, 0.0)
@@ -1115,7 +1189,13 @@ class VolumeSpikeScanner:
                 if len(ser) >= 25:
                     r["oi_chg24"] = round((ser[-1][1] / ser[-25][1] - 1) * 100, 2) if ser[-25][1] else None
             r["oi_div"] = oi_divergence(r.get("px_chg4"), r.get("oi_chg4"))
+            mc, src = self.mcap_for(r["symbol"], now)
+            if mc:
+                r["mcap"] = round(mc); r["mcap_src"] = src
+                if r.get("oi_usd"):
+                    r["oi_mcap_pct"] = round(100 * r["oi_usd"] / mc, 1)
 
+        self._mcaps(now)                                  # one fetch before the threads share it
         with ThreadPoolExecutor(max_workers=4) as ex:
             list(ex.map(enrich, hot))
 
@@ -1233,11 +1313,13 @@ def _tg_text(a, btc):
 VSPIKE = VolumeSpikeScanner()
 
 
-def start(notify=None, planner=None):
+def start(notify=None, planner=None, mcap_extra=None):
     """Call once from main(). `notify(text)` = optional Telegram sender.
-    `planner(symbol, tf)` = the dashboard's analyze_symbol, used for alert stop/targets."""
+    `planner(symbol, tf)` = the dashboard's analyze_symbol, used for alert stop/targets.
+    `mcap_extra()` = {TOKEN: mcap} for Binance Alpha tokens (OI as % of market cap)."""
     VSPIKE.notify = notify
     VSPIKE.planner = planner
+    VSPIKE.mcap_extra = mcap_extra
     for _ in range(2):
         threading.Thread(target=VSPIKE.plan_worker, daemon=True, name="vspike-plan").start()
     threading.Thread(target=VSPIKE.loop, daemon=True, name="vspike").start()
