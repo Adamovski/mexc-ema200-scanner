@@ -7103,7 +7103,7 @@ const HDR_TIPS={
 };
 // ── 🧪 System backtest tab: the live volume-spike system replayed over Binance history (system_backtest.py)
 let SBT=null, _sbtPoll=null;
-let SBTF={rec:'watch',tf:'',setup:'',exit:'new',one:1,sort:'t',dir:-1,open:'',page:0};
+let SBTF={side:'long',rec:'watch',tf:'',setup:'',exit:'new',one:1,sort:'t',dir:-1,open:'',page:0};
 try{ Object.assign(SBTF, JSON.parse(localStorage.getItem('sbtF')||'{}')); if(SBTF.exit==='old') SBTF.exit='new'; }catch(e){}
 async function loadSbt(run){
   try{ SBT=await fetch('/sbt'+(run?'/run':''),{cache:'no-store'}).then(r=>r.json()); }catch(e){ SBT={status:'error',error:'could not reach the server'}; }
@@ -7114,12 +7114,14 @@ function sbtSet(k,v){ SBTF[k]=v; if(k!=='page') SBTF.page=0; try{ localStorage.s
 function sbtRows(skip){
   const R=SBT.result, C=R.cols;
   let rows=R.rows.map(x=>{ const o={}; C.forEach((c,i)=>o[c]=x[i]); return o; });
+  const SH=SBTF.side==='short';
   rows=rows.filter(o=>{
-    if(skip!=='rec'){ if(SBTF.rec==='go'&&o.rec!=='long') return false; if(SBTF.rec==='watch'&&!(o.rec==='long'||o.rec==='watch_long')) return false; if(SBTF.rec==='skip'&&o.rec!=='skip') return false; }
+    if((o.setup==='short')!==SH) return false;
+    if(skip!=='rec'){ if(SBTF.rec==='go'&&!(o.rec==='long'||o.rec==='short')) return false; if(SBTF.rec==='watch'&&!['long','watch_long','short','watch_short'].includes(o.rec)) return false; if(SBTF.rec==='skip'&&o.rec!=='skip') return false; }
     if(skip!=='tf'&&SBTF.tf&&o.tf!==SBTF.tf) return false;
     if(skip!=='setup'&&SBTF.setup&&o.setup!==SBTF.setup) return false;
     return true; });
-  rows.forEach(o=>{ const fd=SBTF.exit==='fade'; o.R=fd?o.r_s:o.r; o.S=fd?o.st_s:o.st; o.CT=fd?o.closed_s:o.closed_t; o.H1=fd?(['be','trail'].includes(o.S)||(o.R!=null&&o.R>0.3)):o.hits>=1;
+  rows.forEach(o=>{ const fd=!SH&&SBTF.exit==='fade'; o.R=fd?o.r_s:o.r; o.S=fd?o.st_s:o.st; o.CT=fd?o.closed_s:o.closed_t; o.H1=fd?(['be','trail'].includes(o.S)||(o.R!=null&&o.R>0.3)):o.hits>=1;
     o.P=(o.R!=null&&o.sl_pct!=null)?o.R*Math.abs(o.sl_pct):null; });
   if(SBTF.one){ const busy={}; rows=rows.filter(o=>{ if(busy[o.sym]!=null&&o.t<busy[o.sym]) return false; busy[o.sym]=o.S==='open'?Infinity:(o.CT||o.t); return true; }); }
   return rows;
@@ -7137,7 +7139,7 @@ const sbtF=(x,d=2)=>x==null?'—':(x>0?'+':'')+x.toFixed(d);
 const sbtC=x=>x==null?'var(--dim)':x>0?'var(--accent)':x<0?'var(--red)':'var(--dim)';
 function sbtCard(lab,val,tip,col){ return `<div data-tip="${esc(tip)}" style="border:1px solid var(--line,#30363d);border-radius:10px;padding:8px 12px;min-width:110px"><div class="muted" style="font-size:11px">${lab}</div><div style="font-size:18px;font-weight:700;color:${col||'inherit'}">${val}</div></div>`; }
 const SBT_GROUPS=[
-  ['call','Call at the time','The scanner\\'s recommendation when the alert fired. This table ignores the Call filter above so you can compare them.',o=>({long:'✅ Long',watch_long:'👀 Watch',skip:'✗ Skip'}[o.rec]||o.rec||'—'),'rec'],
+  ['call','Call at the time','The scanner\\'s recommendation when the alert fired. This table ignores the Call filter above so you can compare them.',o=>({long:'✅ Long',watch_long:'👀 Watch',short:'🔴 Short',watch_short:'👀 Watch short',skip:'✗ Skip'}[o.rec]||o.rec||'—'),'rec'],
   ['tf','Spike timeframe','Timeframe whose candle spiked. 1h spikes are traded on the 4h plan, 4h on 4h, 1D on the Daily plan.',o=>o.tf,'tf'],
   ['setup','Setup','Momentum = green high-volume candle. Flush = liquidation flush (big drop on volume with OI falling) that is a long-the-bounce setup.',o=>o.setup],
   ['score','Score','Alert score 0–100 (volume size, other timeframes spiking, spot confirmation, EMA200, OI, funding, BTC).',o=>o.score>=75?'75+':o.score>=65?'65–74':o.score>=55?'55–64':'45–54'],
@@ -7157,10 +7159,10 @@ function sbtTrades(a){
   const rows=[...a].sort((x,y)=>{ const p=val(x),q=val(y); return (p>q?1:p<q?-1:0)*dir; });
   const per=100, pg=Math.min(SBTF.page, Math.max(0,Math.ceil(rows.length/per)-1)), sl=rows.slice(pg*per,pg*per+per);
   const th=(key,lab,tip)=>`<th style="cursor:pointer;white-space:nowrap" data-tip="${esc(tip+' Click to sort.')}" onclick="sbtSet('dir',SBTF.sort==='${key}'?-SBTF.dir:-1);sbtSet('sort','${key}')">${lab}${SBTF.sort===key?(SBTF.dir>0?' ▲':' ▼'):''}</th>`;
-  const recL={long:'✅ Long',watch_long:'👀 Watch',skip:'✗ Skip'};
+  const recL={long:'✅ Long',watch_long:'👀 Watch',short:'🔴 Short',watch_short:'👀 Watch short',skip:'✗ Skip'};
   return `<div style="overflow-x:auto"><table style="font-size:11.5px"><thead><tr>${th('t','Time','When the spike candle closed (your local time). Entry = price at that close.')}${th('sym','Coin','Binance USDT perp.')}${th('tf','TF','Spike timeframe.')}${th('rec','Call','Scanner call at the time.')}${th('score','Score','Alert score 0–100.')}${th('ratio','Spike','Volume ÷ previous 20-candle average.')}${th('sl','Stop','Stop distance (= 1R).')}${th('tp1','TP1','First target % above entry (first real resistance ≥10% away, front-run).')}${th('st','Status','How the plan ended with the selected exit model.')}${th('r','Result R','Whole-position result in R.')}${th('p','Result %','Same result as % of the position (R × stop %).')}${th('mfe','Best / worst','Highest and lowest price vs entry within the plan\\'s life (max 7 days).')}</tr></thead><tbody>`
    +sl.map(o=>{ const ps=PL_ST[o.S]||[o.S,'var(--dim)'];
-     return `<tr><td style="white-space:nowrap">${new Date(o.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td><td><a href="${tvLink(o.sym)}" target="_blank" rel="noopener">${dispSym(o.sym)}</a></td><td>${o.tf}</td><td>${recL[o.rec]||o.rec}</td><td>${o.score}</td><td>${(+o.ratio).toFixed(1)}×</td><td>${o.sl_pct.toFixed(1)}%</td><td>+${o.tp1_pct.toFixed(1)}%</td>`
+     return `<tr><td style="white-space:nowrap">${new Date(o.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td><td><a href="${tvLink(o.sym)}" target="_blank" rel="noopener">${dispSym(o.sym)}</a></td><td>${o.tf}</td><td>${recL[o.rec]||o.rec}</td><td>${o.score}</td><td>${(+o.ratio).toFixed(1)}×</td><td>${o.sl_pct.toFixed(1)}%</td><td>${o.tp1_pct>0?'+':''}${o.tp1_pct.toFixed(1)}%</td>`
       +`<td style="color:${ps[1]};white-space:nowrap" data-tip="${esc('TP1 +'+o.tp1_pct+'%, TP2 +'+o.tp2_pct+'%, TP3 +'+o.tp3_pct+'% · stop '+o.sl_pct+'% · targets hit: '+o.hits+' · long: '+o.st+' '+sbtF(o.r)+'R · fade (short): '+o.st_s+' '+sbtF(o.r_s)+'R')}">${ps[0]}</td>`
       +`<td style="color:${sbtC(o.R)};font-weight:700">${o.S==='open'?'<span class="muted">open '+sbtF(o.R)+'</span>':sbtF(o.R)+'R'}</td><td style="color:${sbtC(o.P)}">${o.P==null?'—':sbtF(o.P,1)+'%'}</td><td class="rr" style="white-space:nowrap">+${o.mfe}% / ${o.mae}%</td></tr>`; }).join('')
    +`</tbody></table></div>`+(rows.length>per?`<div style="margin:6px 0">${Array.from({length:Math.ceil(rows.length/per)},(_,i)=>`<button style="${SBT_CHIP(i===pg)};margin:2px" onclick="sbtSet('page',${i})">${i+1}</button>`).join('')}</div>`:'');
@@ -7179,14 +7181,14 @@ function renderSbt(){
     :`<button style="${SBT_CHIP(false)}" onclick="loadSbt(true)" data-tip="Re-run the whole replay with the current live rules. Takes ~1–2 hours in the background; it also rebuilds itself every 3 days.">🔄 Re-run now</button>`;
   if(!SBT.result){ el.innerHTML=`<h3 style="margin:0 0 6px">🧪 System backtest</h3>${SBT.error?'<div class="warn">'+esc(SBT.error)+'</div>':''}${run?runLine:'<div class="muted">No backtest stored yet. The first one starts ~4 min after the server boots.</div>'+runLine}`; return; }
   const M=SBT.result.meta, rows=sbtRows(), st=sbtStat(rows);
-  const alt=(()=>{ const e=SBTF.exit; SBTF.exit=e==='fade'?'new':'fade'; const s=sbtStat(sbtRows()); SBTF.exit=e; return s; })();
+  const alt=SBTF.side==='short'?null:(()=>{ const e=SBTF.exit; SBTF.exit=e==='fade'?'new':'fade'; const s=sbtStat(sbtRows()); SBTF.exit=e; return s; })();
   const chip=(k,v,lab,tip)=>`<button style="${SBT_CHIP(SBTF[k]===v)}" data-tip="${esc(tip||'')}" onclick="sbtSet('${k}',${JSON.stringify(v).replace(/"/g,"'")})">${lab}</button>`;
   let h=`<h3 style="margin:0 0 4px">🧪 System backtest <span class="muted" style="font-size:12px;font-weight:400">built ${new Date(M.built*1000).toLocaleString()} · ${M.symbols} Binance perps · last ${M.days} days · ${SBT.result.rows.length} alerts</span></h3>`
    +`<div class="muted" style="font-size:12px;margin-bottom:8px;max-width:1100px">Replays the live volume-spike system hour by hour over Binance history with the scanner's <b>own code</b>: the same volume ratios (1h/4h/1D), spot confirmation, OI divergence, funding, BTC regime, scores and Long/Watch/Skip calls, the same wide stops and real-level targets, and the same exit rules. Several timeframes spiking at once = one alert. <b>Gaps vs live:</b> no 15m spikes; plans start from candles, not the Analyze card; exits walked on 1h candles (stop checked first); OI history only ~20 days; only coins listed today (delisted coins missing); no fees or slippage.</div>`
    +`<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:6px"><span class="muted" style="font-size:12px">Call:</span>${chip('rec','go','✅ Long','Only alerts the scanner called Long.')}${chip('rec','watch','✅+👀 Long & Watch','Long and Watch long calls (what the forward test counts).')}${chip('rec','skip','✗ Skip','Only the alerts the scanner said to skip: they should do worse.')}${chip('rec','','All','Every long alert.')}`
    +`<span class="muted" style="font-size:12px;margin-left:10px">TF:</span>${chip('tf','','All')}${chip('tf','1h','1h')}${chip('tf','4h','4h')}${chip('tf','1d','1D')}`
    +`<span class="muted" style="font-size:12px;margin-left:10px">Setup:</span>${chip('setup','','All')}${chip('setup','momentum','Momentum')}${chip('setup','flush','Flush')}</div>`
-   +`<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px"><span class="muted" style="font-size:12px">Trade:</span>${chip('exit','new','🟢 Long the spike (live system)',M.exit_new)}${chip('exit','fade','🔴 Fade it (short)',M.fade||'Short the same alert')}`
+   +`<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px"><span class="muted" style="font-size:12px">System:</span>${chip('side','long','🟢 Green spikes','Big-volume UP candles, the live long system.')}${chip('side','short','🔴 Red spikes → short',M.short_system||'Big-volume DOWN candles traded short.')}${SBTF.side==='long'?`<span class="muted" style="font-size:12px;margin-left:10px">Trade:</span>${chip('exit','new','Long it (live)',M.exit_new)}${chip('exit','fade','Fade it (short)',M.fade||'Short the same alert')}`:''}`
    +`<span class="muted" style="font-size:12px;margin-left:10px">Positions:</span>${chip('one',1,'One per coin','A new alert on a coin is ignored while the previous trade on that coin is still open (live rule).')}${chip('one',0,'Every alert','Count every alert as its own trade.')}<span style="margin-left:10px">${runLine}</span></div>`;
   if(!st.n){ el.innerHTML=h+'<div class="muted">No graded trades for this filter.</div>'; return; }
   h+=`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px">`
@@ -7199,7 +7201,7 @@ function renderSbt(){
    +sbtCard('Max drawdown',st.dd.toFixed(1)+'R','Worst peak-to-trough drop of the cumulative R curve.','var(--red)')
    +sbtCard('Reached TP1',st.tp1.toFixed(0)+'%','Share of trades that hit TP1 before the stop.')
    +sbtCard('Stopped before TP1',st.sl.toFixed(0)+'%','Share of trades that lost the full −1R.')
-   +`</div><div class="muted" style="font-size:12px" data-tip="The same alerts traded in the opposite direction, for comparison.">Same alerts traded the other way (${SBTF.exit==='fade'?'long':'short / fade'}): avg ${sbtF(alt.avg)}R, win ${alt.n?alt.win.toFixed(0):'—'}%, total ${sbtF(alt.tot,1)}R.</div>`
+   +`</div>`+(alt?`<div class="muted" style="font-size:12px" data-tip="The same alerts traded in the opposite direction, for comparison.">Same alerts traded the other way (${SBTF.exit==='fade'?'long':'short / fade'}): avg ${sbtF(alt.avg)}R, win ${alt.n?alt.win.toFixed(0):'—'}%, total ${sbtF(alt.tot,1)}R.</div>`:'')
    +sbtEquity(rows);
   h+=`<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:12px">`;
   for(const [gk,title,tip,fn,skip] of SBT_GROUPS){
