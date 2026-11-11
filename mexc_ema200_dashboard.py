@@ -2109,6 +2109,32 @@ def _af_dex(sess, contract):
     return out
 
 
+_AV_CACHE = {}
+
+
+def alpha_vol_ratio(symbol, tf):
+    """Binance Alpha volume ratio for one Alpha-only perp + timeframe (used by the spike scanner as its 'spot')."""
+    tok = str(symbol or "").upper()
+    tok = tok[:-4] if tok.endswith("USDT") else tok
+    for pre in ("1000000", "1000", "1M"):
+        if tok.startswith(pre) and len(tok) > len(pre) + 1:
+            tok = tok[len(pre):]; break
+    k = (tok, tf, int(time.time() // 300))
+    if k in _AV_CACHE:
+        return _AV_CACHE[k]
+    sess = get_session()
+    meta, pairs = _af_lookup(sess)
+    m = meta.get(tok)
+    out = None
+    if m and m.get("alpha_id"):
+        pair = pairs.get(m["alpha_id"]) or (m["alpha_id"] + "USDT")
+        out = _af_tf(_af_klines(sess, pair, tf), tf, time.time() * 1000)
+    if len(_AV_CACHE) > 5000:
+        _AV_CACHE.clear()
+    _AV_CACHE[k] = out
+    return out
+
+
 def alpha_flow(symbol: str) -> dict:
     tok = str(symbol or "").upper().replace("_", "").replace("/", "")
     for q in ("USDT", "USDC"):
@@ -6536,6 +6562,11 @@ function alphaInfo(sym){
   if(src!==_alphaSrc){ _alphaSrc=src; _alphaIdx={}; for(const r of src){ const k=String(r.symbol||((r.token||'')+'USDT')).toUpperCase(); _alphaIdx[k]=r; } }
   const k=String(sym||'').toUpperCase().replace('_',''); return _alphaIdx[k.endsWith('USDT')?k:k+'USDT']||false;
 }
+// Chart context (from the scanner's chart_context): short tags + a hover with the full read
+const CTX_COL={'early':'var(--accent)','tight coil':'var(--accent)','absorption':'var(--accent)','sweep + reclaim':'var(--accent)','after flush':'var(--accent)','range breakout':'var(--accent)','4h uptrend':'var(--accent)','late':'var(--red)','4h downtrend':'var(--red)','30d high':'#d29922'};
+function ctxHtml(c, first){ if(!c||(!c.tags&&!c.lines)) return first?'<div><span class="rr" style="color:var(--accent);font-weight:700">🆕 first move</span></div>':'';
+  const tip=(first?'🆕 First Long/Watch alert on this coin in 7 days: the start of a move, not a chase. ':'')+'Chart read at the alert: '+(c.lines||[]).join(' · ');
+  return `<div style="margin-top:2px;line-height:1.5" data-tip="${esc(tip)}">${first?'<span class="rr" style="color:var(--accent);font-weight:700">🆕 first</span> ':''}${(c.tags||[]).map(t=>`<span class="rr" style="color:${CTX_COL[t]||'var(--dim)'};white-space:nowrap">${esc(t)}</span>`).join(' · ')} <span class="rr">📖</span></div>`; }
 function alphaTag(sym){
   const a=alphaInfo(sym);
   if(a===null) return '<span class="rr" data-tip="Binance Alpha list still loading">α ?</span>';
@@ -6657,7 +6688,7 @@ function renderSpikes(){
     const fundTip=r.funding==null?'':`Funding ${(r.funding*100).toFixed(4)}% per 8h. ${r.funding>0.0005?'High: longs are paying a lot, the long side is crowded.':r.funding<-0.0005?'Negative: shorts are paying, the short side is crowded (fuel for a squeeze up).':'Normal level, nobody is overcrowded.'}`;
     const fc=r.funding==null?'':(Math.abs(r.funding)>0.0005?'color:var(--warn);font-weight:650':'');
     return `<tr>`+
-      `<td class="sym"><div class="symbox"><a href="${tv}" target="_blank" rel="noopener">${esc(r.base)}</a>${analyzeBtn(r.symbol)}${alphaTag(r.symbol)}${r.mexc?'<span class="rr" data-tip="Also a MEXC perpetual">mx</span>':''}${r.n_spiking>=2?`<span class="rr" style="color:var(--accent)" data-tip="Spiking on ${r.n_spiking} timeframes">×${r.n_spiking}TF</span>`:''}</div></td>`+
+      `<td class="sym"><div class="symbox"><a href="${tv}" target="_blank" rel="noopener">${esc(r.base)}</a>${analyzeBtn(r.symbol)}${alphaTag(r.symbol)}${r.mexc?'<span class="rr" data-tip="Also a MEXC perpetual">mx</span>':''}${r.n_spiking>=2?`<span class="rr" style="color:var(--accent)" data-tip="Spiking on ${r.n_spiking} timeframes">×${r.n_spiking}TF</span>`:''}</div>${ctxHtml(r.ctx)}</td>`+
       `<td class="score" data-tip="${esc(why||'No spike above the threshold right now.')}">${m.score!=null?m.score:'—'}<span class="rr">${m.score!=null?bt:''}</span></td>`+
       `<td data-tip="${esc(m.setup==='flush'?('Liquidation flush: price dumped '+m.low_pct+'% on '+(m.ratio||0).toFixed(1)+'× volume while open interest FELL '+((m.flush||{}).oi)+'%, so leveraged longs were force-closed rather than new shorts opening. '+((m.flush||{}).reclaimed?'Buyers have already pushed it back into the upper half of the candle (long lower wick): the classic bounce long.':'It has NOT reclaimed yet; a long is safer once it closes back above the candle midpoint.')):m.dir==='long'?'The spike candle closed (or is running) clearly UP vs this coin’s typical candle: buyers drove the volume.':m.dir==='short'?'The spike candle went clearly DOWN: sellers drove the volume.':'Big volume but price barely moved: absorption, wait for a break.')}">${m.ratio>=minR?(m.setup==='flush'?'<span style="color:var(--accent);font-weight:650;white-space:nowrap">🟢 FLUSH ↺</span>':vsSigPill(m.dir)):'<span class="muted">—</span>'}</td>`+
       `<td data-tip="${esc(r.oi_div?('Last 4h: price '+(r.px_chg4>0?'+':'')+r.px_chg4+'%, open interest '+(r.oi_chg4>0?'+':'')+r.oi_chg4+'%'):'Only checked for spiking coins')}">${r.oi_div?`<span style="color:${VS_OID[r.oi_div]||'var(--dim)'};white-space:nowrap">${r.oi_div}</span>`:'<span class="muted">—</span>'}</td>`+
@@ -6850,14 +6881,15 @@ function renderFt(){
 }
 
 // ── Alert feed with trade plans ───────────────────────────────────────────
-let FEEDF='all', FEED_SKIPPED=false;
+let FEEDF='all', FEED_SKIPPED=false, FEED_REPEATS=false;
 const feedRecOk=a=>a.rec==='long'||a.rec==='watch_long';
 const PL_ST={open:['● Open','var(--blue)'],tp1:['TP1 ✓','var(--accent)'],tp2:['TP2 ✓✓','var(--accent)'],tp3:['🏆 TP3 · runner on','var(--accent)'],sl:['✗ Stop','var(--red)'],be:['⚖ Break-even','var(--dim)'],trail:['🏃 Trailed out','var(--accent)'],expired:['⌛ Expired','var(--dim)'],invalid:['— no plan','var(--dim2)'],dup:['↺ already in this coin','var(--dim2)']};
 function plClosed(st){ return st&&(['sl','be','trail','expired'].includes(st.status)||(st.status==='tp3'&&st.closed_t!=null)); }
 function renderFeed(){
   const fd=document.getElementById('vsFeed'); if(!fd||!vsData) return;
   const allLong=(vsData.alerts||[]).filter(a=>a.dir==='long'); const nSkipped=allLong.filter(a=>!feedRecOk(a)).length;
-  let al=FEED_SKIPPED?allLong:allLong.filter(feedRecOk);
+  const nRep=allLong.filter(a=>a.dup).length;
+  let al=(FEED_SKIPPED?allLong:allLong.filter(feedRecOk)).filter(a=>FEED_REPEATS||!a.dup);
   const cnt=f=>al.filter(a=>feedMatch(a,f)).length;
   const chips=[['all','All'],['open','Open'],['won','Hit a target'],['stopped','Stopped out'],['closed','Closed']].map(([k,l])=>`<span onclick="FEEDF='${k}';renderFeed()" style="cursor:pointer;padding:4px 10px;border-radius:8px;font-size:12px;border:1px solid ${FEEDF===k?'var(--accent)':'var(--line)'};background:${FEEDF===k?'rgba(63,185,80,.18)':'rgba(21,28,41,.7)'};font-weight:${FEEDF===k?700:500}">${l} <span class="rr">${cnt(k)}</span></span>`).join('');
   al=feedSort(al.filter(a=>feedMatch(a,FEEDF))).slice(0,60);
@@ -6875,13 +6907,13 @@ function renderFeed(){
     const R=st&&st.r!=null?`<b style="color:${st.r>0?'var(--accent)':st.r<0?'var(--red)':'var(--dim)'}">${st.r>0?'+':''}${st.r.toFixed(2)}R${_rp(st.r)}</b>`:(st&&st.open_r!=null?`<span class="muted" data-tip="Unrealised, at the current price">${st.open_r>0?'+':''}${st.open_r.toFixed(2)}R${_rp(st.open_r)} open</span>`:'—');
     const rec=a.rec?({long:'✅ Long',watch_long:'👀 Watch',skip:(a.low_upside?'✗ low upside':'✗ Skip'),wait:'⏳ Wait'})[a.rec]||'':'';
     return `<tr><td class="muted" style="white-space:nowrap" data-tip="${esc('Alert fired '+agoTxt(a.t)+(st&&st.closed_t?' · closed after '+durTxt(st.closed_t-a.t):''))}">${new Date(a.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}<br><span class="rr">${st&&st.closed_t?'closed in '+durTxt(st.closed_t-a.t):agoTxt(a.t)}</span></td>`+
-      `<td class="sym"><div class="symbox">${esc(a.symbol.replace(/USDT$/,''))}${analyzeBtn(a.symbol)}${alphaTag(a.symbol)}</div></td><td style="white-space:nowrap" data-tip="${esc('Spike seen on the '+a.tf+' chart.'+(pl&&pl.tf&&pl.tf!==a.tf?' Lower-timeframe spikes are treated as an early signal: the stop and targets come from the '+pl.tf+' chart, because only the higher-timeframe move is worth trading.':''))}">${a.tf}${pl&&pl.tf&&pl.tf!==a.tf?' <span class="rr">→ '+pl.tf+' plan</span>':''}${a.setup==='flush'?' <span class="rr" style="color:var(--accent)" data-tip="Liquidation-flush long: bought the dump after leveraged longs were wiped out">↺ flush</span>':''}</td>`+
+      `<td class="sym"><div class="symbox">${esc(a.symbol.replace(/USDT$/,''))}${analyzeBtn(a.symbol)}${alphaTag(a.symbol)}</div>${ctxHtml(a.ctx,a.first)}${a.repeat?'<div class="rr" data-tip="This coin already had a Long/Watch alert in the last 24h: logged, but not a new trade and no Telegram ping.">↺ repeat</div>':''}</td><td style="white-space:nowrap" data-tip="${esc('Spike seen on the '+a.tf+' chart.'+(pl&&pl.tf&&pl.tf!==a.tf?' Lower-timeframe spikes are treated as an early signal: the stop and targets come from the '+pl.tf+' chart, because only the higher-timeframe move is worth trading.':''))}">${a.tf}${pl&&pl.tf&&pl.tf!==a.tf?' <span class="rr">→ '+pl.tf+' plan</span>':''}${a.setup==='flush'?' <span class="rr" style="color:var(--accent)" data-tip="Liquidation-flush long: bought the dump after leveraged longs were wiped out">↺ flush</span>':''}</td>`+
       `<td>${a.ratio.toFixed(1)}×${a.mode==='live'?'<span class="rr">live</span>':''}</td><td class="score" data-tip="${esc((a.why||[]).join(' · '))}">${a.score} <span class="rr">${rec}</span></td>`+
       `<td>${fmtNum(a.price)}</td>${stopTxt}${tpCell(0)}${tpCell(1)}${tpCell(2)}`+
       `<td data-tip="${esc(stTip)}">${st&&st.now_pct!=null?pc(st.now_pct):'—'}</td>`+
       `<td style="white-space:nowrap;color:${stInfo[1]};font-weight:650" data-tip="${esc(stTip)}">${stInfo[0]}${pl&&pl.late?' <span class="rr">late</span>':''}${pl&&!pl.adj?' <span class="rr">old rules</span>':''}</td><td style="white-space:nowrap">${R}</td>`+
       `<td>${oc(a.out['1h'])}</td><td>${oc(a.out['4h'])}</td><td>${oc(a.out['24h'])}</td></tr>`; }).join('');
-  const skipToggle=`<label class="muted" style="font-size:12px;display:flex;gap:5px;align-items:center;margin-left:8px" data-tip="By default the feed only lists alerts the checklist recommends (✅ Long or 👀 Watch long). Skipped ones (weak score, red flags or low upside) are still tracked for the forward test; tick this to see them."><input type="checkbox" ${FEED_SKIPPED?'checked':''} onchange="FEED_SKIPPED=this.checked;renderFeed()"> show skipped (${nSkipped})</label>`;
+  const skipToggle=`<label class="muted" style="font-size:12px;display:flex;gap:5px;align-items:center;margin-left:8px" data-tip="By default the feed only lists alerts the checklist recommends (✅ Long or 👀 Watch long). Skipped ones (weak score, red flags or low upside) are still tracked for the forward test; tick this to see them."><input type="checkbox" ${FEED_SKIPPED?'checked':''} onchange="FEED_SKIPPED=this.checked;renderFeed()"> show skipped (${nSkipped})</label><label class="muted" style="font-size:12px;display:flex;gap:5px;align-items:center;margin-left:8px" data-tip="One alert per coin per move: later spikes on a coin that already had a Long/Watch alert in the last 24h (or still has an open trade) are logged as repeats and hidden here. Tick to show them."><input type="checkbox" ${FEED_REPEATS?'checked':''} onchange="FEED_REPEATS=this.checked;renderFeed()"> show repeats (${nRep})</label>`;
   fd.innerHTML=`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;align-items:center">${chips}${skipToggle}</div>`+(!al.length?'<div class="muted" style="font-size:12px">No recommended (✅ / 👀) long alerts here yet. Skipped alerts are hidden: tick "show skipped" to see them.</div>':
     `<table><thead><tr>${feedTh('t','Time')}${feedTh('sym','Coin')}${feedTh('tf','TF')}${feedTh('vol','Vol')}${feedTh('score','Score','Alert score, with the recommendation at the time')}${feedTh('entry','Entry','Price when the alert fired')}${feedTh('stop','Stop','Stop loss (wide, timeframe-scaled). Moves to break-even after TP1. Sorts by stop distance.')}${feedTh('tp1','TP1','Target 1 with % from entry and reward:risk. A third of the position comes off here. Sorts by % to TP1.')}${feedTh('tp2','TP2')}${feedTh('tp3','TP3')}${feedTh('now','Now','Current price vs entry')}${feedTh('status','Status','Sorts by how far the plan got: TP3 → trailed → TP2 → TP1 → open → break-even → expired → stopped')}${feedTh('res','Result','Result in R (multiples of the risk), closed or unrealised. 1/3 off at TP1 and TP2, stop to break-even after TP1, runner trails.')}${feedTh('o1h','+1h')}${feedTh('o4h','+4h')}${feedTh('o24h','+24h')}</tr></thead><tbody>${rows}</tbody></table>`);
 }
@@ -7116,6 +7148,7 @@ const SBT_GROUPS=[
   ['ema','vs EMA200','Price above or below the EMA200 of the spike timeframe.',o=>o.vs_ema==null?'n/a (new coin)':o.vs_ema>0?'above EMA200':'below EMA200'],
   ['tp1r','TP1 distance','How far TP1 is, in R (stop distance). Under 1R = target closer than the stop.',o=>o.rr1>=2?'2R+':o.rr1>=1?'1–2R':o.rr1>=0.5?'0.5–1R':'<0.5R'],
   ['stop','Stop width','Stop distance from entry.',o=>{ const s=Math.abs(o.sl_pct); return s>=20?'20–25%+':s>=15?'15–20%':s>=10?'10–15%':'<10%'; }],
+  ['run','How early (vs 48h low)','How far price already was above its 48-hour low when the alert fired. Tests whether getting in low beats chasing.',o=>o.run48==null?'n/a':o.run48<10?'<10% (early)':o.run48<20?'10–20%':o.run48<40?'20–40%':'40%+ (late)'],
   ['week','Week','Week the alert fired (Monday start).',o=>{ const d=new Date(o.t*1000); d.setUTCDate(d.getUTCDate()-((d.getUTCDay()+6)%7)); return d.toISOString().slice(0,10); }],
 ];
 function sbtTrades(a){
@@ -7614,7 +7647,8 @@ def main() -> None:
     if APP_MODE != "stocks":
         try:
             import volume_spikes
-            volume_spikes.start(notify=lambda txt: send_telegram(cfg, txt),
+            volume_spikes.start(alpha_vol=alpha_vol_ratio,
+                                notify=lambda txt: send_telegram(cfg, txt),
                                 planner=lambda sym, tf: analyze_symbol(get_session(), sym, tf, cfg),
                                 mcap_extra=lambda: {r.get("token"): r.get("mcap")
                                                     for r in ((state.watchlist_mon or {}).get("rows") or [])
