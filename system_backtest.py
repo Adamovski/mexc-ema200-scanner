@@ -44,7 +44,8 @@ _LOCK = threading.Lock()
 COLS = ["t", "sym", "tf", "rec", "setup", "score", "ratio", "spot", "oi_div", "btc", "vs_ema", "has_spot",
         "entry", "sl_pct", "tp1_pct", "tp2_pct", "tp3_pct", "rr1",
         "st", "r", "closed_t", "hits", "mfe", "mae",          # current exit model (½/¼/¼)
-        "st_old", "r_old", "closed_old"]                      # old exit model (⅓/⅓/⅓)
+        "st_old", "r_old", "closed_old",                      # old exit model (⅓/⅓/⅓)
+        "run48"]                                              # % above the 48h low at the alert (early vs late)
 
 
 def _kl(kind, sym, tf, n):
@@ -213,7 +214,8 @@ def replay_symbol(sym, F, btcser, t_from):
             a = {"t": T - 1, "symbol": sym, "tf": tf, "price": price, "rec": rc["call"] if rc else None,
                  "setup": m.get("setup") or "momentum", "score": m["score"], "ratio": m["ratio"],
                  "spot": r["spot"].get(tf), "oi_div": r.get("oi_div"), "btc": (btc or {}).get("regime"),
-                 "vs_ema": m.get("vs_ema"), "flush_low": m.get("lo") if m.get("setup") == "flush" else None}
+                 "vs_ema": m.get("vs_ema"), "flush_low": m.get("lo") if m.get("setup") == "flush" else None,
+                 "run48": round((price / min(k[3] for k in c1[max(0, i - 48):i]) - 1) * 100, 1)}
             row = _plan_and_grade(a, ser, f1, T)
             if row:
                 out.append(row)
@@ -256,7 +258,8 @@ def _plan_and_grade(a, ser, f1, T):
             entry, pl["sl_pct"], tp[0], tp[1], tp[2], pl["rr"][0],
             n["status"] if closed else "open", n.get("r") if closed else n.get("open_r"), n.get("closed_t"),
             n["hits"], n.get("mfe"), n.get("mae"),
-            o["status"] if closed_o else "open", o.get("r") if closed_o else o.get("open_r"), o.get("closed_t")]
+            o["status"] if closed_o else "open", o.get("r") if closed_o else o.get("open_r"), o.get("closed_t"),
+            a.get("run48")]
 
 
 def _save(res):
