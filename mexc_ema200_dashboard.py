@@ -6826,7 +6826,7 @@ function renderFeed(){
   let al=FEED_SKIPPED?allLong:allLong.filter(feedRecOk);
   const cnt=f=>al.filter(a=>feedMatch(a,f)).length;
   const chips=[['all','All'],['open','Open'],['won','Hit a target'],['stopped','Stopped out'],['closed','Closed']].map(([k,l])=>`<span onclick="FEEDF='${k}';renderFeed()" style="cursor:pointer;padding:4px 10px;border-radius:8px;font-size:12px;border:1px solid ${FEEDF===k?'var(--accent)':'var(--line)'};background:${FEEDF===k?'rgba(63,185,80,.18)':'rgba(21,28,41,.7)'};font-weight:${FEEDF===k?700:500}">${l} <span class="rr">${cnt(k)}</span></span>`).join('');
-  al=al.filter(a=>feedMatch(a,FEEDF)).slice(0,60);
+  al=feedSort(al.filter(a=>feedMatch(a,FEEDF))).slice(0,60);
   const pc=(v,d)=>v==null?'—':`<span style="color:${v>0?'var(--accent)':v<0?'var(--red)':'var(--dim)'}">${v>0?'+':''}${(+v).toFixed(d==null?2:d)}%</span>`;
   const rr=v=>v==null?'':`<span class="rr">${(+v).toFixed(1)}R</span>`;
   const oc=v=>v==null?'<span class="muted">…</span>':v==='na'?'<span class="muted" data-tip="App was asleep at that time, so it was not graded">n/a</span>':pc(v);
@@ -6849,8 +6849,23 @@ function renderFeed(){
       `<td>${oc(a.out['1h'])}</td><td>${oc(a.out['4h'])}</td><td>${oc(a.out['24h'])}</td></tr>`; }).join('');
   const skipToggle=`<label class="muted" style="font-size:12px;display:flex;gap:5px;align-items:center;margin-left:8px" data-tip="By default the feed only lists alerts the checklist recommends (✅ Long or 👀 Watch long). Skipped ones (weak score, red flags or low upside) are still tracked for the forward test; tick this to see them."><input type="checkbox" ${FEED_SKIPPED?'checked':''} onchange="FEED_SKIPPED=this.checked;renderFeed()"> show skipped (${nSkipped})</label>`;
   fd.innerHTML=`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;align-items:center">${chips}${skipToggle}</div>`+(!al.length?'<div class="muted" style="font-size:12px">No recommended (✅ / 👀) long alerts here yet. Skipped alerts are hidden: tick "show skipped" to see them.</div>':
-    `<table><thead><tr><th>Time</th><th>Coin</th><th>TF</th><th>Vol</th><th data-tip="Alert score, with the recommendation at the time">Score</th><th data-tip="Price when the alert fired">Entry</th><th data-tip="Stop loss from the Analyze card (below support, ATR-buffered). Moves to break-even after TP1.">Stop</th><th data-tip="Target 1 with % from entry and reward:risk. A third of the position comes off here.">TP1</th><th>TP2</th><th>TP3</th><th data-tip="Current price vs entry">Now</th><th>Status</th><th data-tip="Result in R (multiples of the risk). 1/3 off at each target, stop to break-even after TP1. Closed = bold; open = unrealised.">Result</th><th>+1h</th><th>+4h</th><th>+24h</th></tr></thead><tbody>${rows}</tbody></table>`);
+    `<table><thead><tr>${feedTh('t','Time')}${feedTh('sym','Coin')}${feedTh('tf','TF')}${feedTh('vol','Vol')}${feedTh('score','Score','Alert score, with the recommendation at the time')}${feedTh('entry','Entry','Price when the alert fired')}${feedTh('stop','Stop','Stop loss (wide, timeframe-scaled). Moves to break-even after TP1. Sorts by stop distance.')}${feedTh('tp1','TP1','Target 1 with % from entry and reward:risk. A third of the position comes off here. Sorts by % to TP1.')}${feedTh('tp2','TP2')}${feedTh('tp3','TP3')}${feedTh('now','Now','Current price vs entry')}${feedTh('status','Status','Sorts by how far the plan got: TP3 → trailed → TP2 → TP1 → open → break-even → expired → stopped')}${feedTh('res','Result','Result in R (multiples of the risk), closed or unrealised. 1/3 off at TP1 and TP2, stop to break-even after TP1, runner trails.')}${feedTh('o1h','+1h')}${feedTh('o4h','+4h')}${feedTh('o24h','+24h')}</tr></thead><tbody>${rows}</tbody></table>`);
 }
+// Sortable alert-plan feed (click a header; click again to reverse). Blanks always sort last.
+let FEEDSORT={k:'t',d:-1}; try{ const _f=JSON.parse(localStorage.getItem('feedSort')||'null'); if(_f&&_f.k) FEEDSORT=_f; }catch(e){}
+const FEED_ST_ORDER={tp3:6,trail:5,tp2:4,tp1:3,open:2,be:1,expired:0,sl:-1,invalid:-2};
+function feedVal(a,k){ const pl=a.plan, st=a.pstate||{}; const o=a.out||{}; const n=v=>(typeof v==='number')?v:null;
+  switch(k){ case 't': return a.t; case 'sym': return a.symbol; case 'tf': return ({'15m':15,'1h':60,'4h':240,'1d':1440})[a.tf]||null;
+    case 'vol': return a.ratio; case 'score': return a.score; case 'entry': return a.price;
+    case 'stop': return pl&&pl.sl_pct!=null?pl.sl_pct:null; case 'tp1': return pl&&pl.tp_pct?pl.tp_pct[0]:null; case 'tp2': return pl&&pl.tp_pct?pl.tp_pct[1]:null; case 'tp3': return pl&&pl.tp_pct?pl.tp_pct[2]:null;
+    case 'now': return n(st.now_pct); case 'status': return st.status!=null?(FEED_ST_ORDER[st.status]??null):null;
+    case 'res': return n(st.r)!=null?st.r:n(st.open_r); case 'o1h': return n(o['1h']); case 'o4h': return n(o['4h']); case 'o24h': return n(o['24h']); }
+  return null; }
+function feedSort(arr){ const s=FEEDSORT; return arr.slice().sort((x,y)=>{ const a=feedVal(x,s.k), b=feedVal(y,s.k);
+  if(a==null&&b==null) return 0; if(a==null) return 1; if(b==null) return -1; return (typeof a==='string'?a.localeCompare(b):a-b)*s.d; }); }
+function feedSortBy(k){ if(FEEDSORT.k===k) FEEDSORT.d*=-1; else FEEDSORT={k, d:(k==='sym'||k==='tf'||k==='stop')?1:-1};
+  try{ localStorage.setItem('feedSort',JSON.stringify(FEEDSORT)); }catch(e){} renderFeed(); }
+function feedTh(k,label,tip){ const on=FEEDSORT.k===k; return `<th onclick="feedSortBy('${k}')" style="cursor:pointer;${on?'color:var(--accent)':''}"${tip?` data-tip="${tip}"`:''}>${label}${on?(FEEDSORT.d>0?' ▲':' ▼'):''}</th>`; }
 function feedMatch(a,f){ const st=a.pstate; if(f==='all') return true; if(!st) return f==='open';
   if(f==='open') return !plClosed(st)&&st.status!=='invalid'; if(f==='won') return (st.hits||0)>=1; if(f==='stopped') return st.status==='sl'; if(f==='closed') return plClosed(st); return true; }
 
