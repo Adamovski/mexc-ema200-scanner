@@ -369,6 +369,25 @@ def _plan_and_grade(a, ser, f1, T):
             a.get("run48"), a.get("btc7")]
 
 
+CHUNK = 900_000     # Upstash free plan caps one request at ~1 MB: big blobs are split over several keys
+
+
+def _rset(key, blob):
+    z = base64.b64encode(gzip.compress(blob.encode())).decode()
+    parts = [z[i:i + CHUNK] for i in range(0, len(z), CHUNK)] or [""]
+    for n, part in enumerate(parts):
+        vs._redis_cmd("SET", f"{key}:{n}", part)
+    vs._redis_cmd("SET", key + ":n", str(len(parts)))
+
+
+def _rget(key):
+    n = vs._redis_cmd("GET", key + ":n")
+    if not n:
+        return None
+    z = "".join(vs._redis_cmd("GET", f"{key}:{i}") or "" for i in range(int(n)))
+    return gzip.decompress(base64.b64decode(z)).decode() if z else None
+
+
 def _save(res):
     blob = json.dumps(res, separators=(",", ":"))
     try:
@@ -378,7 +397,7 @@ def _save(res):
         pass
     try:
         if vs._redis():
-            vs._redis_cmd("SET", BT_KEY, base64.b64encode(gzip.compress(blob.encode())).decode())
+            _rset(BT_KEY, blob)
     except Exception as e:
         print(f"[sbt] redis save failed: {e}", flush=True)
 
@@ -388,13 +407,13 @@ def _ckpt_save(obj):
         if obj is None:
             os.path.exists(BT_PATH + ".ckpt") and os.remove(BT_PATH + ".ckpt")
             if vs._redis():
-                vs._redis_cmd("DEL", BT_KEY + ":ckpt")
+                vs._redis_cmd("DEL", BT_KEY + ":ckpt:n")
             return
         blob = json.dumps(obj, separators=(",", ":"))
         with open(BT_PATH + ".ckpt", "w") as fh:
             fh.write(blob)
         if vs._redis():
-            vs._redis_cmd("SET", BT_KEY + ":ckpt", base64.b64encode(gzip.compress(blob.encode())).decode())
+            _rset(BT_KEY + ":ckpt", blob)
     except Exception as e:
         print(f"[sbt] checkpoint save failed: {e}", flush=True)
 
@@ -402,9 +421,9 @@ def _ckpt_save(obj):
 def _ckpt_load():
     try:
         if vs._redis():
-            z = vs._redis_cmd("GET", BT_KEY + ":ckpt")
+            z = _rget(BT_KEY + ":ckpt")
             if z:
-                return json.loads(gzip.decompress(base64.b64decode(z)).decode())
+                return json.loads(z)
         with open(BT_PATH + ".ckpt") as fh:
             return json.loads(fh.read())
     except Exception:
@@ -415,9 +434,7 @@ def _load():
     raw = None
     try:
         if vs._redis():
-            z = vs._redis_cmd("GET", BT_KEY)
-            if z:
-                raw = gzip.decompress(base64.b64decode(z)).decode()
+            raw = _rget(BT_KEY)
     except Exception as e:
         print(f"[sbt] redis load failed: {e}", flush=True)
     if not raw:
