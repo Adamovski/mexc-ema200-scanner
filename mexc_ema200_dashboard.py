@@ -3125,6 +3125,7 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabWatch2" onclick="showTab('watch2')">🅰️ Binance Alpha</div>
   <div class="tab" id="tabSpikes" onclick="showTab('spikes')">🔊 Volume spikes</div>
   <div class="tab" id="tabCalls" onclick="showTab('calls')">📌 My calls</div>
+  <div class="tab" id="tabSbt" onclick="showTab('sbt')" data-tip="The whole volume-spike system replayed over ~50 days of Binance history: same scores, calls, stops, targets and exits as live.">🧪 System backtest</div>
   <div class="tab" id="tabCallsHC" onclick="showTab('callshc')" data-tip="Your ⭐ high-conviction calls only, with their own scorecard. Choose ⭐ High conviction next to any Track button on the Analyze tab.">⭐ High conviction</div>
 </div>
 <div class="filterbar" id="filterbar"></div>
@@ -3210,7 +3211,7 @@ Hover any cell to see what it means for that coin. Click ⚲ for the full Analyz
   </table>
   <div class="empty" id="vsEmpty" style="display:none"></div>
 </div>
-<div class="wrap" style="margin-top:22px"><h3 style="margin:0 0 6px;font-size:14px">📡 Alert feed with trade plans</h3><div class="muted" style="font-size:12px;margin-bottom:6px">Every logged long alert gets a long plan: the Analyze card's stop and 3 targets taken from real resistance (1h/4h/Daily/Weekly swing highs and range highs, merged into zones; TP1 = first real level past the minimum), measured from the alert price and tracked on 15m highs and lows. Stops are wide on purpose (4h: ≥5×ATR / 8%, cap 25%; Daily: ≥2×ATR / 12%, cap 35%). ⅓ off at TP1, ⅓ at TP2, the last ⅓ is a runner: stop goes to break-even after TP1, and after TP2 the runner also trails 3×ATR(4h) under the high. Closed at market after 7 days. Hover any cell for the reasoning.</div><div id="vsFeed" style="overflow-x:auto"></div></div>
+<div class="wrap" style="margin-top:22px"><h3 style="margin:0 0 6px;font-size:14px">📡 Alert feed with trade plans</h3><div class="muted" style="font-size:12px;margin-bottom:6px">Every logged long alert gets a long plan: the Analyze card's stop and 3 targets taken from real resistance (1h/4h/Daily/Weekly swing highs and range highs, merged into zones; TP1 = first real level past the minimum), measured from the alert price and tracked on 15m highs and lows. Stops are wide on purpose (4h: ≥5×ATR / 8%, cap 25%; Daily: ≥2×ATR / 12%, cap 35%). Half off at TP1, ¼ at TP2, the last ¼ is a runner: stop goes to break-even after TP1, locks half of TP1 once price has run 1.5× the TP1 distance, sits at TP1 or better after TP2, and the runner trails 3×ATR(4h) under the high. Closed at market after 7 days. Hover any cell for the reasoning.</div><div id="vsFeed" style="overflow-x:auto"></div></div>
 <div class="wrap" style="margin-top:26px;margin-bottom:40px"><h3 style="margin:0 0 4px;font-size:15px">🧪 Forward test: how the alerts actually performed</h3><div class="muted" style="font-size:12px;margin-bottom:10px">Every logged long alert is graded on the price 1h, 4h and 24h later. Filter it, then see which spike levels, timeframes and conditions are working.</div>
 <div id="vsFtBar" style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px"></div><div id="vsStats"></div></div>
 </div>
@@ -3236,6 +3237,8 @@ Hover any cell to see what it means for that coin. Click ⚲ for the full Analyz
      A technical estimate to speed up your own analysis — not financial advice.</p>
 </div>
 </div>
+
+<div class="view" id="viewSbt"><div class="wrap" id="sbtBody" style="padding-top:12px"><span class="muted">Loading…</span></div></div>
 
 <div class="view" id="viewCalls">
 <div class="status">
@@ -3733,7 +3736,7 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["dtb","Dtb"],["accum","Accum"],["capit","Capit"],["micro","Micro"],["signals","Signals"],["watch2","Watch2"],["spikes","Spikes"],["watch3","Watch3"],["coil","Coil"],["scalp","Scalp"],["spot","Spot"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["dtb","Dtb"],["accum","Accum"],["capit","Capit"],["micro","Micro"],["signals","Signals"],["watch2","Watch2"],["spikes","Spikes"],["watch3","Watch3"],["coil","Coil"],["scalp","Scalp"],["spot","Spot"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["sbt","Sbt"],["analyze","Analyze"],["info","Info"]]){
     const _tb=document.getElementById("tab"+v), _vw=document.getElementById("view"+v);
     if(!_tb||!_vw) continue;
     _tb.classList.toggle("active", t===which);
@@ -3751,6 +3754,8 @@ function showTab(which){
   if(which==="accum") renderAccum();
   if(which==="backtest") loadBacktest();
   if(which==="calls") renderCalls();
+  if(which==="sbt") loadSbt();
+  uiSave({tab:which});
   { const hb=document.getElementById('tabCallsHC'); if(hb) hb.classList.toggle('active', which==='callshc'); }
   if(which==="callshc"){ const vc=document.getElementById('viewCalls'); if(vc) vc.classList.add('active'); renderCalls(); }
   if(which==="watch2") renderWatch2();
@@ -3843,6 +3848,7 @@ async function analyze(){
   const box=document.getElementById("azResult");
   const sym=inp.value.trim();
   if(!sym){ box.innerHTML='<div class="azerr">Enter a ticker, e.g. BTC.</div>'; return; }
+  uiSave({az:sym, aztf:azTf});
   btn.disabled=true; const t=btn.textContent; btn.textContent="…";
   box.innerHTML=`<div class="azhint">Fetching ${azTf} candles from MEXC and analyzing…</div>`;
   try{
@@ -6693,15 +6699,33 @@ function ftTradesHtml(arr,key){ const U=ftU();
   const rows=so?graded.concat(open):graded;
   const tog=open.length?`<div style="margin:4px 0"><a href="#" onclick="ftOpenTog(window.__ftKeys[${ki}],event);return false">${so?'▾ hide':'▸ show'} ${open.length} open / not graded</a></div>`:'';
   const recL={long:'✅ Long',watch_long:'👀 Watch',skip:'✗ Skip'};
-  return `<div style="overflow-x:auto;margin:6px 0 10px;cursor:default" onclick="event.stopPropagation()"><table style="font-size:11.5px"><thead><tr><th>Time</th><th>Coin</th><th>TF</th><th>Spike</th><th>Rec</th><th>Entry</th><th>Stop</th><th>TP1</th><th>Status</th><th>Result</th><th data-tip="Best and worst move vs entry while the plan was open (MFE / MAE).">Best / worst</th></tr></thead><tbody>`+
+  return `<div style="overflow-x:auto;margin:6px 0 10px;cursor:default" onclick="event.stopPropagation()"><table style="font-size:11.5px"><thead><tr><th data-tip="When the volume-spike alert fired (your local time). Entry is the price at that moment.">Time</th><th data-tip="The coin. Click to open its TradingView chart.">Coin</th><th data-tip="Timeframe of the candle that spiked. 15m/1h spikes are traded on the 4h plan (early signal, bigger move); 4h on 4h; 1D on the Daily plan.">TF</th><th data-tip="Spike size: that candle's USDT volume ÷ the average of the previous 20 candles. 5× = five times normal volume.">Spike</th><th data-tip="The scanner's call when the alert fired. ✅ Long = score ≥65 and no red flags. 👀 Watch = score ≥50 with at most one red flag. ✗ Skip = weaker or flagged (fake pump, BTC dumping, futures-only, below EMA200, crowded funding, or TP1 too close).">Rec</th><th data-tip="Price when the alert fired; the plan is graded from here.">Entry</th><th data-tip="Stop-loss distance from entry. Wide on purpose (4h plan: at least 5×ATR or 8%, capped at 25%; Daily: 2×ATR or 12%, cap 35%). This distance = 1R.">Stop</th><th data-tip="First target, % above entry: the first real resistance zone (swing highs, 30-day high, range top) at least 10% away, set just under the level so it fills before sellers. Half the position comes off here.">TP1</th><th data-tip="How the plan ended. ✗ Stop = hit the stop before TP1 (−1R). ⚖ Break-even = TP1 banked, rest stopped at entry. 🏃 Trailed out = TP1 (and maybe TP2) banked, rest exited on the raised/trailing stop above entry. 🏆 TP3 = all targets hit. ⌛ Expired = closed at market after 7 days. ● Open = still running.">Status</th><th data-tip="Result of the whole position. R = multiple of the risk (stop distance): +1R = made what the stop would have lost. The % in brackets = the same result as % of the position, i.e. R × stop %. Old ⅓-⅓-⅓ trades bank only ⅓ at TP1, which is why break-evens show about +0.15–0.25R.">Result</th><th data-tip="Best / worst: the highest price reached above entry (MFE) and the deepest drop below entry (MAE) while the plan was open. A big best % with a small result = the move came and went before the next target.">Best / worst</th></tr></thead><tbody>`+
     rows.map(a=>{ const v=ftVal(a), st=a.pstate||{}, ps=PL_ST[st.status]||['—','var(--dim)'], pl=a.plan||{};
       const pc=(v!=null&&FTF.h==='R'&&pl.sl_pct!=null)?v*Math.abs(pl.sl_pct):null;
       const res=v==null?'<span class="muted">pending</span>':`<b style="color:${v>0?'var(--accent)':v<0?'var(--red)':'var(--dim)'}">${v>0?'+':''}${v.toFixed(2)}${U}</b>${pc!=null?` <span class="rr">(${pc>=0?'+':''}${pc.toFixed(1)}%)</span>`:''}`;
       return `<tr><td style="white-space:nowrap">${new Date(a.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td>`
         +`<td><a href="${tvLink(a.symbol)}" target="_blank" rel="noopener">${dispSym(a.symbol)}</a></td><td>${a.tf||'—'}</td><td>${a.ratio!=null?(+a.ratio).toFixed(1)+'×':'—'}</td><td>${recL[a.rec]||a.rec||'—'}</td>`
         +`<td>${fmtNum(a.price)}</td><td>${pl.sl_pct!=null?pl.sl_pct.toFixed(1)+'%':'—'}</td><td>${pl.tp_pct&&pl.tp_pct[0]!=null?'+'+pl.tp_pct[0].toFixed(1)+'%':'—'}</td>`
-        +`<td style="color:${ps[1]};white-space:nowrap">${ps[0]}</td><td style="white-space:nowrap">${res}</td><td class="rr" style="white-space:nowrap">${st.mfe!=null?'+'+st.mfe+'% / '+st.mae+'%':'—'}</td></tr>`; }).join('')
+        +`<td style="color:${ps[1]};white-space:nowrap" data-tip="${esc(ftStTip(a))}">${ps[0]}</td><td style="white-space:nowrap" data-tip="${esc(ftResTip(a,v))}">${res}</td><td class="rr" style="white-space:nowrap">${st.mfe!=null?'+'+st.mfe+'% / '+st.mae+'%':'—'}</td></tr>`; }).join('')
     +`</tbody></table>${tog}</div>`; }
+function ftStTip(a){ const st=a.pstate||{}, pl=a.plan||{}, h=st.hits||0, tp=pl.tp_pct||[];
+  const sc=(pl.scale&&pl.scale.length===3)?pl.scale:[1/3,1/3,1/3], f=x=>Math.round(x*100)+'%';
+  const parts=[`Targets: TP1 +${tp[0]??'?'}%, TP2 +${tp[1]??'?'}%, TP3 +${tp[2]??'?'}%. Stop ${pl.sl_pct??'?'}%.`, `Size taken off: ${f(sc[0])} at TP1, ${f(sc[1])} at TP2, ${f(sc[2])} runner.`];
+  parts.push(h?`Hit TP1${h>=2?' and TP2':''}${h>=3?' and TP3':''}.`:'Never reached TP1.');
+  if(st.status==='be') parts.push(`Then fell back to entry: the remaining ${f(1-sc[0]-(h>=2?sc[1]:0))} closed at break-even.`);
+  if(st.status==='trail') parts.push('The rest exited on the raised stop (above entry).');
+  if(st.status==='sl') parts.push('Stopped out for the full −1R.');
+  if(st.status==='expired') parts.push('Still open after 7 days, closed at market.');
+  if(st.mfe!=null) parts.push(`Best +${st.mfe}% / worst ${st.mae}% while open.`);
+  if(a.plan&&a.plan.sl_basis) parts.push('Stop: '+a.plan.sl_basis);
+  return parts.join(' '); }
+function ftResTip(a,v){ const pl=a.plan||{}, st=a.pstate||{}; if(v==null) return 'Not graded yet: the plan is still open (or the alert was late, so it is left out of the stats).';
+  const sc=(pl.scale&&pl.scale.length===3)?pl.scale:[1/3,1/3,1/3], rr=pl.rr||[], h=st.hits||0;
+  let s=`Result ${v>0?'+':''}${v.toFixed(2)}R. `;
+  if(h>=1) s+=`TP1 is ${rr[0]}R away, so banking ${Math.round(sc[0]*100)}% there = +${(sc[0]*rr[0]).toFixed(2)}R. `;
+  if(h>=2) s+=`TP2 (${rr[1]}R) × ${Math.round(sc[1]*100)}% = +${(sc[1]*rr[1]).toFixed(2)}R. `;
+  if(pl.sl_pct!=null) s+=`1R = ${Math.abs(pl.sl_pct).toFixed(1)}% here, so ${v.toFixed(2)}R ≈ ${(v*Math.abs(pl.sl_pct)).toFixed(1)}% on the position.`;
+  return s; }
 function ftVal(a){ if(FTF.h==='R'){ const st=a.pstate; if(a.plan&&(a.plan.late||!a.plan.adj)) return null; return (st&&plClosed(st)&&typeof st.r==='number')?st.r:null; } const v=a.out&&a.out[FTF.h]; return (typeof v==='number')?v:null; }
 const ftU=()=>FTF.h==='R'?'R':'%';
 function ftStat(arr){ const v=arr.map(ftVal).filter(x=>x!=null); if(!v.length) return {n:0,pend:arr.length};
@@ -6716,6 +6740,7 @@ function ftFiltered(skip){
   const now=Date.now()/1000, per=(FT_PER.find(p=>p[0]===FTF.per)||[0,0,0])[2];
   return ftHist.filter(a=>{
     if(a.dir!=='long') return false;
+    if(a.pstate&&a.pstate.status==='dup') return false;
     if(per && a.t<now-per) return false;
     if(skip!=='tf' && FTF.tf && a.tf!==FTF.tf) return false;
     if(skip!=='lvl' && FTF.lvl && !(a.ratio>=FTF.lvl)) return false;
@@ -6726,9 +6751,10 @@ function ftFiltered(skip){
     if(FTF.rec==='skip' && a.rec!=='skip') return false;
     return true; }).sort((x,y)=>x.t-y.t).filter(ftDedupe());
 }
-function ftDedupe(){ const seen={};
-  return a=>{ const pl=a.plan||{}, k=a.symbol+'|'+(pl.sl!=null?(+pl.sl).toPrecision(6):'')+'|'+(pl.tps&&pl.tps[0]!=null?(+pl.tps[0]).toPrecision(6):'');
-    if(!pl.sl) return true; const t0=seen[k]; if(t0!=null && a.t-t0<6*3600) return false; seen[k]=a.t; return true; }; }
+function ftDedupe(){ const busy={};   // one position per coin: a new alert only counts once the previous trade on that coin has closed
+  return a=>{ const pl=a.plan||{}; if(!pl.sl) return true;
+    if(busy[a.symbol]!=null && a.t<busy[a.symbol]) return false;
+    const st=a.pstate||{}; busy[a.symbol]=(plClosed(st)&&st.closed_t)?st.closed_t:Infinity; return true; }; }
 function ftSvgBars(days){
   const W=640,H=120,pad=22, n=days.length, bw=Math.max(6,(W-pad*2)/Math.max(n,1)-6);
   const mx=Math.max(1,...days.map(d=>Math.abs(d.avg||0)));
@@ -6791,7 +6817,7 @@ function renderFt(){
   const best=slices.filter(s=>s.st.avg>0).slice(0,3), worst=[...slices].reverse().filter(s=>s.st.avg<0).slice(0,3);
   window.__ftKeys=[]; window.__ftArr={};
   const line=s=>{ const i=window.__ftKeys.push(s.k)-1; window.__ftArr[s.k]=s.arr; const op=ftOpenK.has(s.k);
-    return `<li style="cursor:pointer" onclick="ftToggleSl(${i},event)" data-tip="Click to ${op?'hide':'see'} the ${s.arr.length} trades behind this line"><b>${esc(s.k)}</b>: ${s.st.win}% win, avg ${s.st.avg>0?'+':''}${s.st.avg.toFixed(2)}${U} <span class="rr">n=${s.st.n}</span> <span class="rr" style="color:var(--accent)">${op?'▾ hide trades':'▸ trades'}</span>${op?ftTradesHtml(s.arr,s.k):''}</li>`; };
+    return `<li style="cursor:pointer" onclick="ftToggleSl(${i},event)" data-tip="${esc(s.k)}: alerts with this trait. ${s.st.win}% of the ${s.st.n} graded ones closed in profit, averaging ${s.st.avg>0?'+':''}${s.st.avg.toFixed(2)}${U} each (median ${s.st.med>0?'+':''}${s.st.med.toFixed(2)}${U}, best ${s.st.best.toFixed(2)}, worst ${s.st.worst.toFixed(2)}). n = graded trades; ${s.arr.length-s.st.n} more are still open. One trade per coin. Click to ${op?'hide':'see'} them."><b>${esc(s.k)}</b>: ${s.st.win}% win, avg ${s.st.avg>0?'+':''}${s.st.avg.toFixed(2)}${U} <span class="rr">n=${s.st.n}</span> <span class="rr" style="color:var(--accent)">${op?'▾ hide trades':'▸ trades'}</span>${op?ftTradesHtml(s.arr,s.k):''}</li>`; };
   h+=`<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-bottom:16px">`+
     `<div style="border:1px solid rgba(63,185,80,.45);border-radius:10px;padding:10px 12px"><div style="font-weight:700;margin-bottom:4px">🏆 Working best (after ${hz})</div>${best.length?'<ul style="margin:0;padding-left:18px;font-size:12.5px;line-height:1.6">'+best.map(line).join('')+'</ul>':'<div class="muted" style="font-size:12px">Not enough data yet. Each slice needs 8+ graded alerts.</div>'}</div>`+
     `<div style="border:1px solid rgba(248,81,73,.45);border-radius:10px;padding:10px 12px"><div style="font-weight:700;margin-bottom:4px">⚠️ Working worst (after ${hz})</div>${worst.length?'<ul style="margin:0;padding-left:18px;font-size:12.5px;line-height:1.6">'+worst.map(line).join('')+'</ul>':'<div class="muted" style="font-size:12px">Nothing clearly losing yet (8+ graded alerts needed per slice).</div>'}</div></div>`;
@@ -6819,14 +6845,14 @@ function renderFt(){
   h+=`<div style="font-weight:700;margin:18px 0 4px">Over time <span class="muted" style="font-weight:400;font-size:12px">${trend}</span></div>`+
     `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px"><div><div class="muted" style="font-size:12px;margin-bottom:4px">Average ${FTF.h==='R'?'R per closed plan':'move after '+hz}, per day (last 14 days, UTC). Hover a bar for detail.</div>${ftSvgBars(days)}</div>`+
     `<div><div class="muted" style="font-size:12px;margin-bottom:4px">Cumulative: ${FTF.h==='R'?'every matching alert traded with its plan, same risk each (R)':'every matching alert, same size, closed after '+hz} (no fees). Now <b style="color:${cum>=0?'var(--accent)':'var(--red)'}">${cum>0?'+':''}${cum.toFixed(1)}${U}</b> over ${graded.length} trades.</div>${ftSvgCurve(pts)}</div></div>`;
-  h+=`<div class="muted" style="font-size:11.5px;margin-top:10px">Longs only. ${FTF.h==='R'?'Trade plan: ⅓ off at TP1, ⅓ at TP2, last ⅓ runs (stop to break-even after TP1, then a 3×ATR(4h) trail after TP2), closed at market after 7 days; R = multiples of the risk to the stop. A win = closed above 0R. Log restarted at v79 (wide stops, BE at TP1).':'A win = price higher '+hz+' after the alert.'} No fees or slippage. Under ~30 alerts, any % is mostly luck.</div>`;
+  h+=`<div class="muted" style="font-size:11.5px;margin-top:10px">Longs only. ${FTF.h==='R'?'Trade plan: ½ off at TP1, ¼ at TP2, last ¼ runs (stop to break-even after TP1, lock ½ of TP1 once price runs 1.5× the TP1 distance, stop at TP1 or better after TP2, then a 3×ATR(4h) trail), closed at market after 7 days; R = multiples of the risk to the stop. A win = closed above 0R. One trade per coin: a new alert on a coin only counts once the previous trade on it has closed. Log restarted at v82 (½ at TP1).':'A win = price higher '+hz+' after the alert.'} No fees or slippage. Under ~30 alerts, any % is mostly luck.</div>`;
   box.innerHTML=h;
 }
 
 // ── Alert feed with trade plans ───────────────────────────────────────────
 let FEEDF='all', FEED_SKIPPED=false;
 const feedRecOk=a=>a.rec==='long'||a.rec==='watch_long';
-const PL_ST={open:['● Open','var(--blue)'],tp1:['TP1 ✓','var(--accent)'],tp2:['TP2 ✓✓','var(--accent)'],tp3:['🏆 TP3 · runner on','var(--accent)'],sl:['✗ Stop','var(--red)'],be:['⚖ Break-even','var(--dim)'],trail:['🏃 Trailed out','var(--accent)'],expired:['⌛ Expired','var(--dim)'],invalid:['— no plan','var(--dim2)']};
+const PL_ST={open:['● Open','var(--blue)'],tp1:['TP1 ✓','var(--accent)'],tp2:['TP2 ✓✓','var(--accent)'],tp3:['🏆 TP3 · runner on','var(--accent)'],sl:['✗ Stop','var(--red)'],be:['⚖ Break-even','var(--dim)'],trail:['🏃 Trailed out','var(--accent)'],expired:['⌛ Expired','var(--dim)'],invalid:['— no plan','var(--dim2)'],dup:['↺ already in this coin','var(--dim2)']};
 function plClosed(st){ return st&&(['sl','be','trail','expired'].includes(st.status)||(st.status==='tp3'&&st.closed_t!=null)); }
 function renderFeed(){
   const fd=document.getElementById('vsFeed'); if(!fd||!vsData) return;
@@ -7043,6 +7069,124 @@ const HDR_TIPS={
   contraction:"Volatility contraction: recent ATR ÷ its prior average. Well under 1 = a tight coil, close to expanding.",
   support:"The support the coin is coiling on (daily/weekly swing low or base low) — identified from swing-low pivots."
 };
+// ── 🧪 System backtest tab: the live volume-spike system replayed over Binance history (system_backtest.py)
+let SBT=null, _sbtPoll=null;
+let SBTF={rec:'watch',tf:'',setup:'',exit:'new',one:1,sort:'t',dir:-1,open:'',page:0};
+try{ Object.assign(SBTF, JSON.parse(localStorage.getItem('sbtF')||'{}')); }catch(e){}
+async function loadSbt(run){
+  try{ SBT=await fetch('/sbt'+(run?'/run':''),{cache:'no-store'}).then(r=>r.json()); }catch(e){ SBT={status:'error',error:'could not reach the server'}; }
+  renderSbt(); clearTimeout(_sbtPoll);
+  if(SBT&&SBT.status==='running'&&activeTab==='sbt') _sbtPoll=setTimeout(()=>loadSbt(),10000);
+}
+function sbtSet(k,v){ SBTF[k]=v; if(k!=='page') SBTF.page=0; try{ localStorage.setItem('sbtF',JSON.stringify(SBTF)); }catch(e){} renderSbt(); }
+function sbtRows(skip){
+  const R=SBT.result, C=R.cols;
+  let rows=R.rows.map(x=>{ const o={}; C.forEach((c,i)=>o[c]=x[i]); return o; });
+  rows=rows.filter(o=>{
+    if(skip!=='rec'){ if(SBTF.rec==='go'&&o.rec!=='long') return false; if(SBTF.rec==='watch'&&!(o.rec==='long'||o.rec==='watch_long')) return false; if(SBTF.rec==='skip'&&o.rec!=='skip') return false; }
+    if(skip!=='tf'&&SBTF.tf&&o.tf!==SBTF.tf) return false;
+    if(skip!=='setup'&&SBTF.setup&&o.setup!==SBTF.setup) return false;
+    return true; });
+  rows.forEach(o=>{ const old=SBTF.exit==='old'; o.R=old?o.r_old:o.r; o.S=old?o.st_old:o.st; o.CT=old?o.closed_old:o.closed_t;
+    o.P=(o.R!=null&&o.sl_pct!=null)?o.R*Math.abs(o.sl_pct):null; });
+  if(SBTF.one){ const busy={}; rows=rows.filter(o=>{ if(busy[o.sym]!=null&&o.t<busy[o.sym]) return false; busy[o.sym]=o.S==='open'?Infinity:(o.CT||o.t); return true; }); }
+  return rows;
+}
+function sbtStat(a){
+  const g=a.filter(o=>o.S!=='open'&&o.R!=null), n=g.length; if(!n) return {n:0,open:a.length};
+  const rs=g.map(o=>o.R), sum=rs.reduce((s,x)=>s+x,0), gp=rs.filter(x=>x>0).reduce((s,x)=>s+x,0), gl=-rs.filter(x=>x<0).reduce((s,x)=>s+x,0), so=[...rs].sort((x,y)=>x-y);
+  const pc=g.map(o=>o.P).filter(x=>x!=null);
+  let cum=0,pk=0,dd=0; for(const o of [...g].sort((x,y)=>(x.CT||x.t)-(y.CT||y.t))){ cum+=o.R; pk=Math.max(pk,cum); dd=Math.min(dd,cum-pk); }
+  return {n, open:a.length-n, win:100*rs.filter(x=>x>0.001).length/n, avg:sum/n, med:so[n>>1], tot:sum, pf:gl?gp/gl:null, dd,
+    avgP:pc.length?pc.reduce((s,x)=>s+x,0)/pc.length:null, tp1:100*g.filter(o=>o.hits>=1).length/n, sl:100*g.filter(o=>o.S==='sl').length/n, best:so[n-1], worst:so[0]};
+}
+const SBT_CHIP=on=>`cursor:pointer;padding:4px 10px;border-radius:8px;font-size:12px;color:inherit;font-weight:${on?700:500};border:1px solid ${on?'var(--accent)':'var(--line)'};background:${on?'rgba(63,185,80,.18)':'rgba(21,28,41,.7)'};white-space:nowrap`;
+const sbtF=(x,d=2)=>x==null?'—':(x>0?'+':'')+x.toFixed(d);
+const sbtC=x=>x==null?'var(--dim)':x>0?'var(--accent)':x<0?'var(--red)':'var(--dim)';
+function sbtCard(lab,val,tip,col){ return `<div data-tip="${esc(tip)}" style="border:1px solid var(--line,#30363d);border-radius:10px;padding:8px 12px;min-width:110px"><div class="muted" style="font-size:11px">${lab}</div><div style="font-size:18px;font-weight:700;color:${col||'inherit'}">${val}</div></div>`; }
+const SBT_GROUPS=[
+  ['call','Call at the time','The scanner\\'s recommendation when the alert fired. This table ignores the Call filter above so you can compare them.',o=>({long:'✅ Long',watch_long:'👀 Watch',skip:'✗ Skip'}[o.rec]||o.rec||'—'),'rec'],
+  ['tf','Spike timeframe','Timeframe whose candle spiked. 1h spikes are traded on the 4h plan, 4h on 4h, 1D on the Daily plan.',o=>o.tf,'tf'],
+  ['setup','Setup','Momentum = green high-volume candle. Flush = liquidation flush (big drop on volume with OI falling) that is a long-the-bounce setup.',o=>o.setup],
+  ['score','Score','Alert score 0–100 (volume size, other timeframes spiking, spot confirmation, EMA200, OI, funding, BTC).',o=>o.score>=75?'75+':o.score>=65?'65–74':o.score>=55?'55–64':'45–54'],
+  ['spike','Spike size','Candle volume ÷ average of the previous 20 candles.',o=>o.ratio>=15?'15×+':o.ratio>=8?'8–15×':o.ratio>=4?'4–8×':'2.5–4×'],
+  ['spot','Spot confirmation','Binance SPOT volume ratio on the same candle. Leads = spot spiked at least as hard as futures (real buying). Futures-only = leverage-driven.',o=>!o.has_spot?'no Binance spot':o.spot>=o.ratio?'spot leads':o.spot>=2?'spot confirms':o.spot>=1.5?'spot weak':'futures-only'],
+  ['oi','OI vs price (4h)','Open interest change vs price over the last 4h. Real up = new longs backing it. Fake pump = OI falling while price rises (short covering). Binance keeps ~20 days of hourly OI, so older alerts show "no OI data".',o=>o.oi_div||'no OI data'],
+  ['btc','BTC that day','BTC daily move vs its usual daily move: big down/up = more than 1.5× usual.',o=>o.btc||'—'],
+  ['ema','vs EMA200','Price above or below the EMA200 of the spike timeframe.',o=>o.vs_ema==null?'n/a (new coin)':o.vs_ema>0?'above EMA200':'below EMA200'],
+  ['tp1r','TP1 distance','How far TP1 is, in R (stop distance). Under 1R = target closer than the stop.',o=>o.rr1>=2?'2R+':o.rr1>=1?'1–2R':o.rr1>=0.5?'0.5–1R':'<0.5R'],
+  ['stop','Stop width','Stop distance from entry.',o=>{ const s=Math.abs(o.sl_pct); return s>=20?'20–25%+':s>=15?'15–20%':s>=10?'10–15%':'<10%'; }],
+  ['week','Week','Week the alert fired (Monday start).',o=>{ const d=new Date(o.t*1000); d.setUTCDate(d.getUTCDate()-((d.getUTCDay()+6)%7)); return d.toISOString().slice(0,10); }],
+];
+function sbtTrades(a){
+  const k=SBTF.sort, dir=SBTF.dir, val=o=>({t:o.t,sym:o.sym,tf:o.tf,rec:o.rec,score:o.score,ratio:o.ratio,sl:o.sl_pct,tp1:o.tp1_pct,st:o.S,r:o.R??-99,p:o.P??-99,mfe:o.mfe,mae:o.mae})[k];
+  const rows=[...a].sort((x,y)=>{ const p=val(x),q=val(y); return (p>q?1:p<q?-1:0)*dir; });
+  const per=100, pg=Math.min(SBTF.page, Math.max(0,Math.ceil(rows.length/per)-1)), sl=rows.slice(pg*per,pg*per+per);
+  const th=(key,lab,tip)=>`<th style="cursor:pointer;white-space:nowrap" data-tip="${esc(tip+' Click to sort.')}" onclick="sbtSet('dir',SBTF.sort==='${key}'?-SBTF.dir:-1);sbtSet('sort','${key}')">${lab}${SBTF.sort===key?(SBTF.dir>0?' ▲':' ▼'):''}</th>`;
+  const recL={long:'✅ Long',watch_long:'👀 Watch',skip:'✗ Skip'};
+  return `<div style="overflow-x:auto"><table style="font-size:11.5px"><thead><tr>${th('t','Time','When the spike candle closed (your local time). Entry = price at that close.')}${th('sym','Coin','Binance USDT perp.')}${th('tf','TF','Spike timeframe.')}${th('rec','Call','Scanner call at the time.')}${th('score','Score','Alert score 0–100.')}${th('ratio','Spike','Volume ÷ previous 20-candle average.')}${th('sl','Stop','Stop distance (= 1R).')}${th('tp1','TP1','First target % above entry (first real resistance ≥10% away, front-run).')}${th('st','Status','How the plan ended with the selected exit model.')}${th('r','Result R','Whole-position result in R.')}${th('p','Result %','Same result as % of the position (R × stop %).')}${th('mfe','Best / worst','Highest and lowest price vs entry within the plan\\'s life (max 7 days).')}</tr></thead><tbody>`
+   +sl.map(o=>{ const ps=PL_ST[o.S]||[o.S,'var(--dim)'];
+     return `<tr><td style="white-space:nowrap">${new Date(o.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td><td><a href="${tvLink(o.sym)}" target="_blank" rel="noopener">${dispSym(o.sym)}</a></td><td>${o.tf}</td><td>${recL[o.rec]||o.rec}</td><td>${o.score}</td><td>${(+o.ratio).toFixed(1)}×</td><td>${o.sl_pct.toFixed(1)}%</td><td>+${o.tp1_pct.toFixed(1)}%</td>`
+      +`<td style="color:${ps[1]};white-space:nowrap" data-tip="${esc('TP1 +'+o.tp1_pct+'%, TP2 +'+o.tp2_pct+'%, TP3 +'+o.tp3_pct+'% · stop '+o.sl_pct+'% · targets hit: '+o.hits+' · old exits: '+(o.st_old)+' '+sbtF(o.r_old)+'R · new exits: '+o.st+' '+sbtF(o.r)+'R')}">${ps[0]}</td>`
+      +`<td style="color:${sbtC(o.R)};font-weight:700">${o.S==='open'?'<span class="muted">open '+sbtF(o.R)+'</span>':sbtF(o.R)+'R'}</td><td style="color:${sbtC(o.P)}">${o.P==null?'—':sbtF(o.P,1)+'%'}</td><td class="rr" style="white-space:nowrap">+${o.mfe}% / ${o.mae}%</td></tr>`; }).join('')
+   +`</tbody></table></div>`+(rows.length>per?`<div style="margin:6px 0">${Array.from({length:Math.ceil(rows.length/per)},(_,i)=>`<button style="${SBT_CHIP(i===pg)};margin:2px" onclick="sbtSet('page',${i})">${i+1}</button>`).join('')}</div>`:'');
+}
+function sbtEquity(a){
+  const g=a.filter(o=>o.S!=='open'&&o.R!=null).sort((x,y)=>(x.CT||x.t)-(y.CT||y.t)); if(g.length<2) return '';
+  let c=0; const pts=g.map(o=>(c+=o.R)); const mn=Math.min(0,...pts), mx=Math.max(0,...pts), W=1000,H=140, y=v=>H-6-(v-mn)/((mx-mn)||1)*(H-12);
+  const path=pts.map((v,i)=>`${(i/(pts.length-1)*W).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+  return `<div data-tip="Cumulative R of the graded trades, in the order they closed. Ends at ${sbtF(c,1)}R after ${g.length} trades. Flat or falling = the edge isn't there for this filter." style="margin:8px 0 14px"><svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:140px;background:rgba(255,255,255,.02);border-radius:8px"><line x1="0" x2="${W}" y1="${y(0)}" y2="${y(0)}" stroke="var(--dim2,#555)" stroke-dasharray="4 4"/><polyline points="${path}" fill="none" stroke="${c>=0?'var(--accent)':'var(--red)'}" stroke-width="2" vector-effect="non-scaling-stroke"/></svg></div>`;
+}
+function renderSbt(){
+  const el=document.getElementById('sbtBody'); if(!el) return;
+  if(!SBT){ el.innerHTML='<span class="muted">Loading…</span>'; return; }
+  const run=SBT.status==='running';
+  const runLine=run?`<div class="muted" style="margin:6px 0">⏳ Backtest running: ${SBT.progress||0}% of coins replayed, ${SBT.partial||0} alerts so far. It takes ~15–25 min (Binance rate limits); this page refreshes itself.</div>`
+    :`<button style="${SBT_CHIP(false)}" onclick="loadSbt(true)" data-tip="Re-run the whole replay with the current live rules. Takes ~15–25 minutes in the background; it also rebuilds itself every 3 days.">🔄 Re-run now</button>`;
+  if(!SBT.result){ el.innerHTML=`<h3 style="margin:0 0 6px">🧪 System backtest</h3>${SBT.error?'<div class="warn">'+esc(SBT.error)+'</div>':''}${run?runLine:'<div class="muted">No backtest stored yet. The first one starts ~4 min after the server boots.</div>'+runLine}`; return; }
+  const M=SBT.result.meta, rows=sbtRows(), st=sbtStat(rows);
+  const alt=(()=>{ const e=SBTF.exit; SBTF.exit=e==='old'?'new':'old'; const s=sbtStat(sbtRows()); SBTF.exit=e; return s; })();
+  const chip=(k,v,lab,tip)=>`<button style="${SBT_CHIP(SBTF[k]===v)}" data-tip="${esc(tip||'')}" onclick="sbtSet('${k}',${JSON.stringify(v).replace(/"/g,"'")})">${lab}</button>`;
+  let h=`<h3 style="margin:0 0 4px">🧪 System backtest <span class="muted" style="font-size:12px;font-weight:400">built ${new Date(M.built*1000).toLocaleString()} · ${M.symbols} Binance perps · last ${M.days} days · ${SBT.result.rows.length} alerts</span></h3>`
+   +`<div class="muted" style="font-size:12px;margin-bottom:8px;max-width:1100px">Replays the live volume-spike system hour by hour over Binance history with the scanner's <b>own code</b>: the same volume ratios (1h/4h/1D), spot confirmation, OI divergence, funding, BTC regime, scores and Long/Watch/Skip calls, the same wide stops and real-level targets, and the same exit rules. Several timeframes spiking at once = one alert. <b>Gaps vs live:</b> no 15m spikes; plans start from candles, not the Analyze card; exits walked on 1h candles (stop checked first); OI history only ~20 days; only coins listed today (delisted coins missing); no fees or slippage.</div>`
+   +`<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:6px"><span class="muted" style="font-size:12px">Call:</span>${chip('rec','go','✅ Long','Only alerts the scanner called Long.')}${chip('rec','watch','✅+👀 Long & Watch','Long and Watch long calls (what the forward test counts).')}${chip('rec','skip','✗ Skip','Only the alerts the scanner said to skip: they should do worse.')}${chip('rec','','All','Every long alert.')}`
+   +`<span class="muted" style="font-size:12px;margin-left:10px">TF:</span>${chip('tf','','All')}${chip('tf','1h','1h')}${chip('tf','4h','4h')}${chip('tf','1d','1D')}`
+   +`<span class="muted" style="font-size:12px;margin-left:10px">Setup:</span>${chip('setup','','All')}${chip('setup','momentum','Momentum')}${chip('setup','flush','Flush')}</div>`
+   +`<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px"><span class="muted" style="font-size:12px">Exits:</span>${chip('exit','new','½ · ¼ · ¼ (live now)',M.exit_new)}${chip('exit','old','⅓ · ⅓ · ⅓ (before)',M.exit_old)}`
+   +`<span class="muted" style="font-size:12px;margin-left:10px">Positions:</span>${chip('one',1,'One per coin','A new alert on a coin is ignored while the previous trade on that coin is still open (live rule).')}${chip('one',0,'Every alert','Count every alert as its own trade.')}<span style="margin-left:10px">${runLine}</span></div>`;
+  if(!st.n){ el.innerHTML=h+'<div class="muted">No graded trades for this filter.</div>'; return; }
+  h+=`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px">`
+   +sbtCard('Trades',st.n,`${st.n} closed trades (+${st.open} still open at the end of the data, not counted).`)
+   +sbtCard('Win rate',st.win.toFixed(0)+'%','Share of trades that closed above 0R.')
+   +sbtCard('Avg per trade',sbtF(st.avg)+'R',`Average result per trade in R (median ${sbtF(st.med)}R). Positive = the system makes money on average before fees.`,sbtC(st.avg))
+   +sbtCard('Avg %',st.avgP==null?'—':sbtF(st.avgP,1)+'%','Average result as % of the position (R × that trade\\'s stop %).',sbtC(st.avgP))
+   +sbtCard('Total',sbtF(st.tot,1)+'R','Sum of all results. With 1% account risk per trade, +10R ≈ +10% on the account.',sbtC(st.tot))
+   +sbtCard('Profit factor',st.pf==null?'∞':st.pf.toFixed(2),'Gross wins ÷ gross losses. Above 1 = profitable; 1.5+ is solid.',st.pf>1?'var(--accent)':'var(--red)')
+   +sbtCard('Max drawdown',st.dd.toFixed(1)+'R','Worst peak-to-trough drop of the cumulative R curve.','var(--red)')
+   +sbtCard('Reached TP1',st.tp1.toFixed(0)+'%','Share of trades that hit TP1 before the stop.')
+   +sbtCard('Stopped before TP1',st.sl.toFixed(0)+'%','Share of trades that lost the full −1R.')
+   +`</div><div class="muted" style="font-size:12px" data-tip="Same trades, other exit model.">Same trades with the ${SBTF.exit==='old'?'new ½·¼·¼':'old ⅓·⅓·⅓'} exits: avg ${sbtF(alt.avg)}R, win ${alt.n?alt.win.toFixed(0):'—'}%, total ${sbtF(alt.tot,1)}R.</div>`
+   +sbtEquity(rows);
+  h+=`<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:12px">`;
+  for(const [gk,title,tip,fn,skip] of SBT_GROUPS){
+    const src=skip?sbtRows(skip):rows, groups={};
+    for(const o of src){ const k=fn(o); (groups[k]=groups[k]||[]).push(o); }
+    const ks=Object.keys(groups).sort((a,b)=>gk==='week'?a.localeCompare(b):(sbtStat(groups[b]).avg||-9)-(sbtStat(groups[a]).avg||-9));
+    h+=`<div style="border:1px solid var(--line,#30363d);border-radius:10px;padding:8px 10px"><div style="font-weight:700;margin-bottom:4px" data-tip="${esc(tip)}">${title} <span class="muted" style="font-size:11px;font-weight:400">ⓘ</span></div><table style="font-size:11.5px;width:100%"><thead><tr><th></th><th data-tip="Closed trades in this group.">n</th><th data-tip="Closed above 0R.">Win</th><th data-tip="Average R per trade.">Avg R</th><th data-tip="Average % of the position.">Avg %</th><th data-tip="Sum of R.">Total</th><th data-tip="Gross wins ÷ gross losses.">PF</th><th data-tip="Reached TP1 before the stop.">TP1</th></tr></thead><tbody>`
+     +ks.map(k=>{ const s=sbtStat(groups[k]), id=gk+'|'+k, op=SBTF.open===id;
+        if(!s.n) return `<tr><td>${esc(k)}</td><td colspan="7" class="muted">${s.open} open</td></tr>`;
+        return `<tr style="cursor:pointer" onclick="sbtSet('open',SBTF.open===${JSON.stringify(id).replace(/"/g,"'")}?'':${JSON.stringify(id).replace(/"/g,"'")})" data-tip="Click to ${op?'hide':'see'} these ${groups[k].length} trades"><td>${op?'▾':'▸'} ${esc(k)}</td><td>${s.n}</td><td>${s.win.toFixed(0)}%</td><td style="color:${sbtC(s.avg)};font-weight:700">${sbtF(s.avg)}</td><td style="color:${sbtC(s.avgP)}">${s.avgP==null?'—':sbtF(s.avgP,1)+'%'}</td><td style="color:${sbtC(s.tot)}">${sbtF(s.tot,1)}</td><td>${s.pf==null?'∞':s.pf.toFixed(2)}</td><td>${s.tp1.toFixed(0)}%</td></tr>`
+          +(op?`<tr><td colspan="8">${sbtTrades(groups[k])}</td></tr>`:''); }).join('')
+     +`</tbody></table></div>`;
+  }
+  h+=`</div><h3 style="margin:16px 0 6px;font-size:14px">All trades <span class="muted" style="font-size:12px;font-weight:400">${rows.length} (click a header to sort)</span></h3>`+sbtTrades(rows);
+  el.innerHTML=h;
+}
+// ── Keep the page where you left it (tab, analyzed coin, scroll) when the browser reloads or discards the tab
+function uiSave(o){ try{ const s=JSON.parse(localStorage.getItem('uiState')||'{}'); Object.assign(s,o,{at:Date.now()}); localStorage.setItem('uiState',JSON.stringify(s)); }catch(e){} }
+function uiLoad(){ try{ return JSON.parse(localStorage.getItem('uiState')||'{}'); }catch(e){ return {}; } }
+addEventListener('pagehide',()=>uiSave({y:scrollY}));
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='hidden') uiSave({y:scrollY}); });
 function applyHeaderTips(){
   document.querySelectorAll("th[data-k],th[data-fk],th[data-ck],th[data-bk],th[data-sk],th[data-xk],th[data-ek]").forEach(th=>{
     const k=th.dataset.k||th.dataset.fk||th.dataset.ck||th.dataset.bk||th.dataset.wk||th.dataset.sk||th.dataset.xk||th.dataset.ek;
@@ -7050,6 +7194,9 @@ function applyHeaderTips(){
   });
 }
 applyHeaderTips();
+{ const u=uiLoad(); if(u.tab&&document.getElementById('view'+({callshc:'Calls'}[u.tab]||u.tab.charAt(0).toUpperCase()+u.tab.slice(1)))) activeTab=u.tab;
+  if(u.az&&activeTab==='analyze'){ const inp=document.getElementById('azInput'); if(inp) inp.value=u.az; if(u.aztf) azTf=u.aztf; setTimeout(()=>{ try{ document.querySelectorAll('.tfbtn').forEach(x=>x.classList.toggle('active',x.dataset.tf===azTf)); analyze(); }catch(e){} },300); }
+  if(u.y) setTimeout(()=>scrollTo(0,u.y),2500); }
 showTab(activeTab); poll(); setInterval(poll, 3000);
 setInterval(()=>{ if(activeTab==='spikes') loadSpikes(); }, 20000);
 </script>
@@ -7323,6 +7470,13 @@ def make_handler(state: State):
                 except Exception as e:
                     body = json.dumps({"rows": None, "status": f"volume-spike scanner unavailable: {e}"}).encode()
                 self._send(200, body, "application/json")
+            elif self.path.startswith("/sbt"):
+                try:
+                    import system_backtest
+                    body = json.dumps(system_backtest.payload(self.path), default=str).encode()
+                except Exception as e:
+                    body = json.dumps({"status": "error", "error": str(e)}).encode()
+                self._send(200, body, "application/json")
             elif self.path.startswith("/backtest"):
                 self._backtest()
             elif self.path.startswith("/calls/delete"):
@@ -7466,6 +7620,12 @@ def main() -> None:
                                                     for r in ((state.watchlist_mon or {}).get("rows") or [])
                                                     if r.get("token") and r.get("mcap")})
             print("  Volume-spike scanner: ON (Binance, 15m/1h/4h/1D)")
+            try:
+                import system_backtest
+                system_backtest.start()
+                print("  System backtest: ON (rebuilds every 3 days)")
+            except Exception as e:
+                print(f"  System backtest failed to start: {e}")
         except Exception as e:
             print(f"  Volume-spike scanner failed to start: {e}")
         threading.Thread(target=breakout_watcher, args=(state,), daemon=True).start()
