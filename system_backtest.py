@@ -33,9 +33,9 @@ import time
 
 import volume_spikes as vs
 
-BT_KEY = "vs_sysbt_v1"
+BT_KEY = "vs_sysbt_v2"
 BT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system_backtest.json")
-DAYS = int(os.environ.get("SBT_DAYS", 50))
+DAYS = int(os.environ.get("SBT_DAYS", 180))
 REFRESH_EVERY = 3 * 86400
 
 STATE = {"status": "idle", "progress": None, "result": None, "started": None, "error": None}
@@ -44,14 +44,28 @@ _LOCK = threading.Lock()
 COLS = ["t", "sym", "tf", "rec", "setup", "score", "ratio", "spot", "oi_div", "btc", "vs_ema", "has_spot",
         "entry", "sl_pct", "tp1_pct", "tp2_pct", "tp3_pct", "rr1",
         "st", "r", "closed_t", "hits", "mfe", "mae",          # current exit model (½/¼/¼)
-        "st_old", "r_old", "closed_old",                      # old exit model (⅓/⅓/⅓)
-        "run48"]                                              # % above the 48h low at the alert (early vs late)
+        "st_s", "r_s", "closed_s",                            # FADE: the same alert traded SHORT
+        "run48",                                              # % above the 48h low at the alert (early vs late)
+        "btc7"]                                               # BTC % change over the 7 days before (market regime)
 
 
 def _kl(kind, sym, tf, n):
+    """Last n candles, paging back through history (futures max 1500 per call, spot 1000)."""
     path = "/fapi/v1/klines" if kind == "fut" else "/api/v3/klines"
-    k = vs._parse_klines(vs._get(kind, path, {"symbol": sym, "interval": tf, "limit": n}))
-    return k or None
+    page = 1500 if kind == "fut" else 1000
+    out, end = [], None
+    while len(out) < n:
+        p = {"symbol": sym, "interval": tf, "limit": min(page, n - len(out))}
+        if end:
+            p["endTime"] = end
+        k = vs._parse_klines(vs._get(kind, path, p))
+        if not k:
+            break
+        out = k + out
+        if len(k) < p["limit"]:
+            break
+        end = k[0][0] * 1000 - 1
+    return out or None
 
 
 def _oi(sym):
@@ -115,6 +129,13 @@ def _btc_at(bd, b1, T):
     today = (price / d[-1][4] - 1) * 100
     usual = sum(abs(d[j][4] / d[j - 1][4] - 1) * 100 for j in range(len(d) - 30, len(d))) / 30
     return {"regime": "big_down" if today <= -1.5 * usual else "big_up" if today >= 1.5 * usual else "normal"}
+
+
+def _btc7(b1, T):
+    i = b1.closed_idx(T)
+    if i < 170:
+        return None
+    return round((b1.c[i - 1][4] / b1.c[i - 169][4] - 1) * 100, 1)
 
 
 def _cheap_ratio(c, i, forming, T, secs):
@@ -192,21 +213,26 @@ def replay_symbol(sym, F, btcser, t_from):
             else:
                 sc, _ = vs.score_row(r, tf, btc)
             m["score"] = sc
-        cand = []
+        cand, cand_s = [], []
         for tf, m in r["tfs"].items():
-            if m["ratio"] < vs.SPIKE_RATIO or m.get("score") is None:
+            if m["ratio"] < vs.SPIKE_RATIO or m.get("score") is None or (tf, m["candle"]) in seen:
                 continue
-            is_long = m["dir"] == "long" or m.get("setup") == "flush"
-            if m["score"] < vs.ALERT_MIN_SCORE or not is_long:
+            if m["score"] < vs.ALERT_MIN_SCORE:
                 continue
-            if (tf, m["candle"]) in seen:
-                continue
-            cand.append(tf)
+            if m["dir"] == "long" or m.get("setup") == "flush":
+                cand.append(tf)
+            elif m["dir"] == "short":
+                cand_s.append(tf)                           # red spike: the SHORT system
+        order = {t: n for n, t in enumerate(vs.TF_ORDER)}
+        for tf in cand + cand_s:
+            seen.add((tf, r["tfs"][tf]["candle"]))
+        if cand_s:
+            tf = max(cand_s, key=lambda x: (r["tfs"][x]["score"], order.get(x, 0)))
+            row = _short_alert(r, tf, btc, ser, f1, T, price, c1, i, sym, btcser)
+            if row:
+                out.append(row)
         if not cand:
             continue
-        order = {t: n for n, t in enumerate(vs.TF_ORDER)}
-        for tf in cand:
-            seen.add((tf, r["tfs"][tf]["candle"]))
         tf = max(cand, key=lambda x: (r["tfs"][x]["score"], order.get(x, 0)))   # several TFs = one alert (live v82)
         m = r["tfs"][tf]
         if True:
@@ -215,11 +241,94 @@ def replay_symbol(sym, F, btcser, t_from):
                  "setup": m.get("setup") or "momentum", "score": m["score"], "ratio": m["ratio"],
                  "spot": r["spot"].get(tf), "oi_div": r.get("oi_div"), "btc": (btc or {}).get("regime"),
                  "vs_ema": m.get("vs_ema"), "flush_low": m.get("lo") if m.get("setup") == "flush" else None,
-                 "run48": round((price / min(k[3] for k in c1[max(0, i - 48):i]) - 1) * 100, 1)}
+                 "run48": round((price / min(k[3] for k in c1[max(0, i - 48):i]) - 1) * 100, 1),
+                 "btc7": _btc7(btcser["1h"], T)}
             row = _plan_and_grade(a, ser, f1, T)
             if row:
                 out.append(row)
     return out
+
+
+FADE_RR = (0.7, 1.4, 2.5)      # short targets in R (stop = same width as the long plan's stop)
+
+
+def short_rec(r, tf, btc):
+    """The scanner's own short-side checklist (recommend() with long-only switched off)."""
+    m = r["tfs"][tf]
+    sc = m.get("score") or 0
+    flags = []
+    od, f, ve = r.get("oi_div"), r.get("funding") or 0, m.get("vs_ema")
+    if od == "exhausting": flags.append("exhausting")
+    if (btc or {}).get("regime") == "big_up": flags.append("btc up")
+    if f < -0.0005: flags.append("shorts crowded")
+    if ve is not None and ve > 0: flags.append("above ema200")
+    sp = r["spot"].get(tf)
+    if sp is not None and sp < 1.5: flags.append("futures-only")
+    if sc >= 65 and not flags:
+        return "short"
+    if sc >= 50 and len(flags) <= 1:
+        return "watch_short"
+    return "skip"
+
+
+def _short_alert(r, tf, btc, ser, f1, T, price, c1, i, sym, btcser):
+    """Red high-volume spike traded SHORT: stop = the same wide-stop rules above entry, targets FADE_RR."""
+    m = r["tfs"][tf]
+    ptf = vs.PLAN_TF.get(tf, tf)
+    c = ser[ptf].closed(T)
+    atr = vs._atr(c) if c else None
+    sl, _ = vs.wide_stop(price, ptf, atr)                 # long-side distance, mirrored above entry
+    sd = (price - sl) / price
+    i0 = f1.closed_idx(T)
+    fut = f1.c[i0:i0 + 7 * 24 + 1]
+    if not fut or sd <= 0:
+        return None
+    a4 = vs._atr(ser["4h"].closed(T))
+    st, rr, ct = sim_short(price, sd, fut, a4, vs.EXIT_CFG)
+    mfe = round((1 - min(k[3] for k in fut) / price) * 100, 2)      # best = deepest drop
+    mae = round(-(max(k[2] for k in fut) / price - 1) * 100, 2)      # worst = highest rise (negative)
+    tp = [round(-k * sd * 100, 2) for k in FADE_RR]
+    hits = sum(1 for k in FADE_RR if min(x[3] for x in fut) <= price * (1 - k * sd))
+    hi48 = max(k[2] for k in c1[max(0, i - 48):i])
+    return [int(T), sym, tf, short_rec(r, tf, btc), "short", m["score"], m["ratio"], r["spot"].get(tf), r.get("oi_div"),
+            (btc or {}).get("regime"), m.get("vs_ema"), r["spot"].get(tf) is not None,
+            float(f"{price:.6g}"), round(sd * 100, 2), tp[0], tp[1], tp[2], FADE_RR[0],
+            st, rr, ct, hits, mfe, mae,
+            None, None, None,
+            round((price / hi48 - 1) * 100, 1), _btc7(btcser["1h"], T)]
+
+
+def sim_short(entry, sd, fut, atr4, cfg):
+    """Fade the spike: SHORT at the alert price, stop sd above, targets FADE_RR × risk below, same
+    management as the long plan (½/¼/¼, break-even after TP1, lock ½ of TP1, stop ≤ TP1 after TP2,
+    3×ATR(4h) trail over the lowest low). 1h candles, stop checked first. Returns (status, r, closed_t)."""
+    risk = entry * sd
+    stop = entry + risk
+    tps = [entry - k * risk for k in FADE_RR]
+    sc = cfg["scale"]
+    hits, ll = 0, entry
+    for k in fut:
+        hi, lo = k[2], k[3]
+        if hi >= stop:
+            r = sum(FADE_RR[i] * sc[i] for i in range(min(hits, 2))) + (1 - sum(sc[:min(hits, 2)])) * (entry - stop) / risk
+            st = "sl" if hits == 0 else ("be" if abs(stop - entry) <= entry * 1e-9 else "trail")
+            return st, round(r, 2), k[0]
+        while hits < 3 and lo <= tps[hits]:
+            hits += 1
+        ll = min(ll, lo)
+        if hits >= 1:
+            stop = min(stop, entry)
+            if cfg.get("lock") and ll <= entry - 1.5 * (entry - tps[0]):
+                stop = min(stop, entry - 0.5 * (entry - tps[0]))
+        if hits >= 2:
+            if cfg.get("tp1_after_tp2"):
+                stop = min(stop, tps[0])
+            if atr4:
+                stop = min(stop, ll + vs.TRAIL_ATR * atr4)
+    last = fut[-1][4]
+    r = sum(FADE_RR[i] * sc[i] for i in range(min(hits, 2))) + (1 - sum(sc[:min(hits, 2)])) * (entry - last) / risk
+    done = len(fut) > 7 * 24
+    return ("expired" if done else "open"), round(r, 2), (fut[-1][0] + 3600 if done else None)
 
 
 def _plan_and_grade(a, ser, f1, T):
@@ -243,23 +352,21 @@ def _plan_and_grade(a, ser, f1, T):
         return None
     end_t = fut[-1][0] + 3600
     now = end_t if len(fut) > 7 * 24 else end_t       # expiry fires only when 7 days have passed
-    res = {}
-    for name, cfg in (("new", vs.EXIT_CFG), ("old", vs.EXIT_OLD)):
-        b = copy.deepcopy(a)
-        b["pstate"] = {"status": "open", "hits": 0, "mfe": 0, "mae": 0, "checked": 0}
-        vs.step_plan(b, fut, fut[-1][4], now, cfg=cfg, bar=3600)
-        res[name] = b["pstate"]
-    n, o = res["new"], res["old"]
+    b = copy.deepcopy(a)
+    b["pstate"] = {"status": "open", "hits": 0, "mfe": 0, "mae": 0, "checked": 0}
+    vs.step_plan(b, fut, fut[-1][4], now, cfg=vs.EXIT_CFG, bar=3600)
+    n = b["pstate"]
     closed = n["status"] in ("sl", "be", "trail", "expired")
-    closed_o = o["status"] in ("sl", "be", "trail", "expired")
+    s_st, s_r, s_ct = sim_short(entry, abs(pl["sl_pct"]) / 100, fut, pl.get("trail_atr"), vs.EXIT_CFG)
     tp = pl["tp_pct"] + [None] * 3
+    entry = float(f"{entry:.6g}")
     return [int(T), a["symbol"], a["tf"], a["rec"], a["setup"], a["score"], a["ratio"], a["spot"], a["oi_div"],
             a["btc"], a["vs_ema"], a["spot"] is not None,
             entry, pl["sl_pct"], tp[0], tp[1], tp[2], pl["rr"][0],
             n["status"] if closed else "open", n.get("r") if closed else n.get("open_r"), n.get("closed_t"),
             n["hits"], n.get("mfe"), n.get("mae"),
-            o["status"] if closed_o else "open", o.get("r") if closed_o else o.get("open_r"), o.get("closed_t"),
-            a.get("run48")]
+            s_st, s_r, s_ct,
+            a.get("run48"), a.get("btc7")]
 
 
 def _save(res):
@@ -274,6 +381,34 @@ def _save(res):
             vs._redis_cmd("SET", BT_KEY, base64.b64encode(gzip.compress(blob.encode())).decode())
     except Exception as e:
         print(f"[sbt] redis save failed: {e}", flush=True)
+
+
+def _ckpt_save(obj):
+    try:
+        if obj is None:
+            os.path.exists(BT_PATH + ".ckpt") and os.remove(BT_PATH + ".ckpt")
+            if vs._redis():
+                vs._redis_cmd("DEL", BT_KEY + ":ckpt")
+            return
+        blob = json.dumps(obj, separators=(",", ":"))
+        with open(BT_PATH + ".ckpt", "w") as fh:
+            fh.write(blob)
+        if vs._redis():
+            vs._redis_cmd("SET", BT_KEY + ":ckpt", base64.b64encode(gzip.compress(blob.encode())).decode())
+    except Exception as e:
+        print(f"[sbt] checkpoint save failed: {e}", flush=True)
+
+
+def _ckpt_load():
+    try:
+        if vs._redis():
+            z = vs._redis_cmd("GET", BT_KEY + ":ckpt")
+            if z:
+                return json.loads(gzip.decompress(base64.b64decode(z)).decode())
+        with open(BT_PATH + ".ckpt") as fh:
+            return json.loads(fh.read())
+    except Exception:
+        return None
 
 
 def _load():
@@ -307,38 +442,53 @@ def run():
         tick = vs.fetch_tickers() or {}
         uni = vs.fetch_universe() or set()
         syms = sorted(s for s, t in tick.items() if t["turnover24"] >= vs.MIN_TURNOVER and (not uni or s in uni))
-        btc = {"1d": _Series(_kl("fut", "BTCUSDT", "1d", 120), 86400),
-               "1h": _Series(_kl("fut", "BTCUSDT", "1h", 1500), 3600)}
+        n1h = DAYS * 24 + 320
+        btc = {"1d": _Series(_kl("fut", "BTCUSDT", "1d", DAYS + 60), 86400),
+               "1h": _Series(_kl("fut", "BTCUSDT", "1h", n1h), 3600)}
+        ck = _ckpt_load()                                   # resume after a restart / sleep
+        if ck and ck.get("days") == DAYS and time.time() - ck.get("t0", 0) < 2 * 86400:
+            t0, rows, finished, skipped = ck["t0"], ck["rows"], set(ck["done"]), ck.get("skipped", 0)
+            print(f"[sbt] resuming: {len(finished)} coins already done", flush=True)
+        else:
+            rows, finished, skipped = [], set(), 0
         t_from = int(t0) - DAYS * 86400
-        rows, done, skipped = [], 0, 0
+        done = len(finished)
         for s in syms:
+            if s in finished:
+                continue
             try:
-                F = {"1h": _Series(_kl("fut", s, "1h", 1500), 3600),
-                     "4h": _Series(_kl("fut", s, "4h", 700), 14400),
-                     "1d": _Series(_kl("fut", s, "1d", 330), 86400)}
+                F = {"1h": _Series(_kl("fut", s, "1h", n1h), 3600),
+                     "4h": _Series(_kl("fut", s, "4h", DAYS * 6 + 320), 14400),
+                     "1d": _Series(_kl("fut", s, "1d", DAYS + 320), 86400)}
                 if len(F["1h"].c) < 100:
                     skipped += 1
                 else:
-                    F["spot"] = _kl("spot", s, "1h", 1500)
+                    F["spot"] = _kl("spot", s, "1h", n1h)
                     F["oi"] = _oi(s)
                     F["fund"] = _funding(s)
                     rows += replay_symbol(s, F, btc, t_from)
+                F = None
             except Exception as e:
                 print(f"[sbt] {s} failed: {e}", flush=True)
                 skipped += 1
             done += 1
+            finished.add(s)
             STATE["progress"] = round(100 * done / max(1, len(syms)))
             STATE["partial"] = len(rows)
-            time.sleep(0.15)
+            if done % 20 == 0:
+                _ckpt_save({"days": DAYS, "t0": t0, "rows": rows, "done": sorted(finished), "skipped": skipped})
+            time.sleep(0.1)
         rows.sort(key=lambda x: x[0])
         res = {"cols": COLS, "rows": rows,
                "meta": {"built": time.time(), "secs": round(time.time() - t0), "days": DAYS, "symbols": len(syms),
                         "skipped": skipped, "from": t_from, "to": int(t0),
                         "spike_ratio": vs.SPIKE_RATIO, "alert_min_score": vs.ALERT_MIN_SCORE,
                         "exit_new": "½ at TP1, ¼ at TP2, ¼ runner · BE after TP1 · lock ½ of TP1 once price runs 1.5× TP1 · stop ≥ TP1 after TP2 · 3×ATR(4h) trail",
-                        "exit_old": "⅓ at TP1, ⅓ at TP2, ⅓ runner · BE after TP1 · 3×ATR(4h) trail after TP2",
+                        "short_system": f"RED volume spikes (score ≥ alert minimum) traded SHORT: stop = the same wide-stop rules above entry, targets {FADE_RR} R, ½/¼/¼ management; setup = 'short'",
+                        "fade": f"SHORT the same alert: stop = the long plan's stop distance above entry, targets {FADE_RR} R below, same ½/¼/¼ management",
                         "stops": {k: list(v) for k, v in vs.STOP_RULES.items()}}}
         _save(res)
+        _ckpt_save(None)
         STATE.update(status="done", result=res, progress=100)
         print(f"[sbt] done: {len(rows)} alerts from {len(syms)} perps in {res['meta']['secs']}s", flush=True)
     except Exception as e:
@@ -367,7 +517,7 @@ def _loop():
             STATE["status"] = "done"
     while True:
         r = STATE.get("result")
-        if not r or time.time() - r["meta"]["built"] > REFRESH_EVERY:
+        if not r or time.time() - r["meta"]["built"] > REFRESH_EVERY or _ckpt_load():
             run()
         time.sleep(3600)
 
