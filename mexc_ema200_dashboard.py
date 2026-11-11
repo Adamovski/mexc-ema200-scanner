@@ -6685,8 +6685,13 @@ function ftChip(k,v,label,extra){ const on=FTF[k]===v; return `<span onclick="ft
 // Click a 'Working best / worst' line to open the trades behind it (kept open across refreshes).
 const ftOpenK=new Set();
 function ftToggleSl(i,ev){ if(ev&&ev.target&&ev.target.closest&&ev.target.closest('a,table')) return; const k=(window.__ftKeys||[])[i]; if(k==null) return; ftOpenK.has(k)?ftOpenK.delete(k):ftOpenK.add(k); renderFt(); }
-function ftTradesHtml(arr){ const U=ftU();
-  const rows=arr.slice().sort((x,y)=>((ftVal(y)!=null)-(ftVal(x)!=null))||(y.t-x.t));
+const ftShowOpen=new Set();
+function ftOpenTog(k,ev){ if(ev) ev.stopPropagation(); ftShowOpen.has(k)?ftShowOpen.delete(k):ftShowOpen.add(k); renderFt(); }
+function ftTradesHtml(arr,key){ const U=ftU();
+  const graded=arr.filter(a=>ftVal(a)!=null).sort((x,y)=>y.t-x.t), open=arr.filter(a=>ftVal(a)==null).sort((x,y)=>y.t-x.t);
+  const ki=key!=null?(window.__ftKeys||[]).indexOf(key):-1, so=key!=null&&ftShowOpen.has(key);
+  const rows=so?graded.concat(open):graded;
+  const tog=open.length?`<div style="margin:4px 0"><a href="#" onclick="ftOpenTog(window.__ftKeys[${ki}],event);return false">${so?'▾ hide':'▸ show'} ${open.length} open / not graded</a></div>`:'';
   const recL={long:'✅ Long',watch_long:'👀 Watch',skip:'✗ Skip'};
   return `<div style="overflow-x:auto;margin:6px 0 10px;cursor:default" onclick="event.stopPropagation()"><table style="font-size:11.5px"><thead><tr><th>Time</th><th>Coin</th><th>TF</th><th>Spike</th><th>Rec</th><th>Entry</th><th>Stop</th><th>TP1</th><th>Status</th><th>Result</th><th data-tip="Best and worst move vs entry while the plan was open (MFE / MAE).">Best / worst</th></tr></thead><tbody>`+
     rows.map(a=>{ const v=ftVal(a), st=a.pstate||{}, ps=PL_ST[st.status]||['—','var(--dim)'], pl=a.plan||{};
@@ -6696,7 +6701,7 @@ function ftTradesHtml(arr){ const U=ftU();
         +`<td><a href="${tvLink(a.symbol)}" target="_blank" rel="noopener">${dispSym(a.symbol)}</a></td><td>${a.tf||'—'}</td><td>${a.ratio!=null?(+a.ratio).toFixed(1)+'×':'—'}</td><td>${recL[a.rec]||a.rec||'—'}</td>`
         +`<td>${fmtNum(a.price)}</td><td>${pl.sl_pct!=null?pl.sl_pct.toFixed(1)+'%':'—'}</td><td>${pl.tp_pct&&pl.tp_pct[0]!=null?'+'+pl.tp_pct[0].toFixed(1)+'%':'—'}</td>`
         +`<td style="color:${ps[1]};white-space:nowrap">${ps[0]}</td><td style="white-space:nowrap">${res}</td><td class="rr" style="white-space:nowrap">${st.mfe!=null?'+'+st.mfe+'% / '+st.mae+'%':'—'}</td></tr>`; }).join('')
-    +`</tbody></table></div>`; }
+    +`</tbody></table>${tog}</div>`; }
 function ftVal(a){ if(FTF.h==='R'){ const st=a.pstate; if(a.plan&&(a.plan.late||!a.plan.adj)) return null; return (st&&plClosed(st)&&typeof st.r==='number')?st.r:null; } const v=a.out&&a.out[FTF.h]; return (typeof v==='number')?v:null; }
 const ftU=()=>FTF.h==='R'?'R':'%';
 function ftStat(arr){ const v=arr.map(ftVal).filter(x=>x!=null); if(!v.length) return {n:0,pend:arr.length};
@@ -6719,8 +6724,11 @@ function ftFiltered(skip){
     if(FTF.rec==='go' && a.rec!=='long') return false;
     if(FTF.rec==='watch' && !(a.rec==='long'||a.rec==='watch_long')) return false;
     if(FTF.rec==='skip' && a.rec!=='skip') return false;
-    return true; });
+    return true; }).sort((x,y)=>x.t-y.t).filter(ftDedupe());
 }
+function ftDedupe(){ const seen={};
+  return a=>{ const pl=a.plan||{}, k=a.symbol+'|'+(pl.sl!=null?(+pl.sl).toPrecision(6):'')+'|'+(pl.tps&&pl.tps[0]!=null?(+pl.tps[0]).toPrecision(6):'');
+    if(!pl.sl) return true; const t0=seen[k]; if(t0!=null && a.t-t0<6*3600) return false; seen[k]=a.t; return true; }; }
 function ftSvgBars(days){
   const W=640,H=120,pad=22, n=days.length, bw=Math.max(6,(W-pad*2)/Math.max(n,1)-6);
   const mx=Math.max(1,...days.map(d=>Math.abs(d.avg||0)));
@@ -6783,7 +6791,7 @@ function renderFt(){
   const best=slices.filter(s=>s.st.avg>0).slice(0,3), worst=[...slices].reverse().filter(s=>s.st.avg<0).slice(0,3);
   window.__ftKeys=[]; window.__ftArr={};
   const line=s=>{ const i=window.__ftKeys.push(s.k)-1; window.__ftArr[s.k]=s.arr; const op=ftOpenK.has(s.k);
-    return `<li style="cursor:pointer" onclick="ftToggleSl(${i},event)" data-tip="Click to ${op?'hide':'see'} the ${s.arr.length} trades behind this line"><b>${esc(s.k)}</b>: ${s.st.win}% win, avg ${s.st.avg>0?'+':''}${s.st.avg.toFixed(2)}${U} <span class="rr">n=${s.st.n}</span> <span class="rr" style="color:var(--accent)">${op?'▾ hide trades':'▸ trades'}</span>${op?ftTradesHtml(s.arr):''}</li>`; };
+    return `<li style="cursor:pointer" onclick="ftToggleSl(${i},event)" data-tip="Click to ${op?'hide':'see'} the ${s.arr.length} trades behind this line"><b>${esc(s.k)}</b>: ${s.st.win}% win, avg ${s.st.avg>0?'+':''}${s.st.avg.toFixed(2)}${U} <span class="rr">n=${s.st.n}</span> <span class="rr" style="color:var(--accent)">${op?'▾ hide trades':'▸ trades'}</span>${op?ftTradesHtml(s.arr,s.k):''}</li>`; };
   h+=`<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-bottom:16px">`+
     `<div style="border:1px solid rgba(63,185,80,.45);border-radius:10px;padding:10px 12px"><div style="font-weight:700;margin-bottom:4px">🏆 Working best (after ${hz})</div>${best.length?'<ul style="margin:0;padding-left:18px;font-size:12.5px;line-height:1.6">'+best.map(line).join('')+'</ul>':'<div class="muted" style="font-size:12px">Not enough data yet. Each slice needs 8+ graded alerts.</div>'}</div>`+
     `<div style="border:1px solid rgba(248,81,73,.45);border-radius:10px;padding:10px 12px"><div style="font-weight:700;margin-bottom:4px">⚠️ Working worst (after ${hz})</div>${worst.length?'<ul style="margin:0;padding-left:18px;font-size:12.5px;line-height:1.6">'+worst.map(line).join('')+'</ul>':'<div class="muted" style="font-size:12px">Nothing clearly losing yet (8+ graded alerts needed per slice).</div>'}</div></div>`;
