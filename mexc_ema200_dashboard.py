@@ -7104,7 +7104,7 @@ const HDR_TIPS={
 // ── 🧪 System backtest tab: the live volume-spike system replayed over Binance history (system_backtest.py)
 let SBT=null, _sbtPoll=null;
 let SBTF={rec:'watch',tf:'',setup:'',exit:'new',one:1,sort:'t',dir:-1,open:'',page:0};
-try{ Object.assign(SBTF, JSON.parse(localStorage.getItem('sbtF')||'{}')); }catch(e){}
+try{ Object.assign(SBTF, JSON.parse(localStorage.getItem('sbtF')||'{}')); if(SBTF.exit==='old') SBTF.exit='new'; }catch(e){}
 async function loadSbt(run){
   try{ SBT=await fetch('/sbt'+(run?'/run':''),{cache:'no-store'}).then(r=>r.json()); }catch(e){ SBT={status:'error',error:'could not reach the server'}; }
   renderSbt(); clearTimeout(_sbtPoll);
@@ -7119,7 +7119,7 @@ function sbtRows(skip){
     if(skip!=='tf'&&SBTF.tf&&o.tf!==SBTF.tf) return false;
     if(skip!=='setup'&&SBTF.setup&&o.setup!==SBTF.setup) return false;
     return true; });
-  rows.forEach(o=>{ const old=SBTF.exit==='old'; o.R=old?o.r_old:o.r; o.S=old?o.st_old:o.st; o.CT=old?o.closed_old:o.closed_t;
+  rows.forEach(o=>{ const fd=SBTF.exit==='fade'; o.R=fd?o.r_s:o.r; o.S=fd?o.st_s:o.st; o.CT=fd?o.closed_s:o.closed_t; o.H1=fd?(['be','trail'].includes(o.S)||(o.R!=null&&o.R>0.3)):o.hits>=1;
     o.P=(o.R!=null&&o.sl_pct!=null)?o.R*Math.abs(o.sl_pct):null; });
   if(SBTF.one){ const busy={}; rows=rows.filter(o=>{ if(busy[o.sym]!=null&&o.t<busy[o.sym]) return false; busy[o.sym]=o.S==='open'?Infinity:(o.CT||o.t); return true; }); }
   return rows;
@@ -7130,7 +7130,7 @@ function sbtStat(a){
   const pc=g.map(o=>o.P).filter(x=>x!=null);
   let cum=0,pk=0,dd=0; for(const o of [...g].sort((x,y)=>(x.CT||x.t)-(y.CT||y.t))){ cum+=o.R; pk=Math.max(pk,cum); dd=Math.min(dd,cum-pk); }
   return {n, open:a.length-n, win:100*rs.filter(x=>x>0.001).length/n, avg:sum/n, med:so[n>>1], tot:sum, pf:gl?gp/gl:null, dd,
-    avgP:pc.length?pc.reduce((s,x)=>s+x,0)/pc.length:null, tp1:100*g.filter(o=>o.hits>=1).length/n, sl:100*g.filter(o=>o.S==='sl').length/n, best:so[n-1], worst:so[0]};
+    avgP:pc.length?pc.reduce((s,x)=>s+x,0)/pc.length:null, tp1:100*g.filter(o=>o.H1).length/n, sl:100*g.filter(o=>o.S==='sl').length/n, best:so[n-1], worst:so[0]};
 }
 const SBT_CHIP=on=>`cursor:pointer;padding:4px 10px;border-radius:8px;font-size:12px;color:inherit;font-weight:${on?700:500};border:1px solid ${on?'var(--accent)':'var(--line)'};background:${on?'rgba(63,185,80,.18)':'rgba(21,28,41,.7)'};white-space:nowrap`;
 const sbtF=(x,d=2)=>x==null?'—':(x>0?'+':'')+x.toFixed(d);
@@ -7149,6 +7149,7 @@ const SBT_GROUPS=[
   ['tp1r','TP1 distance','How far TP1 is, in R (stop distance). Under 1R = target closer than the stop.',o=>o.rr1>=2?'2R+':o.rr1>=1?'1–2R':o.rr1>=0.5?'0.5–1R':'<0.5R'],
   ['stop','Stop width','Stop distance from entry.',o=>{ const s=Math.abs(o.sl_pct); return s>=20?'20–25%+':s>=15?'15–20%':s>=10?'10–15%':'<10%'; }],
   ['run','How early (vs 48h low)','How far price already was above its 48-hour low when the alert fired. Tests whether getting in low beats chasing.',o=>o.run48==null?'n/a':o.run48<10?'<10% (early)':o.run48<20?'10–20%':o.run48<40?'20–40%':'40%+ (late)'],
+  ['btc7','BTC over the prior week','BTC % change over the 7 days before the alert: the market regime the trade was taken in.',o=>o.btc7==null?'n/a':o.btc7<=-5?'BTC −5% or worse':o.btc7<0?'BTC −5% to 0':o.btc7<5?'BTC 0 to +5%':'BTC +5% or more'],
   ['week','Week','Week the alert fired (Monday start).',o=>{ const d=new Date(o.t*1000); d.setUTCDate(d.getUTCDate()-((d.getUTCDay()+6)%7)); return d.toISOString().slice(0,10); }],
 ];
 function sbtTrades(a){
@@ -7160,7 +7161,7 @@ function sbtTrades(a){
   return `<div style="overflow-x:auto"><table style="font-size:11.5px"><thead><tr>${th('t','Time','When the spike candle closed (your local time). Entry = price at that close.')}${th('sym','Coin','Binance USDT perp.')}${th('tf','TF','Spike timeframe.')}${th('rec','Call','Scanner call at the time.')}${th('score','Score','Alert score 0–100.')}${th('ratio','Spike','Volume ÷ previous 20-candle average.')}${th('sl','Stop','Stop distance (= 1R).')}${th('tp1','TP1','First target % above entry (first real resistance ≥10% away, front-run).')}${th('st','Status','How the plan ended with the selected exit model.')}${th('r','Result R','Whole-position result in R.')}${th('p','Result %','Same result as % of the position (R × stop %).')}${th('mfe','Best / worst','Highest and lowest price vs entry within the plan\\'s life (max 7 days).')}</tr></thead><tbody>`
    +sl.map(o=>{ const ps=PL_ST[o.S]||[o.S,'var(--dim)'];
      return `<tr><td style="white-space:nowrap">${new Date(o.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td><td><a href="${tvLink(o.sym)}" target="_blank" rel="noopener">${dispSym(o.sym)}</a></td><td>${o.tf}</td><td>${recL[o.rec]||o.rec}</td><td>${o.score}</td><td>${(+o.ratio).toFixed(1)}×</td><td>${o.sl_pct.toFixed(1)}%</td><td>+${o.tp1_pct.toFixed(1)}%</td>`
-      +`<td style="color:${ps[1]};white-space:nowrap" data-tip="${esc('TP1 +'+o.tp1_pct+'%, TP2 +'+o.tp2_pct+'%, TP3 +'+o.tp3_pct+'% · stop '+o.sl_pct+'% · targets hit: '+o.hits+' · old exits: '+(o.st_old)+' '+sbtF(o.r_old)+'R · new exits: '+o.st+' '+sbtF(o.r)+'R')}">${ps[0]}</td>`
+      +`<td style="color:${ps[1]};white-space:nowrap" data-tip="${esc('TP1 +'+o.tp1_pct+'%, TP2 +'+o.tp2_pct+'%, TP3 +'+o.tp3_pct+'% · stop '+o.sl_pct+'% · targets hit: '+o.hits+' · long: '+o.st+' '+sbtF(o.r)+'R · fade (short): '+o.st_s+' '+sbtF(o.r_s)+'R')}">${ps[0]}</td>`
       +`<td style="color:${sbtC(o.R)};font-weight:700">${o.S==='open'?'<span class="muted">open '+sbtF(o.R)+'</span>':sbtF(o.R)+'R'}</td><td style="color:${sbtC(o.P)}">${o.P==null?'—':sbtF(o.P,1)+'%'}</td><td class="rr" style="white-space:nowrap">+${o.mfe}% / ${o.mae}%</td></tr>`; }).join('')
    +`</tbody></table></div>`+(rows.length>per?`<div style="margin:6px 0">${Array.from({length:Math.ceil(rows.length/per)},(_,i)=>`<button style="${SBT_CHIP(i===pg)};margin:2px" onclick="sbtSet('page',${i})">${i+1}</button>`).join('')}</div>`:'');
 }
@@ -7174,18 +7175,18 @@ function renderSbt(){
   const el=document.getElementById('sbtBody'); if(!el) return;
   if(!SBT){ el.innerHTML='<span class="muted">Loading…</span>'; return; }
   const run=SBT.status==='running';
-  const runLine=run?`<div class="muted" style="margin:6px 0">⏳ Backtest running: ${SBT.progress||0}% of coins replayed, ${SBT.partial||0} alerts so far. It takes ~15–25 min (Binance rate limits); this page refreshes itself.</div>`
-    :`<button style="${SBT_CHIP(false)}" onclick="loadSbt(true)" data-tip="Re-run the whole replay with the current live rules. Takes ~15–25 minutes in the background; it also rebuilds itself every 3 days.">🔄 Re-run now</button>`;
+  const runLine=run?`<div class="muted" style="margin:6px 0">⏳ Backtest running: ${SBT.progress||0}% of coins replayed, ${SBT.partial||0} alerts so far. 180 days × ~420 coins takes ~1–2 h (Binance rate limits). It saves progress every 20 coins and resumes if the server restarts; this page refreshes itself.</div>`
+    :`<button style="${SBT_CHIP(false)}" onclick="loadSbt(true)" data-tip="Re-run the whole replay with the current live rules. Takes ~1–2 hours in the background; it also rebuilds itself every 3 days.">🔄 Re-run now</button>`;
   if(!SBT.result){ el.innerHTML=`<h3 style="margin:0 0 6px">🧪 System backtest</h3>${SBT.error?'<div class="warn">'+esc(SBT.error)+'</div>':''}${run?runLine:'<div class="muted">No backtest stored yet. The first one starts ~4 min after the server boots.</div>'+runLine}`; return; }
   const M=SBT.result.meta, rows=sbtRows(), st=sbtStat(rows);
-  const alt=(()=>{ const e=SBTF.exit; SBTF.exit=e==='old'?'new':'old'; const s=sbtStat(sbtRows()); SBTF.exit=e; return s; })();
+  const alt=(()=>{ const e=SBTF.exit; SBTF.exit=e==='fade'?'new':'fade'; const s=sbtStat(sbtRows()); SBTF.exit=e; return s; })();
   const chip=(k,v,lab,tip)=>`<button style="${SBT_CHIP(SBTF[k]===v)}" data-tip="${esc(tip||'')}" onclick="sbtSet('${k}',${JSON.stringify(v).replace(/"/g,"'")})">${lab}</button>`;
   let h=`<h3 style="margin:0 0 4px">🧪 System backtest <span class="muted" style="font-size:12px;font-weight:400">built ${new Date(M.built*1000).toLocaleString()} · ${M.symbols} Binance perps · last ${M.days} days · ${SBT.result.rows.length} alerts</span></h3>`
    +`<div class="muted" style="font-size:12px;margin-bottom:8px;max-width:1100px">Replays the live volume-spike system hour by hour over Binance history with the scanner's <b>own code</b>: the same volume ratios (1h/4h/1D), spot confirmation, OI divergence, funding, BTC regime, scores and Long/Watch/Skip calls, the same wide stops and real-level targets, and the same exit rules. Several timeframes spiking at once = one alert. <b>Gaps vs live:</b> no 15m spikes; plans start from candles, not the Analyze card; exits walked on 1h candles (stop checked first); OI history only ~20 days; only coins listed today (delisted coins missing); no fees or slippage.</div>`
    +`<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:6px"><span class="muted" style="font-size:12px">Call:</span>${chip('rec','go','✅ Long','Only alerts the scanner called Long.')}${chip('rec','watch','✅+👀 Long & Watch','Long and Watch long calls (what the forward test counts).')}${chip('rec','skip','✗ Skip','Only the alerts the scanner said to skip: they should do worse.')}${chip('rec','','All','Every long alert.')}`
    +`<span class="muted" style="font-size:12px;margin-left:10px">TF:</span>${chip('tf','','All')}${chip('tf','1h','1h')}${chip('tf','4h','4h')}${chip('tf','1d','1D')}`
    +`<span class="muted" style="font-size:12px;margin-left:10px">Setup:</span>${chip('setup','','All')}${chip('setup','momentum','Momentum')}${chip('setup','flush','Flush')}</div>`
-   +`<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px"><span class="muted" style="font-size:12px">Exits:</span>${chip('exit','new','½ · ¼ · ¼ (live now)',M.exit_new)}${chip('exit','old','⅓ · ⅓ · ⅓ (before)',M.exit_old)}`
+   +`<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px"><span class="muted" style="font-size:12px">Trade:</span>${chip('exit','new','🟢 Long the spike (live system)',M.exit_new)}${chip('exit','fade','🔴 Fade it (short)',M.fade||'Short the same alert')}`
    +`<span class="muted" style="font-size:12px;margin-left:10px">Positions:</span>${chip('one',1,'One per coin','A new alert on a coin is ignored while the previous trade on that coin is still open (live rule).')}${chip('one',0,'Every alert','Count every alert as its own trade.')}<span style="margin-left:10px">${runLine}</span></div>`;
   if(!st.n){ el.innerHTML=h+'<div class="muted">No graded trades for this filter.</div>'; return; }
   h+=`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px">`
@@ -7198,7 +7199,7 @@ function renderSbt(){
    +sbtCard('Max drawdown',st.dd.toFixed(1)+'R','Worst peak-to-trough drop of the cumulative R curve.','var(--red)')
    +sbtCard('Reached TP1',st.tp1.toFixed(0)+'%','Share of trades that hit TP1 before the stop.')
    +sbtCard('Stopped before TP1',st.sl.toFixed(0)+'%','Share of trades that lost the full −1R.')
-   +`</div><div class="muted" style="font-size:12px" data-tip="Same trades, other exit model.">Same trades with the ${SBTF.exit==='old'?'new ½·¼·¼':'old ⅓·⅓·⅓'} exits: avg ${sbtF(alt.avg)}R, win ${alt.n?alt.win.toFixed(0):'—'}%, total ${sbtF(alt.tot,1)}R.</div>`
+   +`</div><div class="muted" style="font-size:12px" data-tip="The same alerts traded in the opposite direction, for comparison.">Same alerts traded the other way (${SBTF.exit==='fade'?'long':'short / fade'}): avg ${sbtF(alt.avg)}R, win ${alt.n?alt.win.toFixed(0):'—'}%, total ${sbtF(alt.tot,1)}R.</div>`
    +sbtEquity(rows);
   h+=`<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:12px">`;
   for(const [gk,title,tip,fn,skip] of SBT_GROUPS){
