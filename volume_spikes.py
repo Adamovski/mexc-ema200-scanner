@@ -330,12 +330,13 @@ def score_row(r, tf, btc):
         s += min(20, 10 * len(others)); why.append("+ also spiking on " + "/".join(others))
     sp = r["spot"].get(tf)
     if sp is not None:
+        src = "Alpha" if (r.get("spot_src") or {}).get(tf) == "alpha" else "spot"
         if sp >= m["ratio"]:
-            s += 15; why.append(f"+ spot leads ({sp:.1f}×)")
+            s += 15; why.append(f"+ {src} leads ({sp:.1f}×)")
         elif sp >= 2:
-            s += 8; why.append(f"+ spot confirms ({sp:.1f}×)")
+            s += 8; why.append(f"+ {src} confirms ({sp:.1f}×)")
         elif sp < 1.5:
-            s -= 10; why.append(f"− futures-only (spot {sp:.1f}×)")
+            s -= 10; why.append(f"− futures-only ({src} {sp:.1f}×)")
     elif r.get("has_spot") is False:
         why.append("· no Binance spot market")
     if d == "absorb":
@@ -354,6 +355,8 @@ def score_row(r, tf, btc):
             s += 8; why.append(f"+ OI div: {od}")
         elif long and od == "fake pump":
             s -= 12; why.append("− OI div: fake pump (price up, OI down = short covering)")
+        elif long and od == "short squeeze":
+            s += 6; why.append("+ short squeeze: OI falling while spot/Alpha buyers lift price (squeeze fuel)")
         elif not long and od == "shorts piling":
             s += 8; why.append("+ OI div: shorts piling")
         elif not long and od == "exhausting":
@@ -372,6 +375,98 @@ def score_row(r, tf, btc):
         elif (long and rg == "big_up") or (not long and rg == "big_down"):
             s += 5; why.append("+ with BTC")
     return max(0, min(100, round(s))), why
+
+
+ALPHA_MIN_BASE = {"15m": 500, "1h": 2000, "4h": 8000, "1d": 50000}   # min avg Alpha $ volume/candle to trust its ratio
+SQUEEZE_SPOT = 3.0      # OI falling + spot/Alpha volume >= this x normal = short squeeze, not a fake pump
+REPEAT_WINDOW = 24 * 3600   # one alert per coin per day: the FIRST move is the one to catch
+
+
+def _ema(vals, n):
+    if len(vals) < n:
+        return None
+    k = 2 / (n + 1); e = sum(vals[:n]) / n
+    for v in vals[n:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
+def chart_context(price, m15, c1h, c4h, c1d, r=None):
+    """Plain-English read of the chart around a spike, the way a trader would describe it
+    (trend, where price sits in its range, whether the move is early or late, flush / coil /
+    absorption / sweep before it, leverage). Returns {"tags": [...short...], "lines": [...]}."""
+    tags, lines = [], []
+    try:
+        f = lambda x: format(x, ".4g")
+        # trend
+        if c4h and len(c4h) > 60:
+            e50, e200 = _ema([k[4] for k in c4h], 50), _ema([k[4] for k in c4h], 200)
+            if e50:
+                up = price > e50
+                lines.append(f"Trend (4h): price {'above' if up else 'below'} EMA50 ({f(e50)})"
+                             + (f", {'above' if price > e200 else 'below'} EMA200 ({f(e200)})" if e200 else ""))
+                tags.append("4h uptrend" if up and (not e200 or price > e200) else "4h downtrend" if not up and e200 and price < e200 else "4h mixed")
+        # range & how far the move has already gone
+        if m15 and len(m15) > 200:
+            w48 = m15[-192:]
+            lo48, hi48 = min(k[3] for k in w48), max(k[2] for k in w48)
+            pre = m15[-192:-8]                                    # the 2 days BEFORE the last 2 hours
+            plo, phi = min(k[3] for k in pre), max(k[2] for k in pre)
+            width = (phi / plo - 1) * 100
+            run = (price / lo48 - 1) * 100
+            lines.append(f"48h range before this: {f(plo)}–{f(phi)} ({width:.0f}% wide); price is {run:.0f}% above the 48h low")
+            if width <= 15:
+                tags.append("tight coil"); lines.append("Coiling: a tight 2-day range before the spike (energy building)")
+            if price > phi * 1.01:
+                tags.append("range breakout")
+            if run <= 15:
+                tags.append("early"); lines.append("Early: price is still near the bottom of the move")
+            elif run >= 40:
+                tags.append("late"); lines.append(f"Late: already +{run:.0f}% off the 48h low, chasing risk is high")
+            # absorption: big volume on flat candles in the last 3 days (before the last 2h)
+            base = sorted(k[5] for k in m15[-300:-8])
+            med = base[len(base) // 2] if base else 0
+            ab = [k for k in m15[-296:-8] if med and k[5] >= 6 * med and abs(k[4] / k[1] - 1) <= 0.006]
+            if ab:
+                big = max(ab, key=lambda k: k[5])
+                tags.append("absorption")
+                lines.append(f"Absorption: {len(ab)} flat 15m candle(s) on {big[5] / med:.0f}× normal volume in the last 3 days "
+                             "(someone soaking up supply without moving price)")
+            # sweep: wick under the prior range low, then reclaimed
+            for k in m15[-48:-1]:
+                if k[3] < plo * 0.995 and k[4] > plo and med and k[5] >= 3 * med:
+                    tags.append("sweep + reclaim")
+                    lines.append(f"Sweep: wicked to {f(k[3])} under the range low {f(plo)} on {k[5] / med:.0f}× volume and closed back above it (stops taken, then bought)")
+                    break
+        # flush in the last week
+        if c1h and len(c1h) > 170:
+            worst = min((c1h[i][4] / c1h[i - 24][4] - 1) * 100 for i in range(len(c1h) - 168, len(c1h) - 24) if c1h[i - 24][4])
+            if worst <= -15:
+                tags.append("after flush"); lines.append(f"Flush earlier this week: {worst:.0f}% in 24h, then based")
+        # where we are on the daily
+        if c1d and len(c1d) > 30:
+            hi30, lo30 = max(k[2] for k in c1d[-30:]), min(k[3] for k in c1d[-30:])
+            pos = (price - lo30) / ((hi30 - lo30) or 1) * 100
+            lines.append(f"30-day range {f(lo30)}–{f(hi30)}: price at {pos:.0f}% of it" + (" (near the top: resistance overhead)" if pos >= 85 else " (near the bottom)" if pos <= 20 else ""))
+            if price >= hi30 * 0.995:
+                tags.append("30d high")
+        # leverage
+        if r:
+            od, fu = r.get("oi_div"), r.get("funding")
+            if od:
+                lines.append({"short squeeze": "OI falling while spot/Alpha buyers lift price: shorts are being squeezed",
+                              "fake pump": "OI falling with no real spot buying: short covering that often fades",
+                              "real up": "OI rising with price: new longs are backing the move",
+                              "accumulating": "Price flat while OI stacks up: positioning before a move",
+                              "exhausting": "OI and price both falling: longs unwinding"}.get(od, f"OI: {od}"))
+            if fu is not None:
+                lines.append(f"Funding {fu * 100:.3f}%: " + ("longs crowded" if fu > 0.0005 else "shorts paying (squeeze fuel)" if fu < 0 else "neutral"))
+            sp = [v for v in (r.get("spot") or {}).values() if v is not None]
+            if r.get("has_spot") is False and not (r.get("spot_src") or {}):
+                lines.append("No Binance spot market: futures + Alpha only (these move the hardest, both ways)")
+    except Exception as e:
+        lines.append(f"(context unavailable: {e})")
+    return {"tags": tags[:5], "lines": lines[:9]}
 
 
 def oi_divergence(px4, oi4):
@@ -562,7 +657,8 @@ class _Tracker:
 
     def compact(self):
         keep = ("t", "symbol", "tf", "dir", "ratio", "mode", "score", "price", "chg", "spot", "spot_leads",
-                "btc", "out", "mexc", "vs_ema", "n_tf", "rec", "oi_div", "plan", "pstate", "setup", "upside", "low_upside", "min_tp1", "rec_orig")
+                "btc", "out", "mexc", "vs_ema", "n_tf", "rec", "oi_div", "plan", "pstate", "setup", "upside", "low_upside", "min_tp1", "rec_orig",
+                "dup", "repeat", "first", "from_low", "spot_src", "ctx")
         with self.lock:
             return json.loads(json.dumps([{k: a.get(k) for k in keep} for a in self.alerts]))
 
@@ -916,6 +1012,7 @@ class VolumeSpikeScanner:
         self.plan_busy = set()
         self.mcap, self.mcap_t = {}, 0
         self.mcap_extra = None        # fn() -> {TOKEN: mcap} for Binance Alpha tokens (injected by the dashboard)
+        self.alpha_vol = None         # fn(symbol, tf) -> {"ratio", "chg", "base_usd"} Binance Alpha volume (injected)
         self.snap = {"rows": [], "btc": None, "status": "warming up — first pass takes ~3 min after boot",
                      "updated": None, "progress": None, "universe": 0}
 
@@ -1197,6 +1294,15 @@ class VolumeSpikeScanner:
                     r["spot"][tf] = self._spot_ratio(r["symbol"], tf, m)
             if r["symbol"] in self.no_spot:
                 r["has_spot"] = False
+            if self.alpha_vol and r.get("has_spot") is False:          # v83: Alpha-only coin -> Binance Alpha volume = its spot
+                for tf, m in r["tfs"].items():
+                    if m["ratio"] >= SPIKE_RATIO and r["spot"].get(tf) is None:
+                        try:
+                            av = self.alpha_vol(r["symbol"], tf)
+                        except Exception:
+                            av = None
+                        if av and av.get("ratio") is not None and (av.get("base_usd") or 0) >= ALPHA_MIN_BASE.get(tf, 0):
+                            r["spot"][tf] = av["ratio"]; r.setdefault("spot_src", {})[tf] = "alpha"
             m15 = self.m15.get(r["symbol"]) or []
             if len(m15) > 17 and m15[-17][4]:
                 r["px_chg4"] = round((r["price"] / m15[-17][4] - 1) * 100, 2)
@@ -1211,6 +1317,8 @@ class VolumeSpikeScanner:
                 if len(ser) >= 25:
                     r["oi_chg24"] = round((ser[-1][1] / ser[-25][1] - 1) * 100, 2) if ser[-25][1] else None
             r["oi_div"] = oi_divergence(r.get("px_chg4"), r.get("oi_chg4"))
+            if r["oi_div"] == "fake pump" and max([v for v in r["spot"].values() if v is not None] or [0]) >= SQUEEZE_SPOT:
+                r["oi_div"] = "short squeeze"          # v83: shorts covering INTO real spot/Alpha buying (AGT 15 Oct, 11 Nov)
             mc, src = self.mcap_for(r["symbol"], now)
             if mc:
                 r["mcap"] = round(mc); r["mcap_src"] = src
@@ -1227,6 +1335,13 @@ class VolumeSpikeScanner:
             for a in self.tracker.alerts:
                 if a.get("plan") and "low_upside" in a:
                     latest_plan[(a["symbol"], a["tf"])] = a
+        with self.tracker.lock:                           # v83: coins alerted in the last 24h -> later spikes are repeats
+            recent = {}
+            for a in self.tracker.alerts:
+                if a.get("dir") == "long" and now - a["t"] < REPEAT_WINDOW and a.get("rec") in ("long", "watch_long"):
+                    recent[a["symbol"]] = min(recent.get(a["symbol"], a["t"]), a["t"])
+            seen7 = {a["symbol"] for a in self.tracker.alerts if a.get("dir") == "long" and now - a["t"] < 7 * 86400
+                     and a.get("rec") in ("long", "watch_long")}
         with self.tracker.lock:                           # v82: one trade per coin while a plan is open
             in_trade = {a["symbol"] for a in self.tracker.alerts       # a Long/Watch trade still open (or being planned)
                         if a.get("dir") == "long" and not a.get("dup") and a.get("rec") in ("long", "watch_long")
@@ -1256,6 +1371,7 @@ class VolumeSpikeScanner:
                          "ratio": m["ratio"], "mode": m["mode"], "score": sc,
                          "price": r["price"], "chg": m["chg"], "spot": sp,
                          "spot_leads": bool(sp is not None and sp >= m["ratio"]),
+                         "spot_src": (r.get("spot_src") or {}).get(tf, "spot" if sp is not None else None), "oi_div": r.get("oi_div"),
                          "btc": (btc or {}).get("regime"), "why": why, "out": {},
                          "flush_low": m.get("lo") if m.get("setup") == "flush" else None,
                          "mexc": r.get("mexc"), "vs_ema": m.get("vs_ema"), "n_tf": sum(1 for x in r["tfs"].values() if x["ratio"] >= 2)}
@@ -1266,15 +1382,34 @@ class VolumeSpikeScanner:
                 a["tfs_all"] = sorted({x["tf"] for x in cand}, key=lambda t: order.get(t, 0))
                 if len(cand) > 1:
                     a["why"] = (a.get("why") or []) + ["· same move also alerted on " + "/".join(t for t in a["tfs_all"] if t != a["tf"]) + " (one trade)"]
-                if r["symbol"] in in_trade:
-                    a["dup"] = True                        # already holding this coin: logged, not traded again
+                if r["symbol"] in recent:
+                    a["repeat"] = True                     # v83: coin already alerted today -> not a new trade, no ping
+                if r["symbol"] in in_trade or a.get("repeat"):
+                    a["dup"] = True                        # already holding / already alerted: logged, not traded again
                     a["pstate"] = {"status": "dup", "hits": 0}
                     a["plan"] = None
+                else:
+                    a["first"] = r["symbol"] not in seen7  # first alert on this coin in 7 days = the start of a move
+                    m15 = self.m15.get(r["symbol"]) or []
+                    lows = [k[3] for k in m15[-192:]]       # last 48h of 15m candles
+                    if lows and min(lows) > 0:
+                        a["from_low"] = round((r["price"] / min(lows) - 1) * 100, 1)   # how far above the 48h low we are
+                    if a["first"]:
+                        a["why"] = (a.get("why") or []) + ["🆕 first alert on this coin in 7 days"
+                                                           + (f", {a['from_low']}% above its 48h low" if a.get("from_low") is not None else "")]
                 for x in cand:                             # mark the twins as seen so they don't re-fire
                     if x is not a:
                         self.tracker.seen.add(x["key"])
+                if not a.get("dup"):
+                    s_ = r["symbol"]
+                    a["ctx"] = chart_context(r["price"], self.m15.get(s_), self.hist.get((s_, "1h")),
+                                             self.hist.get((s_, "4h")), self.hist.get((s_, "1d")), r)
                 if self.tracker.add(a):
                     new.append(a)
+            if any(m["ratio"] >= SPIKE_RATIO for m in r["tfs"].values()):
+                s_ = r["symbol"]
+                r["ctx"] = chart_context(r["price"], self.m15.get(s_), self.hist.get((s_, "1h")),
+                                         self.hist.get((s_, "4h")), self.hist.get((s_, "1d")), r)
             r["best_tf"], r["best_score"] = (best[0], best[1]) if best else (None, None)
             r["rec"] = recommend(r, best[0], btc) if best else None
             lp = latest_plan.get((r["symbol"], best[0])) if best else None
@@ -1298,7 +1433,7 @@ class VolumeSpikeScanner:
             with self.tracker.lock:
                 self.tracker._save()
         if self.notify and TELEGRAM_ON:
-            for a in sorted(new, key=lambda x: -x["score"])[:10]:
+            for a in sorted([x for x in new if not x.get("dup")], key=lambda x: (-bool(x.get("first")), -x["score"]))[:10]:
                 try:
                     self.notify(_tg_text(a, btc))
                 except Exception:
@@ -1347,7 +1482,9 @@ def _tg_text(a, btc):
     arrow = {"long": "🟢 LONG", "short": "🔴 SHORT", "absorb": "⚪ ABSORPTION"}[a["dir"]]
     sp = f" · spot {a['spot']:.1f}×" if a.get("spot") is not None else ""
     b = f"\nBTC {btc['today']:+.1f}% today (usual ±{btc['usual']:.1f}%)" if btc else ""
-    return (f"🔊 <b>VOLUME SPIKE — {a['symbol'][:-4]}</b> [{a['tf']}]\n"
+    sp = sp.replace("spot", "Alpha") if a.get("spot_src") == "alpha" else sp
+    first = "🆕 FIRST MOVE · " if a.get("first") else ""
+    return (f"🔊 <b>{first}VOLUME SPIKE — {a['symbol'][:-4]}</b> [{a['tf']}]\n"
             f"vol {a['ratio']:.1f}×{' (live)' if a['mode'] == 'live' else ''}{sp} · price {a['chg']:+.2f}%\n"
             f"{arrow} · score {a['score']}/100 · {a['price']:.6g}{b}\n" + "\n".join(a["why"][1:6]))
 
@@ -1355,13 +1492,14 @@ def _tg_text(a, btc):
 VSPIKE = VolumeSpikeScanner()
 
 
-def start(notify=None, planner=None, mcap_extra=None):
+def start(notify=None, planner=None, mcap_extra=None, alpha_vol=None):
     """Call once from main(). `notify(text)` = optional Telegram sender.
     `planner(symbol, tf)` = the dashboard's analyze_symbol, used for alert stop/targets.
     `mcap_extra()` = {TOKEN: mcap} for Binance Alpha tokens (OI as % of market cap)."""
     VSPIKE.notify = notify
     VSPIKE.planner = planner
     VSPIKE.mcap_extra = mcap_extra
+    VSPIKE.alpha_vol = alpha_vol
     for _ in range(2):
         threading.Thread(target=VSPIKE.plan_worker, daemon=True, name="vspike-plan").start()
     threading.Thread(target=VSPIKE.loop, daemon=True, name="vspike").start()
