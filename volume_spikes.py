@@ -64,7 +64,7 @@ HIST_CANDLES = 260          # 1h/4h/1d: EMA200 + baseline (weight 2 per call)
 M15_CANDLES = 400           # 15m: EMA200 + covers the forming 1D candle (weight 2)
 LIVE_MIN_FRAC = 0.20
 HORIZONS = [("1h", 3600), ("4h", 14400), ("24h", 86400)]
-DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "volume_spikes_alerts_v79.json")
+DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "volume_spikes_alerts_v82.json")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -434,7 +434,7 @@ def recommend(r, tf, btc):
 # ─────────────────────────────────────────────────────────────────────────────
 # Alert log + forward test
 # ─────────────────────────────────────────────────────────────────────────────
-REDIS_KEY = "vspike_alerts_v79"      # v79: fresh log - wide stops, BE at TP1, trailed runner
+REDIS_KEY = "vspike_alerts_v82"      # v82: fresh log - 50/25/25 scale-out, lock half TP1, stop >= TP1 after TP2
 
 
 def _redis():
@@ -813,6 +813,8 @@ def finish_plan(plan, entry, atr=None, min_tp1_pct=10.0, c1h=None, c4h=None, c1d
     plan["tps"], plan["basis"] = tps, basis
     plan["adj"] = notes
     plan["v"] = PLAN_VER
+    plan["exit_v"] = EXIT_CFG["v"]
+    plan["scale"] = list(EXIT_CFG["scale"])
     plan["rr"] = [round((t - entry) / risk, 2) for t in plan["tps"]]
     plan["sl_pct"] = round((plan["sl"] / entry - 1) * 100, 2)
     plan["tp_pct"] = [round((t / entry - 1) * 100, 2) for t in plan["tps"]]
@@ -820,24 +822,41 @@ def finish_plan(plan, entry, atr=None, min_tp1_pct=10.0, c1h=None, c4h=None, c1d
     return plan
 
 
-def step_plan(a, candles, px, now):
-    """Advance one alert's plan through new 15m candles (v78 management, from the backtest):
-    ⅓ off at TP1, ⅓ at TP2, the last ⅓ is a RUNNER (TP3 is only its reference target).
-    Stop: original until TP1 → break-even after TP1 (v79) → after TP2 the runner also trails
-    3×ATR(4h) under the highest high. Stop is checked first inside a candle (conservative)."""
+EXIT_CFG = {"v": 2, "scale": (0.5, 0.25, 0.25), "tp1_after_tp2": True, "lock": True}   # v82 (backtest: see /sbt)
+EXIT_OLD = {"v": 1, "scale": (1 / 3, 1 / 3, 1 / 3), "tp1_after_tp2": False, "lock": False}
+
+
+def exit_cfg(pl):
+    """Exit model a plan was created with (old plans keep the ⅓-⅓-⅓ rules they were opened under)."""
+    return EXIT_CFG if (pl or {}).get("exit_v", 1) >= 2 else EXIT_OLD
+
+
+def step_plan(a, candles, px, now, cfg=None, bar=900):
+    """Advance one alert's plan through new candles (v82 management, from the system backtest):
+    HALF off at TP1, ¼ at TP2, the last ¼ is a RUNNER (TP3 is only its reference target).
+    Stop: original until TP1 → break-even after TP1 → once price has run 1.5× the TP1 distance,
+    lock in half of TP1 → after TP2 the stop is at least TP1 and the runner trails 3×ATR(4h)
+    under the highest high. Stop is checked first inside a candle (conservative).
+    `cfg` overrides the exit model (backtest), `bar` = candle length in seconds."""
     pl, st = a.get("plan"), a.get("pstate")
     if not pl or not st or st["status"] in ("sl", "be", "trail", "expired", "invalid"):
         return False
+    cfg = cfg or exit_cfg(pl)
+    sc = cfg["scale"]
     entry, risk = a["price"], a["price"] - pl["sl"]
     if risk <= 0:
         return False
     changed = False
     stop = st.get("stop", pl["sl"]); hh = st.get("hh", entry)
     ta = pl.get("trail_atr")
-    start = (int(a["t"]) // 900) * 900 + 900          # first candle fully after the alert
+    tp1 = pl["tps"][0]
+    start = (int(a["t"]) // bar) * bar + bar          # first candle fully after the alert
 
     def banked(h):
-        return sum(pl["rr"][:min(h, 2)]) / 3
+        return sum(pl["rr"][i] * sc[i] for i in range(min(h, 2)))
+
+    def left(h):
+        return 1 - sum(sc[:min(h, 2)])
 
     for k in candles:
         if k[0] < start or k[0] < st.get("checked", 0):
@@ -846,8 +865,7 @@ def step_plan(a, candles, px, now):
         st["mfe"] = round(max(st.get("mfe", 0), (hi / entry - 1) * 100), 2)
         st["mae"] = round(min(st.get("mae", 0), (lo / entry - 1) * 100), 2)
         if lo <= stop:
-            left = 1 - min(st["hits"], 2) / 3
-            st["r"] = round(banked(st["hits"]) + left * (stop - entry) / risk, 2)
+            st["r"] = round(banked(st["hits"]) + left(st["hits"]) * (stop - entry) / risk, 2)
             st["status"] = "sl" if st["hits"] == 0 else ("be" if abs(stop - entry) <= entry * 1e-9 else "trail")
             st["exit_px"] = stop
             st["closed_t"] = k[0]; changed = True
@@ -855,21 +873,24 @@ def step_plan(a, candles, px, now):
         while st["hits"] < 3 and hi >= pl["tps"][st["hits"]]:
             st["hits"] += 1; st["status"] = f"tp{st['hits']}"; changed = True
             st.setdefault("hit_t", []).append(k[0])
-        if k[0] + 900 <= now:                              # ratchet only on CLOSED candles
+        if k[0] + bar <= now:                              # ratchet only on CLOSED candles
             hh = max(hh, hi)
             if st["hits"] >= 1:
-                stop = max(stop, entry)                    # break-even once TP1 is banked (v79)
+                stop = max(stop, entry)                    # break-even once TP1 is banked
+                if cfg.get("lock") and hh >= entry + 1.5 * (tp1 - entry):
+                    stop = max(stop, entry + 0.5 * (tp1 - entry))   # lock half of TP1 once it ran 1.5× further
             if st["hits"] >= 2:
+                if cfg.get("tp1_after_tp2"):
+                    stop = max(stop, tp1)                  # TP2 banked: never give back below TP1
                 if ta:
                     stop = max(stop, hh - TRAIL_ATR * ta)
             st["stop"] = stop; st["hh"] = hh
-            st["checked"] = k[0] + 900                    # only skip fully closed candles next time
+            st["checked"] = k[0] + bar                    # only skip fully closed candles next time
     if px:
         st["last_px"] = px
         st["now_pct"] = round((px / entry - 1) * 100, 2)
         if st["status"] not in ("sl", "be", "trail", "expired"):
-            left = 1 - min(st["hits"], 2) / 3
-            st["open_r"] = round(banked(st["hits"]) + left * (px - entry) / risk, 2)
+            st["open_r"] = round(banked(st["hits"]) + left(st["hits"]) * (px - entry) / risk, 2)
             if now - a["t"] > PLAN_EXPIRY:
                 st["r"] = st["open_r"]; st["status"] = "expired"; st["closed_t"] = now; changed = True
     return changed
@@ -1206,8 +1227,14 @@ class VolumeSpikeScanner:
             for a in self.tracker.alerts:
                 if a.get("plan") and "low_upside" in a:
                     latest_plan[(a["symbol"], a["tf"])] = a
+        with self.tracker.lock:                           # v82: one trade per coin while a plan is open
+            in_trade = {a["symbol"] for a in self.tracker.alerts       # a Long/Watch trade still open (or being planned)
+                        if a.get("dir") == "long" and not a.get("dup") and a.get("rec") in ("long", "watch_long")
+                        and now - a["t"] < PLAN_EXPIRY + 3600
+                        and (a.get("pstate") or {}).get("status", "open") not in ("sl", "be", "trail", "expired", "invalid")}
         for r in rows:
             best = None
+            cand = []
             for tf, m in r["tfs"].items():
                 if m["ratio"] < SPIKE_RATIO:
                     continue
@@ -1232,8 +1259,22 @@ class VolumeSpikeScanner:
                          "btc": (btc or {}).get("regime"), "why": why, "out": {},
                          "flush_low": m.get("lo") if m.get("setup") == "flush" else None,
                          "mexc": r.get("mexc"), "vs_ema": m.get("vs_ema"), "n_tf": sum(1 for x in r["tfs"].values() if x["ratio"] >= 2)}
-                    if self.tracker.add(a):
-                        new.append(a)
+                    cand.append(a)
+            if cand:                                       # v82: several TFs at once = ONE alert, ONE trade
+                order = {t: i for i, t in enumerate(TF_ORDER)}
+                a = max(cand, key=lambda x: (x["score"], order.get(x["tf"], 0)))
+                a["tfs_all"] = sorted({x["tf"] for x in cand}, key=lambda t: order.get(t, 0))
+                if len(cand) > 1:
+                    a["why"] = (a.get("why") or []) + ["· same move also alerted on " + "/".join(t for t in a["tfs_all"] if t != a["tf"]) + " (one trade)"]
+                if r["symbol"] in in_trade:
+                    a["dup"] = True                        # already holding this coin: logged, not traded again
+                    a["pstate"] = {"status": "dup", "hits": 0}
+                    a["plan"] = None
+                for x in cand:                             # mark the twins as seen so they don't re-fire
+                    if x is not a:
+                        self.tracker.seen.add(x["key"])
+                if self.tracker.add(a):
+                    new.append(a)
             r["best_tf"], r["best_score"] = (best[0], best[1]) if best else (None, None)
             r["rec"] = recommend(r, best[0], btc) if best else None
             lp = latest_plan.get((r["symbol"], best[0])) if best else None
