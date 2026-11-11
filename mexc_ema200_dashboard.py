@@ -3151,6 +3151,7 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabWatch2" onclick="showTab('watch2')">🅰️ Binance Alpha</div>
   <div class="tab" id="tabSpikes" onclick="showTab('spikes')">🔊 Volume spikes</div>
   <div class="tab" id="tabCalls" onclick="showTab('calls')">📌 My calls</div>
+  <div class="tab" id="tabOib" onclick="showTab('oib')" data-tip="Pre-pump watch: open interest rising hard while price has barely moved.">🧲 OI build-up</div>
   <div class="tab" id="tabSbt" onclick="showTab('sbt')" data-tip="The whole volume-spike system replayed over ~50 days of Binance history: same scores, calls, stops, targets and exits as live.">🧪 System backtest</div>
   <div class="tab" id="tabCallsHC" onclick="showTab('callshc')" data-tip="Your ⭐ high-conviction calls only, with their own scorecard. Choose ⭐ High conviction next to any Track button on the Analyze tab.">⭐ High conviction</div>
 </div>
@@ -3264,6 +3265,7 @@ Hover any cell to see what it means for that coin. Click ⚲ for the full Analyz
 </div>
 </div>
 
+<div class="view" id="viewOib"><div class="wrap" id="oibBody" style="padding-top:12px"><span class="muted">Loading…</span></div></div>
 <div class="view" id="viewSbt"><div class="wrap" id="sbtBody" style="padding-top:12px"><span class="muted">Loading…</span></div></div>
 
 <div class="view" id="viewCalls">
@@ -3762,7 +3764,7 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["dtb","Dtb"],["accum","Accum"],["capit","Capit"],["micro","Micro"],["signals","Signals"],["watch2","Watch2"],["spikes","Spikes"],["watch3","Watch3"],["coil","Coil"],["scalp","Scalp"],["spot","Spot"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["sbt","Sbt"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["dtb","Dtb"],["accum","Accum"],["capit","Capit"],["micro","Micro"],["signals","Signals"],["watch2","Watch2"],["spikes","Spikes"],["watch3","Watch3"],["coil","Coil"],["scalp","Scalp"],["spot","Spot"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["sbt","Sbt"],["oib","Oib"],["analyze","Analyze"],["info","Info"]]){
     const _tb=document.getElementById("tab"+v), _vw=document.getElementById("view"+v);
     if(!_tb||!_vw) continue;
     _tb.classList.toggle("active", t===which);
@@ -3781,6 +3783,7 @@ function showTab(which){
   if(which==="backtest") loadBacktest();
   if(which==="calls") renderCalls();
   if(which==="sbt") loadSbt();
+  if(which==="oib") loadOib();
   uiSave({tab:which});
   { const hb=document.getElementById('tabCallsHC'); if(hb) hb.classList.toggle('active', which==='callshc'); }
   if(which==="callshc"){ const vc=document.getElementById('viewCalls'); if(vc) vc.classList.add('active'); renderCalls(); }
@@ -7101,6 +7104,38 @@ const HDR_TIPS={
   contraction:"Volatility contraction: recent ATR ÷ its prior average. Well under 1 = a tight coil, close to expanding.",
   support:"The support the coin is coiling on (daily/weekly swing low or base low) — identified from swing-low pivots."
 };
+// ── 🧲 OI build-up tab: open interest piling in while price hasn't moved (oi_build.py)
+let OIB=null, OIBS={k:'strength',d:-1,flagOnly:1}; let _oibT=null;
+try{ Object.assign(OIBS, JSON.parse(localStorage.getItem('oibS')||'{}')); }catch(e){}
+async function loadOib(){ try{ OIB=await fetch('/oib',{cache:'no-store'}).then(r=>r.json()); }catch(e){ OIB={status:'error: could not reach the server',rows:[],log:[]}; }
+  renderOib(); clearTimeout(_oibT); if(activeTab==='oib') _oibT=setTimeout(loadOib,60000); }
+function oibSet(k,v){ OIBS[k]=v; try{ localStorage.setItem('oibS',JSON.stringify(OIBS)); }catch(e){} renderOib(); }
+const oibP=(x,d=1)=>x==null?'—':(x>0?'+':'')+(+x).toFixed(d)+'%';
+const oibU=x=>x==null?'—':x>=1e9?'$'+(x/1e9).toFixed(2)+'B':x>=1e6?'$'+(x/1e6).toFixed(1)+'M':'$'+(x/1e3).toFixed(0)+'K';
+const oibC=x=>x==null?'var(--dim)':x>0?'var(--accent)':x<0?'var(--red)':'var(--dim)';
+function renderOib(){
+  const el=document.getElementById('oibBody'); if(!el) return;
+  if(!OIB){ el.innerHTML='<span class="muted">Loading…</span>'; return; }
+  const R=OIB.rules||{}, upd=OIB.updated?new Date(OIB.updated*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}):'—';
+  let rows=(OIB.rows||[]).filter(r=>!OIBS.flagOnly||r.flag);
+  const k=OIBS.k; rows=[...rows].sort((a,b)=>{ const p=a[k]??-1e9, q=b[k]??-1e9; return (p>q?1:p<q?-1:0)*OIBS.d; });
+  const th=(key,lab,tip)=>`<th style="cursor:pointer;white-space:nowrap" data-tip="${esc(tip+' Click to sort.')}" onclick="oibSet('d',OIBS.k==='${key}'?-OIBS.d:-1);oibSet('k','${key}')">${lab}${OIBS.k===key?(OIBS.d>0?' ▲':' ▼'):''}</th>`;
+  const chip=(on,lab,js,tip)=>`<button data-tip="${esc(tip)}" onclick="${js}" style="cursor:pointer;padding:4px 10px;border-radius:8px;font-size:12px;color:inherit;font-weight:${on?700:500};border:1px solid ${on?'var(--accent)':'var(--line)'};background:${on?'rgba(63,185,80,.18)':'rgba(21,28,41,.7)'}">${lab}</button>`;
+  let h=`<h3 style="margin:0 0 4px">🧲 OI build-up <span class="muted" style="font-size:12px;font-weight:400">pre-pump watch · ${OIB.n||0} Binance perps scanned · updated ${upd} · every 15 min</span></h3>`
+   +`<div class="muted" style="font-size:12px;max-width:1100px;margin-bottom:8px">Open interest = the total size of open futures positions. When it jumps while price barely moves, traders are loading up <b>before</b> a move (AGT on 11 Nov: OI +323% in 24h, price flat). <b>🧲 Flag</b> = OI up ≥${R.oi_min_24h}% in 24h while price moved ≤${R.px_max_24h}% either way, OI ≥ ${oibU(R.oi_min_usd)}. <b>Funding</b> tells you who is piling in: negative = shorts paying (squeeze fuel, bullish), high positive = longs crowded (can dump instead). <b>Tested on the last ~3 weeks of Binance data (60 flags):</b> 22% ran +20% and 15% dropped −20% within 3 days, vs 6% and 4% for random coins, so a big move usually follows, but the direction was a coin flip (median −4% after 3 days in a falling market; negative funding did not make it bullish). Use it as a watchlist and wait for price to break out of the range; the log below tracks what each live flag does next.</div>`
+   +`<div style="display:flex;gap:6px;margin-bottom:8px">${chip(OIBS.flagOnly,'🧲 Flagged only',"oibSet('flagOnly',1)",'Only coins that meet the OI-up / price-flat rule.')}${chip(!OIBS.flagOnly,'All OI risers (≥15%)',"oibSet('flagOnly',0)",'Every coin with OI up at least 15% in 24h, flagged or not.')}</div>`;
+  if(!rows.length) h+=`<div class="muted">${OIB.status==='starting'?'First scan runs ~2 min after the server starts.':'Nothing matches right now.'}</div>`;
+  else h+=`<div style="overflow-x:auto"><table style="font-size:12px"><thead><tr><th data-tip="Binance USDT perp.">Coin</th>${th('oi24','OI 24h','Change in open interest (USD) over the last 24 hours.')}${th('oi4','OI 4h','Change in open interest over the last 4 hours: is it still building?')}${th('px24','Price 24h','Price change over 24 hours. Small = the move has not happened yet.')}${th('px4','Price 4h','Price change over 4 hours.')}${th('range24','24h range','High vs low of the last 24 hours. Tight range + OI building = coiled spring.')}${th('strength','Strength','OI change ÷ price change (min 2): how much positioning per % of price movement. Higher = more pressure building.')}${th('oi_usd','OI $','Open interest in USD now.')}${th('oi_mcap','OI % mcap','Open interest as % of market cap: above ~30% the futures market is big vs the coin itself (violent moves either way).')}${th('funding','Funding','Funding rate now. Negative = shorts paying longs (shorts crowded: squeeze fuel). Above +0.05% = longs crowded.')}${th('turnover24','Volume 24h','Futures turnover in the last 24h.')}</tr></thead><tbody>`
+   +rows.map(r=>{ const f=r.funding; const fc=f==null?'var(--dim)':f<0?'var(--accent)':f>0.0005?'var(--red)':'var(--dim)';
+      return `<tr><td class="sym"><div class="symbox">${r.flag?'🧲 ':''}${esc(r.symbol.replace(/USDT$/,''))}${analyzeBtn(r.symbol)}${alphaTag(r.symbol)}${r.new?' <span class="rr" style="color:var(--accent)">new</span>':''}</div></td>`
+       +`<td style="color:var(--accent);font-weight:700">${oibP(r.oi24,0)}</td><td style="color:${oibC(r.oi4)}">${oibP(r.oi4,0)}</td><td style="color:${oibC(r.px24)}">${oibP(r.px24)}</td><td style="color:${oibC(r.px4)}">${oibP(r.px4)}</td><td>${r.range24==null?'—':r.range24.toFixed(1)+'%'}</td><td style="font-weight:700">${r.strength??'—'}</td><td>${oibU(r.oi_usd)}</td><td style="color:${r.oi_mcap>=30?'var(--red)':r.oi_mcap>=15?'#d29922':'inherit'}">${r.oi_mcap==null?'—':r.oi_mcap+'%'}</td><td style="color:${fc}">${f==null?'—':(f*100).toFixed(3)+'%'}</td><td>${oibU(r.turnover24)}</td></tr>`; }).join('')+`</tbody></table></div>`;
+  const L=OIB.log||[];
+  const g=L.filter(e=>e.h24!=null), med=a=>{ const s=[...a].sort((x,y)=>x-y); return s.length?s[s.length>>1]:null; };
+  h+=`<h3 style="margin:18px 0 4px;font-size:14px">📒 Flag log: did it pump? <span class="muted" style="font-size:12px;font-weight:400">${L.length} flags · ${g.length} with 24h result${g.length?` · median after 24h ${oibP(med(g.map(e=>e.h24)))} · went +20% at some point: ${Math.round(100*L.filter(e=>(e.best||0)>=20).length/Math.max(1,L.length))}% · fell −20%: ${Math.round(100*L.filter(e=>(e.worst||0)<=-20).length/Math.max(1,L.length))}%`:''}</span></h3>`
+   +(L.length?`<div style="overflow-x:auto"><table style="font-size:12px"><thead><tr><th data-tip="When the coin was first flagged (once per coin per 24h).">Flagged</th><th>Coin</th><th data-tip="Price when flagged.">Price</th><th data-tip="OI change over 24h at the flag.">OI 24h</th><th data-tip="Price change over 24h at the flag.">Px 24h</th><th data-tip="Funding at the flag.">Funding</th><th data-tip="Best and worst move from the flag price since (tracked 7 days).">Best / worst</th><th data-tip="Price change 4h after the flag.">+4h</th><th data-tip="Price change 24h after the flag.">+24h</th><th data-tip="Price change 72h after the flag.">+72h</th><th data-tip="Change from the flag price now.">Now</th></tr></thead><tbody>`
+     +L.map(e=>`<tr><td style="white-space:nowrap">${new Date(e.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td><td><a href="${tvLink(e.sym)}" target="_blank" rel="noopener">${dispSym(e.sym)}</a></td><td>${(+e.price).toPrecision(5)}</td><td style="color:var(--accent)">${oibP(e.oi24,0)}</td><td>${oibP(e.px24)}</td><td>${e.funding==null?'—':(e.funding*100).toFixed(3)+'%'}</td><td class="rr" style="white-space:nowrap"><span style="color:var(--accent)">${oibP(e.best)}</span> / <span style="color:var(--red)">${oibP(e.worst)}</span></td><td style="color:${oibC(e.h4)}">${oibP(e.h4)}</td><td style="color:${oibC(e.h24)}">${oibP(e.h24)}</td><td style="color:${oibC(e.h72)}">${oibP(e.h72)}</td><td style="color:${oibC(e.now)}">${oibP(e.now)}</td></tr>`).join('')+`</tbody></table></div>`:'<div class="muted">No flags logged yet. Each new 🧲 flag is recorded here with what price did next.</div>');
+  el.innerHTML=h;
+}
 // ── 🧪 System backtest tab: the live volume-spike system replayed over Binance history (system_backtest.py)
 let SBT=null, _sbtPoll=null;
 let SBTF={side:'long',rec:'watch',tf:'',setup:'',exit:'new',one:1,sort:'t',dir:-1,open:'',page:0};
@@ -7506,6 +7541,13 @@ def make_handler(state: State):
                 except Exception as e:
                     body = json.dumps({"rows": None, "status": f"volume-spike scanner unavailable: {e}"}).encode()
                 self._send(200, body, "application/json")
+            elif self.path.startswith("/oib"):
+                try:
+                    import oi_build
+                    body = json.dumps(oi_build.payload(), default=str).encode()
+                except Exception as e:
+                    body = json.dumps({"status": f"error: {e}", "rows": [], "log": []}).encode()
+                self._send(200, body, "application/json")
             elif self.path.startswith("/sbt"):
                 try:
                     import system_backtest
@@ -7660,6 +7702,9 @@ def main() -> None:
             try:
                 import system_backtest
                 system_backtest.start()
+                import oi_build
+                oi_build.start()
+                print("  OI build-up scanner: ON (every 15 min)")
                 print("  System backtest: ON (rebuilds every 3 days)")
             except Exception as e:
                 print(f"  System backtest failed to start: {e}")
