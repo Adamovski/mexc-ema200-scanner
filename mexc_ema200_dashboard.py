@@ -6682,6 +6682,21 @@ async function loadFtHist(force){
 }
 function ftSet(k,v){ FTF[k]=v; if(k==='rec'){ try{ localStorage.setItem('ftRec',v); }catch(e){} } renderFt(); }
 function ftChip(k,v,label,extra){ const on=FTF[k]===v; return `<span onclick="ftSet('${k}',${typeof v==='string'?`'${v}'`:v})" style="cursor:pointer;padding:4px 10px;border-radius:8px;font-size:12px;font-weight:${on?700:500};border:1px solid ${on?'var(--accent)':'var(--line)'};background:${on?'rgba(63,185,80,.18)':'rgba(21,28,41,.7)'};white-space:nowrap">${label}${extra?' <span class="rr">'+extra+'</span>':''}</span>`; }
+// Click a 'Working best / worst' line to open the trades behind it (kept open across refreshes).
+const ftOpenK=new Set();
+function ftToggleSl(i,ev){ if(ev&&ev.target&&ev.target.closest&&ev.target.closest('a,table')) return; const k=(window.__ftKeys||[])[i]; if(k==null) return; ftOpenK.has(k)?ftOpenK.delete(k):ftOpenK.add(k); renderFt(); }
+function ftTradesHtml(arr){ const U=ftU();
+  const rows=arr.slice().sort((x,y)=>((ftVal(y)!=null)-(ftVal(x)!=null))||(y.t-x.t));
+  const recL={long:'✅ Long',watch_long:'👀 Watch',skip:'✗ Skip'};
+  return `<div style="overflow-x:auto;margin:6px 0 10px;cursor:default" onclick="event.stopPropagation()"><table style="font-size:11.5px"><thead><tr><th>Time</th><th>Coin</th><th>TF</th><th>Spike</th><th>Rec</th><th>Entry</th><th>Stop</th><th>TP1</th><th>Status</th><th>Result</th><th data-tip="Best and worst move vs entry while the plan was open (MFE / MAE).">Best / worst</th></tr></thead><tbody>`+
+    rows.map(a=>{ const v=ftVal(a), st=a.pstate||{}, ps=PL_ST[st.status]||['—','var(--dim)'], pl=a.plan||{};
+      const pc=(v!=null&&FTF.h==='R'&&pl.sl_pct!=null)?v*Math.abs(pl.sl_pct):null;
+      const res=v==null?'<span class="muted">pending</span>':`<b style="color:${v>0?'var(--accent)':v<0?'var(--red)':'var(--dim)'}">${v>0?'+':''}${v.toFixed(2)}${U}</b>${pc!=null?` <span class="rr">(${pc>=0?'+':''}${pc.toFixed(1)}%)</span>`:''}`;
+      return `<tr><td style="white-space:nowrap">${new Date(a.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td>`
+        +`<td><a href="${tvLink(a.symbol)}" target="_blank" rel="noopener">${dispSym(a.symbol)}</a></td><td>${a.tf||'—'}</td><td>${a.ratio!=null?(+a.ratio).toFixed(1)+'×':'—'}</td><td>${recL[a.rec]||a.rec||'—'}</td>`
+        +`<td>${fmtNum(a.price)}</td><td>${pl.sl_pct!=null?pl.sl_pct.toFixed(1)+'%':'—'}</td><td>${pl.tp_pct&&pl.tp_pct[0]!=null?'+'+pl.tp_pct[0].toFixed(1)+'%':'—'}</td>`
+        +`<td style="color:${ps[1]};white-space:nowrap">${ps[0]}</td><td style="white-space:nowrap">${res}</td><td class="rr" style="white-space:nowrap">${st.mfe!=null?'+'+st.mfe+'% / '+st.mae+'%':'—'}</td></tr>`; }).join('')
+    +`</tbody></table></div>`; }
 function ftVal(a){ if(FTF.h==='R'){ const st=a.pstate; if(a.plan&&(a.plan.late||!a.plan.adj)) return null; return (st&&plClosed(st)&&typeof st.r==='number')?st.r:null; } const v=a.out&&a.out[FTF.h]; return (typeof v==='number')?v:null; }
 const ftU=()=>FTF.h==='R'?'R':'%';
 function ftStat(arr){ const v=arr.map(ftVal).filter(x=>x!=null); if(!v.length) return {n:0,pend:arr.length};
@@ -6761,12 +6776,14 @@ function renderFt(){
     oi:a=>a.oi_div?'OI '+a.oi_div:null, up:a=>a.low_upside==null?null:a.low_upside?'low upside':'enough upside', setup:a=>a.setup==='flush'?'flush':'momentum', ema:a=>a.vs_ema==null?null:a.vs_ema>0?'above EMA200':'below EMA200', multi:a=>a.n_tf>=2?'2+ TFs spiking':'1 TF only', mode:a=>a.mode==='live'?'live (mid-candle)':'closed candle'};
   const keys=Object.keys(dims);
   const addSlices=(ks)=>{ const m={}; all.forEach(a=>{ const parts=ks.map(k=>dims[k](a)); if(parts.some(p=>p==null)) return; const key=parts.join(' · '); (m[key]=m[key]||[]).push(a); });
-    Object.entries(m).forEach(([k,arr])=>{ const st=ftStat(arr); if(st.n>=8) slices.push({k,st}); }); };
+    Object.entries(m).forEach(([k,arr])=>{ const st=ftStat(arr); if(st.n>=8) slices.push({k,st,arr}); }); };
   keys.forEach(k=>addSlices([k])); for(let i=0;i<keys.length;i++) for(let j=i+1;j<keys.length;j++) addSlices([keys[i],keys[j]]);
   const score=s=>s.st.avg*Math.sqrt(s.st.n);
   slices.sort((a,b)=>score(b)-score(a));
   const best=slices.filter(s=>s.st.avg>0).slice(0,3), worst=[...slices].reverse().filter(s=>s.st.avg<0).slice(0,3);
-  const line=s=>`<li><b>${esc(s.k)}</b>: ${s.st.win}% win, avg ${s.st.avg>0?'+':''}${s.st.avg.toFixed(2)}${U} <span class="rr">n=${s.st.n}</span></li>`;
+  window.__ftKeys=[]; window.__ftArr={};
+  const line=s=>{ const i=window.__ftKeys.push(s.k)-1; window.__ftArr[s.k]=s.arr; const op=ftOpenK.has(s.k);
+    return `<li style="cursor:pointer" onclick="ftToggleSl(${i},event)" data-tip="Click to ${op?'hide':'see'} the ${s.arr.length} trades behind this line"><b>${esc(s.k)}</b>: ${s.st.win}% win, avg ${s.st.avg>0?'+':''}${s.st.avg.toFixed(2)}${U} <span class="rr">n=${s.st.n}</span> <span class="rr" style="color:var(--accent)">${op?'▾ hide trades':'▸ trades'}</span>${op?ftTradesHtml(s.arr):''}</li>`; };
   h+=`<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-bottom:16px">`+
     `<div style="border:1px solid rgba(63,185,80,.45);border-radius:10px;padding:10px 12px"><div style="font-weight:700;margin-bottom:4px">🏆 Working best (after ${hz})</div>${best.length?'<ul style="margin:0;padding-left:18px;font-size:12.5px;line-height:1.6">'+best.map(line).join('')+'</ul>':'<div class="muted" style="font-size:12px">Not enough data yet. Each slice needs 8+ graded alerts.</div>'}</div>`+
     `<div style="border:1px solid rgba(248,81,73,.45);border-radius:10px;padding:10px 12px"><div style="font-weight:700;margin-bottom:4px">⚠️ Working worst (after ${hz})</div>${worst.length?'<ul style="margin:0;padding-left:18px;font-size:12.5px;line-height:1.6">'+worst.map(line).join('')+'</ul>':'<div class="muted" style="font-size:12px">Nothing clearly losing yet (8+ graded alerts needed per slice).</div>'}</div></div>`;
