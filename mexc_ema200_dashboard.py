@@ -7140,7 +7140,31 @@ function renderOib(){
   el.innerHTML=h;
 }
 // ── 🚨 Pump radar tab: coins up 60%+ in 24h on real volume, and what happened after each flag (pump_radar.py)
-let PRAD=null, PRADS={tier:'urgent',first:0,hr:60,hv:0,ht:10e6,hf:0,hs:'t',hd:-1}; let _pradT=null;
+let PRAD=null, PRADS={tier:'urgent',first:0,hr:60,hv:0,ht:10e6,hf:0,hs:'t',hd:-1,xsl:20,xbe:10,xtg:15,xtd:7.5,xtp:0,xtx:0}; let _pradT=null;
+const PRAD_BOT={xsl:20,xbe:10,xtg:15,xtd:7.5,xtp:0,xtx:0};
+let PRADP=null, _pradPB=null, _pradPL=false;
+async function loadPradPaths(built){ if(_pradPL) return; _pradPL=true;
+  try{ const j=await fetch('/prad/paths',{cache:'no-store'}).then(r=>r.json()); PRADP=j.paths||{}; _pradPB=built; }catch(e){ PRADP=PRADP||{}; }
+  _pradPL=false; renderPrad(); }
+// Exit simulator on a stored 7-day hourly path (flat [o,h,l,c,…] as % from the flag price ×10). Stop is checked before a new high in each candle (cautious).
+function pradSim(path,o){
+  if(!path||!path.length) return null;
+  const sl=o.xsl, be=o.xbe, tg=o.xtg, td=o.xtd, tp=o.xtp, tx=o.xtx, n=path.length/4;
+  let stop=sl?-sl:-1e9, peak=0, beOn=false, tr=false;
+  const how=()=>tr?'trailing stop':beOn?'stop at entry':'stop loss';
+  for(let j=0;j<n;j++){
+    const op=path[4*j]/10, hi=path[4*j+1]/10, lo=path[4*j+2]/10, c=path[4*j+3]/10;
+    if(op<=stop) return {res:op,how:how(),hours:j+1};
+    if(lo<=stop) return {res:stop,how:how(),hours:j+1};
+    if(tp&&hi>=tp) return {res:Math.max(tp,op),how:'take profit',hours:j+1};
+    peak=Math.max(peak,hi);
+    if(be&&!beOn&&peak>=be){ beOn=true; stop=Math.max(stop,0); }
+    if(tg&&!tr&&peak>=tg) tr=true;
+    if(tr){ stop=Math.max(stop,((1+peak/100)*(1-td/100)-1)*100); if(c<=stop) return {res:stop,how:'trailing stop',hours:j+1}; }
+    if(tx&&j+1>=tx) return {res:c,how:'time close',hours:j+1};
+  }
+  return {res:path[path.length-1]/10, how:n>=168?'7 days up':'open', hours:n};
+}
 try{ Object.assign(PRADS, JSON.parse(localStorage.getItem('pradS')||'{}')); }catch(e){}
 async function loadPrad(){ try{ PRAD=await fetch('/prad',{cache:'no-store'}).then(r=>r.json()); }catch(e){ PRAD={status:'error: could not reach the server',rows:[],log:[]}; }
   renderPrad(); clearTimeout(_pradT); if(activeTab==='prad') _pradT=setTimeout(loadPrad,60000); }
@@ -7176,7 +7200,11 @@ function renderPrad(){
   // ── last ~2 months, rebuilt from Binance hourly candles every 6 hours
   const HI=PRAD.hist||{}, HR=HI.rows||[];
   const hsel=(k,opts)=>`<select onchange="pradSet('${k}',+this.value)" style="background:var(--panel,#151c29);color:inherit;border:1px solid var(--line);border-radius:8px;padding:3px 6px;font-size:12px">${opts.map(([v,l])=>`<option value="${v}"${PRADS[k]==v?' selected':''}>${l}</option>`).join('')}</select>`;
+  if(HR.length&&(PRADP==null||_pradPB!==HI.built)) loadPradPaths(HI.built);
+  const XS={xsl:PRADS.xsl,xbe:PRADS.xbe,xtg:PRADS.xtg,xtd:PRADS.xtd,xtp:PRADS.xtp,xtx:PRADS.xtx};
+  const isBot=Object.keys(PRAD_BOT).every(k=>PRAD_BOT[k]==XS[k]);
   let H=HR.filter(e=>e.chg24>=PRADS.hr&&(PRADS.hv?(e.volx||0)>=PRADS.hv:true)&&e.turnover24>=PRADS.ht&&(!PRADS.hf||e.n===1));
+  if(PRADP&&Object.keys(PRADP).length) H=H.map(e=>{ const r=pradSim(PRADP[e.sym+'|'+e.t],XS); return r?Object.assign({},e,r):e; });
   const hk=PRADS.hs; H=[...H].sort((a,b)=>{ const p=a[hk]??-1e12, q=b[hk]??-1e12; return (p>q?1:p<q?-1:0)*PRADS.hd; });
   const hres=H.filter(e=>e.res!=null), havg=hres.length?hres.reduce((a,e)=>a+e.res,0)/hres.length:null, hwin=hres.filter(e=>e.res>0).length;
   const srt=[...hres].sort((a,b)=>b.res-a.res), exTop=srt.length>5?srt.slice(5).reduce((a,e)=>a+e.res,0)/(srt.length-5):null;
@@ -7184,10 +7212,19 @@ function renderPrad(){
   const built=HI.built?new Date(HI.built*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
   h+=`<h3 style="margin:22px 0 4px;font-size:14px">📜 Last 2 months: every pump like this and what it did <span class="muted" style="font-size:12px;font-weight:400">Binance hourly candles · ${HI.scanned||0} perps · built ${built} · refreshed every 6 h</span></h3>`
    +`<div class="muted" style="font-size:12px;max-width:1100px;margin-bottom:8px">Every time a coin closed an hour up the chosen amount over 24h on the chosen volume (and again each further +${R.repeat_step}% within 24h). <b>Volume ×</b> = its last-24h volume vs its average day in the week before: how unusual the volume is. <b>Best / worst</b> = within the next 7 days. <b>Bot rule</b> uses the same exit as the MEXC pump bot, checked on hourly candles (stop assumed first when one candle hits both, so slightly cautious). Unleveraged, before fees.</div>`
-   +`<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:8px;font-size:12px"><span>24h rise ≥ ${hsel('hr',[[25,'25%'],[40,'40%'],[60,'60%'],[100,'100%'],[200,'200%']])}</span><span>Volume × ≥ ${hsel('hv',[[0,'any'],[3,'3×'],[6,'6×'],[12,'12×'],[25,'25×']])}</span><span>24h volume ≥ ${hsel('ht',[[5e6,'$5M'],[10e6,'$10M'],[30e6,'$30M'],[100e6,'$100M']])}</span>${chip(!PRADS.hf,'Every flag',"pradSet('hf',0)",'Include repeat flags as the pump kept climbing (what the bot trades).')}${chip(PRADS.hf,'First per pump',"pradSet('hf',1)",'Only the first flag on a coin in 24h.')}</div>`;
+   +`<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:8px;font-size:12px"><span>24h rise ≥ ${hsel('hr',[[25,'25%'],[40,'40%'],[60,'60%'],[100,'100%'],[200,'200%']])}</span><span>Volume × ≥ ${hsel('hv',[[0,'any'],[3,'3×'],[6,'6×'],[12,'12×'],[25,'25×']])}</span><span>24h volume ≥ ${hsel('ht',[[5e6,'$5M'],[10e6,'$10M'],[30e6,'$30M'],[100e6,'$100M']])}</span>${chip(!PRADS.hf,'Every flag',"pradSet('hf',0)",'Include repeat flags as the pump kept climbing (what the bot trades).')}${chip(PRADS.hf,'First per pump',"pradSet('hf',1)",'Only the first flag on a coin in 24h.')}</div>`
+   +`<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:8px;font-size:12px;padding:8px 10px;border:1px solid var(--line);border-radius:10px"><b>Exit settings</b>`
+   +`<span data-tip="Stop loss below the entry price.">Stop loss ${hsel('xsl',[[5,'−5%'],[10,'−10%'],[15,'−15%'],[20,'−20%'],[25,'−25%'],[30,'−30%'],[40,'−40%'],[0,'none']])}</span>`
+   +`<span data-tip="Once price reaches this gain, the stop moves up to the entry price.">Stop to entry at ${hsel('xbe',[[0,'off'],[5,'+5%'],[10,'+10%'],[15,'+15%'],[20,'+20%'],[30,'+30%']])}</span>`
+   +`<span data-tip="Gain at which the trailing stop switches on.">Trailing starts at ${hsel('xtg',[[0,'off'],[5,'+5%'],[10,'+10%'],[15,'+15%'],[20,'+20%'],[30,'+30%'],[50,'+50%'],[100,'+100%']])}</span>`
+   +`<span data-tip="How far below the highest price the trailing stop sits.">Trail ${hsel('xtd',[[3,'3%'],[5,'5%'],[7.5,'7.5%'],[10,'10%'],[15,'15%'],[20,'20%'],[25,'25%'],[30,'30%']])}</span>`
+   +`<span data-tip="Fixed take profit: sell everything at this gain.">Take profit ${hsel('xtp',[[0,'none'],[10,'+10%'],[15,'+15%'],[20,'+20%'],[30,'+30%'],[50,'+50%'],[100,'+100%']])}</span>`
+   +`<span data-tip="Close the trade at market after this long, whatever it is doing.">Close after ${hsel('xtx',[[0,'7 days'],[1,'1 h'],[2,'2 h'],[4,'4 h'],[8,'8 h'],[12,'12 h'],[24,'24 h'],[48,'48 h'],[72,'72 h']])}</span>`
+   +(isBot?`<span class="muted">= the live pump bot</span>`:`<button onclick="Object.assign(PRADS,PRAD_BOT);pradSet('xsl',PRAD_BOT.xsl)" style="cursor:pointer;padding:3px 9px;border-radius:8px;font-size:12px;color:inherit;border:1px solid var(--line);background:rgba(21,28,41,.7)">↺ Bot settings</button>`)
+   +`<span class="muted">${PRADP==null?'loading price paths…':Object.keys(PRADP).length?'recalculated on hourly candles over 7 days; still open after 7 days = closed at that price':'price paths arrive after the next history rebuild (a few minutes after a deploy)'}</span></div>`;
   if(!HR.length) h+=`<div class="muted">${HI.status==='building'?'Building the 2-month history from Binance (a few minutes)…':HI.status&&HI.status.startsWith('error')?esc(HI.status):'The 2-month history builds ~2 min after the server starts and takes a few minutes.'}</div>`;
-  else h+=`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">${card('Pumps',H.length,'Flags matching the filters.')}${card('Coins',new Set(H.map(e=>e.sym)).size,'Different coins.')}${card('Bot rule: avg per flag',P(havg,2),'Average result of the bot exit rule per flag.',C(havg))}${card('Without the 5 best',P(exTop,2),'The same average with the 5 best trades removed: shows how much rests on a few huge runners.',C(exTop))}${card('Bot rule: in profit',hres.length?Math.round(100*hwin/hres.length)+'%':'—','Share in profit.')}${card('Ran +30% in 7 days',H.length?Math.round(100*H.filter(e=>(e.best||0)>=30).length/H.length)+'%':'—','Share that went at least 30% higher within a week.','var(--accent)')}${card('Fell 20% in 7 days',H.length?Math.round(100*H.filter(e=>(e.worst||0)<=-20).length/H.length)+'%':'—','Share that dropped at least 20% within a week.','var(--red)')}${card('Median after 24h',P(med(H.map(e=>e.h24))),'Typical change a day later.',C(med(H.map(e=>e.h24))))}</div>`
-   +`<div style="overflow-x:auto;max-height:640px;overflow-y:auto"><table style="font-size:12px"><thead><tr>${hth('t','Time','When the hourly candle closed.')}<th>Coin</th>${hth('n','#','1 = first flag on this pump, 2+ = repeat flags.')}${hth('chg24','24h','24h rise at the flag.')}${hth('volx','Volume ×','24h volume vs the average day in the week before.')}${hth('turnover24','Volume 24h','Futures volume over the 24h.')}${hth('from_high','From high','Distance from the 24h high at the flag.')}${hth('best','Best 7d','Highest point within 7 days.')}${hth('worst','Worst 7d','Lowest point within 7 days.')}${hth('h4','+4h','Change after 4h.')}${hth('h24','+24h','Change after 24h.')}${hth('h72','+72h','Change after 72h.')}${hth('res','Bot rule','Bot exit rule result.')}<th>MEXC</th></tr></thead><tbody>`
+  else h+=`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">${card('Pumps',H.length,'Flags matching the filters.')}${card('Coins',new Set(H.map(e=>e.sym)).size,'Different coins.')}${card(isBot?'Bot rule: avg per flag':'Your exit: avg per flag',P(havg,2),'Average result per flag with the exit settings above (unleveraged, before fees).',C(havg))}${card('Without the 5 best',P(exTop,2),'The same average with the 5 best trades removed: shows how much rests on a few huge runners.',C(exTop))}${card('Bot rule: in profit',hres.length?Math.round(100*hwin/hres.length)+'%':'—','Share in profit.')}${card('Ran +30% in 7 days',H.length?Math.round(100*H.filter(e=>(e.best||0)>=30).length/H.length)+'%':'—','Share that went at least 30% higher within a week.','var(--accent)')}${card('Fell 20% in 7 days',H.length?Math.round(100*H.filter(e=>(e.worst||0)<=-20).length/H.length)+'%':'—','Share that dropped at least 20% within a week.','var(--red)')}${card('Median after 24h',P(med(H.map(e=>e.h24))),'Typical change a day later.',C(med(H.map(e=>e.h24))))}</div>`
+   +`<div style="overflow-x:auto;max-height:640px;overflow-y:auto"><table style="font-size:12px"><thead><tr>${hth('t','Time','When the hourly candle closed.')}<th>Coin</th>${hth('n','#','1 = first flag on this pump, 2+ = repeat flags.')}${hth('chg24','24h','24h rise at the flag.')}${hth('volx','Volume ×','24h volume vs the average day in the week before.')}${hth('turnover24','Volume 24h','Futures volume over the 24h.')}${hth('from_high','From high','Distance from the 24h high at the flag.')}${hth('best','Best 7d','Highest point within 7 days.')}${hth('worst','Worst 7d','Lowest point within 7 days.')}${hth('h4','+4h','Change after 4h.')}${hth('h24','+24h','Change after 24h.')}${hth('h72','+72h','Change after 72h.')}${hth('res',isBot?'Bot rule':'Your exit','Result with the exit settings above, and how it closed.')}<th>MEXC</th></tr></thead><tbody>`
    +H.slice(0,400).map(e=>`<tr><td style="white-space:nowrap">${new Date(e.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td><td><a href="${tvLink(e.sym)}" target="_blank" rel="noopener">${dispSym(e.sym)}</a></td><td>${e.n}</td><td style="color:var(--accent)">${P(e.chg24,0)}</td><td>${e.volx==null?'—':e.volx+'×'}</td><td>${U(e.turnover24)}</td><td>${P(e.from_high)}</td><td style="color:var(--accent)">${P(e.best,0)}</td><td style="color:var(--red)">${P(e.worst,0)}</td><td style="color:${C(e.h4)}">${P(e.h4)}</td><td style="color:${C(e.h24)}">${P(e.h24)}</td><td style="color:${C(e.h72)}">${P(e.h72)}</td><td style="color:${C(e.res)};white-space:nowrap">${P(e.res)} <span class="muted">· ${e.how==='open'?'open':e.how}${e.hours!=null&&e.how!=='open'?', '+e.hours+' h':''}</span></td><td>${e.mexc==null?'—':e.mexc?'✓':'✗'}</td></tr>`).join('')+`</tbody></table></div>`+(H.length>400?`<div class="muted" style="font-size:12px">Showing 400 of ${H.length}; tighten the filters or sort to see others.</div>`:'');
   el.innerHTML=h;
 }
@@ -7596,6 +7633,20 @@ def make_handler(state: State):
                 except Exception as e:
                     body = json.dumps({"rows": None, "status": f"volume-spike scanner unavailable: {e}"}).encode()
                 self._send(200, body, "application/json")
+            elif self.path.startswith("/prad/paths"):
+                try:
+                    import pump_radar, gzip
+                    raw = json.dumps(pump_radar.paths_payload(), separators=(",", ":")).encode()
+                    body = gzip.compress(raw, 6)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Encoding", "gzip")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(body)
+                except Exception as e:
+                    self._send(200, json.dumps({"paths": {}, "error": str(e)}).encode(), "application/json")
             elif self.path.startswith("/prad"):
                 try:
                     import pump_radar

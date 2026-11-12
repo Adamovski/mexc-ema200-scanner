@@ -231,6 +231,8 @@ def _hist_events(sym, kl, mexc):
                 e[k] = round((fut[h - 1][4] / c - 1) * 100, 1)
         r, how, tc = simulate(c, fut)
         e["res"], e["how"], e["hours"] = r, how, round((tc - kl[i][0]) / 3600) if tc else None
+        # 7-day hourly path for the page's own exit settings: [open, high, low, close] as % from the flag price x10
+        e["path"] = [x for b in wk for x in (round((b[1] / c - 1) * 1000), round((b[2] / c - 1) * 1000), round((b[3] / c - 1) * 1000), round((b[4] / c - 1) * 1000))]
         out.append(e)
         last = e
     return out
@@ -258,7 +260,8 @@ def build_history():
     HIST.update(rows=rows, built=int(now), status="ok", coins=coins, scanned=len(uni))
     try:
         if vs._redis():
-            vs._redis_cmd("SET", HIST_KEY, json.dumps(HIST, separators=(",", ":")))
+            slim = dict(HIST, rows=[{f: v for f, v in e.items() if f != "path"} for e in rows])   # paths stay in memory only (size)
+            vs._redis_cmd("SET", HIST_KEY, json.dumps(slim, separators=(",", ":")))
     except Exception as ex:
         print(f"[prad] history save failed: {ex}", flush=True)
     print(f"[prad] history: {len(rows)} pumps on {coins} coins", flush=True)
@@ -274,7 +277,8 @@ def _hist_loop():
     except Exception as e:
         print(f"[prad] history load failed: {e}", flush=True)
     while True:
-        if not HIST.get("built") or time.time() - HIST["built"] >= HIST_EVERY:
+        no_paths = bool(HIST.get("rows")) and "path" not in HIST["rows"][0]   # loaded from Redis: rebuild so the page's exit simulator has paths
+        if no_paths or not HIST.get("built") or time.time() - HIST["built"] >= HIST_EVERY:
             try:
                 build_history()
             except Exception as e:
@@ -302,7 +306,12 @@ def payload():
                 "log": list(reversed(LOG[-300:])),
                 "rules": {"urgent_24h": URGENT_24H, "pumping_24h": PUMPING_24H, "min_turnover": MIN_TURNOVER, "repeat_step": REPEAT_STEP,
                           "sl": SL, "be": BE, "trail_start": TRAIL_START, "trail": TRAIL},
-                "hist": HIST}
+                "hist": {k: ([{f: v for f, v in e.items() if f != "path"} for e in v] if k == "rows" else v) for k, v in HIST.items()}}
+
+
+def paths_payload():
+    """Hourly paths of the 2-month history, keyed sym|t; loaded once by the page for its exit-settings simulator."""
+    return {"built": HIST.get("built"), "paths": {f'{e["sym"]}|{e["t"]}': e.get("path") or [] for e in HIST.get("rows") or []}}
 
 
 def start():
