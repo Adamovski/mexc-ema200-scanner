@@ -31,7 +31,12 @@ LOG_KEY = "prad_log_v1"
 LOG_MAX = 500
 FOLLOW_DAYS = 7
 
+HIST_KEY = "prad_hist_v1"
+HIST_EVERY = 6 * 3600
+HIST_MIN_RISE, HIST_MIN_TURN = 25.0, 5_000_000      # the history keeps every pump of 25%+ in 24h on $5M+, the page filters further
+
 STATE = {"rows": [], "updated": None, "status": "starting", "n": 0}
+HIST = {"rows": [], "built": None, "status": "not built yet", "coins": 0}
 LOG = []
 MEXC = {"syms": set(), "t": 0}
 _LOCK = threading.Lock()
@@ -198,6 +203,86 @@ def scan_once():
     _save_log()
 
 
+def _hist_events(sym, kl, mexc):
+    """Every pump of HIST_MIN_RISE%+ in 24h on HIST_MIN_TURN+ volume in this coin's hourly candles, with what it did next."""
+    out, last = [], None
+    for i in range(24 * 8, len(kl) - 1):
+        c = kl[i][4]
+        chg = (c / kl[i - 24][4] - 1) * 100 if kl[i - 24][4] else 0
+        if chg < HIST_MIN_RISE:
+            continue
+        turn = sum(b[5] for b in kl[i - 23:i + 1])
+        if turn < HIST_MIN_TURN:
+            continue
+        t = kl[i][0] + 3600                                   # the hourly candle has just closed
+        if last and t - last["t"] < 86400 and c < last["price"] * (1 + REPEAT_STEP / 100):
+            continue
+        n = last["n"] + 1 if last and t - last["t"] < 86400 else 1
+        prior = sum(b[5] for b in kl[i - 24 * 8 + 1:i - 23]) / 7
+        hi24 = max(b[2] for b in kl[i - 23:i + 1])
+        fut = kl[i + 1:]
+        wk = fut[:168]
+        e = {"t": t, "sym": sym, "price": c, "chg24": round(chg, 1), "turnover24": round(turn), "volx": round(turn / prior, 1) if prior else None,
+             "from_high": _pct(c, hi24), "n": n, "mexc": _base(sym) in mexc if mexc else None,
+             "best": round(max(0.0, (max(b[2] for b in wk) / c - 1) * 100), 1) if wk else None,
+             "worst": round(min(0.0, (min(b[3] for b in wk) / c - 1) * 100), 1) if wk else None}
+        for k, h in (("h1", 1), ("h4", 4), ("h24", 24), ("h72", 72)):
+            if len(fut) >= h:
+                e[k] = round((fut[h - 1][4] / c - 1) * 100, 1)
+        r, how, tc = simulate(c, fut)
+        e["res"], e["how"], e["hours"] = r, how, round((tc - kl[i][0]) / 3600) if tc else None
+        out.append(e)
+        last = e
+    return out
+
+
+def build_history():
+    """Last ~62 days of Binance hourly candles for every USDT perp; rebuilt every HIST_EVERY seconds."""
+    HIST["status"] = "building"
+    now = time.time()
+    uni = sorted(vs.fetch_universe() or [])
+    mexc = _mexc_syms(now)
+    rows, coins = [], 0
+    for sym in uni:
+        try:
+            kl = vs._parse_klines(vs._get("fut", "/fapi/v1/klines", {"symbol": sym, "interval": "1h", "limit": 1500}))
+            if kl and len(kl) > 24 * 9:
+                ev = _hist_events(sym, kl, mexc)
+                if ev:
+                    coins += 1
+                    rows += ev
+        except Exception as ex:
+            print(f"[prad] history {sym}: {ex}", flush=True)
+        time.sleep(0.3)
+    rows.sort(key=lambda e: -e["t"])
+    HIST.update(rows=rows, built=int(now), status="ok", coins=coins, scanned=len(uni))
+    try:
+        if vs._redis():
+            vs._redis_cmd("SET", HIST_KEY, json.dumps(HIST, separators=(",", ":")))
+    except Exception as ex:
+        print(f"[prad] history save failed: {ex}", flush=True)
+    print(f"[prad] history: {len(rows)} pumps on {coins} coins", flush=True)
+
+
+def _hist_loop():
+    time.sleep(120)
+    try:
+        if vs._redis():
+            raw = vs._redis_cmd("GET", HIST_KEY)
+            if raw:
+                HIST.update(json.loads(raw))
+    except Exception as e:
+        print(f"[prad] history load failed: {e}", flush=True)
+    while True:
+        if not HIST.get("built") or time.time() - HIST["built"] >= HIST_EVERY:
+            try:
+                build_history()
+            except Exception as e:
+                HIST["status"] = f"error: {e}"
+                print(f"[prad] history failed: {e}", flush=True)
+        time.sleep(600)
+
+
 def _loop():
     time.sleep(60)
     _load_log()
@@ -216,8 +301,10 @@ def payload():
         return {"rows": STATE["rows"], "updated": STATE["updated"], "status": STATE["status"], "n": STATE["n"],
                 "log": list(reversed(LOG[-300:])),
                 "rules": {"urgent_24h": URGENT_24H, "pumping_24h": PUMPING_24H, "min_turnover": MIN_TURNOVER, "repeat_step": REPEAT_STEP,
-                          "sl": SL, "be": BE, "trail_start": TRAIL_START, "trail": TRAIL}}
+                          "sl": SL, "be": BE, "trail_start": TRAIL_START, "trail": TRAIL},
+                "hist": HIST}
 
 
 def start():
     threading.Thread(target=_loop, daemon=True).start()
+    threading.Thread(target=_hist_loop, daemon=True).start()
