@@ -3152,6 +3152,7 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabSpikes" onclick="showTab('spikes')">🔊 Volume spikes</div>
   <div class="tab" id="tabCalls" onclick="showTab('calls')">📌 My calls</div>
   <div class="tab" id="tabOib" onclick="showTab('oib')" data-tip="Pre-pump watch: open interest rising hard while price has barely moved.">🧲 OI build-up</div>
+  <div class="tab" id="tabPrad" onclick="showTab('prad')" data-tip="Urgent-pump watch: coins up 60%+ in 24h on real futures volume, like the Crime Scanner channel's 🚨 alerts, with what happened after each one.">🚨 Pump radar</div>
   <div class="tab" id="tabSbt" onclick="showTab('sbt')" data-tip="The whole volume-spike system replayed over ~50 days of Binance history: same scores, calls, stops, targets and exits as live.">🧪 System backtest</div>
   <div class="tab" id="tabCallsHC" onclick="showTab('callshc')" data-tip="Your ⭐ high-conviction calls only, with their own scorecard. Choose ⭐ High conviction next to any Track button on the Analyze tab.">⭐ High conviction</div>
 </div>
@@ -3266,6 +3267,7 @@ Hover any cell to see what it means for that coin. Click ⚲ for the full Analyz
 </div>
 
 <div class="view" id="viewOib"><div class="wrap" id="oibBody" style="padding-top:12px"><span class="muted">Loading…</span></div></div>
+<div class="view" id="viewPrad"><div class="wrap" id="pradBody" style="padding-top:12px"><span class="muted">Loading…</span></div></div>
 <div class="view" id="viewSbt"><div class="wrap" id="sbtBody" style="padding-top:12px"><span class="muted">Loading…</span></div></div>
 
 <div class="view" id="viewCalls">
@@ -3764,7 +3766,7 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["dtb","Dtb"],["accum","Accum"],["capit","Capit"],["micro","Micro"],["signals","Signals"],["watch2","Watch2"],["spikes","Spikes"],["watch3","Watch3"],["coil","Coil"],["scalp","Scalp"],["spot","Spot"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["sbt","Sbt"],["oib","Oib"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["dtb","Dtb"],["accum","Accum"],["capit","Capit"],["micro","Micro"],["signals","Signals"],["watch2","Watch2"],["spikes","Spikes"],["watch3","Watch3"],["coil","Coil"],["scalp","Scalp"],["spot","Spot"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["sbt","Sbt"],["oib","Oib"],["prad","Prad"],["analyze","Analyze"],["info","Info"]]){
     const _tb=document.getElementById("tab"+v), _vw=document.getElementById("view"+v);
     if(!_tb||!_vw) continue;
     _tb.classList.toggle("active", t===which);
@@ -3784,6 +3786,7 @@ function showTab(which){
   if(which==="calls") renderCalls();
   if(which==="sbt") loadSbt();
   if(which==="oib") loadOib();
+  if(which==="prad") loadPrad();
   uiSave({tab:which});
   { const hb=document.getElementById('tabCallsHC'); if(hb) hb.classList.toggle('active', which==='callshc'); }
   if(which==="callshc"){ const vc=document.getElementById('viewCalls'); if(vc) vc.classList.add('active'); renderCalls(); }
@@ -7136,6 +7139,42 @@ function renderOib(){
      +L.map(e=>`<tr><td style="white-space:nowrap">${new Date(e.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td><td><a href="${tvLink(e.sym)}" target="_blank" rel="noopener">${dispSym(e.sym)}</a></td><td>${(+e.price).toPrecision(5)}</td><td style="color:var(--accent)">${oibP(e.oi24,0)}</td><td>${oibP(e.px24)}</td><td>${e.funding==null?'—':(e.funding*100).toFixed(3)+'%'}</td><td class="rr" style="white-space:nowrap"><span style="color:var(--accent)">${oibP(e.best)}</span> / <span style="color:var(--red)">${oibP(e.worst)}</span></td><td style="color:${oibC(e.h4)}">${oibP(e.h4)}</td><td style="color:${oibC(e.h24)}">${oibP(e.h24)}</td><td style="color:${oibC(e.h72)}">${oibP(e.h72)}</td><td style="color:${oibC(e.now)}">${oibP(e.now)}</td></tr>`).join('')+`</tbody></table></div>`:'<div class="muted">No flags logged yet. Each new 🧲 flag is recorded here with what price did next.</div>');
   el.innerHTML=h;
 }
+// ── 🚨 Pump radar tab: coins up 60%+ in 24h on real volume, and what happened after each flag (pump_radar.py)
+let PRAD=null, PRADS={tier:'urgent',first:0}; let _pradT=null;
+try{ Object.assign(PRADS, JSON.parse(localStorage.getItem('pradS')||'{}')); }catch(e){}
+async function loadPrad(){ try{ PRAD=await fetch('/prad',{cache:'no-store'}).then(r=>r.json()); }catch(e){ PRAD={status:'error: could not reach the server',rows:[],log:[]}; }
+  renderPrad(); clearTimeout(_pradT); if(activeTab==='prad') _pradT=setTimeout(loadPrad,60000); }
+function pradSet(k,v){ PRADS[k]=v; try{ localStorage.setItem('pradS',JSON.stringify(PRADS)); }catch(e){} renderPrad(); }
+function renderPrad(){
+  const el=document.getElementById('pradBody'); if(!el) return;
+  if(!PRAD){ el.innerHTML='<span class="muted">Loading…</span>'; return; }
+  const R=PRAD.rules||{}, upd=PRAD.updated?new Date(PRAD.updated*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}):'—';
+  const P=(x,d=1)=>x==null?'—':(x>0?'+':'')+(+x).toFixed(d)+'%', U=x=>x==null?'—':x>=1e9?'$'+(x/1e9).toFixed(2)+'B':x>=1e6?'$'+(x/1e6).toFixed(1)+'M':'$'+(x/1e3).toFixed(0)+'K';
+  const C=x=>x==null?'var(--dim)':x>0?'var(--accent)':x<0?'var(--red)':'var(--dim)';
+  const med=a=>{ const s=a.filter(x=>x!=null).sort((x,y)=>x-y), n=s.length; return n?(n%2?s[n>>1]:(s[n/2-1]+s[n/2])/2):null; };
+  const chip=(on,lab,js,tip)=>`<button data-tip="${esc(tip)}" onclick="${js}" style="cursor:pointer;padding:4px 10px;border-radius:8px;font-size:12px;color:inherit;font-weight:${on?700:500};border:1px solid ${on?'var(--accent)':'var(--line)'};background:${on?'rgba(63,185,80,.18)':'rgba(21,28,41,.7)'}">${lab}</button>`;
+  const rows=(PRAD.rows||[]).filter(r=>PRADS.tier==='all'||r.tier==='urgent');
+  let h=`<h3 style="margin:0 0 4px">🚨 Pump radar <span class="muted" style="font-size:12px;font-weight:400">${PRAD.n||0} Binance perps scanned · updated ${upd} · every 2 min</span></h3>`
+   +`<div class="muted" style="font-size:12px;max-width:1100px;margin-bottom:8px">Modelled on the Crime Scanner channel's 🚨 URGENT PUMP alerts. <b>🚨 Flag</b> = up ≥${R.urgent_24h}% in 24h with ≥ ${U(R.min_turnover)} futures volume. A coin already flagged is flagged again each time it climbs another ${R.repeat_step}% (the channel repeats its alerts the same way). 📈 Pumping = up ${R.pumping_24h}–${R.urgent_24h}%, shown to watch only. These are late, violent moves: they go a lot further or collapse, often both.</div>`
+   +`<div style="display:flex;gap:6px;margin-bottom:8px">${chip(PRADS.tier==='urgent','🚨 Urgent only',"pradSet('tier','urgent')",'Only coins up '+R.urgent_24h+'%+ in 24h.')}${chip(PRADS.tier==='all','📈 Include pumping',"pradSet('tier','all')",'Also coins up '+R.pumping_24h+'–'+R.urgent_24h+'%.')}</div>`;
+  if(!rows.length) h+=`<div class="muted">${PRAD.status==='starting'?'First scan runs ~1 min after the server starts.':'No coin is pumping that hard right now.'}</div>`;
+  else h+=`<div style="overflow-x:auto"><table style="font-size:12px"><thead><tr><th>Coin</th><th data-tip="Price change over 24 hours.">24h</th><th data-tip="How far below its 24h high it trades. 0% = at the high.">From high</th><th data-tip="Futures turnover over 24h.">Volume 24h</th><th data-tip="Open interest in USD now.">OI $</th><th data-tip="OI change over 4h: still rising = pumps like this ran further more often (channel's note).">OI 4h</th><th data-tip="Open interest as % of market cap. Above ~30% = futures dwarf the coin: violent both ways.">OI % mcap</th><th data-tip="Funding now. Extreme positive = longs crowded; extreme negative = shorts crowded (squeeze fuel).">Funding</th><th data-tip="Has a MEXC USDT perpetual (what the pump bot trades).">MEXC</th></tr></thead><tbody>`
+   +rows.map(r=>{ const f=r.funding, fc=f==null?'var(--dim)':f<0?'var(--accent)':f>0.0005?'var(--red)':'var(--dim)';
+      return `<tr><td class="sym"><div class="symbox">${r.tier==='urgent'?'🚨 ':'📈 '}${esc(r.symbol.replace(/USDT$/,''))}${analyzeBtn(r.symbol)}${r.new?' <span class="rr" style="color:var(--accent)">new flag</span>':''}</div></td>`
+       +`<td style="color:var(--accent);font-weight:700">${P(r.chg24,0)}</td><td style="color:${r.from_high>-3?'var(--accent)':'var(--red)'}">${P(r.from_high)}</td><td>${U(r.turnover24)}</td><td>${U(r.oi_usd)}</td><td style="color:${C(r.oi4)}">${P(r.oi4,0)}</td><td style="color:${r.oi_mcap>=30?'var(--red)':'inherit'}">${r.oi_mcap==null?'—':r.oi_mcap+'%'}</td><td style="color:${fc}">${f==null?'—':(f*100).toFixed(3)+'%'}</td><td>${r.mexc==null?'—':r.mexc?'✓':'✗'}</td></tr>`; }).join('')+`</tbody></table></div>`;
+  let L=PRAD.log||[];
+  if(PRADS.first) L=L.filter(e=>(e.n||1)===1);
+  const done=L.filter(e=>e.how&&e.how!=='open'), res=L.filter(e=>e.res!=null);
+  const avg=res.length?res.reduce((s,e)=>s+e.res,0)/res.length:null, win=res.filter(e=>e.res>0).length;
+  const card=(lab,val,tip,col)=>`<div data-tip="${esc(tip)}" style="border:1px solid var(--line,#30363d);border-radius:10px;padding:8px 12px;min-width:120px"><div class="muted" style="font-size:11px">${lab}</div><div style="font-size:18px;font-weight:700;color:${col||'inherit'}">${val}</div></div>`;
+  h+=`<h3 style="margin:18px 0 4px;font-size:14px">📒 Flag log: what happened next</h3>`
+   +`<div class="muted" style="font-size:12px;max-width:1100px;margin-bottom:8px">Each flag followed on 5-minute candles for ${7} days. <b>Bot rule</b> = the MEXC pump bot's exit: stop ${R.sl}% below, stop to entry at +${R.be}%, then a ${R.trail}% trailing stop from +${R.trail_start}%. Moves are unleveraged and before fees; at 10× multiply by ten.</div>`
+   +`<div style="display:flex;gap:6px;margin-bottom:8px">${chip(!PRADS.first,'Every flag',"pradSet('first',0)",'Count repeat flags on the same coin too (what the bot does).')}${chip(PRADS.first,'First flag per pump',"pradSet('first',1)",'Only the first flag on a coin in 24h.')}</div>`
+   +`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">${card('Flags',L.length,'Flags logged (newest 300).')}${card('Coins',new Set(L.map(e=>e.sym)).size,'Different coins. Few coins = the numbers mostly describe one or two pumps.')}${card('Bot rule: avg per flag',P(avg,2),'Average result of the bot exit rule per flag (open ones at the latest price).',C(avg))}${card('Bot rule: in profit',res.length?Math.round(100*win/res.length)+'%':'—','Share of flags where the bot rule is in profit.')}${card('Closed / open',done.length+' / '+(L.length-done.length),'Flags the bot rule has closed vs still running.')}${card('Median best move',P(med(L.map(e=>e.best))),'Typical highest point after the flag.','var(--accent)')}${card('Median worst move',P(med(L.map(e=>e.worst))),'Typical lowest point after the flag.','var(--red)')}${card('Median after 24h',P(med(L.map(e=>e.h24))),'Typical change 24h after the flag.',C(med(L.map(e=>e.h24))))}</div>`
+   +(L.length?`<div style="overflow-x:auto"><table style="font-size:12px"><thead><tr><th>Flagged</th><th>Coin</th><th data-tip="1 = first flag on this pump, 2+ = repeat flags as it kept climbing.">#</th><th>Price</th><th data-tip="24h change when flagged.">24h</th><th data-tip="Best and worst move from the flag price since.">Best / worst</th><th>+1h</th><th>+4h</th><th>+24h</th><th data-tip="The bot's exit rule: result and how it closed.">Bot rule</th><th>Now</th><th>MEXC</th></tr></thead><tbody>`
+     +L.map(e=>`<tr><td style="white-space:nowrap">${new Date(e.t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td><td><a href="${tvLink(e.sym)}" target="_blank" rel="noopener">${dispSym(e.sym)}</a></td><td>${e.n||1}</td><td>${(+e.price).toPrecision(5)}</td><td>${P(e.chg24,0)}</td><td class="rr" style="white-space:nowrap"><span style="color:var(--accent)">${P(e.best)}</span> / <span style="color:var(--red)">${P(e.worst)}</span></td><td style="color:${C(e.h1)}">${P(e.h1)}</td><td style="color:${C(e.h4)}">${P(e.h4)}</td><td style="color:${C(e.h24)}">${P(e.h24)}</td><td style="color:${C(e.res)};white-space:nowrap">${P(e.res)}${e.how?' <span class="muted">· '+(e.how==='open'?'open':e.how)+'</span>':''}</td><td style="color:${C(e.now)}">${P(e.now)}</td><td>${e.mexc==null?'—':e.mexc?'✓':'✗'}</td></tr>`).join('')+`</tbody></table></div>`:'<div class="muted">No flags logged yet. Every 🚨 flag is recorded here and followed for 7 days.</div>');
+  el.innerHTML=h;
+}
 // ── 🧪 System backtest tab: the live volume-spike system replayed over Binance history (system_backtest.py)
 let SBT=null, _sbtPoll=null;
 let SBTF={side:'long',rec:'watch',tf:'',setup:'',exit:'new',one:1,sort:'t',dir:-1,open:'',page:0};
@@ -7541,6 +7580,13 @@ def make_handler(state: State):
                 except Exception as e:
                     body = json.dumps({"rows": None, "status": f"volume-spike scanner unavailable: {e}"}).encode()
                 self._send(200, body, "application/json")
+            elif self.path.startswith("/prad"):
+                try:
+                    import pump_radar
+                    body = json.dumps(pump_radar.payload(), default=str).encode()
+                except Exception as e:
+                    body = json.dumps({"status": f"error: {e}", "rows": [], "log": []}).encode()
+                self._send(200, body, "application/json")
             elif self.path.startswith("/oib"):
                 try:
                     import oi_build
@@ -7705,6 +7751,12 @@ def main() -> None:
                 import oi_build
                 oi_build.start()
                 print("  OI build-up scanner: ON (every 15 min)")
+                try:
+                    import pump_radar
+                    pump_radar.start()
+                    print("  Pump radar: ON (every 2 min)")
+                except Exception as e:
+                    print(f"  Pump radar failed to start: {e}")
                 print("  System backtest: ON (rebuilds every 3 days)")
             except Exception as e:
                 print(f"  System backtest failed to start: {e}")

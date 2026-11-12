@@ -7,7 +7,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # App code
-COPY mexc_ema200_scanner.py mexc_ema200_dashboard.py volume_spikes.py system_backtest.py oi_build.py ./
+COPY mexc_ema200_scanner.py mexc_ema200_dashboard.py volume_spikes.py system_backtest.py oi_build.py pump_radar.py ./
 
 # The server reads $PORT (set by most hosts). Default 8000 for local `docker run`.
 ENV PORT=8000
