@@ -14,7 +14,9 @@ only COOL_H hours after its last alert. Each alert is then followed for 7 days.
 Known gaps: delisted coins are missing (survivorship bias); within a candle the page assumes the stop came first.
 The result lives in Upstash Redis (chunked), with a checkpoint so a restart resumes the scan.
 """
+import gc
 import gzip
+import io
 import json
 import os
 import threading
@@ -33,8 +35,9 @@ FOLLOW_D = 7
 DAYS = int(os.environ.get("P60_DAYS", 360))
 ONE_MIN_DAYS = 29
 REFRESH_EVERY = 24 * 3600
-KEY = "p60_v1"
-WORKERS = 4
+KEY = "p60_v2"
+OLD_KEYS = ["p60_v1", "p60_v1:ckpt"]
+WORKERS = 2
 STATE = {"status": "idle", "done": 0, "total": 0, "events": 0, "started": None, "error": None}
 RES = {"blob": None, "made": None}
 _LOCK = threading.Lock()
@@ -161,12 +164,28 @@ def _coin(sym, now):
     return out
 
 
-def _publish(res):
-    RES["blob"] = gzip.compress(json.dumps(res, separators=(",", ":")).encode(), 6)
-    RES["made"] = res.get("made")
+def _publish_blob(gz, made):
+    RES["blob"] = gz
+    RES["made"] = made
+
+
+TMP = os.path.join(os.environ.get("TMPDIR", "/tmp"), "p60_events.jsonl")
+
+
+def _drop_old():
+    """Remove the first version's big checkpoint from Redis (loading it was what ran out of memory)."""
+    for k in OLD_KEYS:
+        try:
+            n = vs._redis_cmd("GET", k + ":n")
+            for i in range(int(n or 0)):
+                vs._redis_cmd("DEL", f"{k}:{i}")
+            vs._redis_cmd("DEL", k + ":n")
+        except Exception:
+            pass
 
 
 def run():
+    """Memory-light: each coin's alerts go straight to a file on disk; the final gzip is streamed from it."""
     with _LOCK:
         if STATE["status"] == "running":
             return
@@ -174,40 +193,58 @@ def run():
     try:
         det = _get("/detail") or []
         syms = sorted(d["symbol"] for d in det if d.get("quoteCoin") == "USDT" and d.get("state", 0) == 0 and d["symbol"].endswith("_USDT"))
-        ck = None
-        try:
-            raw = sbt._rget(KEY + ":ckpt") if vs._redis() else None
-            ck = json.loads(raw) if raw else None
-        except Exception:
-            ck = None
-        if ck and time.time() - ck.get("now", 0) < 2 * 86400:
-            now, events, finished = ck["now"], ck["events"], set(ck["done"])
-            print(f"[p60] resuming: {len(finished)} coins already done", flush=True)
-        else:
-            now, events, finished = int(time.time()), [], set()
-        todo = [s for s in syms if s not in finished]
-        STATE.update(total=len(syms), done=len(finished), events=len(events))
-        with ThreadPoolExecutor(WORKERS) as ex:
-            for n, (s, ev) in enumerate(zip(todo, ex.map(lambda s: _safe_coin(s, now), todo))):
-                events += ev
-                finished.add(s)
-                STATE.update(done=len(finished), events=len(events))
-                if (n + 1) % 100 == 0 and vs._redis():
-                    try:
-                        sbt._rset(KEY + ":ckpt", json.dumps({"now": now, "events": events, "done": sorted(finished)}, separators=(",", ":")))
-                    except Exception as e:
-                        print(f"[p60] checkpoint failed: {e}", flush=True)
-        events.sort(key=lambda e: e["ts"])
-        res = {"made": now, "rise": RISE, "days": DAYS, "coins": len(syms), "events": events}
-        _publish(res)
+        det = None
+        now = int(time.time())
+        STATE.update(total=len(syms))
+        n_ev = 0
+        with open(TMP, "w") as fh:
+            with ThreadPoolExecutor(WORKERS) as ex:
+                for k, ev in enumerate(ex.map(lambda s: _safe_coin(s, now), syms)):
+                    for e in ev:
+                        fh.write(json.dumps(e, separators=(",", ":")) + "\n")
+                    n_ev += len(ev)
+                    ev = None
+                    STATE.update(done=k + 1, events=n_ev)
+                    if k % 25 == 0:
+                        fh.flush()
+                        gc.collect()
+        lines = []
+        with open(TMP) as fh:                                   # sort by time: keep only (ts, offset) in memory
+            off = 0
+            for line in fh:
+                lines.append((int(line[line.find('"ts":') + 5:].split(",", 1)[0]), off))
+                off += len(line.encode())
+        lines.sort()
+        buf = io.BytesIO()
+        with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=6) as gz, open(TMP, "rb") as fh:
+            gz.write(json.dumps({"made": now, "rise": RISE, "days": DAYS, "coins": len(syms)})[:-1].encode() + b',"events":[')
+            for n, (_, off) in enumerate(lines):
+                fh.seek(off)
+                gz.write((b"," if n else b"") + fh.readline().rstrip(b"\n"))
+            gz.write(b"]}")
+        lines = None
+        blob = buf.getvalue()
+        buf = None
+        _publish_blob(blob, now)
         if vs._redis():
             try:
-                sbt._rset(KEY, json.dumps(res, separators=(",", ":")))
-                vs._redis_cmd("DEL", KEY + ":ckpt:n")
+                import base64
+                z = base64.b64encode(blob).decode()
+                parts = [z[i:i + sbt.CHUNK] for i in range(0, len(z), sbt.CHUNK)] or [""]
+                for i, part in enumerate(parts):
+                    vs._redis_cmd("SET", f"{KEY}:gz:{i}", part)
+                vs._redis_cmd("SET", KEY + ":gz:n", str(len(parts)))
+                vs._redis_cmd("SET", KEY + ":made", str(now))
+                z = parts = None
             except Exception as e:
                 print(f"[p60] save failed: {e}", flush=True)
+        try:
+            os.remove(TMP)
+        except Exception:
+            pass
+        gc.collect()
         STATE.update(status="done")
-        print(f"[p60] done: {len(events)} alerts from {len(syms)} coins", flush=True)
+        print(f"[p60] done: {n_ev} alerts from {len(syms)} coins, {len(blob) // 1024} KB", flush=True)
     except Exception as e:
         STATE.update(status="error", error=str(e)[:200])
         print(f"[p60] failed: {e}", flush=True)
@@ -229,27 +266,31 @@ def blob():
     return RES["blob"]
 
 
-def _loop():
-    time.sleep(300)                                  # let the live scanners warm up first
+def _load():
     try:
-        raw = sbt._rget(KEY) if vs._redis() else None
-        if raw:
-            _publish(json.loads(raw))
-            STATE["status"] = "done"
+        import base64
+        n = vs._redis_cmd("GET", KEY + ":gz:n")
+        if not n:
+            return
+        z = "".join(vs._redis_cmd("GET", f"{KEY}:gz:{i}") or "" for i in range(int(n)))
+        _publish_blob(base64.b64decode(z), int(vs._redis_cmd("GET", KEY + ":made") or 0))
+        STATE["status"] = "done"
     except Exception as e:
         print(f"[p60] load failed: {e}", flush=True)
+
+
+def _loop():
+    time.sleep(300)                                  # let the live scanners warm up first
+    if vs._redis():
+        _drop_old()
+        _load()
     while True:
-        ck = False
-        try:
-            ck = bool(vs._redis() and vs._redis_cmd("GET", KEY + ":ckpt:n"))
-        except Exception:
-            pass
-        if not RES["made"] or time.time() - RES["made"] > REFRESH_EVERY or ck:
+        if not RES["made"] or time.time() - RES["made"] > REFRESH_EVERY:
             run()
         time.sleep(1800)
 
 
 def start():
-    # Off by default: the full scan needs more than the free plan's 512 MB. Set P60_ON=1 to run it.
-    if os.environ.get("P60_ON") == "1":
+    # Memory-light version (v2). Set P60_ON=0 to switch the scan off.
+    if os.environ.get("P60_ON", "1") == "1":
         threading.Thread(target=_loop, daemon=True).start()
