@@ -325,6 +325,6 @@ def _loop():
 
 
 def start():
-    # Memory-light version (v2). Set P60_ON=0 to switch the scan off.
-    if os.environ.get("P60_ON", "1") == "1":
+    # Off on Render: the free plan has no memory to spare. The scan runs on GitHub Actions instead (see .github/workflows/p60-scan.yml).
+    if os.environ.get("P60_ON", "0") == "1":
         threading.Thread(target=_loop, daemon=True).start()
