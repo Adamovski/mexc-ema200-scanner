@@ -3153,6 +3153,7 @@ PAGE = """<!doctype html>
   <div class="tab" id="tabCalls" onclick="showTab('calls')">📌 My calls</div>
   <div class="tab" id="tabOib" onclick="showTab('oib')" data-tip="Pre-pump watch: open interest rising hard while price has barely moved.">🧲 OI build-up</div>
   <div class="tab" id="tabPrad" onclick="showTab('prad')" data-tip="Urgent-pump watch: coins up 60%+ in 24h on real futures volume, like the Crime Scanner channel's 🚨 alerts, with what happened after each one.">🚨 Pump radar</div>
+  <div class="tab" id="tabP60" onclick="showTab('p60')" data-tip="Every MEXC futures coin, back ~12 months: each time one traded 60% above its 24h low, and what it did over the next 7 days. 1-minute candles for the last ~30 days, 5-minute before.">🚀 +60% history</div>
   <div class="tab" id="tabSbt" onclick="showTab('sbt')" data-tip="The whole volume-spike system replayed over ~50 days of Binance history: same scores, calls, stops, targets and exits as live.">🧪 System backtest</div>
   <div class="tab" id="tabCallsHC" onclick="showTab('callshc')" data-tip="Your ⭐ high-conviction calls only, with their own scorecard. Choose ⭐ High conviction next to any Track button on the Analyze tab.">⭐ High conviction</div>
 </div>
@@ -3268,6 +3269,7 @@ Hover any cell to see what it means for that coin. Click ⚲ for the full Analyz
 
 <div class="view" id="viewOib"><div class="wrap" id="oibBody" style="padding-top:12px"><span class="muted">Loading…</span></div></div>
 <div class="view" id="viewPrad"><div class="wrap" id="pradBody" style="padding-top:12px"><span class="muted">Loading…</span></div></div>
+<div class="view" id="viewP60"><div class="wrap" style="padding-top:12px"><iframe id="p60frame" title="+60% history" style="width:100%;height:calc(100vh - 170px);min-height:700px;border:0;background:transparent"></iframe></div></div>
 <div class="view" id="viewSbt"><div class="wrap" id="sbtBody" style="padding-top:12px"><span class="muted">Loading…</span></div></div>
 
 <div class="view" id="viewCalls">
@@ -3766,7 +3768,7 @@ function rvCell(v){ return v==null?'<td>—</td>'
   :`<td${(+v)>=1.5?' style="color:var(--accent);font-weight:600"':''}>${(+v).toFixed(2)}×</td>`; }
 function showTab(which){
   activeTab=which;
-  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["dtb","Dtb"],["accum","Accum"],["capit","Capit"],["micro","Micro"],["signals","Signals"],["watch2","Watch2"],["spikes","Spikes"],["watch3","Watch3"],["coil","Coil"],["scalp","Scalp"],["spot","Spot"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["sbt","Sbt"],["oib","Oib"],["prad","Prad"],["analyze","Analyze"],["info","Info"]]){
+  for(const [t,v] of [["market","Market"],["history","History"],["setups","Setups"],["flags","Flags"],["cpr","Cpr"],["bounce","Bounce"],["stb","Stb"],["shorts","Shorts"],["early","Early"],["dtb","Dtb"],["accum","Accum"],["capit","Capit"],["micro","Micro"],["signals","Signals"],["watch2","Watch2"],["spikes","Spikes"],["watch3","Watch3"],["coil","Coil"],["scalp","Scalp"],["spot","Spot"],["bestlong","BestLong"],["bestshort","BestShort"],["watch","Watch"],["perf","Perf"],["backtest","Backtest"],["calls","Calls"],["sbt","Sbt"],["oib","Oib"],["prad","Prad"],["p60","P60"],["analyze","Analyze"],["info","Info"]]){
     const _tb=document.getElementById("tab"+v), _vw=document.getElementById("view"+v);
     if(!_tb||!_vw) continue;
     _tb.classList.toggle("active", t===which);
@@ -3787,6 +3789,7 @@ function showTab(which){
   if(which==="sbt") loadSbt();
   if(which==="oib") loadOib();
   if(which==="prad") loadPrad();
+  if(which==="p60"){ const _f=document.getElementById("p60frame"); if(_f && !_f.src) _f.src="/p60/page"; }
   uiSave({tab:which});
   { const hb=document.getElementById('tabCallsHC'); if(hb) hb.classList.toggle('active', which==='callshc'); }
   if(which==="callshc"){ const vc=document.getElementById('viewCalls'); if(vc) vc.classList.add('active'); renderCalls(); }
@@ -7633,6 +7636,35 @@ def make_handler(state: State):
                 except Exception as e:
                     body = json.dumps({"rows": None, "status": f"volume-spike scanner unavailable: {e}"}).encode()
                 self._send(200, body, "application/json")
+            elif self.path.startswith("/p60/page"):
+                try:
+                    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "p60.html"), "rb") as fh:
+                        self._send(200, fh.read(), "text/html; charset=utf-8")
+                except Exception as e:
+                    self._send(500, str(e).encode(), "text/plain")
+            elif self.path.startswith("/p60/status"):
+                try:
+                    import pump60
+                    body = json.dumps(pump60.status(), default=str).encode()
+                except Exception as e:
+                    body = json.dumps({"status": "error", "error": str(e)}).encode()
+                self._send(200, body, "application/json")
+            elif self.path.startswith("/p60/data"):
+                try:
+                    import pump60
+                    body = pump60.blob()
+                except Exception:
+                    body = None
+                if not body:
+                    self._send(200, b'{"events":[],"pending":true}', "application/json")
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Encoding", "gzip")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(body)
             elif self.path.startswith("/prad/paths"):
                 try:
                     import pump_radar, gzip
@@ -7822,6 +7854,12 @@ def main() -> None:
                     import pump_radar
                     pump_radar.start()
                     print("  Pump radar: ON (every 2 min)")
+                    try:
+                        import pump60
+                        pump60.start()
+                        print("  +60% history: ON (MEXC, rebuilt daily)")
+                    except Exception as e:
+                        print(f"  +60% history failed to start: {e}")
                 except Exception as e:
                     print(f"  Pump radar failed to start: {e}")
                 print("  System backtest: ON (rebuilds every 3 days)")

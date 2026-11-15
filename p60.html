@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>+60% in a day — what MEXC coins did next</title>
+<style>
+:root{--bg:#0a0d13;--card:#141a26;--fg:#eaf0f7;--mut:#8593a8;--line:#222b3b;--ok:#3fb950;--bad:#f85149;--acc:#58a6ff;--ref:#5f6b80}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 -apple-system,Segoe UI,Inter,sans-serif;background:var(--bg);color:var(--fg)}
+.wrap{max-width:1600px;margin:0 auto;padding:4px 2px}h1{font:700 22px -apple-system,Segoe UI,Inter,sans-serif;margin:0 0 4px}h2{font:700 16px -apple-system,Segoe UI,Inter,sans-serif;margin:0 0 6px}
+.sub,.note{color:var(--mut);max-width:1100px}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px 20px;margin:16px 0}
+.ctls{display:flex;flex-wrap:wrap;gap:12px;margin:10px 0}.ctl{display:flex;flex-direction:column;gap:4px;font-size:12.5px;color:var(--mut)}
+select,input{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:6px 8px;min-width:110px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-top:12px}.tile{border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.lbl{color:var(--mut);font-size:12.5px}.val{font:700 22px -apple-system,Segoe UI,Inter,sans-serif;margin:2px 0}.foot{color:var(--mut);font-size:12px}
+.up{color:var(--ok)}.dn{color:var(--bad)}.mut{color:var(--mut)}table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
+th{color:var(--mut);font-weight:500;cursor:pointer}td.l,th.l{text-align:left}.scroll{overflow-x:auto}.tag{font-size:11px;border-radius:8px;padding:1px 6px;border:1px solid var(--line)}
+button{font:inherit;border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:10px;padding:6px 10px;cursor:pointer}
+</style></head><body><div class="wrap">
+<h1>🚀 +60% in a day — what MEXC coins did next</h1>
+<p class="sub" id="status">Loading…</p>
+<p class="note">Every MEXC USDT futures coin, scanned back as far as MEXC keeps candles. An <b>alert</b> is the first moment a coin trades <b>60% above its lowest price of the previous 24 hours</b>; the "buy" is at that +60% level. A coin can alert again only 24 hours after its last alert. Each alert is then followed for <b>7 days</b>. Alerts in the last ~30 days are pinned with <b>1-minute</b> candles; older ones with <b>5-minute</b> candles (MEXC keeps no older 1-minute data). Coins MEXC has since delisted are not in the scan, so results lean a little optimistic.</p>
+
+<div class="card"><h2>Filters</h2><div class="ctls">
+<label class="ctl">From<input type="date" id="f-from"></label>
+<label class="ctl">Until<input type="date" id="f-to"></label>
+<label class="ctl">Coin<input id="f-coin" placeholder="e.g. AKE"></label>
+<label class="ctl">Which alerts<select id="f-first"><option value="0">Every alert</option><option value="72">Only a coin's first in 72 h</option><option value="168">Only a coin's first in 7 days</option></select></label>
+<label class="ctl">24 h volume before alert<select id="f-vol"><option value="0">Any</option><option value="100000">≥ 100k USDT</option><option value="1000000">≥ 1M USDT</option><option value="10000000">≥ 10M USDT</option></select></label>
+<label class="ctl">Rise took<select id="f-speed"><option value="0">Any time</option><option value="1">≤ 1 h</option><option value="4">≤ 4 h</option><option value="12">≤ 12 h</option></select></label>
+<label class="ctl">Followed<select id="f-done"><option value="0">All</option><option value="1">Full 7 days only</option></select></label>
+</div><div class="tiles" id="tiles"></div></div>
+
+<div class="card"><h2>Strategy tester</h2>
+<p class="note">Trades every alert above at the +60% level. Within a candle the stop is assumed to come first (cautious). Fees 0.08% per side.</p>
+<div class="ctls">
+<label class="ctl">Side<select id="s-side"><option value="long">Long (buy the pump)</option><option value="short">Short (fade the pump)</option></select></label>
+<label class="ctl">Stop loss %<input type="number" id="s-sl" value="30" step="1"></label>
+<label class="ctl">Take profit % (0 = none)<input type="number" id="s-tp" value="10" step="1"></label>
+<label class="ctl">Trailing starts at % (0 = never)<input type="number" id="s-tg" value="0" step="1"></label>
+<label class="ctl">Trailing distance %<input type="number" id="s-td" value="20" step="1"></label>
+<label class="ctl">Close after (h, 0 = 7 days)<input type="number" id="s-tx" value="0" step="1"></label>
+<label class="ctl">Margin % of account<input type="number" id="s-pct" value="1.5" step="0.5"></label>
+<label class="ctl">Leverage<input type="number" id="s-lev" value="10" step="1"></label>
+</div><div class="tiles" id="stiles"></div></div>
+
+<div class="card"><h2>Alerts</h2><p class="note">Click a row's chart for the full 7 days. Moves are % from the buy (+60%) price.</p>
+<div class="scroll"><table><thead id="th"></thead><tbody id="tb"></tbody></table></div><p class="mut" id="more"></p></div>
+</div>
+<script>
+const $=id=>document.getElementById(id),el=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e},
+sv=(t,a)=>{const e=document.createElementNS('http://www.w3.org/2000/svg',t);for(const k in a)e.setAttribute(k,a[k]);return e},
+fp=v=>v==null?'—':(v>0?'+':'')+v.toFixed(1)+'%',cls=v=>v==null?'mut':v>0?'up':v<0?'dn':'',pc=(n,d)=>d?Math.round(n/d*100)+'%':'—',
+med=a=>{a=a.filter(v=>v!=null).sort((x,y)=>x-y);return a.length?a[a.length>>1]:null},
+when=ts=>new Date(ts*1000).toLocaleString('en-GB',{day:'numeric',month:'short',year:'2-digit',hour:'2-digit',minute:'2-digit'}),
+dur=m=>m<90?Math.round(m)+'m':m<2880?(m/60).toFixed(1)+'h':(m/1440).toFixed(1)+'d',
+fmtUsd=v=>v>=1e6?(v/1e6).toFixed(1)+'M':v>=1e3?Math.round(v/1e3)+'k':Math.round(v);
+let D={events:[]},SORT='ts',DIR=-1,SHOW=200;
+function sel(){const fr=$('f-from').value?Date.parse($('f-from').value)/1000:0,to=$('f-to').value?Date.parse($('f-to').value)/1000+86400:1e12,c=$('f-coin').value.trim().toUpperCase(),
+  fw=+$('f-first').value,v=+$('f-vol').value,sp=+$('f-speed').value,dn=$('f-done').value==='1';const last={};
+  return D.events.filter(e=>{const prev=last[e.coin];last[e.coin]=e.ts;if(fw&&prev!=null&&e.ts-prev<fw*3600)return false;
+    return e.ts>=fr&&e.ts<to&&(!c||e.coin.includes(c))&&e.vol24>=v&&(!sp||e.rise_h<=sp)&&(!dn||e.done)})}
+function Z(){return {side:$('s-side').value,sl:+$('s-sl').value||0,tp:+$('s-tp').value||0,tg:+$('s-tg').value||0,td:+$('s-td').value||0,tx:(+$('s-tx').value||0)*60}}
+function sim(e,z){const L=z.side==='long',B=e.bars;let best=0,on=false;          // returns {v: % on the coin after fees, why, t: minutes}
+  for(const [m,h,l,c] of B){if(z.tx&&m>=z.tx)return {v:(L?c:-c)-.16,why:'time',t:m};
+    const fav=L?h:-l,adv=L?l:-h;                                             // best and worst move for the trade in this bar
+    const stopLvl=on?(L?((1+best/100)*(1-z.td/100)-1)*100:-(((1-best/100)*(1+z.td/100)-1)*100)):-z.sl;
+    if(z.sl&&adv<=stopLvl)return {v:stopLvl-.16,why:on?'trail':'stop',t:m};
+    if(z.tp&&fav>=z.tp)return {v:z.tp-.16,why:'target',t:m};
+    best=Math.max(best,fav);if(z.tg&&!on&&best>=z.tg)on=true}
+  const c=B.length?B[B.length-1][3]:0;return {v:(L?c:-c)-.16,why:e.done?'7 days':'open',t:B.length?B[B.length-1][0]:0}}
+function tiles(P){const T=$('tiles');T.replaceChildren();const add=(l,v,c,f)=>{const t=el('div','tile');t.append(el('div','lbl',l),el('div','val '+(c||''),v),el('div','foot',f||''));T.append(t)};
+  const n=P.length,up=x=>P.filter(e=>e.hi>=x).length,dn=x=>P.filter(e=>e.lo<=-x).length,coins=new Set(P.map(e=>e.coin)).size;
+  add('Alerts',String(n),'',coins+' coins');add('Median peak',fp(med(P.map(e=>e.hi))),'up','best point within 7 days');
+  add('Median low before peak',fp(med(P.map(e=>e.lbp))),'dn','dip sat through before the high');add('Median lowest',fp(med(P.map(e=>e.lo))),'dn','worst point within 7 days');
+  ['h1','h4','h24','d3','d7'].forEach((k,i)=>{const v=P.map(e=>e.marks[k]);add('Median after '+['1 h','4 h','24 h','3 days','7 days'][i],fp(med(v)),cls(med(v)),v.filter(x=>x!=null).length+' old enough')});
+  [10,20,50,100].forEach(x=>add('Reached +'+x+'%',pc(up(x),n),'up',up(x)+' of '+n));
+  [20,30,50].forEach(x=>add('Fell '+x+'%',pc(dn(x),n),'dn',dn(x)+' of '+n));
+  const d7=P.filter(e=>e.marks.d7!=null);add('Below buy price after 7 days',pc(d7.filter(e=>e.marks.d7<0).length,d7.length),'dn',d7.filter(e=>e.marks.d7<0).length+' of '+d7.length)}
+function stiles(P){const T=$('stiles');T.replaceChildren();const add=(l,v,c,f)=>{const t=el('div','tile');t.append(el('div','lbl',l),el('div','val '+(c||''),v),el('div','foot',f||''));T.append(t)};
+  const z=Z(),R=P.slice().sort((a,b)=>a.ts-b.ts).map(e=>({e,r:sim(e,z)})),C=R.filter(x=>x.r.why!=='open');
+  const w=C.filter(x=>x.r.v>0.5).length,l=C.filter(x=>x.r.v<-0.5).length,avg=C.length?C.reduce((s,x)=>s+x.r.v,0)/C.length:null;
+  let eq=1000,pk=1000,dd=0;const pct=+$('s-pct').value||0,lev=+$('s-lev').value||1;
+  for(const x of C){eq+=eq*pct/100*lev*x.r.v/100;if(eq<0)eq=0;pk=Math.max(pk,eq);dd=Math.max(dd,1-eq/pk)}
+  add('Trades closed',String(C.length),'',(R.length-C.length)+' still open');add('Won',pc(w,C.length),'up',w+' won · '+l+' lost · '+(C.length-w-l)+' about even');
+  add('Average per trade',fp(avg),cls(avg),'% move on the coin, after fees');
+  const be=z.tp&&z.sl?100*z.sl/(z.sl+z.tp):null;if(be)add('Break-even win rate',be.toFixed(0)+'%','','for this stop and target');
+  add('Account 1,000 →',Math.round(eq).toLocaleString('en')+' USDT',eq>=1000?'up':'dn',pct+'% margin × '+lev+', one after another (no overlap)');
+  add('Worst drop',(dd*100).toFixed(1)+'%','dn','from a high, along the way');return new Map(R.map(x=>[x.e,x.r]))}
+function spark(e,r){const W=150,H=34,B=e.bars;if(!B.length)return el('span','mut','—');const end=B[B.length-1][0]||1;
+  let hi=Math.max(5,...B.map(b=>b[1])),lo=Math.min(-5,...B.map(b=>b[2]));const X=m=>m/end*W,Y=v=>2+(hi-v)/(hi-lo)*(H-4),s=sv('svg',{width:W,height:H});
+  s.append(sv('line',{x1:0,x2:W,y1:Y(0),y2:Y(0),stroke:'var(--ref)','stroke-dasharray':'2 2'}));
+  s.append(sv('polyline',{points:[[0,0]].concat(B.map(b=>[b[0],b[3]])).map(([m,v])=>X(m)+','+Y(v)).join(' '),fill:'none',stroke:'var(--acc)','stroke-width':1.2}));
+  if(r&&r.why!=='open'&&r.why!=='7 days')s.append(sv('circle',{cx:X(r.t),cy:Y($('s-side').value==='long'?r.v+.16:-(r.v+.16)),r:2.5,fill:r.v>0?'var(--ok)':'var(--bad)'}));return s}
+function big(e,r){const z=Z(),W=Math.min(1100,innerWidth-80),H=260,ml=96,mb=22,B=e.bars,box=el('div');const end=B[B.length-1][0]||1;
+  let hi=Math.max(5,...B.map(b=>b[1])),lo=Math.min(-5,...B.map(b=>b[2]));const L=z.side==='long';
+  const lv=[[0,'var(--ref)','buy (+60% level)']];if(z.sl)lv.push([L?-z.sl:z.sl,'var(--bad)','stop '+(L?'−':'+')+z.sl+'%']);if(z.tp)lv.push([L?z.tp:-z.tp,'var(--ok)','take profit '+(L?'+':'−')+z.tp+'%']);if(z.tg)lv.push([L?z.tg:-z.tg,'var(--ok)','trailing starts']);
+  lv.forEach(([v])=>{hi=Math.max(hi,v);lo=Math.min(lo,v)});const pad=(hi-lo)*.05;hi+=pad;lo-=pad;
+  const X=m=>ml+m/end*(W-ml-8),Y=v=>6+(hi-v)/(hi-lo)*(H-mb-12),s=sv('svg',{width:W,height:H});
+  for(let i=0;i<=5;i++){const v=lo+(hi-lo)*i/5;s.append(sv('line',{x1:ml,x2:W-8,y1:Y(v),y2:Y(v),stroke:'var(--ref)','stroke-opacity':.25}));const t=sv('text',{x:ml-4,y:Y(v)+4,'text-anchor':'end','font-size':10,fill:'var(--mut)'});t.textContent=+(e.entry*(1+v/100)).toPrecision(4)+' · '+(v>0?'+':'')+v.toFixed(0)+'%';s.append(t)}
+  for(let i=0;i<=7;i++){const m=end*i/7,t=sv('text',{x:X(m),y:H-6,'text-anchor':'middle','font-size':10,fill:'var(--mut)'});t.textContent=dur(m);s.append(t)}
+  lv.forEach(([v,c,lab])=>{s.append(sv('line',{x1:ml,x2:W-8,y1:Y(v),y2:Y(v),stroke:c,'stroke-dasharray':'4 4'}));const t=sv('text',{x:W-10,y:Y(v)-3,'text-anchor':'end','font-size':10,fill:c});t.textContent=lab+' @ '+(+(e.entry*(1+v/100)).toPrecision(5));s.append(t)});
+  s.append(sv('polygon',{points:B.map(b=>X(b[0])+','+Y(b[1])).concat(B.slice().reverse().map(b=>X(b[0])+','+Y(b[2]))).join(' '),fill:'var(--acc)','fill-opacity':.15}));
+  s.append(sv('polyline',{points:[[0,0]].concat(B.map(b=>[b[0],b[3]])).map(([m,v])=>X(m)+','+Y(v)).join(' '),fill:'none',stroke:'var(--acc)','stroke-width':1.3}));
+  if(r&&r.why!=='open'&&r.why!=='7 days'){const v=L?r.v+.16:-(r.v+.16);s.append(sv('circle',{cx:X(r.t),cy:Y(v),r:5,fill:r.v>0?'var(--ok)':'var(--bad)'}))}
+  box.append(s,el('div','mut','Line: close of each candle (15-minute for the first day, hourly after); shaded: each candle\'s high–low. Dot: where the tested strategy closed.'));return box}
+const COLS=[['ts','Alert time'],['coin','Coin'],['rise_h','Rise took'],['vol24','24 h volume'],['','Buy at'],['h1','1 h'],['h4','4 h'],['h24','24 h'],['d3','3 days'],['d7','7 days'],['hi','Peak'],['lbp','Low before peak'],['lo','Lowest'],['res','Strategy'],['','7 days chart']];
+function val(e,k,R){if(['h1','h4','h24','d3','d7'].includes(k))return e.marks[k];if(k==='res')return R.get(e).v;return e[k]}
+function table(P,R){const H=$('th'),T=$('tb');H.replaceChildren();T.replaceChildren();const h=el('tr');
+  COLS.forEach(([k,n],i)=>{const th=el('th',i<2?'l':'',n+(SORT===k?(DIR>0?' ▴':' ▾'):''));if(k)th.onclick=()=>{DIR=SORT===k?-DIR:-1;SORT=k;draw()};h.append(th)});H.append(h);
+  const S=P.slice().sort((a,b)=>{const x=val(a,SORT,R),y=val(b,SORT,R);if(x==null)return 1;if(y==null)return -1;return (x<y?-1:x>y?1:0)*DIR});
+  S.slice(0,SHOW).forEach(e=>{const r=R.get(e),tr=el('tr');
+    tr.append(el('td','l',when(e.ts)),el('td','l',e.coin),el('td','',e.rise_h+' h'),el('td','',fmtUsd(e.vol24)),el('td','',String(+e.entry.toPrecision(5))));
+    ['h1','h4','h24','d3','d7'].forEach(k=>tr.append(el('td',cls(e.marks[k]),fp(e.marks[k]))));
+    const pk=el('td','up',fp(e.hi));pk.append(el('span','mut',' · '+dur(e.hi_t)));const lw=el('td','dn',fp(e.lo));lw.append(el('span','mut',' · '+dur(e.lo_t)));
+    const rt=el('td',cls(r.v),fp(r.v));rt.append(el('span','mut',' · '+r.why+(r.why==='open'?'':', '+dur(r.t))));
+    const sp=el('td');sp.append(spark(e,r));sp.style.cursor='zoom-in';sp.onclick=()=>{const nx=tr.nextSibling;if(nx&&nx.classList.contains('big')){nx.remove();return}const b=el('tr','big'),d=el('td');d.colSpan=COLS.length;d.append(big(e,r));b.append(d);tr.after(b)};
+    tr.append(pk,el('td',e.lbp<0?'dn':'mut',fp(e.lbp)),lw,rt,sp);T.append(tr)});
+  $('more').textContent=S.length>SHOW?'Showing '+SHOW+' of '+S.length+' — ':'';if(S.length>SHOW){const b=el('button','','Show 200 more');b.onclick=()=>{SHOW+=200;draw()};$('more').append(b)}}
+function draw(){const P=sel();tiles(P);const R=stiles(P);table(P,R)}
+async function status(){try{const s=await (await fetch('/p60/status',{cache:'no-store'})).json();
+  const made=D.made?'Scanned '+new Date(D.made*1000).toLocaleString('en-GB')+' · '+D.coins+' coins · last '+D.days+' days. ':'';
+  $('status').textContent=made+(s.status==='running'?'Scanning now: '+s.done+' of '+s.total+' coins, '+s.events+' alerts so far (takes about 1.5 hours; results appear when it finishes)…':s.status==='error'?'Last scan failed: '+s.error:D.made?'Rescans once a day.':'First scan starts about 5 minutes after the server boots.');
+  if(s.status==='running'||!D.made)setTimeout(status,15000)}catch(e){}}
+async function load(){try{const j=await (await fetch('/p60/data',{cache:'no-store'})).json();if(j.events)D=j}catch(e){}draw();status();if(!D.made)setTimeout(load,60000)}
+document.querySelectorAll('select,input').forEach(x=>x.addEventListener('input',()=>{SHOW=200;draw()}));load();
+</script></body></html>
