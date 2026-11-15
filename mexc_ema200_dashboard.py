@@ -7655,6 +7655,16 @@ def make_handler(state: State):
                     body = pump60.blob()
                 except Exception:
                     body = None
+                if not body:                     # the scan runs on GitHub Actions; fetch its result (cached 1 h)
+                    try:
+                        import urllib.request
+                        c = globals().setdefault("_P60_CACHE", {"t": 0, "b": None})
+                        if not c["b"] or time.time() - c["t"] > 3600:
+                            with urllib.request.urlopen("https://raw.githubusercontent.com/Adamovski/mexc-ema200-scanner/p60-data/p60.json.gz", timeout=20) as r:
+                                c["b"], c["t"] = r.read(), time.time()
+                        body = c["b"]
+                    except Exception:
+                        body = None
                 if not body:
                     self._send(200, b'{"events":[],"pending":true}', "application/json")
                 else:

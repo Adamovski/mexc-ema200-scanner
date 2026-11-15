@@ -57,7 +57,7 @@ def _sess():
 def _get(path, params=None):
     for attempt in range(5):
         with _RL:                                    # ~4 requests a second
-            gap = 0.25 - (time.time() - _last[0])        # gentle: ~4 requests a second, leaves CPU for the dashboard
+            gap = float(os.environ.get("P60_GAP", 0.25)) - (time.time() - _last[0])        # gentle: ~4 requests a second, leaves CPU for the dashboard
             if gap > 0:
                 time.sleep(gap)
             _last[0] = time.time()

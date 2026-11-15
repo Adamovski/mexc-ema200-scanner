@@ -117,7 +117,7 @@ function table(P,R){const H=$('th'),T=$('tb');H.replaceChildren();T.replaceChild
 function draw(){const P=sel();tiles(P);const R=stiles(P);table(P,R)}
 async function status(){try{const s=await (await fetch('/p60/status',{cache:'no-store'})).json();
   const made=D.made?'Scanned '+new Date(D.made*1000).toLocaleString('en-GB')+' · '+D.coins+' coins · last '+D.days+' days. ':'';
-  $('status').textContent=made+(s.status==='running'?'Scanning now: '+s.done+' of '+s.total+' coins, '+s.events+' alerts so far (takes about 1.5 hours; results appear when it finishes)…':s.status==='error'?'Last scan failed: '+s.error:D.made?'Rescans once a day.':'First scan starts about 5 minutes after the server boots.');
+  $('status').textContent=made+(s.status==='running'?'Scanning now: '+s.done+' of '+s.total+' coins, '+s.events+' alerts so far (takes about 1.5 hours; results appear when it finishes)…':s.status==='error'?'Last scan failed: '+s.error:D.made?'Rescanned daily on GitHub.':'Waiting for the first scan (runs daily on GitHub; takes about an hour).');
   if(s.status==='running'||!D.made)setTimeout(status,15000)}catch(e){}}
 async function load(){try{const j=await (await fetch('/p60/data',{cache:'no-store'})).json();if(j.events)D=j}catch(e){}draw();status();if(!D.made)setTimeout(load,60000)}
 document.querySelectorAll('select,input').forEach(x=>x.addEventListener('input',()=>{SHOW=200;draw()}));load();
