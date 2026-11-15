@@ -37,7 +37,7 @@ ONE_MIN_DAYS = 29
 REFRESH_EVERY = 24 * 3600
 KEY = "p60_v2"
 OLD_KEYS = ["p60_v1", "p60_v1:ckpt"]
-WORKERS = 2
+WORKERS = 1
 STATE = {"status": "idle", "done": 0, "total": 0, "events": 0, "started": None, "error": None}
 RES = {"blob": None, "made": None}
 _LOCK = threading.Lock()
@@ -56,8 +56,8 @@ def _sess():
 
 def _get(path, params=None):
     for attempt in range(5):
-        with _RL:                                    # ~12 requests a second over all threads
-            gap = 0.085 - (time.time() - _last[0])
+        with _RL:                                    # ~4 requests a second
+            gap = 0.25 - (time.time() - _last[0])        # gentle: ~4 requests a second, leaves CPU for the dashboard
             if gap > 0:
                 time.sleep(gap)
             _last[0] = time.time()
@@ -106,6 +106,7 @@ def _event(sym, hours, i, now):
     if len(pre) < 10:
         return None
     trig, lows = None, []
+    time.sleep(0.02)
     for k in pre:                                   # first fine candle reaching RISE% above the rolling 24 h low
         while lows and lows[0][0] < k[0] - 86400:
             lows.pop(0)
@@ -126,6 +127,7 @@ def _event(sym, hours, i, now):
         return None
     pct = lambda p: (p / entry - 1) * 100
     bars, cur = [], None
+    time.sleep(0.02)
     for k in post:
         dt = k[0] - t0
         b = int(dt // 900) if dt < 86400 else 96 + int((dt - 86400) // 3600) * 4
@@ -184,8 +186,17 @@ def _drop_old():
             pass
 
 
+def _rget_str(key):
+    try:
+        return vs._redis_cmd("GET", key)
+    except Exception:
+        return None
+
+
 def run():
-    """Memory-light: each coin's alerts go straight to a file on disk; the final gzip is streamed from it."""
+    """Memory- and CPU-light. Every 50 coins the new alerts are saved to Redis as a small compressed part, so a
+    restart resumes where it stopped instead of starting over."""
+    import base64
     with _LOCK:
         if STATE["status"] == "running":
             return
@@ -194,54 +205,77 @@ def run():
         det = _get("/detail") or []
         syms = sorted(d["symbol"] for d in det if d.get("quoteCoin") == "USDT" and d.get("state", 0) == 0 and d["symbol"].endswith("_USDT"))
         det = None
-        now = int(time.time())
-        STATE.update(total=len(syms))
-        n_ev = 0
-        with open(TMP, "w") as fh:
-            with ThreadPoolExecutor(WORKERS) as ex:
-                for k, ev in enumerate(ex.map(lambda s: _safe_coin(s, now), syms)):
-                    for e in ev:
-                        fh.write(json.dumps(e, separators=(",", ":")) + "\n")
-                    n_ev += len(ev)
-                    ev = None
-                    STATE.update(done=k + 1, events=n_ev)
-                    if k % 25 == 0:
-                        fh.flush()
-                        gc.collect()
-        lines = []
-        with open(TMP) as fh:                                   # sort by time: keep only (ts, offset) in memory
-            off = 0
-            for line in fh:
-                lines.append((int(line[line.find('"ts":') + 5:].split(",", 1)[0]), off))
-                off += len(line.encode())
-        lines.sort()
+        prog = None
+        if vs._redis():
+            try:
+                prog = json.loads(_rget_str(KEY + ":prog") or "null")
+            except Exception:
+                prog = None
+        if prog and time.time() - prog.get("now", 0) < 2 * 86400:
+            now, start, parts, n_ev = prog["now"], prog["done"], prog["parts"], prog["events"]
+            print(f"[p60] resuming at coin {start} of {len(syms)}", flush=True)
+        else:
+            now, start, parts, n_ev = int(time.time()), 0, 0, 0
+        STATE.update(total=len(syms), done=start, events=n_ev)
+        pend = []
+
+        def flush(done):
+            nonlocal parts, pend
+            if not vs._redis():
+                return
+            z = base64.b64encode(gzip.compress("\n".join(pend).encode(), 6)).decode() if pend else ""
+            vs._redis_cmd("SET", f"{KEY}:part:{parts}", z)
+            parts += 1
+            vs._redis_cmd("SET", KEY + ":prog", json.dumps({"now": now, "done": done, "parts": parts, "events": n_ev}))
+            pend = []
+
+        for k in range(start, len(syms)):
+            ev = _safe_coin(syms[k], now)
+            pend += [json.dumps(e, separators=(",", ":")) for e in ev]
+            n_ev += len(ev)
+            ev = None
+            STATE.update(done=k + 1, events=n_ev)
+            if (k + 1) % 50 == 0 or k + 1 == len(syms):
+                flush(k + 1)
+                gc.collect()
+            time.sleep(0.05)
+        # assemble: read parts back one at a time, sort by time keeping only (ts, part, line no.)
+        idx = []
+        for pi in range(parts):
+            z = _rget_str(f"{KEY}:part:{pi}") if vs._redis() else None
+            for li, line in enumerate(gzip.decompress(base64.b64decode(z)).decode().split("\n") if z else (pend if not vs._redis() else [])):
+                if line:
+                    idx.append((int(line[line.find('"ts":') + 5:].split(",", 1)[0]), pi, li))
+        idx.sort()
         buf = io.BytesIO()
-        with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=6) as gz, open(TMP, "rb") as fh:
+        cache = {}
+        with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=6) as gz:
             gz.write(json.dumps({"made": now, "rise": RISE, "days": DAYS, "coins": len(syms)})[:-1].encode() + b',"events":[')
-            for n, (_, off) in enumerate(lines):
-                fh.seek(off)
-                gz.write((b"," if n else b"") + fh.readline().rstrip(b"\n"))
+            for n, (_, pi, li) in enumerate(idx):
+                if pi not in cache:
+                    cache.clear()
+                    z = _rget_str(f"{KEY}:part:{pi}")
+                    cache[pi] = gzip.decompress(base64.b64decode(z)).decode().split("\n") if z else []
+                gz.write((b"," if n else b"") + cache[pi][li].encode())
             gz.write(b"]}")
-        lines = None
+        cache = idx = None
         blob = buf.getvalue()
         buf = None
         _publish_blob(blob, now)
         if vs._redis():
             try:
-                import base64
                 z = base64.b64encode(blob).decode()
-                parts = [z[i:i + sbt.CHUNK] for i in range(0, len(z), sbt.CHUNK)] or [""]
-                for i, part in enumerate(parts):
+                ch = [z[i:i + sbt.CHUNK] for i in range(0, len(z), sbt.CHUNK)] or [""]
+                for i, part in enumerate(ch):
                     vs._redis_cmd("SET", f"{KEY}:gz:{i}", part)
-                vs._redis_cmd("SET", KEY + ":gz:n", str(len(parts)))
+                vs._redis_cmd("SET", KEY + ":gz:n", str(len(ch)))
                 vs._redis_cmd("SET", KEY + ":made", str(now))
-                z = parts = None
+                for pi in range(parts):
+                    vs._redis_cmd("DEL", f"{KEY}:part:{pi}")
+                vs._redis_cmd("DEL", KEY + ":prog")
+                z = ch = None
             except Exception as e:
                 print(f"[p60] save failed: {e}", flush=True)
-        try:
-            os.remove(TMP)
-        except Exception:
-            pass
         gc.collect()
         STATE.update(status="done")
         print(f"[p60] done: {n_ev} alerts from {len(syms)} coins, {len(blob) // 1024} KB", flush=True)
