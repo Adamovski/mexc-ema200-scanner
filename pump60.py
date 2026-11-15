@@ -250,4 +250,6 @@ def _loop():
 
 
 def start():
-    threading.Thread(target=_loop, daemon=True).start()
+    # Off by default: the full scan needs more than the free plan's 512 MB. Set P60_ON=1 to run it.
+    if os.environ.get("P60_ON") == "1":
+        threading.Thread(target=_loop, daemon=True).start()
