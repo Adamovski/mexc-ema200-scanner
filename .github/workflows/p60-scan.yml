@@ -1,0 +1,33 @@
+# +60% in a day history: scans every MEXC USDT perp on GitHub's servers once a day and publishes p60.json.gz
+# on the p60-data branch. Apex's "🚀 +60% history" tab downloads that file.
+name: p60-scan
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests
+      - name: Scan
+        env:
+          P60_GAP: "0.12"
+        run: python p60_runner.py
+      - name: Publish to the p60-data branch
+        run: |
+          mkdir out && mv p60.json.gz out/
+          cd out
+          git init -q -b p60-data
+          git config user.name "p60-bot"
+          git config user.email "p60-bot@users.noreply.github.com"
+          git add p60.json.gz
+          git commit -qm "p60 scan $(date -u +%F)"
+          git push -fq "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" p60-data
