@@ -28,6 +28,11 @@ button{font:inherit;border:1px solid var(--line);background:var(--bg);color:var(
 <label class="ctl">Followed<select id="f-done"><option value="0">All</option><option value="1">Full 7 days only</option></select></label>
 </div><div class="tiles" id="tiles"></div></div>
 
+<div class="card"><h2>Your bot's strategies on these alerts</h2>
+<p class="note">The live pump bot's trades, run on every alert above (long, bought at the +60% level, 10×, fees 0.08% per side). Tick the ones to include. "First" = no alert on the coin in the previous 96 h, like the bot's first Urgent pump. Within a candle the stop is assumed to come first.</p>
+<div class="ctls" id="bot-ticks"></div>
+<div class="scroll"><table><thead><tr><th class="l">Trade</th><th>Margin</th><th>Trades</th><th>Won</th><th>Lost</th><th>Avg per trade</th><th>Account 1,000 → (alone)</th><th>Worst drop</th></tr></thead><tbody id="bot-tb"></tbody></table></div></div>
+
 <div class="card"><h2>Strategy tester</h2>
 <p class="note">Trades every alert above at the +60% level. Within a candle the stop is assumed to come first (cautious). Fees 0.08% per side.</p>
 <div class="ctls">
@@ -61,8 +66,10 @@ function Z(){return {side:$('s-side').value,sl:+$('s-sl').value||0,tp:+$('s-tp')
 function sim(e,z){const L=z.side==='long',B=e.bars;let best=0,on=false;          // returns {v: % on the coin after fees, why, t: minutes}
   for(const [m,h,l,c] of B){if(z.tx&&m>=z.tx)return {v:(L?c:-c)-.16,why:'time',t:m};
     const fav=L?h:-l,adv=L?l:-h;                                             // best and worst move for the trade in this bar
-    const stopLvl=on?(L?((1+best/100)*(1-z.td/100)-1)*100:-(((1-best/100)*(1+z.td/100)-1)*100)):-z.sl;
-    if(z.sl&&adv<=stopLvl)return {v:stopLvl-.16,why:on?'trail':'stop',t:m};
+    const beLvl=z.be>0&&best>=z.be?0:-1e9;
+    const stopLvl0=on?(L?((1+best/100)*(1-z.td/100)-1)*100:-(((1-best/100)*(1+z.td/100)-1)*100)):-z.sl;
+    const stopLvl=Math.max(stopLvl0,beLvl);
+    if(z.sl&&adv<=stopLvl)return {v:stopLvl-.16,why:on&&stopLvl===stopLvl0?'trail':stopLvl===0?'at entry':'stop',t:m};
     if(z.tp&&fav>=z.tp)return {v:z.tp-.16,why:'target',t:m};
     best=Math.max(best,fav);if(z.tg&&!on&&best>=z.tg)on=true}
   const c=B.length?B[B.length-1][3]:0;return {v:(L?c:-c)-.16,why:e.done?'7 days':'open',t:B.length?B[B.length-1][0]:0}}
@@ -114,7 +121,22 @@ function table(P,R){const H=$('th'),T=$('tb');H.replaceChildren();T.replaceChild
     const sp=el('td');sp.append(spark(e,r));sp.style.cursor='zoom-in';sp.onclick=()=>{const nx=tr.nextSibling;if(nx&&nx.classList.contains('big')){nx.remove();return}const b=el('tr','big'),d=el('td');d.colSpan=COLS.length;d.append(big(e,r));b.append(d);tr.after(b)};
     tr.append(pk,el('td',e.lbp<0?'dn':'mut',fp(e.lbp)),lw,rt,sp);T.append(tr)});
   $('more').textContent=S.length>SHOW?'Showing '+SHOW+' of '+S.length+' — ':'';if(S.length>SHOW){const b=el('button','','Show 200 more');b.onclick=()=>{SHOW+=200;draw()};$('more').append(b)}}
-function draw(){const P=sel();tiles(P);const R=stiles(P);table(P,R)}
+
+const BOT=[
+ {k:'nf',name:'Normal trade, first pump on a coin',pct:2,first:true,z:{side:'long',sl:30,tp:0,tg:20,td:7.5,be:0,tx:0}},
+ {k:'nr',name:'Normal trade, repeat pump',pct:2,first:false,z:{side:'long',sl:20,tp:0,tg:15,td:7.5,be:9,tx:0}},
+ {k:'rn',name:'Runner (first pump only)',pct:1,first:true,z:{side:'long',sl:30,tp:0,tg:20,td:20,be:30,tx:0}},
+ {k:'sc',name:'Scalp (every alert)',pct:1.5,first:null,z:{side:'long',sl:30,tp:9,tg:0,td:20,be:0,tx:0}}];
+let BTICK;try{BTICK=new Set(JSON.parse(localStorage.getItem('p60bot')||'["nf","nr","rn","sc"]'))}catch(e){BTICK=new Set(['nf','nr','rn','sc'])}
+function isFirst(e){if(e._f!=null)return e._f;const prev=D.events.filter(x=>x.coin===e.coin&&x.ts<e.ts&&e.ts-x.ts<=345600);return e._f=!prev.length}
+function botSection(P){const box=$('bot-ticks');if(!box.children.length)BOT.forEach(s=>{const l=el('label','ctl');l.style.flexDirection='row';l.style.alignItems='center';const c=document.createElement('input');c.type='checkbox';c.checked=BTICK.has(s.k);c.style.minWidth='auto';c.onchange=()=>{c.checked?BTICK.add(s.k):BTICK.delete(s.k);try{localStorage.setItem('p60bot',JSON.stringify([...BTICK]))}catch(e){}draw()};l.append(c,' '+s.name+' · '+s.pct+'%');box.append(l)});
+  const T=$('bot-tb');T.replaceChildren();const lev=10,all=[];
+  const acct=tr=>{let eq=1000,pk=1000,dd=0;tr.sort((a,b)=>a.t-b.t).forEach(x=>{eq+=eq*x.pct/100*lev*x.v/100;if(eq<0)eq=0;pk=Math.max(pk,eq);dd=Math.max(dd,1-eq/pk)});return [eq,dd]};
+  const row=(name,pct,tr,bold)=>{const n=tr.length,w=tr.filter(x=>x.v>0.5).length,l=tr.filter(x=>x.v<-0.5).length,avg=n?tr.reduce((s,x)=>s+x.v,0)/n:null,[eq,dd]=acct(tr.slice());const r=el('tr');if(bold)r.style.fontWeight='600';
+    [[name,'l'],[pct,''],[String(n),''],[n?w+' ('+pc(w,n)+')':'—','up'],[n?String(l):'—','dn'],[fp(avg),cls(avg)],[Math.round(eq).toLocaleString('en')+' USDT',eq>=1000?'up':'dn'],[(dd*100).toFixed(1)+'%','dn']].forEach(([v,c])=>r.append(el('td',c,v)));T.append(r)};
+  BOT.forEach(s=>{if(!BTICK.has(s.k))return;const tr=P.filter(e=>s.first==null||isFirst(e)===s.first).map(e=>({e,r:sim(e,s.z)})).filter(x=>x.r.why!=='open').map(x=>({t:x.e.ts,v:x.r.v,pct:s.pct}));all.push(...tr);row(s.name,s.pct+'%',tr)});
+  if(BTICK.size>1)row('All ticked together','',all,true)}
+function draw(){const P=sel();tiles(P);botSection(P);const R=stiles(P);table(P,R)}
 async function status(){try{const s=await (await fetch('/p60/status',{cache:'no-store'})).json();
   const made=D.made?'Scanned '+new Date(D.made*1000).toLocaleString('en-GB')+' · '+D.coins+' coins · last '+D.days+' days. ':'';
   $('status').textContent=made+(s.status==='running'?'Scanning now: '+s.done+' of '+s.total+' coins, '+s.events+' alerts so far (takes about 1.5 hours; results appear when it finishes)…':s.status==='error'?'Last scan failed: '+s.error:D.made?'Rescanned daily on GitHub.':'Waiting for the first scan (runs daily on GitHub; takes about an hour).');
