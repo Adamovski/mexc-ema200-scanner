@@ -23,7 +23,7 @@ button{font:inherit;border:1px solid var(--line);background:var(--bg);color:var(
 <label class="ctl">Until<input type="date" id="f-to"></label>
 <label class="ctl">Coin<input id="f-coin" placeholder="e.g. AKE"></label>
 <label class="ctl">Which alerts<select id="f-first"><option value="0">Every alert</option><option value="72">Only a coin's first in 72 h</option><option value="168">Only a coin's first in 7 days</option></select></label>
-<label class="ctl">24 h volume before alert<select id="f-vol"><option value="0">Any</option><option value="100000">≥ 100k USDT</option><option value="1000000">≥ 1M USDT</option><option value="10000000">≥ 10M USDT</option></select></label>
+<label class="ctl" title="USDT traded on MEXC futures in the 24 hours up to the alert (hourly candles)">24 h MEXC futures volume before alert<select id="f-vol"><option value="0">Any</option><option value="100000">≥ 100k USDT</option><option value="1000000">≥ 1M USDT</option><option value="5000000">≥ 5M USDT</option><option value="10000000">≥ 10M USDT</option><option value="30000000">≥ 30M USDT</option></select></label>
 <label class="ctl">Rise took<select id="f-speed"><option value="0">Any time</option><option value="1">≤ 1 h</option><option value="4">≤ 4 h</option><option value="12">≤ 12 h</option></select></label>
 <label class="ctl">Followed<select id="f-done"><option value="0">All</option><option value="1">Full 7 days only</option></select></label>
 </div><div class="tiles" id="tiles"></div></div>
