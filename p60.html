@@ -25,8 +25,19 @@ button{font:inherit;border:1px solid var(--line);background:var(--bg);color:var(
 <label class="ctl">Which alerts<select id="f-first"><option value="0">Every alert</option><option value="72">Only a coin's first in 72 h</option><option value="168">Only a coin's first in 7 days</option></select></label>
 <label class="ctl" title="USDT traded on MEXC futures in the 24 hours up to the alert (hourly candles)">24 h MEXC futures volume before alert<select id="f-vol"><option value="0">Any</option><option value="100000">≥ 100k USDT</option><option value="1000000">≥ 1M USDT</option><option value="5000000">≥ 5M USDT</option><option value="10000000">≥ 10M USDT</option><option value="30000000">≥ 30M USDT</option></select></label>
 <label class="ctl">Rise took<select id="f-speed"><option value="0">Any time</option><option value="1">≤ 1 h</option><option value="4">≤ 4 h</option><option value="12">≤ 12 h</option></select></label>
+<label class="ctl">Since the coin's last +60% alert (96 h)<select id="f-since"><option value="">Any</option><option value="first">First alert</option><option value="up">Repeat, price higher than last alert</option><option value="dn">Repeat, price lower than last alert</option></select></label>
+<label class="ctl">Funding at the pump (MEXC)<select id="f-fund"><option value="">Any</option><option value="neg">Negative (shorts pay)</option><option value="low">0 to 0.01%</option><option value="mid">0.01% to 0.05%</option><option value="high">0.05% or more (longs pay a lot)</option><option value="cut">Interval cut below 8 h</option></select></label>
+<label class="ctl">BTC last 24 h<select id="f-btcd"><option value="">Any</option><option value="dn">Down 1.5% or more</option><option value="flat">Within ±1.5%</option><option value="up">Up 1.5% or more</option></select></label>
+<label class="ctl">BTC last 7 days<select id="f-btcw"><option value="">Any</option><option value="dn">Down 5% or more</option><option value="flat">Within ±5%</option><option value="up">Up 5% or more</option></select></label>
+<label class="ctl" title="Binance only keeps ~30 days: load it with the button below">OI last 4 h (Binance)<select id="f-oi"><option value="">Any</option><option value="up">Rising (above +1%)</option><option value="flat">Flat</option><option value="dn">Falling (below −1%)</option><option value="na">No Binance data</option></select></label>
+<label class="ctl" title="Binance only keeps ~30 days">Crowd long/short (Binance)<select id="f-ls"><option value="">Any</option><option value="short">Mostly shorts (below 1)</option><option value="long">Mostly longs (1 or more)</option></select></label>
 <label class="ctl">Followed<select id="f-done"><option value="0">All</option><option value="1">Full 7 days only</option></select></label>
 </div><div class="tiles" id="tiles"></div></div>
+
+<div class="card"><h2>Which signals give an edge</h2>
+<p class="note">Every signal split into groups, each run with the scalp (+9% / −30%), your bot's ticked trades and a short (+20% target / −30% stop). Groups with fewer than 15 alerts are left out. Follows the filters above. Binance OI and long/short only exist for the last ~30 days, and only for coins listed on Binance:
+<button id="bn-load">Load Binance OI and long/short (last 30 days)</button> <span id="bn-st" class="mut"></span></p>
+<div class="scroll"><table><thead><tr><th class="l">Signal</th><th class="l">Group</th><th>Alerts</th><th>Scalp won</th><th>Scalp avg</th><th>Bot trades avg</th><th>Short won</th><th>Short avg</th></tr></thead><tbody id="edge-tb"></tbody></table></div></div>
 
 <div class="card"><h2>Your bot's strategies on these alerts</h2>
 <p class="note">The live pump bot's trades, run on every alert above (long, bought at the +60% level, 10×, fees 0.08% per side). Tick the ones to include. "First" = no alert on the coin in the previous 96 h, like the bot's first Urgent pump. Within a candle the stop is assumed to come first.</p>
@@ -60,7 +71,11 @@ fmtUsd=v=>v>=1e6?(v/1e6).toFixed(1)+'M':v>=1e3?Math.round(v/1e3)+'k':Math.round(
 let D={events:[]},SORT='ts',DIR=-1,SHOW=200;
 function sel(){const fr=$('f-from').value?Date.parse($('f-from').value)/1000:0,to=$('f-to').value?Date.parse($('f-to').value)/1000+86400:1e12,c=$('f-coin').value.trim().toUpperCase(),
   fw=+$('f-first').value,v=+$('f-vol').value,sp=+$('f-speed').value,dn=$('f-done').value==='1';const last={};
+  const fs=$('f-since').value,ff=$('f-fund').value,fbd=$('f-btcd').value,fbw=$('f-btcw').value,fo=$('f-oi').value,fl=$('f-ls').value;
   return D.events.filter(e=>{const prev=last[e.coin];last[e.coin]=e.ts;if(fw&&prev!=null&&e.ts-prev<fw*3600)return false;
+    if(fs){const s=sinceLast(e);if(fs==='first'?s!=null:s==null||(fs==='up'?s<0:s>=0))return false}
+    if(ff&&(ff==='cut'?!(e.fund_cyc<8):fundG(e)!==ff))return false;if(fbd&&b3(e.btc_d,1.5)!==fbd)return false;if(fbw&&b3(e.btc_w,5)!==fbw)return false;
+    if(fo&&oiG(e)!==fo)return false;if(fl&&(e.ls==null||(fl==='short')!==(e.ls<1)))return false;
     return e.ts>=fr&&e.ts<to&&(!c||e.coin.includes(c))&&e.vol24>=v&&(!sp||e.rise_h<=sp)&&(!dn||e.done)})}
 function Z(){return {side:$('s-side').value,sl:+$('s-sl').value||0,tp:+$('s-tp').value||0,tg:+$('s-tg').value||0,td:+$('s-td').value||0,tx:(+$('s-tx').value||0)*60}}
 function sim(e,z){const L=z.side==='long',B=e.bars;let best=0,on=false;          // returns {v: % on the coin after fees, why, t: minutes}
@@ -136,11 +151,40 @@ function botSection(P){const box=$('bot-ticks');if(!box.children.length)BOT.forE
     [[name,'l'],[pct,''],[String(n),''],[n?w+' ('+pc(w,n)+')':'—','up'],[n?String(l):'—','dn'],[fp(avg),cls(avg)],[Math.round(eq).toLocaleString('en')+' USDT',eq>=1000?'up':'dn'],[(dd*100).toFixed(1)+'%','dn']].forEach(([v,c])=>r.append(el('td',c,v)));T.append(r)};
   BOT.forEach(s=>{if(!BTICK.has(s.k))return;const tr=P.filter(e=>s.first==null||isFirst(e)===s.first).map(e=>({e,r:sim(e,s.z)})).filter(x=>x.r.why!=='open').map(x=>({t:x.e.ts,v:x.r.v,pct:s.pct}));all.push(...tr);row(s.name,s.pct+'%',tr)});
   if(BTICK.size>1)row('All ticked together','',all,true)}
-function draw(){const P=sel();tiles(P);botSection(P);const R=stiles(P);table(P,R)}
+
+function sinceLast(e){if(e._sl!==undefined)return e._sl;const p=D.events.filter(x=>x.coin===e.coin&&x.ts<e.ts&&e.ts-x.ts<=345600).pop();return e._sl=p?(e.entry/p.entry-1)*100:null}
+function fundG(e){const f=e.fund;return f==null?null:f<0?'neg':f<0.01?'low':f<0.05?'mid':'high'}
+function b3(v,t){return v==null?null:v<=-t?'dn':v>=t?'up':'flat'}
+function oiG(e){return e.oi4===undefined?undefined:e.oi4==null?'na':e.oi4>1?'up':e.oi4<-1?'dn':'flat'}
+const SIG=[['Since last alert (96 h)',e=>{const s=sinceLast(e);return s==null?'first':s>=0?'up':'dn'},{first:'first alert',up:'repeat, higher',dn:'repeat, lower'}],
+ ['Funding at the pump',fundG,{neg:'negative',low:'0–0.01%',mid:'0.01–0.05%',high:'0.05%+'}],
+ ['Funding interval',e=>e.fund_cyc==null?null:e.fund_cyc<8?'cut':'normal',{cut:'cut below 8 h',normal:'8 h'}],
+ ['BTC last 24 h',e=>b3(e.btc_d,1.5),{dn:'down 1.5%+',flat:'±1.5%',up:'up 1.5%+'}],
+ ['BTC last 7 days',e=>b3(e.btc_w,5),{dn:'down 5%+',flat:'±5%',up:'up 5%+'}],
+ ['Pump took',e=>e.rise_h<1?'a':e.rise_h<3?'b':e.rise_h<8?'c':'d',{a:'under 1 h',b:'1–3 h',c:'3–8 h',d:'8 h or more'}],
+ ['24 h MEXC volume',e=>e.vol24<1e6?'a':e.vol24<1e7?'b':'c',{a:'under 1M',b:'1M–10M',c:'10M+'}],
+ ['OI last 4 h (Binance)',oiG,{up:'rising',flat:'flat',dn:'falling',na:'no Binance data'}],
+ ['Crowd long/short (Binance)',e=>e.ls==null?null:e.ls<1?'short':'long',{short:'mostly shorts',long:'mostly longs'}]];
+function edge(P){const T=$('edge-tb');T.replaceChildren();const SC={side:'long',sl:30,tp:9,tg:0,td:20,be:0,tx:0},SH={side:'short',sl:30,tp:20,tg:0,td:20,be:0,tx:0};
+  const botAvg=g=>{let s=0,n=0;BOT.forEach(b=>{if(!BTICK.has(b.k))return;g.forEach(e=>{if(b.first!=null&&isFirst(e)!==b.first)return;const r=sim(e,b.z);if(r.why==='open')return;s+=r.v*b.pct;n+=b.pct})});return n?s/n:null};
+  SIG.forEach(([name,fn,lab])=>{const by={};P.forEach(e=>{const k=fn(e);if(k==null)return;(by[k]=by[k]||[]).push(e)});
+    Object.keys(lab).forEach((k,i)=>{const g=(by[k]||[]).filter(e=>e.done);if(g.length<15)return;const a=g.map(e=>sim(e,SC)),b=g.map(e=>sim(e,SH));
+      const wa=a.filter(x=>x.v>0).length,wb=b.filter(x=>x.v>0).length,aa=a.reduce((s,x)=>s+x.v,0)/g.length,ab=b.reduce((s,x)=>s+x.v,0)/g.length,bt=botAvg(g);const r=el('tr');
+      [[i?'':name,'l'],[lab[k],'l'],[String(g.length),''],[pc(wa,g.length),wa/g.length>=0.75?'up':'dn'],[fp(aa),cls(aa)],[fp(bt),cls(bt)],[pc(wb,g.length),''],[fp(ab),cls(ab)]].forEach(([v,c])=>r.append(el('td',c,v)));T.append(r)})})}
+async function loadBinance(){const btn=$('bn-load'),st=$('bn-st');btn.disabled=true;const now=Date.now()/1000;let cache={};try{cache=JSON.parse(localStorage.getItem('p60bn')||'{}')}catch(e){}
+  const todo=D.events.filter(e=>now-e.ts<29.5*86400);let n=0,got=0;
+  const one=async e=>{const key=e.coin+'@'+e.ts;if(cache[key]){Object.assign(e,cache[key]);got+=e.oi4!=null;return}const sym=e.coin+'USDT',t=e.ts*1000;const out={oi4:null,ls:null};
+    try{const oi=await fetch(`https://fapi.binance.com/futures/data/openInterestHist?symbol=${sym}&period=5m&startTime=${t-4*3600e3}&endTime=${t}&limit=60`).then(r=>r.json());if(Array.isArray(oi)&&oi.length>1)out.oi4=(+oi[oi.length-1].sumOpenInterestValue/+oi[0].sumOpenInterestValue-1)*100}catch(_){}
+    try{const ls=await fetch(`https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${sym}&period=5m&startTime=${t-15*60e3}&endTime=${t}&limit=5`).then(r=>r.json());if(Array.isArray(ls)&&ls.length)out.ls=+ls[ls.length-1].longShortRatio}catch(_){}
+    Object.assign(e,out);cache[key]=out;got+=out.oi4!=null};
+  for(let i=0;i<todo.length;i+=4){await Promise.all(todo.slice(i,i+4).map(one));n=Math.min(todo.length,i+4);st.textContent='Loading Binance data: '+n+' of '+todo.length+' alerts…'}
+  try{localStorage.setItem('p60bn',JSON.stringify(cache))}catch(_){}st.textContent='Binance data loaded for '+got+' of '+todo.length+' alerts from the last 30 days (the rest are not on Binance futures).';btn.disabled=false;draw()}
+function draw(){const P=sel();tiles(P);botSection(P);edge(P);const R=stiles(P);table(P,R)}
 async function status(){try{const s=await (await fetch('/p60/status',{cache:'no-store'})).json();
   const made=D.made?'Scanned '+new Date(D.made*1000).toLocaleString('en-GB')+' · '+D.coins+' coins · last '+D.days+' days. ':'';
   $('status').textContent=made+(s.status==='running'?'Scanning now: '+s.done+' of '+s.total+' coins, '+s.events+' alerts so far (takes about 1.5 hours; results appear when it finishes)…':s.status==='error'?'Last scan failed: '+s.error:D.made?'Rescanned daily on GitHub.':'Waiting for the first scan (runs daily on GitHub; takes about an hour).');
   if(s.status==='running'||!D.made)setTimeout(status,15000)}catch(e){}}
 async function load(){try{const j=await (await fetch('/p60/data',{cache:'no-store'})).json();if(j.events)D=j}catch(e){}draw();status();if(!D.made)setTimeout(load,60000)}
+$('bn-load').onclick=loadBinance;
 document.querySelectorAll('select,input').forEach(x=>x.addEventListener('input',()=>{SHOW=200;draw()}));load();
 </script></body></html>

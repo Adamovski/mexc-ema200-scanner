@@ -153,6 +153,36 @@ def _event(sym, hours, i, now):
             "marks": {k: at(v) for k, v in (("h1", 1), ("h4", 4), ("h24", 24), ("d3", 72), ("d7", 168))}, "bars": bars}
 
 
+BTC = {}
+
+
+def _btc(now):
+    """BTC hourly closes (MEXC), to tag each alert with BTC's last 24 h / 7 days."""
+    if not BTC:
+        for k in _klines("BTC_USDT", "Min60", now - (DAYS + 9) * 86400, now):
+            BTC[int(k[0])] = k[4]
+    return BTC
+
+
+def _btc_chg(ts, hours_back):
+    h = int(ts // 3600 * 3600)
+    a, b = BTC.get(h - 3600), BTC.get(h - 3600 - hours_back * 3600)
+    return round((a / b - 1) * 100, 2) if a and b else None
+
+
+def _funding(sym, since):
+    """MEXC funding history for one coin: [(settle time s, rate %, cycle h)], newest first."""
+    out, page = [], 1
+    while page <= 20:
+        d = _get("/funding_rate/history", {"symbol": sym, "page_num": page, "page_size": 1000}) or {}
+        rows = d.get("resultList") or []
+        out += [(r["settleTime"] / 1000, float(r["fundingRate"]) * 100, r.get("collectCycle")) for r in rows]
+        if not rows or rows[-1]["settleTime"] / 1000 < since or page >= (d.get("totalPage") or 1):
+            break
+        page += 1
+    return out
+
+
 def _coin(sym, now):
     hours = _klines(sym, "Min60", now - DAYS * 86400, now)
     out = []
@@ -160,9 +190,22 @@ def _coin(sym, now):
         try:
             ev = _event(sym, hours, i, now)
             if ev:
+                ev["btc_d"], ev["btc_w"] = _btc_chg(ev["ts"], 24), _btc_chg(ev["ts"], 168)
                 out.append(ev)
         except Exception as e:
             print(f"[p60] {sym} event failed: {e}", flush=True)
+    if out:
+        try:
+            fr = _funding(sym, now - DAYS * 86400 - 86400)
+            for ev in out:
+                past = [r for r in fr if r[0] <= ev["ts"]]
+                if past:
+                    ev["fund"] = round(past[0][1], 4)
+                    ev["fund_cyc"] = past[0][2]
+                    day = [r[1] for r in past if r[0] >= ev["ts"] - 86400]
+                    ev["fund_max24"] = round(max(day), 4) if day else None
+        except Exception as e:
+            print(f"[p60] {sym} funding failed: {e}", flush=True)
     return out
 
 
@@ -205,6 +248,7 @@ def run():
         det = _get("/detail") or []
         syms = sorted(d["symbol"] for d in det if d.get("quoteCoin") == "USDT" and d.get("state", 0) == 0 and d["symbol"].endswith("_USDT"))
         det = None
+        _btc(int(time.time()))
         prog = None
         if vs._redis():
             try:
